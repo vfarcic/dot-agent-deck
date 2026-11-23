@@ -1468,6 +1468,10 @@ pub enum RestoreRefusal {
     /// restart note could not be posted, so it was stopped again and the
     /// item stays listed.
     NoteNotDelivered,
+    /// Audit B1: the agent started, but the deck could not record it as the
+    /// one that took the old one's place, so it stopped the agent again
+    /// and the item stays listed.
+    NotRecorded,
     /// A refusal of a newer daemon's.
     #[serde(other)]
     Unknown,
@@ -1539,7 +1543,7 @@ pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
             "Refused: the request named an agent twice, named too many agents, or used an id that is too long."
         }
         RestoreRefusal::CommandReopens => {
-            "Refused: the agent's recorded command reopens an earlier conversation, so starting it over would not start fresh. Start it yourself without that option."
+            "Refused: the agent's command reopens an earlier conversation, so starting it over would not start fresh. Start it yourself without that option."
         }
         RestoreRefusal::NotFresh => {
             "The deck could not confirm that the agent started a new conversation rather than its old one, so it stopped the agent before sending it anything."
@@ -1558,6 +1562,9 @@ pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
         }
         RestoreRefusal::NoteNotDelivered => {
             "The agent came back into its conversation, but the deck could not give it its restart note, so it stopped the agent again. The item is still listed; try again."
+        }
+        RestoreRefusal::NotRecorded => {
+            "The agent started, but the deck could not record it in its work journal, so it stopped the agent again. The item is still listed; try again."
         }
         RestoreRefusal::Unknown => REFUSED_UNKNOWN,
     }
@@ -1619,8 +1626,9 @@ pub struct RestoreOutcome {
     pub would_restore: Vec<AttemptId>,
     /// With `dry_run`: what Git and GitHub say of the item's worktree and
     /// branch now (§4 item 10), so a client can show an open pull request
-    /// in its question. A restore that acted carries the facts it checked.
-    /// Absent otherwise, and from a daemon before it.
+    /// in its question. Absent for a restore that acted (it reads them again
+    /// with its claims held, and does not carry them), and from a daemon
+    /// before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitFacts>,
     /// The full id of the item the request's `id` resolved to, so a client

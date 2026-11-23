@@ -210,7 +210,8 @@ pub fn process_gone_with(
     }
     match probe(pid) {
         ProcessProbe::Started(now) if now == started => Err(ProcessNotGone::StillRunning),
-        ProcessProbe::Started(_) | ProcessProbe::Absent => Ok(()),
+        // Audit F4b: a zombie runs nothing, whichever process it was.
+        ProcessProbe::Started(_) | ProcessProbe::Absent | ProcessProbe::Exited => Ok(()),
         ProcessProbe::Unknown => Err(ProcessNotGone::OldProcessUnknown),
     }
 }
@@ -654,6 +655,7 @@ mod tests {
             "a live process whose identity could not be read"
         );
         assert_eq!(gone(ProcessProbe::Absent), Ok(()));
+        assert_eq!(gone(ProcessProbe::Exited), Ok(()), "a zombie runs nothing");
         assert_eq!(gone(ProcessProbe::Started(2000)), Ok(()), "a reused pid");
         assert_eq!(
             gone(ProcessProbe::Started(1000)),

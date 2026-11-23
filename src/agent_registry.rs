@@ -375,14 +375,125 @@ pub struct AgentSpec {
     /// the conversation it reopened only with its first prompt, so a restore
     /// cannot confirm it came back before the restart note is due.
     pub resume: Option<&'static ResumeSpec>,
-    /// PRD #1790 stage 3: how this agent's own arguments choose or reopen a
-    /// conversation, read even where [`Self::resume`] is `None`: by the
-    /// launch shim, which resumes by id only when the daemon asked it to
-    /// (it asks only for an agent with [`Self::resume`]), and by Start over,
-    /// which refuses a recorded command that would reopen an old
-    /// conversation ([`ResumeSpec::reopens`], audit F3). Codex keeps its
-    /// table here for #2492.
+    /// PRD #1790 stage 3: how this agent's own arguments choose a
+    /// conversation for a resume, read even where [`Self::resume`] is
+    /// `None`, by the launch shim, which resumes by id only when the daemon
+    /// asked it to (it asks only for an agent with [`Self::resume`]). Codex
+    /// keeps its table here for #2492.
     pub session_args: Option<&'static ResumeSpec>,
+    /// Audit B3/F3: how a Start over is held to a fresh start for this
+    /// agent, separately from whether the deck can resume it: the program
+    /// the launch shim stands in front of, the arguments that select an
+    /// existing conversation, and for Claude Code the option that starts one
+    /// under an id the deck chooses ([`FreshSpec`]). `None` for an agent the
+    /// shim does not stand in front of (Antigravity) and the placeholder:
+    /// a Start over of it is not checked for freshness.
+    pub fresh_start: Option<&'static FreshSpec>,
+}
+
+/// Audit B3/F3: one agent's fresh-start contract. A Start over asks the
+/// launch shim, through a one-shot request in the spawn's environment
+/// ([`crate::telemetry::shim::FRESH_ENV_KEYS`]), to check the arguments the
+/// agent is really started with: arguments that select an existing
+/// conversation ([`Self::selects`]) are refused, and the daemon stops the
+/// agent before it posts anything; otherwise, for an agent with
+/// [`Self::new_id_option`], the shim starts it under a new id the daemon
+/// chose, which its first report must then name. The recorded command is
+/// read too ([`Self::command_reopens`]), as an early refusal before anything
+/// starts, never as the guarantee: a shell can reach the program in ways a
+/// reading of its text cannot follow.
+#[derive(Debug)]
+pub struct FreshSpec {
+    /// The program name the shim stands in front of for this agent.
+    pub program: &'static str,
+    /// The option that starts a new conversation under a chosen id, given
+    /// as its own argument followed by the id (Claude Code's
+    /// `--session-id`), or `None`.
+    pub new_id_option: Option<&'static str>,
+    selecting: fn(&[std::ffi::OsString]) -> bool,
+    inspecting: fn(&[std::ffi::OsString]) -> bool,
+}
+
+impl FreshSpec {
+    /// Whether the agent's own `args` select an existing conversation
+    /// (continue the last one, resume, fork or open one by id or name, start
+    /// one under an id chosen in advance), so a launch with them is not a
+    /// fresh start.
+    pub fn selects(&self, args: &[std::ffi::OsString]) -> bool {
+        (self.selecting)(args)
+    }
+
+    /// Whether the agent's own `args` start no conversation at all (a
+    /// version or help query, a managing subcommand): the shim leaves a
+    /// fresh-start request for the launch's later call that does.
+    pub fn inspects(&self, args: &[std::ffi::OsString]) -> bool {
+        (self.inspecting)(args)
+    }
+
+    /// The arguments that start the agent under the new id `id`, as
+    /// separate argv entries; none for an agent without
+    /// [`Self::new_id_option`].
+    pub fn args(&self, id: &str) -> Vec<std::ffi::OsString> {
+        match self.new_id_option {
+            Some(option) => vec![option.into(), id.into()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether the shell command `command` runs [`Self::program`] with
+    /// arguments that [`Self::selects`]: each place the program is named,
+    /// its arguments up to the next shell separator, with `;`, `&`, `|`,
+    /// `(` and `)` read as separators wherever they stand in a word. A
+    /// command that reaches the program another way (a variable, a quoted
+    /// script, `eval`) is not caught here; the shim's check at the real
+    /// argument list is what holds a Start over to a fresh start.
+    pub fn command_reopens(&self, command: &str) -> bool {
+        let tokens = shell_words(command);
+        let separator = |t: &str| matches!(t, ";" | "&" | "&&" | "||" | "|" | "(" | ")");
+        tokens.iter().enumerate().any(|(at, token)| {
+            let base = token.rsplit('/').next().unwrap_or(token);
+            if base != self.program {
+                return false;
+            }
+            let args: Vec<std::ffi::OsString> = tokens[at + 1..]
+                .iter()
+                .take_while(|t| !separator(t))
+                .map(Into::into)
+                .collect();
+            self.selects(&args)
+        })
+    }
+}
+
+/// `command`'s words as [`crate::event::tokenize_command`] reads them, each
+/// further split at the shell's control characters `;`, `&`, `|`, `(` and
+/// `)`, which stand as words of their own (`&&` and `||` stay whole), so
+/// `true;codex resume` and `(codex resume --last)` name `codex`.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in crate::event::tokenize_command(command) {
+        let mut word = String::new();
+        let mut chars = token.chars().peekable();
+        while let Some(c) = chars.next() {
+            if matches!(c, ';' | '&' | '|' | '(' | ')') {
+                if !word.is_empty() {
+                    out.push(std::mem::take(&mut word));
+                }
+                let mut op = c.to_string();
+                if matches!(c, '&' | '|') && chars.peek() == Some(&c) {
+                    op.push(c);
+                    chars.next();
+                }
+                out.push(op);
+            } else {
+                word.push(c);
+            }
+        }
+        if !word.is_empty() {
+            out.push(word);
+        }
+    }
+    out
 }
 
 /// PRD #1790 stage 3 ([`AgentSpec::resume`]): where an agent's resume
@@ -409,7 +520,6 @@ pub struct ResumeSpec {
     valid_id: fn(&str) -> bool,
     conflicting: fn(&[std::ffi::OsString]) -> bool,
     inspecting: fn(&[std::ffi::OsString]) -> bool,
-    reopening: fn(&[std::ffi::OsString]) -> bool,
 }
 
 impl ResumeSpec {
@@ -431,48 +541,6 @@ impl ResumeSpec {
     /// agent; the shim leaves its resume request for that later call.
     pub fn inspects(&self, args: &[std::ffi::OsString]) -> bool {
         (self.inspecting)(args)
-    }
-
-    /// Audit F3: whether the agent's own `args` reopen an earlier
-    /// conversation (continue the last one, resume or fork one by id, start
-    /// one under a chosen id), so a launch with them is not a fresh start.
-    /// Narrower than [`Self::conflicts`], which also refuses modes a resume
-    /// cannot be combined with.
-    pub fn reopens(&self, args: &[std::ffi::OsString]) -> bool {
-        (self.reopening)(args)
-    }
-
-    /// Whether the shell command `command` runs [`Self::program`] with
-    /// arguments that [`Self::reopens`]: each place the program is named, its
-    /// arguments up to the next shell separator. A command the deck cannot
-    /// read that way (the program reached through a wrapper or a variable)
-    /// is not caught here; Start over then confirms the new conversation is
-    /// not the old one where the agent reports it before its prompt.
-    pub fn command_reopens(&self, command: &str) -> bool {
-        let tokens = crate::event::tokenize_command(command);
-        let separator = |t: &str| matches!(t, ";" | "&&" | "||" | "|" | "&" | ")" | "(");
-        tokens.iter().enumerate().any(|(at, token)| {
-            let name = token.trim_end_matches(';');
-            let base = name.rsplit('/').next().unwrap_or(name);
-            if base != self.program {
-                return false;
-            }
-            if name.len() != token.len() {
-                return false;
-            }
-            let args: Vec<std::ffi::OsString> = tokens[at + 1..]
-                .iter()
-                .take_while(|t| !separator(t))
-                .scan(false, |ended, t| {
-                    if *ended {
-                        return None;
-                    }
-                    *ended = t.ends_with(';') || t.ends_with(')');
-                    Some(t.trim_end_matches([';', ')']).into())
-                })
-                .collect();
-            self.reopens(&args)
-        })
     }
 
     /// The arguments that resume `id`, as separate argv entries.
@@ -828,17 +896,25 @@ fn codex_inspects(args: &[std::ffi::OsString]) -> bool {
     false
 }
 
-/// Whether Codex's own `args` reopen a conversation: a first positional
-/// argument `resume` or `fork` (`codex resume --last`, `codex fork <id>`).
-/// Option values are skipped as [`codex_resume_conflicts`] skips them.
-fn codex_reopens(args: &[std::ffi::OsString]) -> bool {
+/// Whether Codex's own `args` select an existing conversation: a first
+/// positional argument `resume` or `fork` (`codex resume --last`,
+/// `codex fork <id>`), the same after `exec`/`e` (`codex exec resume
+/// --last`), or `agents`, which opens the session browser (`codex --help`,
+/// codex-cli 0.169). Option values are skipped as
+/// [`codex_resume_conflicts`] skips them.
+fn codex_selects(args: &[std::ffi::OsString]) -> bool {
     let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    let mut after_exec = false;
     while let Some(arg) = args.next() {
         if arg == "--" {
             return false;
         }
         if !arg.starts_with('-') || arg == "-" {
-            return matches!(arg.as_ref(), "resume" | "fork");
+            if !after_exec && matches!(arg.as_ref(), "exec" | "e") {
+                after_exec = true;
+                continue;
+            }
+            return matches!(arg.as_ref(), "resume" | "fork") || (!after_exec && arg == "agents");
         }
         if !arg.contains('=') && CODEX_VALUE_OPTIONS.contains(&arg.as_ref()) {
             let _ = args.next();
@@ -847,6 +923,210 @@ fn codex_reopens(args: &[std::ffi::OsString]) -> bool {
     false
 }
 
+/// Whether `args`, up to a `--`, hold one of `long` (alone or as
+/// `--opt=value`), or a single-dash argument opening with one of the
+/// single-letter `short` options (alone, or with a value or other flags
+/// attached). Option values are not skipped, so a value that looks like one
+/// of them reads as one: a false "selects" refuses a Start over, never the
+/// other way round.
+fn any_option(args: &[std::ffi::OsString], long: &[&str], short: &[char]) -> bool {
+    for arg in args {
+        let arg = arg.to_string_lossy();
+        if arg == "--" {
+            return false;
+        }
+        if let Some(name) = arg.strip_prefix("--") {
+            let name = name.split_once('=').map_or(name, |(name, _)| name);
+            if long.contains(&name) {
+                return true;
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-')
+            && cluster.chars().next().is_some_and(|c| short.contains(&c))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `args` ask only for help or a version (`long`, `short`), or
+/// their first positional argument is one of `subcommands`, before a `--`.
+fn inspects_with(
+    args: &[std::ffi::OsString],
+    long: &[&str],
+    short: &[&str],
+    subcommands: &[&str],
+) -> bool {
+    for arg in args {
+        let arg = arg.to_string_lossy();
+        if arg == "--" {
+            return false;
+        }
+        if arg
+            .strip_prefix("--")
+            .is_some_and(|name| long.contains(&name))
+            || short.contains(&arg.as_ref())
+        {
+            return true;
+        }
+        if !arg.starts_with('-') {
+            return subcommands.contains(&arg.as_ref());
+        }
+    }
+    false
+}
+
+/// OpenCode's options that select an existing conversation, at the top
+/// level and under `run` (`opencode --help`, `opencode run --help`,
+/// OpenCode 2026-11): `--continue`/`-c`, `--session`/`-s <id>`, `--fork`.
+fn opencode_selects(args: &[std::ffi::OsString]) -> bool {
+    any_option(args, &["continue", "session", "fork"], &['c', 's'])
+}
+
+/// OpenCode's subcommands that start no conversation.
+const OPENCODE_MANAGING_SUBCOMMANDS: [&str; 18] = [
+    "upgrade",
+    "update",
+    "uninstall",
+    "acp",
+    "api",
+    "debug",
+    "auth",
+    "mcp",
+    "plugin",
+    "models",
+    "stats",
+    "session",
+    "service",
+    "reload",
+    "pair",
+    "serve",
+    "help",
+    "completion",
+];
+
+fn opencode_inspects(args: &[std::ffi::OsString]) -> bool {
+    inspects_with(
+        args,
+        &["help", "version", "completions"],
+        &["-h", "-v"],
+        &OPENCODE_MANAGING_SUBCOMMANDS,
+    )
+}
+
+/// Pi's options that select an existing conversation (`pi --help`):
+/// `--continue`/`-c`, `--resume`/`-r`, `--session`, `--session-id`, `--fork`.
+fn pi_selects(args: &[std::ffi::OsString]) -> bool {
+    any_option(
+        args,
+        &["continue", "resume", "session", "session-id", "fork"],
+        &['c', 'r'],
+    )
+}
+
+/// Pi's subcommands that start no conversation (`pi --help`).
+const PI_MANAGING_SUBCOMMANDS: [&str; 8] = [
+    "install",
+    "remove",
+    "uninstall",
+    "update",
+    "list",
+    "config",
+    "auth",
+    "mcp",
+];
+
+fn pi_inspects(args: &[std::ffi::OsString]) -> bool {
+    inspects_with(
+        args,
+        &["help", "version", "export", "list-models"],
+        &["-h", "-v"],
+        &PI_MANAGING_SUBCOMMANDS,
+    )
+}
+
+/// Devin's options that select an existing conversation (`devin --help`):
+/// `--continue`/`-c`, `--resume`/`-r [<id>]`.
+fn devin_selects(args: &[std::ffi::OsString]) -> bool {
+    any_option(args, &["continue", "resume"], &['c', 'r'])
+}
+
+/// Devin's subcommands that start no conversation (`devin --help`).
+const DEVIN_MANAGING_SUBCOMMANDS: [&str; 23] = [
+    "auth",
+    "mcp",
+    "models",
+    "doctor",
+    "rules",
+    "skills",
+    "plugins",
+    "cloud",
+    "desktop",
+    "list",
+    "ls",
+    "rm",
+    "ssh",
+    "forward",
+    "update",
+    "version",
+    "migrate",
+    "sandbox",
+    "setup",
+    "uninstall",
+    "acp",
+    "help",
+    "completion",
+];
+
+fn devin_inspects(args: &[std::ffi::OsString]) -> bool {
+    inspects_with(
+        args,
+        &["help", "version"],
+        &["-h", "-V"],
+        &DEVIN_MANAGING_SUBCOMMANDS,
+    )
+}
+
+/// Claude Code's fresh start: started under a new id the deck chooses.
+pub static CLAUDE_FRESH: FreshSpec = FreshSpec {
+    program: "claude",
+    new_id_option: Some("--session-id"),
+    selecting: claude_reopens,
+    inspecting: claude_inspects,
+};
+
+/// Codex's fresh start.
+pub static CODEX_FRESH: FreshSpec = FreshSpec {
+    program: "codex",
+    new_id_option: None,
+    selecting: codex_selects,
+    inspecting: codex_inspects,
+};
+
+/// OpenCode's fresh start.
+pub static OPENCODE_FRESH: FreshSpec = FreshSpec {
+    program: "opencode",
+    new_id_option: None,
+    selecting: opencode_selects,
+    inspecting: opencode_inspects,
+};
+
+/// Pi's fresh start.
+pub static PI_FRESH: FreshSpec = FreshSpec {
+    program: "pi",
+    new_id_option: None,
+    selecting: pi_selects,
+    inspecting: pi_inspects,
+};
+
+/// Devin's fresh start.
+pub static DEVIN_FRESH: FreshSpec = FreshSpec {
+    program: "devin",
+    new_id_option: None,
+    selecting: devin_selects,
+    inspecting: devin_inspects,
+};
+
 /// Claude Code: `claude --resume <id> <its own arguments>`.
 pub static CLAUDE_RESUME: ResumeSpec = ResumeSpec {
     program: "claude",
@@ -854,7 +1134,6 @@ pub static CLAUDE_RESUME: ResumeSpec = ResumeSpec {
     valid_id: is_canonical_uuid,
     conflicting: claude_resume_conflicts,
     inspecting: claude_inspects,
-    reopening: claude_reopens,
 };
 
 /// Codex: `codex resume <id> <its own options>`.
@@ -864,7 +1143,6 @@ pub static CODEX_RESUME: ResumeSpec = ResumeSpec {
     valid_id: is_canonical_uuid,
     conflicting: codex_resume_conflicts,
     inspecting: codex_inspects,
-    reopening: codex_reopens,
 };
 
 /// PRD #211 ([`AgentSpec::status_osc7501`]): how one agent reports its status
@@ -1464,6 +1742,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     status_osc7501: None,
     resume: Some(&CLAUDE_RESUME),
     session_args: Some(&CLAUDE_RESUME),
+    fresh_start: Some(&CLAUDE_FRESH),
 };
 
 /// PRD #1666 part 2 (`inbox/doorbell/008`): do `rows`, one trimmed screen row
@@ -1546,6 +1825,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     status_osc7501: None,
     resume: None,
     session_args: None,
+    fresh_start: Some(&OPENCODE_FRESH),
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -1591,6 +1871,7 @@ pub static PI: AgentSpec = AgentSpec {
     status_osc7501: None,
     resume: None,
     session_args: None,
+    fresh_start: Some(&PI_FRESH),
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -1656,6 +1937,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // confirm the conversation came back before the restart note.
     resume: None,
     session_args: Some(&CODEX_RESUME),
+    fresh_start: Some(&CODEX_FRESH),
 };
 
 /// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
@@ -1873,6 +2155,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     status_osc7501: None,
     resume: None,
     session_args: None,
+    fresh_start: Some(&DEVIN_FRESH),
 };
 
 /// Google's Antigravity CLI (`agy`, PRD #211) — native-hooks strategy, like
@@ -1955,6 +2238,7 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     }),
     resume: None,
     session_args: None,
+    fresh_start: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -1987,6 +2271,7 @@ pub static NONE: AgentSpec = AgentSpec {
     status_osc7501: None,
     resume: None,
     session_args: None,
+    fresh_start: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -2264,15 +2549,23 @@ mod tests {
         }
     }
 
-    /// PRD #1790 stage 3 (audit F3): the arguments that reopen an earlier
-    /// conversation are told from a fresh start, in a recorded shell command
-    /// too, so Start over refuses a command that would resume.
+    /// PRD #1790 stage 3 (audit F3, B3): each agent's arguments that select
+    /// an existing conversation are told from a fresh start, by a classifier
+    /// of their own, separate from whether the deck can resume the agent;
+    /// a recorded shell command is read with its control characters as
+    /// separators, so compound and subshell forms are caught too.
     #[test]
     fn reopening_arguments_and_commands_are_told_from_a_fresh_start() {
         use std::ffi::OsString;
         const ID: &str = "01234567-89ab-4cde-8fab-0123456789ab";
-        let claude = spec(&AgentType::ClaudeCode).session_args.unwrap();
-        let codex = spec(&AgentType::Codex).session_args.unwrap();
+        let fresh = |agent: AgentType| spec(&agent).fresh_start.unwrap();
+        let claude = fresh(AgentType::ClaudeCode);
+        let codex = fresh(AgentType::Codex);
+        let opencode = fresh(AgentType::OpenCode);
+        let pi = fresh(AgentType::Pi);
+        let devin = fresh(AgentType::Devin);
+        assert!(spec(&AgentType::Antigravity).fresh_start.is_none());
+        assert!(spec(&AgentType::None).fresh_start.is_none());
         let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
         let attached = format!("-r{ID}");
         for args in [
@@ -2285,7 +2578,7 @@ mod tests {
             vec!["--fork-session"],
             vec!["--model", "haiku", "--continue"],
         ] {
-            assert!(claude.reopens(&os(&args)), "Claude: {args:?}");
+            assert!(claude.selects(&os(&args)), "Claude: {args:?}");
         }
         for args in [
             vec![],
@@ -2295,30 +2588,83 @@ mod tests {
             vec!["--append-system-prompt", "--continue"],
             vec!["fix the -c flag"],
         ] {
-            assert!(!claude.reopens(&os(&args)), "Claude: {args:?}");
+            assert!(!claude.selects(&os(&args)), "Claude: {args:?}");
         }
+        assert_eq!(claude.args(ID), os(&["--session-id", ID]));
+        // Changed in round 3: `codex exec resume` selects a conversation too.
         for args in [
             vec!["resume", ID],
             vec!["resume", "--last"],
             vec!["fork", ID],
             vec!["-m", "mini", "resume", "--last"],
+            vec!["exec", "resume", "--last"],
+            vec!["e", "fork", ID],
+            vec!["agents"],
         ] {
-            assert!(codex.reopens(&os(&args)), "Codex: {args:?}");
+            assert!(codex.selects(&os(&args)), "Codex: {args:?}");
         }
         for args in [
             vec![],
             vec!["--model", "mini"],
-            vec!["exec", "resume"],
+            vec!["exec", "fix the tests"],
             vec!["-c", "resume"],
             vec!["--", "resume"],
         ] {
-            assert!(!codex.reopens(&os(&args)), "Codex: {args:?}");
+            assert!(!codex.selects(&os(&args)), "Codex: {args:?}");
+        }
+        assert!(codex.args(ID).is_empty());
+        for args in [
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--session", "ses_abc"],
+            vec!["--session=ses_abc"],
+            vec!["-s", "ses_abc"],
+            vec!["run", "--fork", "-s", "ses_abc", "hi"],
+        ] {
+            assert!(opencode.selects(&os(&args)), "OpenCode: {args:?}");
+        }
+        for args in [vec![], vec!["--model", "x/y"], vec!["run", "--", "-c"]] {
+            assert!(!opencode.selects(&os(&args)), "OpenCode: {args:?}");
+        }
+        for args in [
+            vec!["--continue"],
+            vec!["-r"],
+            vec!["--session", "f"],
+            vec!["--session-id", ID],
+            vec!["--fork", "f"],
+        ] {
+            assert!(pi.selects(&os(&args)), "Pi: {args:?}");
+        }
+        for args in [vec![], vec!["--session-dir", "d"], vec!["--", "-c"]] {
+            assert!(!pi.selects(&os(&args)), "Pi: {args:?}");
+        }
+        for args in [
+            vec!["-c"],
+            vec!["--resume"],
+            vec!["-r", ID],
+            vec!["--continue"],
+        ] {
+            assert!(devin.selects(&os(&args)), "Devin: {args:?}");
+        }
+        for args in [vec![], vec!["--model", "m"], vec!["--", "-c"]] {
+            assert!(!devin.selects(&os(&args)), "Devin: {args:?}");
+        }
+        for (agent, args) in [
+            (opencode, vec!["--version"]),
+            (opencode, vec!["auth", "login"]),
+            (pi, vec!["--help"]),
+            (pi, vec!["list"]),
+            (devin, vec!["version"]),
+            (devin, vec!["-h"]),
+        ] {
+            assert!(agent.inspects(&os(&args)), "{}: {args:?}", agent.program);
         }
         for command in [
             "claude --continue",
             "exec claude --resume 01234567-89ab-4cde-8fab-0123456789ab --model x",
             "(umask 077; printf x > f); exec /usr/local/bin/claude -c",
             "cd /w && claude --model haiku --continue; echo done",
+            "true;claude -c",
         ] {
             assert!(claude.command_reopens(command), "{command}");
         }
@@ -2330,8 +2676,19 @@ mod tests {
         ] {
             assert!(!claude.command_reopens(command), "{command}");
         }
-        assert!(codex.command_reopens("exec codex resume --last"));
+        for command in [
+            "exec codex resume --last",
+            "(codex resume --last)",
+            "true;codex resume --last",
+            "true&&codex fork --last",
+            "codex exec resume --last",
+        ] {
+            assert!(codex.command_reopens(command), "{command}");
+        }
         assert!(!codex.command_reopens("exec codex --model mini"));
+        assert!(opencode.command_reopens("exec opencode --continue"));
+        assert!(opencode.command_reopens("opencode -s ses_1"));
+        assert!(!opencode.command_reopens("exec opencode"));
     }
 
     /// PRD #1790 stage 3 (review R4): Claude Code's conflicting options are

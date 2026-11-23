@@ -298,8 +298,8 @@ test.describe("Interrupted work", () => {
   });
 });
 
-async function openRestorePreview(page: Page, enabled = true) {
-  await page.goto(`/?fixture=1&interrupted=restore${enabled ? "&experimental=1" : ""}`);
+async function openRestorePreview(page: Page, enabled = true, fixture = "restore") {
+  await page.goto(`/?fixture=1&interrupted=${fixture}${enabled ? "&experimental=1" : ""}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await expect(page.getByTestId("interrupted-banner")).toContainText("2 interrupted items from before the restart");
@@ -405,6 +405,47 @@ test.describe("journal/restore/009 — desktop restore in the browser", () => {
       await page.waitForTimeout(450);
     }
     await expect(question).toHaveAttribute("data-presented", "true");
+    await page.keyboard.press("c");
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByTestId("interrupted-banner")).toContainText("1 interrupted item from before the restart");
+  });
+
+  /** Scenario: in a short, narrow window, open the restore question for an agent whose long name wraps taller than the dialog, with the page's clock held so nothing counts before the test scrolls. Showing only the middle of the name, then only its end, then the choices below it leaves c ignored however long each is shown; scrolling through every line from the top makes c restore the agent. */
+  test("journal/restore/009 a part taller than the window counts only once all of it was shown", async ({ page }) => {
+    test.setTimeout(90_000);
+    const dialog = await openRestorePreview(page, true, "restore-long");
+    await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+    await page.setViewportSize({ width: 360, height: 120 });
+    await page.clock.install();
+    await page.keyboard.press("s");
+    const question = dialog.getByTestId("interrupted-restore-question");
+    await expect(question).toContainText("fix-login part0 part1");
+    const name = question.locator(".interrupted-verdict").first();
+    const { part, box, offset } = await name.evaluate((element) => {
+      const dialogBox = element.closest(".interrupted-dialog")!;
+      const shown = element.getBoundingClientRect();
+      return { part: shown.height, box: dialogBox.clientHeight, offset: shown.top - dialogBox.getBoundingClientRect().top + dialogBox.scrollTop };
+    });
+    expect(part, "premise: the name's part is taller than the dialog").toBeGreaterThan(box);
+    // Only its middle, then its end, then the choices below it: never the
+    // whole of the name's part, and never its first line.
+    for (const at of [offset + part / 2 - box / 2, offset + part - box / 2, offset + part + 4000]) {
+      await dialog.evaluate((element, top) => { element.scrollTop = top; }, at);
+      await page.clock.runFor(800);
+      await expect(question).not.toHaveAttribute("data-presented", "true");
+      await page.keyboard.press("c");
+      await page.clock.runFor(200);
+      await expect(question).toBeVisible();
+      await expect(page.getByTestId("interrupted-banner")).toContainText("2 interrupted items from before the restart");
+    }
+    // Every line of it, top to bottom.
+    for (let top = 0; top <= offset + part + box; top += Math.max(5, Math.floor(box / 2))) {
+      await dialog.evaluate((element, at) => { element.scrollTop = at; }, top);
+      await page.clock.runFor(400);
+      if ((await question.getAttribute("data-presented")) === "true") break;
+    }
+    await expect(question).toHaveAttribute("data-presented", "true");
+    await page.clock.resume();
     await page.keyboard.press("c");
     await expect(dialog).toHaveCount(0);
     await expect(page.getByTestId("interrupted-banner")).toContainText("1 interrupted item from before the restart");

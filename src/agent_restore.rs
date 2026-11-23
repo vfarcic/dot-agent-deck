@@ -37,14 +37,21 @@
 //!    record without the pid fields (written by a build before stage 3) is
 //!    listed as Start over (`old-process-unknown`, review R#2); it, a
 //!    process the OS would not let the deck look at, or a session it could
-//!    not list, refuses a restore but not a start over. The same holds,
-//!    strictly, for every agent an earlier failed restore of the attempt
-//!    started (`restore_failed`'s `to`, audit F4): a restore or start over
-//!    is refused while any process of it may be left;
+//!    not list, refuses a restore but not a start over. A process that has
+//!    exited and only waits to be reaped counts as gone, here and in every
+//!    later check alike (audit F4b). The same holds, strictly, for every
+//!    agent an earlier failed restore of the attempt started
+//!    (`restore_failed`'s `to`, audit F4): a restore or start over is
+//!    refused while any process of it may be left;
 //! 7. no other agent the deck runs is in the same conversation, nor being
 //!    restored into it (`session-in-use`, [`Sessions::in_use`],
-//!    [`InFlight`], [`claim`]), and no newer live work runs in the agent's
-//!    folder (`directory-in-use`, review R#3);
+//!    [`InFlight`], [`claim`]): an agent a restore confirmed counts as in
+//!    its conversation from the durable successor link alone (audit B1), and
+//!    an agent a failed restore could not be proven to stop fences the
+//!    conversations it may be writing to, from every item, until it is
+//!    proven gone ([`Sessions::fenced`], audit B2); and no newer live work
+//!    runs in the agent's folder, by whatever path it was started there
+//!    (`directory-in-use`, review R#3, audit S1);
 //! 8. for a start over of a dispatched unit, the saved task is read through
 //!    the held folder without following a symlink, a regular owner-only file
 //!    of bounded size ([`crate::dispatch_task::read_saved_in`]);
@@ -52,15 +59,18 @@
 //!    ([`CallerClaim`]) is refused, as reclaim's is (the same cooperative
 //!    guard, not an authentication boundary);
 //! 10. Git and GitHub, with the list's bounded probes
-//!     ([`crate::interrupted_work_daemon::item_git_facts`], review R#3): a
-//!     worktree that is gone refuses either action (`folder-missing`); an
-//!     open pull request on the item's branch refuses a start over
-//!     (`pr-open`), which would repeat the task beside it, and only adds a
-//!     note to a restore's question, since the resumed agent may be the one
-//!     maintaining it;
-//! 11. for a start over, the recorded command does not reopen an earlier
-//!     conversation ([`crate::agent_registry::ResumeSpec::command_reopens`],
-//!     `command-reopens`, audit F3).
+//!     ([`crate::interrupted_work_daemon::item_git_facts`], review R#3),
+//!     read for a start that acts in [`start`], with its claims held, for
+//!     the item as the fresh read found it (audit S5): a worktree that is
+//!     gone refuses either action (`folder-missing`); an open pull request on
+//!     the item's branch refuses a start over (`pr-open`), which would repeat
+//!     the task beside it, and only adds a note to a restore's question,
+//!     since the resumed agent may be the one maintaining it;
+//! 11. for a start over, a recorded command the deck can read does not
+//!     reopen an earlier conversation
+//!     ([`crate::agent_registry::FreshSpec::command_reopens`],
+//!     `command-reopens`, audit F3): an early refusal only; the launch
+//!     shim's check at the real arguments is the guarantee (below).
 //!
 //! **The request is bounded before anything is read** (audit F5): more
 //! agents than an item lists ([`MAX_ITEM_AGENTS`]), an agent named twice, or
@@ -73,11 +83,15 @@
 //! claimed, in this daemon ([`InFlight`]) and across every daemon sharing the
 //! state directory ([`claim`]: a `flock`ed file per attempt and per
 //! conversation in an owner-only directory of it). With the claims held,
-//! every check above runs again from a fresh read ([`revalidate`]), and the
-//! claims are kept until the agent is confirmed and its successor recorded
-//! in the journal, or it is stopped. A second request meanwhile is refused
-//! (`already-restoring`, `session-in-use`); one after it finds the item
-//! closed, or the new agent live in the conversation.
+//! every check above runs again from a fresh read ([`revalidate`]). A
+//! started agent's claims are released once its successor link,
+//! `attempt_restored` with the conversation it was confirmed in, has been
+//! written and waited for (audit B1), or once it was stopped after a
+//! failure. A link that cannot be written stops the agent (`not-recorded`);
+//! a failure whose stop can be neither proven nor recorded keeps the claims
+//! for this daemon's life ([`keep_fenced`]). A second request meanwhile is
+//! refused (`already-restoring`, `session-in-use`); one after it finds the
+//! item closed, or the new agent in the conversation.
 //!
 //! **Restore.** The restart note is admitted to the inbox first
 //! (`note-refused`, review R#4). The agent is started as a dashboard pane of
@@ -100,29 +114,39 @@
 //! cannot be posted after all stops the agent again and leaves the item
 //! listed as it was (`note-not-delivered`).
 //!
-//! **Start over.** The recorded command, in the verified folder, with no
-//! resume request. For an agent the deck can resume, whose hooks report its
-//! conversation before its prompt (Claude Code), the first conversation it
-//! reports must not be the old one, or it is stopped (`not-fresh`, audit F3);
-//! an agent with no such report (the documented gaps) is started without
-//! that check. A dispatched unit's saved task is posted as its first inbox
+//! **Start over.** The recorded command, in the verified folder. For an
+//! agent with a [`crate::agent_registry::FreshSpec`] (Claude Code, Codex,
+//! OpenCode, Pi, Devin), the spawn carries a one-shot fresh-start request
+//! ([`crate::telemetry::shim::FRESH_ENV_KEYS`]) and the shim directory first
+//! on its `PATH`: the shim checks the arguments the agent is really started
+//! with and refuses ones that select an existing conversation, and starts
+//! Claude Code under a new conversation id the deck chose. A refusal answers
+//! `command-reopens`; a shim not reached, or a Claude Code whose first
+//! attested conversation is not the new one, answers `not-fresh`; either
+//! stops the agent before anything is posted to it ([`confirm_fresh`],
+//! audit B3). Antigravity and a plain shell carry no request and are not
+//! checked. A dispatched unit's saved task is posted as its first inbox
 //! message (reason `saved task`), and no restart note: the agent is new and
-//! has no conversation to be told about. Then `closed how=started_over` and
-//! `attempt_restored{how: started_over}`.
+//! has no conversation to be told about. Then
+//! `attempt_restored{how: started_over}` and `closed how=started_over`.
 //!
-//! **Stopping an agent it started** ([`stop_proven`], audit F4) closes it as
-//! `StopAgent` would, then kills every process left in its POSIX session (a
-//! child that moved to another process group, or ignores `SIGTERM`) and
-//! answers stopped only once the session is empty.
+//! **Stopping an agent it started** ([`stop_proven`], audit F4, F4a) closes
+//! it as `StopAgent` would, then kills every process left in the POSIX
+//! session its leader leads (a child that moved to another process group, or
+//! ignores `SIGTERM`) and answers stopped only once that session was seen
+//! empty ([`sweep_session`]: identity-checked, through a pidfd on Linux).
 //!
 //! **What this does not guard against.** Another process can change the
-//! folder between the last check and the spawn, as for reclaim. The session
-//! scans see processes still in a session; one that left it (`setsid`) is
-//! not found. A launch the shim cannot reach (the agent called by an
-//! absolute path, `PATH` replaced, a wrapper that drops arguments) is never
-//! resumed: it is caught by the confirmation and answered `not-resumed`. A
-//! start over of an agent that reports no conversation before its prompt is
-//! not checked for freshness beyond its recorded command.
+//! folder between the last check and the spawn, as for reclaim, and GitHub
+//! can change after its last read. The session scans see processes still in
+//! a session; one that left it (`setsid`) is not found. Outside Linux's
+//! pidfds a pid reissued between the sweep's identity check and its signal
+//! is not ruled out ([`crate::platform::proc::ProcessHandle`]). A launch the
+//! shim cannot reach (the agent called by an absolute path, `PATH`
+//! replaced, a wrapper that drops arguments) is never resumed and never
+//! started over: the confirmation catches it (`not-resumed`, `not-fresh`).
+//! A program a launch starts after its fresh-start token was spent is not
+//! checked.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -436,18 +460,30 @@ struct Prepared {
 }
 
 /// What a request's read says of every attempt's conversation: each
-/// attempt's latest session, and which attempts ended.
+/// attempt's latest session, which attempts ended, and what restores before
+/// it left behind.
 struct Sessions<'a> {
     latest: HashMap<&'a AttemptId, crate::work_journal::SessionReport<'a>>,
     ended: HashSet<&'a AttemptId>,
     /// Audit F4: for each attempt, the agents its failed restores started.
     successors: HashMap<&'a AttemptId, Vec<&'a AttemptId>>,
+    /// Audit B1: each restore's successor and the conversation it was
+    /// confirmed in (`attempt_restored`'s `session`), the successor's
+    /// ownership of that conversation that does not wait for its own
+    /// `attempt_session`.
+    edges: Vec<(&'a AttemptId, &'a str)>,
+    /// Audit B2: each failed restore's successor whose stop could not be
+    /// proven, and the conversations it may be writing to
+    /// (`restore_failed`'s `sessions`).
+    fences: Vec<(&'a AttemptId, &'a [String])>,
 }
 
 impl<'a> Sessions<'a> {
     fn of(read: &'a crate::work_journal::JournalRead) -> Self {
         let mut ended = HashSet::new();
         let mut successors: HashMap<&AttemptId, Vec<&AttemptId>> = HashMap::new();
+        let mut edges = Vec::new();
+        let mut fences = Vec::new();
         for line in &read.lines {
             match &line.event {
                 Event::AttemptEnded { attempt, .. } => {
@@ -456,8 +492,19 @@ impl<'a> Sessions<'a> {
                 Event::RestoreFailed {
                     attempt,
                     to: Some(to),
+                    sessions,
                     ..
-                } => successors.entry(attempt).or_default().push(to),
+                } => {
+                    successors.entry(attempt).or_default().push(to);
+                    if !sessions.is_empty() {
+                        fences.push((to, sessions.as_slice()));
+                    }
+                }
+                Event::AttemptRestored {
+                    to,
+                    session: Some(session),
+                    ..
+                } => edges.push((to, session.as_str())),
                 _ => {}
             }
         }
@@ -465,24 +512,59 @@ impl<'a> Sessions<'a> {
             latest: crate::work_journal::latest_sessions(&read.lines),
             ended,
             successors,
+            edges,
+            fences,
         }
     }
 
     /// Whether an attempt other than `attempt`, not ended and of a run that
     /// is live, is in `session` now: an agent the deck runs (a copy restored
-    /// before, say) that a resume would write beside.
+    /// before, say) that a resume would write beside. A restored agent is in
+    /// the conversation its restore confirmed (audit B1) until it reports
+    /// another one itself.
     fn in_use(&self, attempt: &AttemptId, session: &str, live: &dyn Fn(&str) -> bool) -> bool {
-        self.latest.iter().any(|(other, report)| {
-            *other != attempt
-                && report.session == session
-                && !self.ended.contains(other)
-                && live(other.run())
+        let running = |other: &AttemptId| {
+            other != attempt && !self.ended.contains(other) && live(other.run())
+        };
+        self.latest
+            .iter()
+            .any(|(other, report)| report.session == session && running(other))
+            || self.edges.iter().any(|(to, confirmed)| {
+                *confirmed == session
+                    && running(to)
+                    && self
+                        .latest
+                        .get(to)
+                        .is_none_or(|report| report.session == session)
+            })
+    }
+
+    /// Audit B2: whether an agent a failed restore started, and could not be
+    /// proven to have stopped, may still be writing to `session`: its launch
+    /// record names a process, or a session member, that is not proven gone
+    /// ([`launch_gone`]), or there is no single record to check. Its attempt
+    /// having ended in the journal does not count: what it left running is
+    /// what matters.
+    fn fenced(&self, session: &str, launches: &[LaunchRecord]) -> bool {
+        self.fences.iter().any(|(to, sessions)| {
+            sessions.iter().any(|fenced| fenced == session) && {
+                let mut records = launches.iter().filter(|r| r.attempt == **to);
+                match (records.next(), records.next()) {
+                    (Some(record), None) => launch_gone(record).is_err(),
+                    _ => true,
+                }
+            }
         })
     }
 
-    /// Review R#3: whether a launch other than `attempt`'s, not ended and of
-    /// a live run, started in `cwd`: newer work in the agent's folder that a
-    /// restore or start over would run beside.
+    /// Review R#3, audit S1/F7: whether a launch other than `attempt`'s,
+    /// not ended and of a live run, started in the directory `cwd` names:
+    /// newer work in the agent's folder that a restore or start over would
+    /// run beside. Directories are compared by what they are
+    /// ([`DirKey`]: the canonical path, or the device and inode), so a
+    /// symlink to the folder or a spelling with `..` in it is the same
+    /// folder; a live launch whose folder cannot be read counts as in it.
+    /// Blocking.
     fn folder_in_use(
         &self,
         attempt: &AttemptId,
@@ -490,12 +572,60 @@ impl<'a> Sessions<'a> {
         launches: &[LaunchRecord],
         live: &dyn Fn(&str) -> bool,
     ) -> bool {
+        let target = DirKey::of(Path::new(cwd));
         launches.iter().any(|other| {
-            other.attempt != *attempt
-                && other.cwd.as_deref() == Some(cwd)
-                && !self.ended.contains(&other.attempt)
-                && live(other.attempt.run())
+            if other.attempt == *attempt
+                || self.ended.contains(&other.attempt)
+                || !live(other.attempt.run())
+            {
+                return false;
+            }
+            let Some(other_cwd) = other.cwd.as_deref() else {
+                return false;
+            };
+            if other_cwd == cwd {
+                return true;
+            }
+            match (&target, DirKey::of(Path::new(other_cwd))) {
+                (Some(target), Some(other)) => target.same(&other),
+                // The agent's own folder that cannot be read is refused
+                // later (`folder-missing`, `folder-unsafe`); another's is
+                // taken to be this one.
+                (None, _) => false,
+                (Some(_), None) => true,
+            }
         })
+    }
+}
+
+/// Audit S1/F7: what a directory is, for telling whether two spellings name
+/// one: its canonical path and, on Unix, its device and inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirKey {
+    canonical: std::path::PathBuf,
+    inode: Option<(u64, u64)>,
+}
+
+impl DirKey {
+    /// `path`'s key, or `None` when it cannot be read.
+    fn of(path: &Path) -> Option<Self> {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let meta = std::fs::metadata(&canonical).ok()?;
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((meta.dev(), meta.ino()))
+        };
+        #[cfg(not(unix))]
+        let inode = {
+            let _ = meta;
+            None
+        };
+        Some(DirKey { canonical, inode })
+    }
+
+    fn same(&self, other: &DirKey) -> bool {
+        self.canonical == other.canonical || (self.inode.is_some() && self.inode == other.inode)
     }
 }
 
@@ -662,11 +792,14 @@ fn check_agent(
         Want::StartOver => {
             // Audit F3: a command that reopens a conversation is no fresh
             // start.
-            let reopens = agent_type
-                .as_ref()
-                .and_then(|agent| crate::agent_registry::spec(agent).session_args)
-                .zip(record.command.as_deref())
-                .is_some_and(|(args, command)| args.command_reopens(command));
+            // An early refusal only: the shim's check at the real arguments
+            // is what holds a start over to a fresh start (audit B3).
+            let reopens = record.command.as_deref().is_some_and(|command| {
+                crate::agent_registry::ALL
+                    .iter()
+                    .filter_map(|spec| spec.fresh_start)
+                    .any(|fresh| fresh.command_reopens(command))
+            });
             if reopens {
                 return Err(RestoreRefusal::CommandReopens);
             }
@@ -686,7 +819,8 @@ fn check_agent(
             if !resume.valid_session_id(session) {
                 return Err(RestoreRefusal::SessionIdInvalid);
             }
-            if sessions.in_use(&agent.attempt, session, live) {
+            if sessions.in_use(&agent.attempt, session, live) || sessions.fenced(session, launches)
+            {
                 return Err(RestoreRefusal::SessionInUse);
             }
             (Some(session.to_string()), Some(resume.program))
@@ -753,7 +887,8 @@ fn old_session_left(pid: u32) -> Result<(), ProcessNotGone> {
     use crate::platform::proc::{ProcessProbe, probe_process, session_has_members};
     match probe_process(pid) {
         ProcessProbe::Started(_) if cfg!(target_os = "linux") => return Ok(()),
-        ProcessProbe::Started(_) | ProcessProbe::Absent => {}
+        // A zombie leader may still lead members: they are what is scanned.
+        ProcessProbe::Started(_) | ProcessProbe::Absent | ProcessProbe::Exited => {}
         ProcessProbe::Unknown => return Err(ProcessNotGone::OldProcessUnknown),
     }
     match session_has_members(pid) {
@@ -882,10 +1017,13 @@ async fn revalidate(
     item: &WorkId,
     held: &Target,
     want: Want,
-) -> Result<(Target, Vec<WorkId>), RestoreRefusal> {
+) -> Result<(Target, Vec<WorkId>, InterruptedItem), RestoreRefusal> {
     let refused = |refused: RestoreRefused| refused.reason;
     let Prepared {
-        works, mut targets, ..
+        works,
+        mut targets,
+        item: fresh_item,
+        ..
     } = prepared(
         registry,
         item.to_string(),
@@ -902,7 +1040,7 @@ async fn revalidate(
     if fresh.session != held.session {
         return Err(RestoreRefusal::SessionInUse);
     }
-    Ok((fresh, works))
+    Ok((fresh, works, fresh_item))
 }
 
 /// Act-time Git facts (review R#3): a refusal of `want` when the worktree is
@@ -964,12 +1102,17 @@ pub async fn restore(
     // §4 item 10 and review R#3: what Git and GitHub say of the item. A dry
     // run carries it, an open pull request above all, so the question can
     // show it; it refuses a restore only when the worktree is gone, since a
-    // resume continues the work that pull request is about.
-    let git = crate::interrupted_work_daemon::item_git_facts(&item).await;
-    let git_refused = git_refusal(&git, Want::Resume);
-    if dry_run {
+    // resume continues the work that pull request is about. A restore that
+    // acts reads it again in `start`, with its claims held (audit S5), and
+    // does not carry it.
+    let git_refused = if dry_run {
+        let git = crate::interrupted_work_daemon::item_git_facts(&item).await;
+        let refused = git_refusal(&git, Want::Resume);
         outcome.git = Some(git);
-    }
+        refused
+    } else {
+        None
+    };
     for target in targets {
         let target = match target {
             Ok(target) => target,
@@ -1036,7 +1179,13 @@ pub async fn start_over(
         Err(refusal) => return refused(refusal, None),
     };
     let item_id = Some(item.id.to_string());
-    let git = crate::interrupted_work_daemon::item_git_facts(&item).await;
+    // A dry run's Git facts, for the question; a start over that acts reads
+    // them again in `start`, with its claims held (audit S5).
+    let git = if dry_run {
+        Some(crate::interrupted_work_daemon::item_git_facts(&item).await)
+    } else {
+        None
+    };
     let target = match targets.pop() {
         Some(Ok(target)) => target,
         Some(Err(refusal)) => return refused(refusal, item_id),
@@ -1047,14 +1196,17 @@ pub async fn start_over(
             );
         }
     };
-    if let Some(reason) = git_refusal(&git, Want::StartOver) {
+    if let Some(reason) = git
+        .as_ref()
+        .and_then(|git| git_refusal(git, Want::StartOver))
+    {
         return refused(RestoreRefused::new(Some(target.attempt), reason), item_id);
     }
     match start(&daemon, &journal, &item.id, target, None, dry_run).await {
         Started::Would(_) => StartOverOutcome {
             dry_run,
             would_start: true,
-            git: Some(git),
+            git,
             item: item_id,
             ..StartOverOutcome::default()
         },
@@ -1095,9 +1247,10 @@ async fn start(
 
 /// Start `target`, an agent of the item `item`: resumed when `mode` is set,
 /// started over otherwise. Its claims are taken first and every check runs
-/// again with them held ([`revalidate`]); the folder is checked here, last
-/// before the spawn, and a dispatched unit's saved task is read through the
-/// held folder.
+/// again with them held ([`revalidate`]), Git and GitHub among them for a
+/// start that acts (audit S5); the folder is checked here, last before the
+/// spawn, and a dispatched unit's saved task is read through the held
+/// folder.
 #[cfg(unix)]
 async fn start(
     daemon: &Daemon<'_>,
@@ -1117,21 +1270,30 @@ async fn start(
     test_barrier(want).await;
     let attempt = target.attempt.clone();
     let refuse = |reason| Started::Refused(RestoreRefused::new(Some(attempt.clone()), reason));
-    let _held = match InFlight::take(&target.attempt, target.session.as_deref()) {
+    let held = match InFlight::take(&target.attempt, target.session.as_deref()) {
         Ok(held) => held,
         Err(reason) => return refuse(reason),
     };
     let Some(state_dir) = journal.state_dir() else {
         return refuse(RestoreRefusal::IncompleteRead);
     };
-    let _claims = match claim::take(state_dir, &target.attempt, target.session.as_deref()) {
+    let claims = match claim::take(state_dir, &target.attempt, target.session.as_deref()) {
         Ok(claims) => claims,
         Err(reason) => return refuse(reason),
     };
-    let (target, works) = match revalidate(daemon.registry, item, &target, want).await {
+    let (target, works, fresh_item) = match revalidate(daemon.registry, item, &target, want).await {
         Ok(fresh) => fresh,
         Err(reason) => return refuse(reason),
     };
+    // Audit S5: Git and GitHub read for the item as this fresh read found
+    // it, with the claims held, close to the spawn. A dry run read them
+    // before, for the question.
+    if !dry_run {
+        let git = crate::interrupted_work_daemon::item_git_facts(&fresh_item).await;
+        if let Some(reason) = git_refusal(&git, want) {
+            return refuse(reason);
+        }
+    }
     let cwd = target.record.cwd.clone().unwrap_or_default();
     let work = target.record.work.clone();
     let wants_task = target.wants_task;
@@ -1170,9 +1332,20 @@ async fn start(
     {
         return refuse(RestoreRefusal::NoteRefused);
     }
-    // The shim this restore resumes through, as this daemon installed it,
-    // and the directory it acknowledges in, held.
-    let shim = match target.program {
+    // Audit B3: the program a start over's fresh-start request is for, by
+    // the agent's type. An agent the shim does not stand in front of (the
+    // default shell, Antigravity) has none, and is started unchecked.
+    let fresh_spec = match want {
+        Want::StartOver => target
+            .agent_type
+            .as_ref()
+            .and_then(|agent| crate::agent_registry::spec(agent).fresh_start),
+        Want::Resume => None,
+    };
+    // The shim this restore or start over goes through, as this daemon
+    // installed it, and the directory it acknowledges in, held.
+    let shim_program = target.program.or(fresh_spec.map(|fresh| fresh.program));
+    let shim = match shim_program {
         Some(program) => {
             let Some(shim_dir) = crate::telemetry::shim::installed_dir() else {
                 return refuse(RestoreRefusal::Unsupported);
@@ -1207,9 +1380,10 @@ async fn start(
         env.push(("SHELL".to_string(), shell.clone()));
     }
     let mut token = None;
-    if let (Some(session), Some(program), Some((shim_dir, _))) =
-        (&target.session, target.program, &shim)
-    {
+    // Audit B3: the new conversation id a start over of Claude Code is
+    // started under, which its first report must name.
+    let mut new_session = None;
+    if let (Some(program), Some((shim_dir, _))) = (shim_program, &shim) {
         // Bound to this attempt's confirmation: a shim reached after it ends
         // claims nothing (audit "later slices" 6, S3).
         let lifetime = confirm_timeout().as_secs().saturating_add(TOKEN_SLACK_SECS);
@@ -1223,36 +1397,29 @@ async fn start(
             return refuse(RestoreRefusal::Unsupported);
         };
         env.push(("PATH".to_string(), path));
-        env.push((
-            crate::telemetry::shim::RESUME_AGENT_ENV.to_string(),
-            program.to_string(),
-        ));
-        env.push((
-            crate::telemetry::shim::RESUME_SESSION_ENV.to_string(),
-            session.clone(),
-        ));
-        env.push((
-            crate::telemetry::shim::RESUME_TOKEN_ENV.to_string(),
-            minted.clone(),
-        ));
+        let [agent_key, session_key, token_key] = match want {
+            Want::Resume => crate::telemetry::shim::RESUME_ENV_KEYS,
+            Want::StartOver => crate::telemetry::shim::FRESH_ENV_KEYS,
+        };
+        env.push((agent_key.to_string(), program.to_string()));
+        let session = match (&target.session, fresh_spec) {
+            (Some(session), _) => Some(session.clone()),
+            (None, Some(fresh)) if fresh.new_id_option.is_some() => {
+                let Some(id) = new_conversation_id() else {
+                    return refuse(RestoreRefusal::SpawnFailed);
+                };
+                new_session = Some(id.clone());
+                Some(id)
+            }
+            (None, _) => None,
+        };
+        if let Some(session) = session {
+            env.push((session_key.to_string(), session));
+        }
+        env.push((token_key.to_string(), minted.clone()));
         token = Some(minted);
     }
-    // Audit F3: a start over of an agent that reports its conversation
-    // before its prompt is watched, so a launch that reopens the old one is
-    // caught before the saved task goes to it.
-    let fresh_check = match (&target.session, &target.old_session) {
-        (None, Some(old)) => target
-            .agent_type
-            .as_ref()
-            .map(crate::agent_registry::spec)
-            .filter(|spec| {
-                spec.resume.is_some()
-                    && spec.first_hook == crate::agent_registry::FirstHook::BeforePrompt
-            })
-            .map(|_| old.clone()),
-        _ => None,
-    };
-    if target.session.is_some() || fresh_check.is_some() {
+    if target.session.is_some() || new_session.is_some() {
         daemon.registry.watch_restore_session(&pane_id);
     }
     let opts = SpawnOptions {
@@ -1284,12 +1451,14 @@ async fn start(
         pane_id: pane_id.clone(),
         role_name: None,
     };
-    // Audit F4: the new agent's session, read while it runs, so a stop can
-    // be proven against everything it started.
-    let sid = daemon
-        .registry
-        .child_pid(&agent_id)
-        .and_then(crate::platform::proc::session_of);
+    // Audit F4, F4a: the new agent's session leader, named by its pid and
+    // start time while it runs, so a stop can be proven against everything
+    // it started and a reissued session id is never taken for it.
+    let leader = daemon.registry.child_pid(&agent_id).and_then(|pid| {
+        let start = crate::platform::proc::process_start_of(pid)?;
+        (crate::platform::proc::session_of(pid) == Some(pid))
+            .then_some(crate::platform::proc::SessionMember { pid, start })
+    });
     let new_attempt = agent_id
         .parse::<u64>()
         .ok()
@@ -1308,46 +1477,60 @@ async fn start(
             Some(daemon.registry.inbox()),
         );
     }
-    // A failed start: stop the agent, proven; record the failure with the
+    // A failed start: stop the agent, proven. Record the failure with the
     // agent it started when `failure` is given, or when the stop could not
-    // be proven (so a later request checks that agent is gone); refuse.
-    let fail = |failure: Option<(RestoreFailure, Option<ShimOutcome>)>, reason| {
-        let started = &started;
-        let attempt = &target.attempt;
-        let work = &record.work;
-        let new_attempt = new_attempt.clone();
-        async move {
-            let stopped = stop_proven(daemon, started, sid).await;
-            let failure = match (failure, stopped) {
-                (Some(failure), _) => Some(failure),
-                (None, false) => Some((RestoreFailure::Unknown, None)),
-                (None, true) => None,
-            };
-            if let Some((failure, shim)) = failure {
-                record_blocking(
-                    journal,
-                    vec![Event::RestoreFailed {
-                        work: work.clone(),
-                        attempt: attempt.clone(),
-                        failure,
-                        shim,
-                        to: new_attempt,
-                    }],
-                )
-                .await;
+    // be proven, then with the conversations `fenced` it may be writing to,
+    // which no restore enters until that agent is proven gone (audit B2). A
+    // record that cannot be written leaves the claims held for this daemon's
+    // life instead, the fence it could not write ([`keep_fenced`]).
+    let held = Mutex::new(Some((held, claims)));
+    let fail =
+        |failure: Option<(RestoreFailure, Option<ShimOutcome>)>, fenced: Vec<String>, reason| {
+            let started = &started;
+            let attempt = &target.attempt;
+            let work = &record.work;
+            let new_attempt = new_attempt.clone();
+            let held = &held;
+            async move {
+                let stopped = stop_proven(daemon, started, leader).await;
+                let failure = match (failure, stopped) {
+                    (Some(failure), _) => Some(failure),
+                    (None, false) => Some((RestoreFailure::Unknown, None)),
+                    (None, true) => None,
+                };
+                let recorded = match failure {
+                    Some((failure, shim)) => {
+                        record_blocking(
+                            journal,
+                            vec![Event::RestoreFailed {
+                                work: work.clone(),
+                                attempt: attempt.clone(),
+                                failure,
+                                shim,
+                                to: new_attempt.clone(),
+                                sessions: if stopped { Vec::new() } else { fenced },
+                            }],
+                        )
+                        .await
+                    }
+                    None => true,
+                };
+                if !stopped && (!recorded || new_attempt.is_none()) {
+                    keep_fenced(held.lock().unwrap_or_else(|e| e.into_inner()).take());
+                }
+                Started::Refused(RestoreRefused::new(
+                    Some(attempt.clone()),
+                    if stopped {
+                        reason
+                    } else {
+                        RestoreRefusal::NotStopped
+                    },
+                ))
             }
-            Started::Refused(RestoreRefused::new(
-                Some(attempt.clone()),
-                if stopped {
-                    reason
-                } else {
-                    RestoreRefusal::NotStopped
-                },
-            ))
-        }
-    };
+        };
 
-    let (how, close, first) = match (&target.session, mode) {
+    // The conversation the new agent is confirmed in, for the durable edge.
+    let (how, close, first, confirmed_session) = match (&target.session, mode) {
         (Some(session), Some(mode)) => {
             let confirmed = confirm(
                 daemon.registry,
@@ -1373,39 +1556,58 @@ async fn start(
                     seen = ?seen,
                     "restore: the agent did not come back into its conversation; stopping it"
                 );
-                return fail(Some((failure, shim_outcome)), RestoreRefusal::NotResumed).await;
+                let fenced = std::iter::once(session.clone()).chain(seen).collect();
+                return fail(
+                    Some((failure, shim_outcome)),
+                    fenced,
+                    RestoreRefusal::NotResumed,
+                )
+                .await;
             }
             (
                 RestoredHow::Resumed,
                 CloseHow::Restored,
                 Some((RESTART_NOTE_REASON, mode.note().to_string())),
+                Some(session.clone()),
             )
         }
         _ => {
-            if let Some(old) = &fresh_check {
-                let seen =
-                    first_session(daemon.registry, &pane_id, &agent_id, confirm_timeout()).await;
+            let mut confirmed_session = None;
+            if let (Some(fresh), Some((_, acks)), Some(token)) =
+                (fresh_spec, shim.as_ref(), token.as_deref())
+            {
+                let checked = confirm_fresh(
+                    daemon.registry,
+                    &pane_id,
+                    &agent_id,
+                    (acks, token),
+                    new_session.as_deref(),
+                    confirm_timeout(),
+                )
+                .await;
                 daemon.registry.unwatch_restore_session(&pane_id);
-                let failure = match seen {
-                    Ok(seen) if seen != *old => None,
-                    Ok(_) => Some(RestoreFailure::SessionMismatch),
-                    Err(failure) => Some(failure),
-                };
-                if let Some(failure) = failure {
-                    tracing::info!(
-                        attempt = %target.attempt,
-                        ?failure,
-                        "restore: the started-over agent did not start a new conversation; stopping it"
-                    );
-                    // Only an unproven stop is recorded: the item stays as
-                    // it was, its verdict unchanged.
-                    return fail(None, RestoreRefusal::NotFresh).await;
+                match checked {
+                    Ok(seen) => confirmed_session = seen,
+                    Err(Unfresh { reason, seen }) => {
+                        tracing::info!(
+                            attempt = %target.attempt,
+                            program = fresh.program,
+                            ?reason,
+                            seen = ?seen,
+                            "restore: the started-over agent was not started fresh; stopping it"
+                        );
+                        // Only an unproven stop is recorded: the item stays
+                        // as it was, its verdict unchanged.
+                        let fenced = target.old_session.iter().cloned().chain(seen).collect();
+                        return fail(None, fenced, reason).await;
+                    }
                 }
             }
             (
                 RestoredHow::StartedOver,
                 CloseHow::StartedOver,
                 task.map(|task| (SAVED_TASK_REASON, task)),
+                confirmed_session,
             )
         }
     };
@@ -1425,24 +1627,47 @@ async fn start(
             attempt = %target.attempt,
             "restore: the restart note could not be posted; stopping the restored agent"
         );
-        return fail(None, RestoreRefusal::NoteNotDelivered).await;
+        let fenced = confirmed_session.into_iter().collect();
+        return fail(None, fenced, RestoreRefusal::NoteNotDelivered).await;
     }
-    let mut events: Vec<Event> = works
+    // Audit B1: the successor link, with the conversation it was confirmed
+    // in, is written and waited for before anything else and before the
+    // claims are released: every later check, in any daemon, finds the new
+    // agent in that conversation from it. One that cannot be written is a
+    // safety failure, not a handoff: the agent is stopped again.
+    let edge_written = match &new_attempt {
+        Some(to) if !edge_refused_for_test() => {
+            record_blocking(
+                journal,
+                vec![Event::AttemptRestored {
+                    work: record.work.clone(),
+                    from: target.attempt.clone(),
+                    to: to.clone(),
+                    how,
+                    session: confirmed_session.clone(),
+                }],
+            )
+            .await
+        }
+        _ => false,
+    };
+    if !edge_written {
+        tracing::warn!(
+            attempt = %target.attempt,
+            "restore: the restored agent's successor link could not be recorded; stopping it"
+        );
+        let fenced = confirmed_session.into_iter().collect();
+        return fail(None, fenced, RestoreRefusal::NotRecorded).await;
+    }
+    let events: Vec<Event> = works
         .iter()
         .map(|work| Event::Closed {
             work: work.clone(),
             how: close,
         })
         .collect();
-    if let Some(to) = new_attempt {
-        events.push(Event::AttemptRestored {
-            work: record.work.clone(),
-            from: target.attempt.clone(),
-            to,
-            how,
-        });
-    }
     let recorded = record_blocking(journal, events).await;
+    drop(held);
     Started::Done(RestoredAgent {
         attempt: target.attempt,
         agent_id,
@@ -1453,16 +1678,59 @@ async fn start(
     })
 }
 
+/// Audit B1/B2: the claims an agent's start held, kept for the rest of this
+/// daemon's life when the deck could neither prove that agent stopped nor
+/// write that down: no other restore in this daemon, or in another one on
+/// the state directory, enters its attempt or conversation meanwhile.
+#[cfg(unix)]
+fn keep_fenced(held: Option<(InFlight, claim::Claims)>) {
+    static FENCED: Mutex<Vec<(InFlight, claim::Claims)>> = Mutex::new(Vec::new());
+    if let Some(held) = held {
+        FENCED.lock().unwrap_or_else(|e| e.into_inner()).push(held);
+    }
+}
+
+/// Whether the successor link's write fails on purpose: in an e2e build
+/// only, when `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_EDGE` is `1`, so lane 1
+/// can reach the path a journal that cannot take it takes (audit B1).
+fn edge_refused_for_test() -> bool {
+    #[cfg(feature = "e2e")]
+    if std::env::var("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_EDGE").as_deref() == Ok("1") {
+        return true;
+    }
+    false
+}
+
+/// A new conversation id for a start over that names one (audit B3): a
+/// random version-4 UUID in canonical lowercase form, `None` without OS
+/// randomness.
+fn new_conversation_id() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
 /// Audit F4: stop an agent a restore or start over just started, as
 /// `StopAgent` would ([`crate::spawn::close_started_agents`]), then kill every
-/// process left in its session `sid` ([`sweep_session`]). `true` only when
-/// that session is then empty; `false` when it could not be read, or a
-/// process stayed in it past [`STOP_PROOF_BOUND`].
+/// process left in the session its `leader` leads ([`sweep_session`]). `true`
+/// only when that session was then seen empty; `false` when the leader was
+/// not known, the session could not be read, or a process stayed in it past
+/// [`STOP_PROOF_BOUND`].
 #[cfg(unix)]
 async fn stop_proven(
     daemon: &Daemon<'_>,
     started: &crate::spawn::SpawnedAgent,
-    sid: Option<u32>,
+    leader: Option<crate::platform::proc::SessionMember>,
 ) -> bool {
     crate::spawn::close_started_agents(
         daemon.registry,
@@ -1471,39 +1739,132 @@ async fn stop_proven(
         std::slice::from_ref(started),
     )
     .await;
-    let Some(sid) = sid else {
+    let Some(leader) = leader else {
         return false;
     };
-    tokio::task::spawn_blocking(move || sweep_session(sid, STOP_PROOF_BOUND))
-        .await
-        .unwrap_or(false)
+    // In an e2e build only: `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP=1` leaves
+    // what the close did not stop running and answers unproven, so lane 1
+    // can reach an unproven stop deterministically (audit B2).
+    #[cfg(feature = "e2e")]
+    if std::env::var("DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP").as_deref() == Ok("1") {
+        return false;
+    }
+    tokio::task::spawn_blocking(move || {
+        sweep_session(&OsView, leader, STOP_PROOF_BOUND, CONFIRM_POLL)
+    })
+    .await
+    .unwrap_or(false)
 }
 
-/// Kill every process in the session `sid` with `SIGKILL`, until it is empty
-/// or `bound` passes; `true` when it emptied. A process is signalled only
-/// while it is still in that session; the daemon's own session is never
-/// swept.
+/// Audit F4a: what [`sweep_session`] reads of processes and how it signals
+/// one, so a test can stand in for the OS.
 #[cfg(unix)]
-fn sweep_session(sid: u32, bound: Duration) -> bool {
-    use crate::platform::proc::{session_members, session_of};
-    if session_of(std::process::id()) == Some(sid) {
+trait ProcessView {
+    type Handle;
+    /// The session this daemon is in.
+    fn own_session(&self) -> Option<u32>;
+    /// What holds `pid` now.
+    fn probe(&self, pid: u32) -> crate::platform::proc::ProcessProbe;
+    /// Whether a pid that is a session's id can be handed to another process
+    /// only once that session is empty (Linux).
+    fn reissue_proves_empty(&self) -> bool;
+    /// The session's members that can still run, each named by pid and
+    /// start time.
+    fn members(&self, sid: u32) -> Option<Vec<crate::platform::proc::SessionMember>>;
+    /// A handle on whichever process holds `pid` now.
+    fn open(&self, pid: u32) -> Option<Self::Handle>;
+    /// The start time and session of the process `handle` names, read after
+    /// it was opened.
+    fn identity(&self, handle: &Self::Handle) -> Option<(u64, u32)>;
+    /// `SIGKILL` through `handle`.
+    fn kill(&self, handle: &Self::Handle);
+}
+
+/// The OS, as [`sweep_session`] sees it.
+#[cfg(unix)]
+struct OsView;
+
+#[cfg(unix)]
+impl ProcessView for OsView {
+    type Handle = crate::platform::proc::ProcessHandle;
+
+    fn own_session(&self) -> Option<u32> {
+        crate::platform::proc::session_of(std::process::id())
+    }
+
+    fn probe(&self, pid: u32) -> crate::platform::proc::ProcessProbe {
+        crate::platform::proc::probe_process(pid)
+    }
+
+    fn reissue_proves_empty(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
+
+    fn members(&self, sid: u32) -> Option<Vec<crate::platform::proc::SessionMember>> {
+        crate::platform::proc::session_members(sid)
+    }
+
+    fn open(&self, pid: u32) -> Option<Self::Handle> {
+        crate::platform::proc::ProcessHandle::open(pid)
+    }
+
+    fn identity(&self, handle: &Self::Handle) -> Option<(u64, u32)> {
+        let pid = handle.pid();
+        Some((
+            crate::platform::proc::process_start_of(pid)?,
+            crate::platform::proc::session_of(pid)?,
+        ))
+    }
+
+    fn kill(&self, handle: &Self::Handle) {
+        handle.kill();
+    }
+}
+
+/// Audit F4, F4a: kill every process in the session `leader` leads with
+/// `SIGKILL`, until it is seen empty or `bound` passes; `true` when it was
+/// seen empty. Once seen empty it is never swept again, so a session id
+/// handed to a new session later is not taken for it. A member is signalled
+/// only through a handle opened on it whose process still has the start time
+/// it was listed with and is still in the session; on Linux that handle is a
+/// pidfd, so the signal cannot reach a process that took the pid after the
+/// check (elsewhere a pid reissued in that short window is the residual
+/// `docs/develop/agent-restore.md` names). A member that started before the
+/// leader cannot be of this launch, and is never signalled. On Linux, the
+/// leader's pid held by another process means the session emptied before
+/// (the kernel hands out no pid that is still a session's id). The daemon's
+/// own session is never swept.
+#[cfg(unix)]
+fn sweep_session<V: ProcessView>(
+    view: &V,
+    leader: crate::platform::proc::SessionMember,
+    bound: Duration,
+    poll: Duration,
+) -> bool {
+    use crate::platform::proc::ProcessProbe;
+    let sid = leader.pid;
+    if view.own_session() == Some(sid) {
         return false;
     }
     let deadline = Instant::now() + bound;
     loop {
-        match session_members(sid) {
+        if let ProcessProbe::Started(start) = view.probe(sid)
+            && start != leader.start
+        {
+            return view.reissue_proves_empty();
+        }
+        match view.members(sid) {
             Some(members) if members.is_empty() => return true,
             Some(members) => {
-                for pid in members {
-                    let Ok(target) = libc::pid_t::try_from(pid) else {
+                for member in members {
+                    if member.start < leader.start {
+                        continue;
+                    }
+                    let Some(handle) = view.open(member.pid) else {
                         continue;
                     };
-                    if target > 0 && session_of(pid) == Some(sid) {
-                        // SAFETY: a positive pid, read in the stopped agent's
-                        // session just now; SIGKILL touches nothing else.
-                        unsafe {
-                            libc::kill(target, libc::SIGKILL);
-                        }
+                    if view.identity(&handle) == Some((member.start, sid)) {
+                        view.kill(&handle);
                     }
                 }
             }
@@ -1512,7 +1873,7 @@ fn sweep_session(sid: u32, bound: Duration) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(CONFIRM_POLL);
+        std::thread::sleep(poll);
     }
 }
 
@@ -1604,29 +1965,75 @@ async fn confirm(
     }
 }
 
-/// Audit F3: wait at most `bound` for the agent `agent_id` in `pane` to
-/// report its first attested session, and answer it; `exited` when the
-/// agent exits first, `timed-out` when nothing came in time.
+/// Why [`confirm_fresh`] gave up: the refusal to answer, and the
+/// conversation the agent reported, when it reported one.
 #[cfg(unix)]
-async fn first_session(
+#[derive(Debug)]
+struct Unfresh {
+    reason: RestoreRefusal,
+    seen: Option<String>,
+}
+
+/// Audit B3: wait at most `bound` for the launch shim to settle a start
+/// over's fresh-start request (`ack`: the held directory and the token), and
+/// for an agent started under `new_session` (Claude Code) to report that
+/// conversation as its first. `Ok` with the conversation confirmed, if any.
+/// `command-reopens` when the shim refused because the agent's real
+/// arguments select an existing conversation; `not-fresh` when the shim was
+/// not reached (the agent reported a conversation first, or nothing came in
+/// time), refused the new id, the agent exited, or it reported another
+/// conversation than the new one.
+#[cfg(unix)]
+async fn confirm_fresh(
     registry: &AgentPtyRegistry,
     pane: &str,
     agent_id: &str,
+    ack: (&crate::platform::trusted_dir::TrustedDir, &str),
+    new_session: Option<&str>,
     bound: Duration,
-) -> Result<String, RestoreFailure> {
+) -> Result<Option<String>, Unfresh> {
+    use crate::telemetry::shim::{AckState, ack_outcome, ack_state};
+    let (acks, token) = ack;
     let deadline = Instant::now() + bound;
+    let not_fresh = |seen| Unfresh {
+        reason: RestoreRefusal::NotFresh,
+        seen,
+    };
     loop {
-        if let Some((generation, seen)) = registry.restore_session_seen(pane)
-            && generation == agent_id
-        {
-            return Ok(seen);
+        let state = ack_state(acks, token);
+        if state == AckState::Refused {
+            let reason = match ack_outcome(acks, token) {
+                ShimOutcome::SessionIdInvalid => RestoreRefusal::NotFresh,
+                _ => RestoreRefusal::CommandReopens,
+            };
+            return Err(Unfresh { reason, seen: None });
+        }
+        let seen = registry
+            .restore_session_seen(pane)
+            .filter(|(generation, _)| generation == agent_id)
+            .map(|(_, seen)| seen);
+        match (state, new_session, seen) {
+            (AckState::Resumed, None, _) => return Ok(None),
+            (AckState::Resumed, Some(new), Some(seen)) => {
+                return if seen == new {
+                    Ok(Some(seen))
+                } else {
+                    Err(not_fresh(Some(seen)))
+                };
+            }
+            // A conversation reported before the shim checked anything: the
+            // launch did not go through it.
+            (AckState::Unclaimed | AckState::Pending, _, Some(seen)) => {
+                return Err(not_fresh(Some(seen)));
+            }
+            _ => {}
         }
         if registry.agent_record_any(agent_id).is_none() || registry.pane_occupant_has_exited(pane)
         {
-            return Err(RestoreFailure::Exited);
+            return Err(not_fresh(None));
         }
         if Instant::now() >= deadline {
-            return Err(RestoreFailure::TimedOut);
+            return Err(not_fresh(None));
         }
         tokio::time::sleep(CONFIRM_POLL).await;
     }
@@ -1901,23 +2308,337 @@ mod tests {
         assert!(claim::take(state.path(), &attempt, None).is_ok());
     }
 
+    /// A process table a test controls: what each pid holds now, which
+    /// session it is in, and every signal the sweep sent.
+    #[cfg(unix)]
+    struct FakeView {
+        own: u32,
+        reissue_proves_empty: bool,
+        /// pid -> (start, session), as the table reads now.
+        table: std::cell::RefCell<HashMap<u32, (u64, u32)>>,
+        /// What `members` answers, in turn; the last answer repeats.
+        listings: std::cell::RefCell<Vec<Vec<crate::platform::proc::SessionMember>>>,
+        /// Applied to the table after a handle is opened, before its
+        /// identity is read: a pid reissued in that window.
+        on_open: std::cell::RefCell<HashMap<u32, (u64, u32)>>,
+        killed: std::cell::RefCell<Vec<(u32, u64)>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeView {
+        fn new(table: &[(u32, u64, u32)]) -> Self {
+            FakeView {
+                own: 1,
+                reissue_proves_empty: true,
+                table: std::cell::RefCell::new(
+                    table.iter().map(|&(p, st, sid)| (p, (st, sid))).collect(),
+                ),
+                listings: std::cell::RefCell::new(Vec::new()),
+                on_open: std::cell::RefCell::new(HashMap::new()),
+                killed: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn listing(self, members: &[(u32, u64)]) -> Self {
+            self.listings.borrow_mut().push(
+                members
+                    .iter()
+                    .map(|&(pid, start)| crate::platform::proc::SessionMember { pid, start })
+                    .collect(),
+            );
+            self
+        }
+    }
+
+    #[cfg(unix)]
+    impl ProcessView for FakeView {
+        type Handle = u32;
+
+        fn own_session(&self) -> Option<u32> {
+            Some(self.own)
+        }
+
+        fn probe(&self, pid: u32) -> crate::platform::proc::ProcessProbe {
+            match self.table.borrow().get(&pid) {
+                Some((start, _)) => crate::platform::proc::ProcessProbe::Started(*start),
+                None => crate::platform::proc::ProcessProbe::Absent,
+            }
+        }
+
+        fn reissue_proves_empty(&self) -> bool {
+            self.reissue_proves_empty
+        }
+
+        fn members(&self, _sid: u32) -> Option<Vec<crate::platform::proc::SessionMember>> {
+            let mut listings = self.listings.borrow_mut();
+            if listings.len() > 1 {
+                Some(listings.remove(0))
+            } else {
+                listings.first().cloned()
+            }
+        }
+
+        fn open(&self, pid: u32) -> Option<u32> {
+            if let Some(now) = self.on_open.borrow_mut().remove(&pid) {
+                self.table.borrow_mut().insert(pid, now);
+            }
+            self.table.borrow().contains_key(&pid).then_some(pid)
+        }
+
+        fn identity(&self, pid: &u32) -> Option<(u64, u32)> {
+            self.table.borrow().get(pid).copied()
+        }
+
+        fn kill(&self, pid: &u32) {
+            let start = self.table.borrow_mut().remove(pid).map(|(start, _)| start);
+            self.killed.borrow_mut().push((*pid, start.unwrap_or(0)));
+        }
+    }
+
+    #[cfg(unix)]
+    fn leader(pid: u32, start: u64) -> crate::platform::proc::SessionMember {
+        crate::platform::proc::SessionMember { pid, start }
+    }
+
+    #[cfg(unix)]
+    const TICK: Duration = Duration::from_millis(1);
+
     /// PRD #1790 stage 3 (audit F4): the sweep never signals the daemon's
     /// own session, and answers an empty session as stopped.
     #[cfg(unix)]
     #[test]
     fn the_sweep_spares_the_daemons_own_session_and_answers_an_empty_one() {
-        let own = crate::platform::proc::session_of(std::process::id()).expect("a session");
-        assert!(!sweep_session(own, Duration::from_millis(10)));
-        #[cfg(target_os = "linux")]
-        assert!(sweep_session(i32::MAX as u32, Duration::from_millis(10)));
+        let own = FakeView::new(&[(1, 10, 1)]).listing(&[(1, 10)]);
+        assert!(!sweep_session(&own, leader(1, 10), TICK, TICK));
+        assert!(own.killed.borrow().is_empty());
+        let empty = FakeView::new(&[]).listing(&[]);
+        assert!(sweep_session(&empty, leader(50, 100), TICK, TICK));
+        let real = crate::platform::proc::session_of(std::process::id()).expect("a session");
+        let start = crate::platform::proc::process_start_of(real).unwrap_or(0);
+        assert!(!sweep_session(&OsView, leader(real, start), TICK, TICK));
     }
 
-    /// PRD #1790 stage 3 (review R#3): a launch of a live run, not ended, in
-    /// the same folder is newer work there; one that ended, of a run that is
-    /// gone, or in another folder is not.
+    /// PRD #1790 stage 3 (audit F4a, S2): the sweep kills the launch's own
+    /// members, and nothing that merely carries its numbers: a session id
+    /// reissued to another leader ends the sweep as already empty, a pid
+    /// reissued between the listing and the signal is not signalled, a
+    /// member older than the launch is never signalled, and a session seen
+    /// empty once is not swept again.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_signals_only_the_launchs_own_processes() {
+        // The launch's leader 50 (start 100) and its child 60.
+        let view = FakeView::new(&[(50, 100, 50), (60, 120, 50)]).listing(&[(50, 100), (60, 120)]);
+        view.listings.borrow_mut().push(Vec::new());
+        assert!(sweep_session(
+            &view,
+            leader(50, 100),
+            Duration::from_secs(5),
+            TICK
+        ));
+        assert_eq!(*view.killed.borrow(), vec![(50, 100), (60, 120)]);
+
+        // Pid 50 now leads another session (start 900): the launch's emptied
+        // before, so nothing is listed as its member, nothing is signalled.
+        let reissued =
+            FakeView::new(&[(50, 900, 50), (61, 950, 50)]).listing(&[(50, 900), (61, 950)]);
+        assert!(sweep_session(&reissued, leader(50, 100), TICK, TICK));
+        assert!(reissued.killed.borrow().is_empty());
+        // Where a reissue proves nothing, it is not proven stopped either.
+        let mut elsewhere = FakeView::new(&[(50, 900, 50)]).listing(&[(50, 900)]);
+        elsewhere.reissue_proves_empty = false;
+        assert!(!sweep_session(&elsewhere, leader(50, 100), TICK, TICK));
+        assert!(elsewhere.killed.borrow().is_empty());
+
+        // Member 60 exits after the listing and its pid is handed to an
+        // unrelated process (start 5000, another session) before the handle
+        // is opened: the identity check refuses it.
+        let racing = FakeView::new(&[(60, 120, 50)]).listing(&[(60, 120)]);
+        racing.on_open.borrow_mut().insert(60, (5000, 7));
+        assert!(!sweep_session(&racing, leader(50, 100), TICK, TICK));
+        assert!(racing.killed.borrow().is_empty(), "{:?}", racing.killed);
+        // Same start, another session: refused too.
+        let moved = FakeView::new(&[(60, 120, 77)]).listing(&[(60, 120)]);
+        assert!(!sweep_session(&moved, leader(50, 100), TICK, TICK));
+        assert!(moved.killed.borrow().is_empty());
+
+        // A listed member that started before the leader is not the launch's.
+        let older = FakeView::new(&[(40, 90, 50)]).listing(&[(40, 90)]);
+        assert!(!sweep_session(&older, leader(50, 100), TICK, TICK));
+        assert!(older.killed.borrow().is_empty());
+
+        // Seen empty, then the number shows members again: not swept.
+        let late = FakeView::new(&[(70, 3000, 50)])
+            .listing(&[])
+            .listing(&[(70, 3000)]);
+        assert!(sweep_session(
+            &late,
+            leader(50, 100),
+            Duration::from_secs(5),
+            TICK
+        ));
+        assert!(late.killed.borrow().is_empty());
+    }
+
+    /// PRD #1790 stage 3 (audit B1): a restored agent is in the conversation
+    /// its restore confirmed, from the durable successor link alone, before
+    /// its own session report exists; it stops being so once it ended, its
+    /// run is gone, or it reports another conversation.
+    #[test]
+    fn a_confirmed_successor_owns_its_conversation_before_its_own_report() {
+        use crate::work_journal::{EndHow, JournalRead, Line};
+        const SESSION: &str = "fedcba98-7654-4321-8fab-0123456789ab";
+        const OTHER: &str = "abcdef01-7654-4321-8fab-0123456789ab";
+        let work = WorkId::parse("w-abcdefgh-0000000000000001").expect("a work id");
+        let a = AttemptId::parse("r-old/1").unwrap();
+        let b = AttemptId::parse("r-old/2").unwrap();
+        let successor = AttemptId::parse("r-live/1").unwrap();
+        let line = |run: &str, seq: u64, event: Event| Line {
+            v: 1,
+            ts_ms: seq,
+            run: run.to_string(),
+            seq,
+            event,
+        };
+        let edge = Event::AttemptRestored {
+            work: work.clone(),
+            from: a.clone(),
+            to: successor.clone(),
+            how: RestoredHow::Resumed,
+            session: Some(SESSION.into()),
+        };
+        let live = |run: &str| run == "r-live";
+        let mut read = JournalRead {
+            lines: vec![line("r-live", 1, edge)],
+            ..JournalRead::default()
+        };
+        assert!(Sessions::of(&read).in_use(&b, SESSION, &live));
+        assert!(!Sessions::of(&read).in_use(&b, OTHER, &live));
+        assert!(!Sessions::of(&read).in_use(&b, SESSION, &|_: &str| false));
+        // It reports another conversation: it left this one.
+        read.lines.push(line(
+            "r-live",
+            2,
+            Event::AttemptSession {
+                work: work.clone(),
+                attempt: successor.clone(),
+                session: OTHER.into(),
+                agent: crate::event::AgentType::ClaudeCode,
+            },
+        ));
+        assert!(!Sessions::of(&read).in_use(&b, SESSION, &live));
+        assert!(Sessions::of(&read).in_use(&b, OTHER, &live));
+        read.lines.push(line(
+            "r-live",
+            3,
+            Event::AttemptEnded {
+                work,
+                attempt: successor,
+                how: EndHow::Exited,
+                code: None,
+                cause: None,
+            },
+        ));
+        assert!(!Sessions::of(&read).in_use(&b, OTHER, &live));
+    }
+
+    /// PRD #1790 stage 3 (audit B2): an agent a failed restore could not be
+    /// proven to stop fences the conversations it may be writing to, from
+    /// every item, until its launch is proven gone; its attempt ending in
+    /// the journal does not lift that.
+    #[test]
+    fn an_unproven_stop_fences_its_conversation_until_its_launch_is_gone() {
+        use crate::work_journal::{EndHow, JournalRead, Line};
+        const SESSION: &str = "fedcba98-7654-4321-8fab-0123456789ab";
+        let work = WorkId::parse("w-abcdefgh-0000000000000001").expect("a work id");
+        let a = AttemptId::parse("r-old/1").unwrap();
+        let successor = AttemptId::parse("r-live/1").unwrap();
+        let line = |seq: u64, event: Event| Line {
+            v: 1,
+            ts_ms: seq,
+            run: "r-live".into(),
+            seq,
+            event,
+        };
+        let read = JournalRead {
+            lines: vec![
+                line(
+                    1,
+                    Event::RestoreFailed {
+                        work: work.clone(),
+                        attempt: a,
+                        failure: RestoreFailure::Unknown,
+                        shim: None,
+                        to: Some(successor.clone()),
+                        sessions: vec![SESSION.into()],
+                    },
+                ),
+                line(
+                    2,
+                    Event::AttemptEnded {
+                        work: work.clone(),
+                        attempt: successor.clone(),
+                        how: EndHow::Exited,
+                        code: None,
+                        cause: None,
+                    },
+                ),
+            ],
+            ..JournalRead::default()
+        };
+        let sessions = Sessions::of(&read);
+        let record = |pid: Option<u32>, pid_start: Option<u64>| LaunchRecord {
+            v: crate::launch_records::SCHEMA_VERSION,
+            work: work.clone(),
+            attempt: successor.clone(),
+            command: None,
+            shell: None,
+            agent_type: None,
+            cwd: Some("/w".into()),
+            cwd_moved_from: None,
+            name: None,
+            role: None,
+            orchestration: None,
+            orchestration_id: None,
+            ts_ms: 1,
+            pid,
+            pid_start,
+        };
+        assert!(sessions.fenced(SESSION, &[]), "no record to check: fenced");
+        assert!(
+            sessions.fenced(SESSION, &[record(None, None)]),
+            "a process it cannot check: fenced"
+        );
+        assert!(!sessions.fenced("another", &[record(None, None)]));
+        #[cfg(target_os = "linux")]
+        {
+            let me = std::process::id();
+            let start = crate::platform::proc::process_start_of(me);
+            assert!(
+                sessions.fenced(SESSION, &[record(Some(me), start)]),
+                "a process still running: fenced"
+            );
+            assert!(
+                !sessions.fenced(SESSION, &[record(Some(i32::MAX as u32), Some(1))]),
+                "a launch proven gone lifts it"
+            );
+        }
+    }
+
+    /// PRD #1790 stage 3 (review R#3, audit S1/F7): a launch of a live run,
+    /// not ended, in the same folder is newer work there, whichever spelling
+    /// names that folder: the same path, a symlink to it, a path through
+    /// `..`. One that ended, of a run that is gone, or in another folder is
+    /// not; a live launch whose folder cannot be read counts as in it.
     #[test]
     fn newer_live_work_in_the_same_folder_makes_it_in_use() {
         use crate::work_journal::{EndHow, JournalRead, Line};
+        let root = crate::test_temp::tempdir().unwrap();
+        let dir = root.path().join("w");
+        let other_dir = root.path().join("other");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let w = dir.to_str().unwrap().to_string();
         let work = WorkId::parse("w-abcdefgh-0000000000000001").expect("a work id");
         let target = AttemptId::parse("r-old/1").expect("an attempt id");
         let newer = AttemptId::parse("r-live/2").expect("an attempt id");
@@ -1957,13 +2678,35 @@ mod tests {
         };
         let sessions = Sessions::of(&read);
         let live = |run: &str| run == "r-live";
-        let mut launches = vec![record(&target, "/w"), record(&ended, "/w")];
-        assert!(!sessions.folder_in_use(&target, "/w", &launches, &live));
-        launches.push(record(&newer, "/other"));
-        assert!(!sessions.folder_in_use(&target, "/w", &launches, &live));
-        launches.push(record(&newer, "/w"));
-        assert!(sessions.folder_in_use(&target, "/w", &launches, &live));
-        assert!(!sessions.folder_in_use(&target, "/w", &launches, &|_: &str| false));
+        let base = vec![record(&target, &w), record(&ended, &w)];
+        assert!(!sessions.folder_in_use(&target, &w, &base, &live));
+        let with = |cwd: &str| {
+            let mut launches = base.clone();
+            launches.push(record(&newer, cwd));
+            launches
+        };
+        assert!(!sessions.folder_in_use(&target, &w, &with(other_dir.to_str().unwrap()), &live));
+        assert!(sessions.folder_in_use(&target, &w, &with(&w), &live));
+        assert!(!sessions.folder_in_use(&target, &w, &with(&w), &|_: &str| false));
+        let dotted = format!("{w}/sub/..");
+        assert!(
+            sessions.folder_in_use(&target, &w, &with(&dotted), &live),
+            "a `..` spelling"
+        );
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            assert!(
+                sessions.folder_in_use(&target, &w, &with(link.to_str().unwrap()), &live),
+                "a symlink to the folder"
+            );
+        }
+        let gone = root.path().join("gone");
+        assert!(
+            sessions.folder_in_use(&target, &w, &with(gone.to_str().unwrap()), &live),
+            "a live launch's unreadable folder counts as this one"
+        );
     }
 
     /// PRD #1790 stage 3 (audit "later slices" 2): a pid no process holds and

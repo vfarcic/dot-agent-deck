@@ -77,13 +77,39 @@ function fullyShown(element: HTMLElement): boolean {
   return shown.top >= top - 1 && shown.bottom <= bottom + 1;
 }
 
-/** Whether `element` fills its dialog's whole visible box: a part taller than the box, seen as far as it can be at once. */
-function coversBox(element: HTMLElement): boolean {
+/** A vertical span of an element, in pixels from its own top. */
+type Span = [number, number];
+
+/**
+ * The span of `element` its dialog's visible box and the window show now,
+ * or `undefined` when none of it is shown. A part shown whole answers its
+ * whole height, however short.
+ */
+function shownSpan(element: HTMLElement): Span | undefined {
   const shown = element.getBoundingClientRect();
+  if (fullyShown(element)) return [0, shown.height];
   const box = element.closest(".interrupted-dialog")?.getBoundingClientRect();
   const top = Math.max(box?.top ?? 0, 0);
   const bottom = Math.min(box?.bottom ?? window.innerHeight, window.innerHeight);
-  return shown.top <= top + 1 && shown.bottom >= bottom - 1;
+  const from = Math.max(shown.top, top) - shown.top;
+  const to = Math.min(shown.bottom, bottom) - shown.top;
+  return to > from ? [from, to] : undefined;
+}
+
+/** `spans` with `span` added, merged and in order. */
+function withSpan(spans: Span[], span: Span): Span[] {
+  const merged: Span[] = [];
+  for (const [from, to] of [...spans, span].sort((a, b) => a[0] - b[0])) {
+    const last = merged[merged.length - 1];
+    if (last && from <= last[1] + 1) last[1] = Math.max(last[1], to);
+    else merged.push([from, to]);
+  }
+  return merged;
+}
+
+/** Whether `spans` cover `from` to `to`, within a pixel at each edge. */
+function coversSpan(spans: Span[], [from, to]: Span): boolean {
+  return spans.some(([a, b]) => a <= from + 1 && b >= to - 1);
 }
 
 /** The parts of a question that must each have been seen: its child elements, or the question itself when it has none. */
@@ -97,11 +123,12 @@ function partsOf(element: HTMLElement): HTMLElement[] {
  * view, painted, and fully shown for {@link QUESTION_PRESENTED_MS}. A new
  * `key` (another question) starts over; `undefined` is no question.
  *
- * With `acrossScroll` (the restore question, review R#5), each of the
- * question's parts ({@link partsOf}) counts once it has been fully shown for
- * that long, at any scroll position, as the TUI counts the rows it has drawn
- * across frames: a question taller than the dialog is presented once every
- * part has been scrolled through, instead of never.
+ * With `acrossScroll` (the restore question, review R#5, audit S4/F9), each
+ * of the question's parts ({@link partsOf}) counts once all of it has been
+ * on screen, at any scroll positions, every slice of it for that long, as
+ * the TUI counts each row of the question it has drawn across frames: a part
+ * taller than the dialog counts once it has been scrolled through from top
+ * to bottom, not when only its middle has filled the box.
  */
 function usePresented(key: string | undefined, question: RefObject<HTMLElement | null>, acrossScroll = false): boolean {
   const [presented, setPresented] = useState<string | undefined>();
@@ -110,8 +137,10 @@ function usePresented(key: string | undefined, question: RefObject<HTMLElement |
     question.current?.scrollIntoView?.({ block: "nearest" });
     let frame = 0;
     let timer: number | undefined;
-    const seen = new Set<Element>();
-    const shownNow = (part: HTMLElement) => fullyShown(part) || (acrossScroll && coversBox(part));
+    /* What of each part has been on screen long enough. */
+    const seen = new Map<Element, Span[]>();
+    const whole = (part: HTMLElement): Span => [0, part.getBoundingClientRect().height];
+    const done = (part: HTMLElement) => coversSpan(seen.get(part) ?? [], whole(part));
     const look = () => {
       frame = window.requestAnimationFrame(() => {
         const element = question.current;
@@ -120,15 +149,26 @@ function usePresented(key: string | undefined, question: RefObject<HTMLElement |
           return;
         }
         const parts = acrossScroll ? partsOf(element) : [element];
-        const candidates = parts.filter((part) => !seen.has(part) && shownNow(part));
+        const candidates = parts.flatMap((part) => {
+          if (done(part)) return [];
+          const span = acrossScroll ? shownSpan(part) : fullyShown(part) ? whole(part) : undefined;
+          return span && !coversSpan(seen.get(part) ?? [], span) ? [{ part, span }] : [];
+        });
         if (candidates.length === 0) {
           look();
           return;
         }
         timer = window.setTimeout(() => {
-          for (const part of candidates) if (part.isConnected && shownNow(part)) seen.add(part);
-          const now = question.current;
-          if (now && (acrossScroll ? partsOf(now) : [now]).every((part) => seen.has(part))) setPresented(key);
+          for (const { part, span } of candidates) {
+            if (!part.isConnected) continue;
+            const now = acrossScroll ? shownSpan(part) : fullyShown(part) ? whole(part) : undefined;
+            if (!now) continue;
+            /* Only what stayed on screen the whole time counts. */
+            const kept: Span = [Math.max(span[0], now[0]), Math.min(span[1], now[1])];
+            if (kept[1] > kept[0] || (kept[1] === kept[0] && whole(part)[1] === 0)) seen.set(part, withSpan(seen.get(part) ?? [], kept));
+          }
+          const current = question.current;
+          if (current && (acrossScroll ? partsOf(current) : [current]).every(done)) setPresented(key);
           else look();
         }, QUESTION_PRESENTED_MS);
       });

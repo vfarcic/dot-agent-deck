@@ -2,7 +2,7 @@
 //! moment they really start, however they are started.
 //!
 //! With telemetry on, the daemon writes a small `sh` script per agent —
-//! `codex` and `devin` — into a directory of its own ([`install`]) and puts
+//! each of [`PROGRAMS`] — into a directory of its own ([`install`]) and puts
 //! that directory first on the `PATH` of every agent it starts. A pane that
 //! runs `codex`, a script that runs it by name (`devbox run codex-big`), or
 //! another agent in the pane that runs it, all reach the script, which
@@ -47,6 +47,17 @@
 //! and its files may be retired; the directory's entries are bounded. A
 //! request for another program is left for it.
 //!
+//! Audit B3: a Start over's spawn carries a fresh-start request of the same
+//! shape ([`FRESH_ENV_KEYS`]) for the agent's program, which the shim checks
+//! against the arguments the program is really started with
+//! ([`crate::agent_registry::FreshSpec`]): arguments that select an
+//! existing conversation publish `<token>.refused`
+//! ([`REFUSED_FRESH_ARGS_SELECT`]) and run unchanged; otherwise `<token>`,
+//! and Claude Code is started under the new id the request carries. Any
+//! other program the shim stands in front of, started meanwhile with
+//! arguments that select a conversation, spends the token as a refusal too.
+//! OpenCode and Pi go through the shim for this check only.
+//!
 //! Anything that goes wrong in step 2 runs the program unchanged: the shim
 //! never stops an agent from starting. The one refusal is a process tree that
 //! has passed through the shim [`MAX_HOPS`] times, which would otherwise keep
@@ -64,8 +75,10 @@ use super::config::EnvMap;
 /// is handled before the command line is parsed.
 pub const SUBCOMMAND: &str = "__telemetry-shim";
 
-/// The programs the shim stands in front of.
-pub const PROGRAMS: [&str; 3] = ["claude", "codex", "devin"];
+/// The programs the shim stands in front of. OpenCode and Pi only for a
+/// Start over's fresh-start check (audit B3): the shim adds nothing to them
+/// otherwise.
+pub const PROGRAMS: [&str; 5] = ["claude", "codex", "devin", "opencode", "pi"];
 
 /// PRD #1790 stage 3: the program a restore spawn asks to resume, by the
 /// name the shim stands in front of ([`crate::agent_registry::ResumeSpec`]).
@@ -77,6 +90,22 @@ pub const RESUME_TOKEN_ENV: &str = "DOT_AGENT_DECK_RESUME_TOKEN";
 /// The request's variables, removed from the environment of the program the
 /// request was for.
 pub const RESUME_ENV_KEYS: [&str; 3] = [RESUME_AGENT_ENV, RESUME_SESSION_ENV, RESUME_TOKEN_ENV];
+
+/// Audit B3: the program a Start over's spawn asks the shim to hold to a
+/// fresh start ([`crate::agent_registry::FreshSpec`]).
+pub const FRESH_AGENT_ENV: &str = "DOT_AGENT_DECK_FRESH_AGENT";
+/// The new conversation id the agent is started under, for an agent with
+/// [`crate::agent_registry::FreshSpec::new_id_option`] (Claude Code).
+pub const FRESH_SESSION_ENV: &str = "DOT_AGENT_DECK_FRESH_SESSION";
+/// The fresh-start request's one-shot token, the name of its
+/// acknowledgement, from the same mint and directory as a resume's.
+pub const FRESH_TOKEN_ENV: &str = "DOT_AGENT_DECK_FRESH_TOKEN";
+/// The fresh-start request's variables, removed from the environment of the
+/// program it named.
+pub const FRESH_ENV_KEYS: [&str; 3] = [FRESH_AGENT_ENV, FRESH_SESSION_ENV, FRESH_TOKEN_ENV];
+/// A refusal's reason: the program's own arguments select an existing
+/// conversation, so the launch is not a fresh start.
+pub const REFUSED_FRESH_ARGS_SELECT: &str = "fresh-args-select";
 
 /// The directory beside the shim's, in the deck's telemetry directory, that
 /// holds resume acknowledgements: `<token>` when the shim resumed the agent,
@@ -263,11 +292,21 @@ struct ResumeRequest {
 
 impl ResumeRequest {
     fn from_env(env: &EnvMap) -> Self {
+        Self::from_keys(env, RESUME_ENV_KEYS)
+    }
+
+    /// Audit B3: a Start over's fresh-start request, which the environment
+    /// carries in the same three-field shape ([`FRESH_ENV_KEYS`]).
+    fn fresh_from_env(env: &EnvMap) -> Self {
+        Self::from_keys(env, FRESH_ENV_KEYS)
+    }
+
+    fn from_keys(env: &EnvMap, [agent, session, token]: [&str; 3]) -> Self {
         let get = |key: &str| env.get(key).filter(|v| !v.is_empty()).cloned();
         ResumeRequest {
-            agent: get(RESUME_AGENT_ENV),
-            session: get(RESUME_SESSION_ENV),
-            token: get(RESUME_TOKEN_ENV),
+            agent: get(agent),
+            session: get(session),
+            token: get(token),
         }
     }
 }
@@ -281,6 +320,7 @@ fn run(name: &str, dir: &Path, args: Vec<OsString>) -> ExitCode {
     // The request is read whether or not the telemetry decision can read the
     // whole environment exactly: its own values are plain ASCII.
     let resume = ResumeRequest::from_env(&env);
+    let fresh = ResumeRequest::fresh_from_env(&env);
     let plan = match plan_with(
         name,
         dir,
@@ -288,7 +328,10 @@ fn run(name: &str, dir: &Path, args: Vec<OsString>) -> ExitCode {
         path.as_deref(),
         guard.as_deref(),
         exact_env().then_some(&env),
-        &resume,
+        &Requests {
+            resume: &resume,
+            fresh: &fresh,
+        },
         std::process::id(),
     ) {
         Ok(plan) => plan,
@@ -364,7 +407,27 @@ fn plan(
     pid: u32,
 ) -> Result<Plan, Refused> {
     let resume = env.map(ResumeRequest::from_env).unwrap_or_default();
-    plan_with(name, dir, args, path, guard, env, &resume, pid)
+    let fresh = env.map(ResumeRequest::fresh_from_env).unwrap_or_default();
+    plan_with(
+        name,
+        dir,
+        args,
+        path,
+        guard,
+        env,
+        &Requests {
+            resume: &resume,
+            fresh: &fresh,
+        },
+        pid,
+    )
+}
+
+/// The one-shot requests a spawn's environment may carry: a restore's
+/// resume, a Start over's fresh start.
+struct Requests<'a> {
+    resume: &'a ResumeRequest,
+    fresh: &'a ResumeRequest,
 }
 
 /// [`plan`], with the resume request `resume` read separately from the
@@ -377,9 +440,10 @@ fn plan_with(
     path: Option<&OsStr>,
     guard: Option<&OsStr>,
     env: Option<&EnvMap>,
-    resume: &ResumeRequest,
+    requests: &Requests<'_>,
     pid: u32,
 ) -> Result<Plan, Refused> {
+    let resume = requests.resume;
     let shimmed = guard.map(|g| g.to_string_lossy().into_owned());
     let shimmed: Vec<&str> = shimmed
         .as_deref()
@@ -391,7 +455,7 @@ fn plan_with(
     let program = resolve(name, path, dir).ok_or(Refused::NotFound)?;
     // A request for this program is consumed here, resumed or refused; one
     // for another program is left in the environment for it.
-    let (resumed, remove_env) = if resume.agent.as_deref() == Some(name) {
+    let (mut resumed, mut remove_env) = if resume.agent.as_deref() == Some(name) {
         (
             resume_args(name, dir, &args, resume),
             RESUME_ENV_KEYS.iter().map(OsString::from).collect(),
@@ -399,6 +463,12 @@ fn plan_with(
     } else {
         (Vec::new(), Vec::new())
     };
+    // Audit B3: a Start over's fresh-start request, checked against the
+    // arguments this program is really started with.
+    resumed.extend(fresh_args(name, dir, &args, requests.fresh));
+    if requests.fresh.agent.as_deref() == Some(name) {
+        remove_env.extend(FRESH_ENV_KEYS.iter().map(OsString::from));
+    }
     let added = match env {
         Some(env) if !shimmed.contains(&name) && launcher_is_certain(name, &program) => {
             additions(name, dir, &args, env, pid)
@@ -467,6 +537,77 @@ fn resume_args(
 
 #[cfg(not(unix))]
 fn resume_args(
+    _name: &str,
+    _dir: &Path,
+    _args: &[OsString],
+    _request: &ResumeRequest,
+) -> Vec<OsString> {
+    Vec::new()
+}
+
+/// Audit B3: what a Start over's fresh-start `request` makes of `name`
+/// called with `args`: the arguments to put in front of them (Claude Code's
+/// new id, [`crate::agent_registry::FreshSpec::args`]), or none. A call that
+/// starts no conversation leaves the request for a later call. The program
+/// the request names claims its token and publishes one outcome: refused
+/// (`<token>.refused`, [`REFUSED_FRESH_ARGS_SELECT`] or
+/// [`REFUSED_SESSION_ID_INVALID`], the program run unchanged) when `args`
+/// select an existing conversation or the new id is not one the agent
+/// accepts, applied (`<token>`) otherwise. Any other program the shim stands
+/// in front of that is started meanwhile with arguments that select a
+/// conversation claims the token too, and refuses it: the launch reached an
+/// agent's old conversation, whichever agent it is. A program started after
+/// the token was claimed finds it spent and is not checked.
+#[cfg(unix)]
+fn fresh_args(name: &str, dir: &Path, args: &[OsString], request: &ResumeRequest) -> Vec<OsString> {
+    let Some(token) = request.token.as_deref().filter(|t| is_resume_token(t)) else {
+        return Vec::new();
+    };
+    let Some(spec) = crate::agent_registry::ALL
+        .iter()
+        .filter_map(|spec| spec.fresh_start)
+        .find(|fresh| fresh.program == name)
+    else {
+        return Vec::new();
+    };
+    let named = request.agent.as_deref() == Some(name);
+    let selects = spec.selects(args);
+    if spec.inspects(args) || !(named || selects) {
+        return Vec::new();
+    }
+    if !token_usable(token, now_secs()) {
+        return Vec::new();
+    }
+    let Ok(acks) = open_acks(dir, true) else {
+        return Vec::new();
+    };
+    if count_entries(&acks, MAX_ACK_ENTRIES) >= MAX_ACK_ENTRIES
+        || acks
+            .create_new_owner_only(&format!("{token}{CLAIM_SUFFIX}"))
+            .is_err()
+    {
+        return Vec::new();
+    }
+    let session = request.session.as_deref().unwrap_or_default();
+    let refusal = if selects {
+        Some(REFUSED_FRESH_ARGS_SELECT)
+    } else if spec.new_id_option.is_some() && !crate::agent_registry::is_canonical_uuid(session) {
+        Some(REFUSED_SESSION_ID_INVALID)
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        let _ = publish(&acks, token, &format!("{token}{REFUSED_SUFFIX}"), reason);
+        return Vec::new();
+    }
+    match publish(&acks, token, token, name) {
+        Ok(()) => spec.args(session),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn fresh_args(
     _name: &str,
     _dir: &Path,
     _args: &[OsString],
@@ -594,7 +735,8 @@ pub enum AckState {
     /// Claimed, with no outcome published: a call is deciding, or failed
     /// after claiming. Never a resume.
     Pending,
-    /// The shim gave the agent its resume arguments.
+    /// The shim gave the agent its resume arguments, or, for a fresh-start
+    /// request, checked its arguments and started it fresh.
     Resumed,
     /// The shim refused the request and ran the agent unchanged.
     Refused,
@@ -1945,5 +2087,103 @@ mod tests {
             }),
             "an environment it cannot read exactly"
         );
+    }
+
+    /// PRD #1790 stage 3 (audit B3): a Start over's fresh-start request is
+    /// checked against the arguments the agent is really started with. A
+    /// launch that selects an existing conversation, for the named program or
+    /// any other one the shim stands in front of, is refused and run
+    /// unchanged; Claude Code is otherwise started under the new id; a call
+    /// that starts no conversation leaves the request for the later one.
+    #[test]
+    fn a_fresh_start_request_is_checked_at_the_real_arguments() {
+        const NEW_ID: &str = "0f000000-89ab-4cde-8fab-0123456789ab";
+        let fresh = |program: &str, token: &str| {
+            env(&[
+                (FRESH_AGENT_ENV, program),
+                (FRESH_SESSION_ENV, NEW_ID),
+                (FRESH_TOKEN_ENV, token),
+            ])
+        };
+        let state = |f: &Fixture, token: &str| {
+            let acks = open_acks(&f.shim, true).unwrap();
+            ack_state(&acks, token)
+        };
+        // Claude: started under the new id, the request removed.
+        let f = fixture();
+        let planned = f
+            .plan("claude", &["--model", "haiku"], &fresh("claude", "fresh-1"))
+            .unwrap();
+        assert_eq!(
+            planned.args,
+            os(&["--session-id", NEW_ID, "--model", "haiku"])
+        );
+        for key in FRESH_ENV_KEYS {
+            assert!(planned.remove_env.contains(&OsString::from(key)), "{key}");
+        }
+        assert_eq!(state(&f, "fresh-1"), AckState::Resumed);
+        // A version query first leaves the token for the real launch.
+        let f = fixture();
+        let query = f
+            .plan("claude", &["--version"], &fresh("claude", "fresh-2"))
+            .unwrap();
+        assert_eq!(query.args, os(&["--version"]));
+        assert_eq!(state(&f, "fresh-2"), AckState::Unclaimed);
+        // Arguments that select a conversation: refused, run unchanged.
+        for (program, args) in [
+            ("claude", vec!["--continue"]),
+            ("codex", vec!["resume", "--last"]),
+            ("codex", vec!["exec", "resume", "--last"]),
+            ("opencode", vec!["--continue"]),
+            ("opencode", vec!["--session", "ses_1"]),
+            ("pi", vec!["--resume"]),
+            ("devin", vec!["-r", NEW_ID]),
+        ] {
+            let f = fixture();
+            let planned = f.plan(program, &args, &fresh(program, "fresh-3")).unwrap();
+            assert_eq!(planned.args, os(&args), "{program} runs unchanged");
+            assert_eq!(
+                state(&f, "fresh-3"),
+                AckState::Refused,
+                "{program} {args:?}"
+            );
+            let reason =
+                std::fs::read_to_string(f.telemetry.join(RESUME_ACKS_DIR).join("fresh-3.refused"))
+                    .unwrap();
+            assert_eq!(reason.trim(), REFUSED_FRESH_ARGS_SELECT);
+        }
+        // Another program reopening a conversation spends the request too;
+        // one that does not leaves it for the named program.
+        let f = fixture();
+        let other = f
+            .plan("opencode", &["--model", "x"], &fresh("codex", "fresh-4"))
+            .unwrap();
+        assert!(other.remove_env.is_empty());
+        assert_eq!(state(&f, "fresh-4"), AckState::Unclaimed);
+        f.plan("claude", &["-c"], &fresh("codex", "fresh-4"))
+            .unwrap();
+        assert_eq!(state(&f, "fresh-4"), AckState::Refused);
+        // A spent token checks nothing more.
+        let again = f
+            .plan("codex", &["--model", "x"], &fresh("codex", "fresh-4"))
+            .unwrap();
+        assert_eq!(again.args, os(&["--model", "x"]));
+        // Codex, OpenCode, Pi and Devin: applied with no new arguments.
+        for program in ["codex", "opencode", "pi", "devin"] {
+            let f = fixture();
+            let planned = f.plan(program, &[], &fresh(program, "fresh-5")).unwrap();
+            assert!(planned.args.is_empty(), "{program}: {planned:?}");
+            assert_eq!(state(&f, "fresh-5"), AckState::Resumed, "{program}");
+        }
+        // Claude with a new id that is not a UUID: refused.
+        let f = fixture();
+        let bad = env(&[
+            (FRESH_AGENT_ENV, "claude"),
+            (FRESH_SESSION_ENV, "--continue"),
+            (FRESH_TOKEN_ENV, "fresh-6"),
+        ]);
+        let planned = f.plan("claude", &[], &bad).unwrap();
+        assert!(planned.args.is_empty());
+        assert_eq!(state(&f, "fresh-6"), AckState::Refused);
     }
 }

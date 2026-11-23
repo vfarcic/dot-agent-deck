@@ -700,6 +700,15 @@ pub enum Event {
         from: AttemptId,
         to: AttemptId,
         how: RestoredHow,
+        /// Audit B1: the conversation `to` was confirmed in: the resumed one
+        /// for a restore, the new one a start over's agent reported. Written
+        /// synchronously before the restore releases its claims, so every
+        /// later check finds `to` in that conversation without waiting for
+        /// `to`'s own `attempt_session`, which the session quota may hold
+        /// back. Absent when no conversation was confirmed, and from a build
+        /// before it was recorded. Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
     },
     /// PRD #1790 stage 3: a resume of `attempt` was tried and did not take,
     /// so the agent it started was stopped before anything was sent to it.
@@ -721,6 +730,15 @@ pub enum Event {
         /// Additive under `v:1`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<AttemptId>,
+        /// Audit B2: the conversations the agent `to` may be writing to (the
+        /// one asked for, and one it reported instead), when the stop of it
+        /// could not be proven. Until `to`'s launch is proven gone, no
+        /// restore of any item into one of these is started, from any
+        /// daemon; `to` ending in the journal does not lift that. Empty when
+        /// the stop was proven, and from a build before it was recorded.
+        /// Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sessions: Vec<String>,
     },
 }
 
@@ -1006,7 +1024,17 @@ fn validate(line: &Line, homes: &HomeSpellings) -> Result<(), Refusal> {
                 plain("unit_id", unit_id)?;
             }
         }
-        Event::Closed { .. } | Event::AttemptRestored { .. } | Event::RestoreFailed { .. } => {}
+        Event::AttemptRestored { session, .. } => {
+            if let Some(session) = session {
+                plain("session", session)?;
+            }
+        }
+        Event::RestoreFailed { sessions, .. } => {
+            for session in sessions {
+                plain("session", session)?;
+            }
+        }
+        Event::Closed { .. } => {}
     }
     Ok(())
 }
@@ -2534,6 +2562,14 @@ impl WorkJournal {
         let Some(store) = &self.shared.store else {
             return false;
         };
+        // In an e2e build only: `DOT_AGENT_DECK_TEST_WITHHOLD_SESSIONS=1`
+        // admits no session event, as a full session quota would, so lane 1
+        // can hold a restored agent's own report back (audit B1).
+        #[cfg(feature = "e2e")]
+        if std::env::var("DOT_AGENT_DECK_TEST_WITHHOLD_SESSIONS").as_deref() == Ok("1") {
+            store.note_drop();
+            return false;
+        }
         let mut queued = store.queued_sessions.load(Ordering::Acquire);
         let taken = loop {
             if queued >= store.session_quota {

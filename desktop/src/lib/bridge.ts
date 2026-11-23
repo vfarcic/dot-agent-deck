@@ -3363,13 +3363,16 @@ class FixtureDeckBridge implements DeckBridge {
    * the three (a list longer than the dialog), or `interrupted=unread` for an
    * empty list that says the journal could not be read whole (verification
    * finding N4), or `interrupted=restore` (PRD #1790 stage 3) for a unit
-   * that can be restored and a Pi that can only start over: a daemon that
-   * does not support it otherwise. Dismiss, a real reclaim, restore and
-   * start-over remove the item for the rest of the session.
+   * that can be restored and a Pi that can only start over, or
+   * `interrupted=restore-long` for the same with an agent name far longer
+   * than the dialog is tall: a daemon that does not support it otherwise.
+   * Dismiss, a real reclaim, restore and start-over remove the item for the
+   * rest of the session.
    */
   private readonly interrupted = (() => {
     const asked = new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("interrupted");
-    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread" || asked === "restore", asked === "many" ? 27 : 0, asked === "unread", asked === "restore");
+    const restorable = asked === "restore" || asked === "restore-long";
+    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread" || restorable, asked === "many" ? 27 : 0, asked === "unread", restorable, asked === "restore-long");
   })();
   async interruptedWorkList(target: InterruptedTarget): Promise<InterruptedReply<InterruptedList>> {
     return this.interrupted.list(target);

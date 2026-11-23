@@ -971,7 +971,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); real `dispatch --single --command … --agent claude --task …`, restart, and real `interrupted start-over` CLI; public attach refusal and inbox history.
 - **Agent:** synthetic routing dispatcher and synthetic `claude` single unit.
-- **Asserts:** the actual dispatch saved the multiline sentinel task verbatim; replacing that task by a symlink refuses `task-unsafe`, starts nothing, posts nothing and keeps the item; restoring its original safe file then starting over with `--agent <attempt> --yes` runs the recorded command in the worktree without resume arguments, delivers exactly the saved task as the first inbox message under deck reason `saved task`, delivers neither restart note, and removes the item.
+- **Asserts:** the actual dispatch saved the multiline sentinel task verbatim; replacing that task by a symlink refuses `task-unsafe`, starts nothing, posts nothing and keeps the item; restoring its original safe file then starting over with `--agent <attempt> --yes` runs the recorded command in the worktree without resume arguments, with `--session-id <new uuid>` in front (round 3, audit B3) and that new conversation reported, delivers exactly the saved task as the first inbox message under deck reason `saved task`, delivers neither restart note, and removes the item.
 - **Does not assert:** other unsafe task file kinds or modes; plain-agent start-over without a saved task; orchestrations; a real agent spending a turn on the task.
 - **Platform coverage:** mac+linux.
 
@@ -1036,8 +1036,8 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI and raw attach requests. Unit companion: `reopening_arguments_and_commands_are_told_from_a_fresh_start` (`src/agent_registry.rs`).
 - **Agent:** synthetic `claude`; one recorded command runs `claude --continue`, one `claude --resume <uuid>`, one a wrapper script that adds `--continue`.
-- **Asserts:** the two direct commands are refused `command-reopens` by the CLI (naming it) and by the raw request, starting nothing; the wrapper's Start over starts once, the agent reports the old conversation, and the answer is `not-fresh`: its card goes, nothing is posted and the item stays listed (audit F3).
-- **Does not assert:** agents whose hooks report no conversation before their prompt (documented gap: they are checked by their recorded command only).
+- **Asserts:** the two direct commands are refused `command-reopens` by the CLI (naming it) and by the raw request, starting nothing; the wrapper's Start over starts at most once, the shim sees its real `--continue` and the answer is `command-reopens` (round 3, audit B3; it was `not-fresh` before): no agent stays live, nothing is posted and the item stays listed (audit F3).
+- **Does not assert:** the other agents' classifiers and the no-recorded-session wrapper (028).
 - **Platform coverage:** mac+linux.
 
 ##### journal/restore/023 — A failed restore stops every process it started.
@@ -1045,7 +1045,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan.
 - **Agent:** synthetic `claude` restored with `wrong-session`, `survive-stop` (a child in its session but another process group, ignoring TERM/HUP) and `ignore-term-child` (a child in its own group ignoring TERM); each child caps itself at 180 seconds and fixture cleanup signals only its exact pid while its start identity matches.
 - **Asserts:** the restore answers `not-resumed` only after both children are gone (exited, or waiting only to be reaped); nothing is sent; with the sentinels removed, a Start over then starts the agent again, so the failed restore's own launch no longer blocks it (audit F4).
-- **Does not assert:** a child that left the session (`setsid`), which no session scan finds; the `not-stopped` answer when the stop cannot be proven.
+- **Does not assert:** a child that left the session (`setsid`), which no session scan finds; the `not-stopped` answer when the stop cannot be proven (027); pid and session-id reuse, covered by the injected-view unit test `the_sweep_signals_only_the_launchs_own_processes`; a retained zombie, covered by `a_retained_zombie_is_gone_for_every_session_check` (`src/platform/proc/mod.rs`).
 - **Platform coverage:** linux.
 
 ##### journal/restore/024 — A restart note that cannot be delivered restores nothing.
@@ -1059,9 +1059,41 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/restore/025 — Newer work in the folder refuses Start over and restore.
 
 - **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests. Unit companion: `newer_live_work_in_the_same_folder_makes_it_in_use`.
-- **Agent:** synthetic `claude`; a newer one started in the same folder on the restarted daemon.
-- **Asserts:** Start over and Restore of the stopped agent are both refused `directory-in-use`, nothing more starts and the item stays listed (review R#3).
-- **Does not assert:** the act-time Git and GitHub refusals (`folder-missing` for a gone worktree, `pr-open` for a Start over beside an open pull request), covered by `act_time_git_facts_refuse_a_gone_worktree_and_an_open_pr_start_over`.
+- **Agent:** synthetic `claude`; a newer one started in the same folder on the restarted daemon, by its own path, through a symlink to it, and through a path with `..` in it (round 3, audit S1/F7), each in a fixture of its own.
+- **Asserts:** for each spelling, Start over and Restore of the stopped agent are both refused `directory-in-use`, nothing more starts and the item stays listed (review R#3).
+- **Does not assert:** the act-time Git and GitHub refusals (`folder-missing` for a gone worktree, covered by `act_time_git_facts_refuse_a_gone_worktree_and_an_open_pr_start_over`; `pr-open` under the claims, 029); a live launch whose folder cannot be read, covered by the unit companion.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/026 — A finished restore keeps its conversation from a second writer.
+
+- **Layer:** L2 two headless `daemon serve` processes with separate sockets and one state directory, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests; the e2e-only `DOT_AGENT_DECK_TEST_WITHHOLD_SESSIONS` (the journal admits no session event) and `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_EDGE` (the successor link's write fails). Unit companion: `a_confirmed_successor_owns_its_conversation_before_its_own_report`.
+- **Agent:** synthetic `claude`; two agents in one conversation (`fixed-session`), in folders of their own.
+- **Asserts:** with session reports withheld, restoring the first succeeds and records its successor link with the confirmed conversation while no `attempt_session` of the successor exists; after that request finished, restoring the second from the same daemon and from the second daemon is refused `session-in-use`, three launches in all (audit B1). With the link's write failing, a restore whose agent came back answers `not-recorded`, the agent is stopped and the item stays listed.
+- **Does not assert:** a journal that fails for a real reason (full disk), or the `not-stopped` + unrecorded case that keeps the claims for the daemon's life.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/027 — An unproven stop fences its conversation from every item.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP` (the stop leaves what the close did not stop and answers unproven). Unit companion: `an_unproven_stop_fences_its_conversation_until_its_launch_is_gone`.
+- **Agent:** synthetic `claude`; two agents in one conversation in folders of their own; the first restored with `wrong-session` and `survive-stop` (a child in its session, another process group, ignoring TERM/HUP, capped at 180 seconds; cleanup signals only its exact pid while its start identity matches).
+- **Asserts:** the first restore answers `not-stopped`; while its child runs, restoring the second from either daemon is refused `session-in-use` though the first's successor attempt ended in the journal; nothing more starts and nothing is sent; once the child is gone, the second restores (audit B2).
+- **Does not assert:** the fence's per-attempt half (023's Start over after a proven stop), a real kernel refusing a SIGKILL.
+- **Platform coverage:** linux.
+
+##### journal/restore/028 — Start over checks the arguments the agent really gets.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests. Unit companions: `reopening_arguments_and_commands_are_told_from_a_fresh_start` (`src/agent_registry.rs`), `a_fresh_start_request_is_checked_at_the_real_arguments` (`src/telemetry/shim.rs`).
+- **Agent:** the synthetic fixture executable, also as `opencode` and `codex`; OpenCode panes (`agent_type: open_code`) running `opencode --continue`, `opencode --session ses_1` and a wrapper running `opencode --session ses_028`; Claude Code panes running `(codex resume --last)`, `true;codex resume --last` and `c=codex; $c resume --last`; two Claude Code panes started with no conversation reported (`no-hook`), one through a wrapper adding `--continue`, one through a wrapper calling the fixture by its full path.
+- **Asserts:** the four commands the deck can read are refused `command-reopens` with nothing started; the OpenCode wrapper, the variable-named Codex and the Claude `--continue` wrapper (whose item is `no-session-id`) are refused `command-reopens` once the shim sees their real arguments; the full-path wrapper, which the shim never sees, is refused `not-fresh`; every started agent is stopped, nothing is sent and every item stays listed (audit B3).
+- **Does not assert:** real OpenCode, Pi, Devin or Codex CLIs (their classifiers are unit-tested against each CLI's `--help`); a Codex-typed pane, whose start runs the deck's hooks trust probe; Antigravity and plain shells, which are started over unchecked.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/029 — Start over reads GitHub again under its claims.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); real `dispatch --single`, a fake `gh` on the daemon's `PATH` that answers an open pull request for the branch once a sentinel exists, an `origin` remote naming a GitHub repository, and the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_BARRIER`.
+- **Agent:** synthetic routing dispatcher and synthetic `claude` single unit.
+- **Asserts:** a Start over held at the barrier after reading the item, while the branch had no pull request, answers `pr-open` once a pull request appears and it is released: Git and GitHub are read again with its claims held; nothing more starts and nothing is sent (audit S5).
+- **Does not assert:** a pull request opened between that read and the spawn, which no read can rule out; the dry run's facts in the question.
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

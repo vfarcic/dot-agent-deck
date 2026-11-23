@@ -103,12 +103,26 @@ function extraUnits(count: number): InterruptedItem[] {
  * lists that many more units after the three; `unread` answers an empty list
  * that says the journal could not be read whole.
  */
-export function fixtureInterruptedWork(enabled: boolean, extra = 0, unread = false, restorable = false) {
+/**
+ * An agent name longer than a short dialog is tall once wrapped (shown
+ * shortened, as any long value is), for the restore question's presentation
+ * check (audit S4/F9, `interrupted=restore-long`).
+ */
+export const FIXTURE_LONG_AGENT_NAME = `fix-login ${Array.from({ length: 300 }, (_, at) => `part${at}`).join(" ")}`;
+
+/** {@link fixtureRestoreItems}, with the restorable agent's name {@link FIXTURE_LONG_AGENT_NAME}. */
+function fixtureRestoreItemsLong(): InterruptedItem[] {
+  const items = fixtureRestoreItems();
+  for (const agent of items[0].agents ?? []) agent.name = FIXTURE_LONG_AGENT_NAME;
+  return items;
+}
+
+export function fixtureInterruptedWork(enabled: boolean, extra = 0, unread = false, restorable = false, longName = false) {
   const decks = new Map<string, InterruptedItem[]>();
   const items = (target: InterruptedTarget) => {
     let held = decks.get(target.deckId);
     if (!held) {
-      held = unread ? [] : restorable ? fixtureRestoreItems() : [...fixtureInterruptedItems(), ...extraUnits(extra)];
+      held = unread ? [] : restorable ? (longName ? fixtureRestoreItemsLong() : fixtureRestoreItems()) : [...fixtureInterruptedItems(), ...extraUnits(extra)];
       decks.set(target.deckId, held);
     }
     return held;

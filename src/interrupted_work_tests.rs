@@ -1724,6 +1724,7 @@ fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list
             failure: RestoreFailure::SessionMismatch,
             shim: None,
             to: None,
+            sessions: Vec::new(),
         },
     );
     let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
@@ -1744,6 +1745,7 @@ fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list
                 from: a.clone(),
                 to: attempt(LIVE, 1),
                 how: restored,
+                session: None,
             },
         );
         let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
