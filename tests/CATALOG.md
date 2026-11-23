@@ -1096,6 +1096,30 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** a pull request opened between that read and the spawn, which no read can rule out; the dry run's facts in the question.
 - **Platform coverage:** mac+linux.
 
+##### journal/restore/030 — An unrecorded unproven stop fences the conversation it reported.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP` (the stop answers unproven) and `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE` (the `restore_failed` write fails). Unit companion: `a_fence_that_could_not_be_recorded_holds_its_conversations_and_kind`.
+- **Agent:** synthetic `claude`; two agents in conversations of their own (the second started with `--resume` into the fixture's other conversation), in folders of their own; the first restored with `wrong-session` (it reports the second's conversation) and `survive-stop` (a capped child in its session; cleanup signals only its exact pid while its start identity matches).
+- **Asserts:** the first restore answers `not-stopped` and no `restore_failed` is written; restoring the second, whose conversation the first reported, from the same daemon and from the second daemon is refused `session-in-use`; nothing more starts and nothing is sent (round-4 B2).
+- **Does not assert:** a claim another daemon held at the moment the fence was taken (logged, unit-level only); the fence lifting, which in this case happens only when the daemon that holds it stops.
+- **Platform coverage:** linux.
+
+##### journal/restore/031 — A survivor in an unknown conversation fences its kind.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP`. Unit companions: `a_survivor_in_an_unknown_conversation_fences_its_whole_kind`, `a_fence_covers_its_kind_only_when_its_conversation_is_unknown`.
+- **Agent:** synthetic `claude`; the first started with `--continue` in its own command (the launch shim refuses the resume beside it), the second in a conversation of its own in another folder; the first restored with `no-hook` (it reports no conversation) and `survive-stop`.
+- **Asserts:** the first restore answers `not-stopped` and writes `restore_failed` with `failure: refused` and `unknown_session: true`; while its child runs, restoring the second, a conversation the first never named, from either daemon is refused `session-in-use`; nothing more starts and nothing is sent; once the child is gone, the second restores (round-4 B2).
+- **Does not assert:** another agent kind's restores going on meanwhile (unit-level); the refused acknowledgement keeping a reported conversation, which `confirm_fresh` reads before it answers (unit-level).
+- **Platform coverage:** linux.
+
+##### journal/restore/032 — A same-name Claude wrapper is checked by its conversation.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests; a user's script named `claude` ahead of the fixture on the daemon's `PATH`.
+- **Agent:** synthetic `claude`, started through that script, which runs the fixture by its full path with `--resume <earlier conversation>` in front of the arguments it is given.
+- **Asserts:** Start over reaches the script through the launch shim (the agent's arguments hold both the deck's `--session-id` and the script's `--resume`), the agent reports the earlier conversation, and Start over is refused `not-fresh`; the agent is stopped, nothing is sent and the item stays listed (round-4 F3/B1).
+- **Does not assert:** the same shape for Codex, OpenCode, Pi or Devin, which report no conversation the deck can check a Start over against: a script of the user's named after one of them that picks a conversation itself is not checked (`docs/interrupted-work.md`).
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

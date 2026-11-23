@@ -163,7 +163,7 @@ function usePresented(key: string | undefined, question: RefObject<HTMLElement |
             if (!part.isConnected) continue;
             const now = acrossScroll ? shownSpan(part) : fullyShown(part) ? whole(part) : undefined;
             if (!now) continue;
-            /* Only what stayed on screen the whole time counts. */
+            /* Only what was on screen at both ends of the interval counts. */
             const kept: Span = [Math.max(span[0], now[0]), Math.min(span[1], now[1])];
             if (kept[1] > kept[0] || (kept[1] === kept[0] && whole(part)[1] === 0)) seen.set(part, withSpan(seen.get(part) ?? [], kept));
           }

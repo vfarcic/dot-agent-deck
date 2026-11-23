@@ -1789,3 +1789,223 @@ fn journal_restore_029_start_over_reads_github_again_under_its_claims() {
     assert_eq!(decks.starts().len(), 1, "nothing more started");
     assert!(decks.inbox(None).is_empty(), "nothing was sent");
 }
+
+/// The survivor child a restore left in its session, from the sentinel file
+/// `file` it wrote.
+#[cfg(target_os = "linux")]
+fn survivor(decks: &Decks, file: &str) -> Survivor {
+    let path = decks.root.join(file);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || path
+            .is_file()),
+        "the survivor child never reported itself"
+    );
+    let child: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let pid = child["pid"].as_u64().unwrap() as u32;
+    let start = dot_agent_deck::platform::proc::process_start_of(pid).expect("premise: it runs");
+    Survivor { pid, start }
+}
+
+/// Scenario: Two scripted Claudes ran in conversations of their own, in folders of their own. After a restart into a daemon that can neither prove a stop nor write a failure record, restoring the first comes back in the second one's conversation and leaves a child running in its session, so it is refused not-stopped. Restoring the second, from that daemon and from a second daemon, is then refused session-in-use, and nothing more starts.
+#[cfg(target_os = "linux")]
+#[spec("journal/restore/030")]
+#[test]
+fn journal_restore_030_an_unrecorded_unproven_stop_fences_the_conversation_it_reported() {
+    let mut decks = Decks::start();
+    let first = decks.start_pane("restore-reported-a-030");
+    let folder = decks.folder("restore-reported-b-030");
+    let second = decks.start_pane_with(
+        "restore-reported-b-030",
+        &folder,
+        &common::capability_export_command(&format!(
+            "exec claude --model restore-synthetic --resume {WRONG_SESSION}"
+        )),
+    );
+    assert_eq!(first["session"], SESSION, "premise: {first}");
+    assert_eq!(second["session"], WRONG_SESSION, "premise: {second}");
+    let first = string(&decks.attempt(&string(&first, "agent")), "attempt");
+    let second = string(&decks.attempt(&string(&second, "agent")), "attempt");
+    decks.restart_with(&[
+        ("DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP", "1"),
+        ("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE", "1"),
+    ]);
+    let other = decks.another_daemon();
+    let first_id = string(&decks.item_for(&first), "id");
+    let second_id = string(&decks.item_for(&second), "id");
+    assert_eq!(
+        decks.item_for(&second)["agents"][0]["restore"]["kind"],
+        "resume",
+        "premise: the second can be restored"
+    );
+    // The first comes back in the second's conversation and leaves a child.
+    for sentinel in ["wrong-session", "survive-stop"] {
+        std::fs::write(decks.root.join(sentinel), "").unwrap();
+    }
+    let reply = final_reply(&decks, restore_request(&first_id, &first));
+    assert_refused(&reply, &first, "not-stopped");
+    let survivor = survivor(&decks, "survivor.json");
+    for sentinel in ["wrong-session", "survive-stop"] {
+        std::fs::remove_file(decks.root.join(sentinel)).unwrap();
+    }
+    assert!(
+        journal::all(&journal::lines(&decks.state), "restore_failed", |_| true).is_empty(),
+        "premise: the failure could not be recorded"
+    );
+    for daemon in [&decks.live, &other] {
+        let reply = final_reply_on(daemon, restore_request(&second_id, &second));
+        assert_refused(&reply, &second, "session-in-use");
+    }
+    assert_eq!(decks.starts().len(), 3, "nothing more started");
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    drop(survivor);
+    drop(other);
+}
+
+/// Scenario: A scripted Claude whose own command continues its conversation and a second one in another conversation ran in folders of their own. After a restart into a daemon that cannot prove a stop, restoring the first is refused by the launch shim, reports no conversation and leaves a child running, so it is refused not-stopped. Restoring the second, in a conversation the first never named, from that daemon and from a second daemon, is refused session-in-use while the child runs, and restores once it is gone.
+#[cfg(target_os = "linux")]
+#[spec("journal/restore/031")]
+#[test]
+fn journal_restore_031_a_survivor_in_an_unknown_conversation_fences_its_kind() {
+    let mut decks = Decks::start();
+    // With `survive-early`, a capped child in the launch's session but out
+    // of its process group, started before the agent: the launch shim's
+    // refusal is seen at once, before the agent itself could start one.
+    let fork = decks.bin.join("fork-survivor");
+    std::fs::write(
+        &fork,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, os, signal, time
+root = {root}
+if os.path.exists(os.path.join(root, 'survive-early')) and os.fork() == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
+    signal.alarm(180)
+    for fd in (0, 1, 2):
+        os.close(fd)
+    tmp = os.path.join(root, 'early-survivor.json.tmp')
+    with open(tmp, 'w') as f:
+        json.dump({{'pid': os.getpid(), 'sid': os.getsid(0)}}, f)
+    os.replace(tmp, os.path.join(root, 'early-survivor.json'))
+    while True:
+        time.sleep(0.1)
+"#,
+            root = serde_json::to_string(&decks.root).unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fork, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let first = decks.start_pane_with(
+        "restore-unknown-a-031",
+        &decks.repo,
+        &common::capability_export_command(
+            "fork-survivor; exec claude --model restore-synthetic --continue",
+        ),
+    );
+    // Every later fresh start is in a conversation of its own.
+    std::fs::write(decks.root.join("session-taken"), "").unwrap();
+    let folder = decks.folder("restore-unknown-b-031");
+    let second = decks.start_pane_with("restore-unknown-b-031", &folder, &decks.command());
+    assert_ne!(
+        first["session"], second["session"],
+        "premise: two conversations"
+    );
+    let first = string(&decks.attempt(&string(&first, "agent")), "attempt");
+    let second = string(&decks.attempt(&string(&second, "agent")), "attempt");
+    decks.restart_with(&[("DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP", "1")]);
+    let other = decks.another_daemon();
+    let first_id = string(&decks.item_for(&first), "id");
+    let second_id = string(&decks.item_for(&second), "id");
+    // The shim refuses the first's `--continue` beside the resume; the agent
+    // runs on with its own arguments, reports nothing and leaves a child.
+    for sentinel in ["no-hook", "survive-early"] {
+        std::fs::write(decks.root.join(sentinel), "").unwrap();
+    }
+    let reply = final_reply(&decks, restore_request(&first_id, &first));
+    assert_refused(&reply, &first, "not-stopped");
+    let survivor = survivor(&decks, "early-survivor.json");
+    for sentinel in ["no-hook", "survive-early"] {
+        std::fs::remove_file(decks.root.join(sentinel)).unwrap();
+    }
+    let failed = journal::wait_for(&decks.state, "the failure record", |lines| {
+        journal::find(lines, "restore_failed", |_| true).cloned()
+    });
+    assert_eq!(failed["failure"], "refused", "{failed}");
+    assert_eq!(failed["unknown_session"], true, "{failed}");
+
+    for daemon in [&decks.live, &other] {
+        let reply = final_reply_on(daemon, restore_request(&second_id, &second));
+        assert_refused(&reply, &second, "session-in-use");
+    }
+    assert_eq!(decks.starts().len(), 3, "nothing more started");
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    let (pid, start) = (survivor.pid, survivor.start);
+    drop(survivor);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !running(pid, start)
+        }),
+        "the test's own child is gone"
+    );
+    let reply = final_reply_on(&other, restore_request(&second_id, &second));
+    assert_eq!(
+        restored_count(&reply),
+        1,
+        "the fence lifts once it is gone: {reply}"
+    );
+    drop(other);
+}
+
+/// Scenario: A scripted Claude runs through a script of the user's named `claude`, ahead of the agent on `PATH`, that starts the agent by its full path in an earlier conversation. After a restart, Start over reaches that script, which hands the deck's new conversation id on beside its own choice; the agent reports the earlier conversation, so Start over is refused not-fresh, the agent is stopped, nothing is sent and the item stays listed.
+#[spec("journal/restore/032")]
+#[test]
+fn journal_restore_032_a_same_name_claude_wrapper_is_checked_by_its_conversation() {
+    let mut decks = Decks::start();
+    let wrap = decks.root.parent().unwrap().join("wrap");
+    std::fs::create_dir_all(&wrap).unwrap();
+    std::fs::set_permissions(&wrap, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        wrap.join("claude"),
+        format!(
+            "#!/bin/sh\nexec {} --resume {SESSION} \"$@\"\n",
+            decks.bin.join("claude").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(wrap.join("claude"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    decks.path = format!("{}:{}", wrap.display(), decks.path);
+    decks.restart();
+    let original = decks.start_pane("restore-same-name-032");
+    assert_eq!(original["session"], SESSION, "premise: {original}");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    decks.restart();
+    let item = decks.item_for(&attempt);
+    let id = string(&item, "id");
+    let reply = final_reply(&decks, start_over_request(&id, &attempt));
+    assert_eq!(start_over_refusal(&reply), "not-fresh", "{reply}");
+    let started = decks
+        .starts()
+        .into_iter()
+        .find(|s| s["pane"] != original["pane"])
+        .expect("premise: Start over started it");
+    let argv: Vec<String> = started["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        argv.iter().any(|a| a == "--session-id") && argv.iter().any(|a| a == "--resume"),
+        "premise: the shim reached the wrapper, which kept its own choice: {argv:?}"
+    );
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            common::agent_records_on(&decks.live.attach_socket).is_empty()
+        }),
+        "the agent is stopped"
+    );
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    assert_eq!(decks.item_for(&attempt)["id"], id, "the item stays listed");
+}

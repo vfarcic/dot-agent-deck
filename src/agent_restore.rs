@@ -118,9 +118,11 @@
 //! agent with a [`crate::agent_registry::FreshSpec`] (Claude Code, Codex,
 //! OpenCode, Pi, Devin), the spawn carries a one-shot fresh-start request
 //! ([`crate::telemetry::shim::FRESH_ENV_KEYS`]) and the shim directory first
-//! on its `PATH`: the shim checks the arguments the agent is really started
-//! with and refuses ones that select an existing conversation, and starts
-//! Claude Code under a new conversation id the deck chose. A refusal answers
+//! on its `PATH`: the shim checks the arguments the program it stands in
+//! front of is started with (the first program of the agent's name on
+//! `PATH` after the shim, which may be a script of the user's) and refuses
+//! ones that select an existing conversation, and starts Claude Code under a
+//! new conversation id the deck chose. A refusal answers
 //! `command-reopens`; a shim not reached, or a Claude Code whose first
 //! attested conversation is not the new one, answers `not-fresh`; either
 //! stops the agent before anything is posted to it ([`confirm_fresh`],
@@ -130,23 +132,30 @@
 //! has no conversation to be told about. Then
 //! `attempt_restored{how: started_over}` and `closed how=started_over`.
 //!
-//! **Stopping an agent it started** ([`stop_proven`], audit F4, F4a) closes
-//! it as `StopAgent` would, then kills every process left in the POSIX
-//! session its leader leads (a child that moved to another process group, or
-//! ignores `SIGTERM`) and answers stopped only once that session was seen
-//! empty ([`sweep_session`]: identity-checked, through a pidfd on Linux).
+//! **Stopping an agent it started** ([`stop_proven`], audit F4, F4a,
+//! round-4 F5) kills every process in the POSIX session its leader leads (a
+//! child that moved to another process group, or ignores `SIGTERM`), the
+//! leader stopped first and killed last, while that leader, named by the
+//! pid and start time read as it was spawned, shows the session is still
+//! the launch's ([`sweep_session`]: identity-checked, through a pidfd on
+//! Linux); then closes it as `StopAgent` would. It answers stopped only once
+//! no process in that session can run.
 //!
 //! **What this does not guard against.** Another process can change the
 //! folder between the last check and the spawn, as for reclaim, and GitHub
 //! can change after its last read. The session scans see processes still in
 //! a session; one that left it (`setsid`) is not found. Outside Linux's
 //! pidfds a pid reissued between the sweep's identity check and its signal
-//! is not ruled out ([`crate::platform::proc::ProcessHandle`]). A launch the
-//! shim cannot reach (the agent called by an absolute path, `PATH`
-//! replaced, a wrapper that drops arguments) is never resumed and never
-//! started over: the confirmation catches it (`not-resumed`, `not-fresh`).
-//! A program a launch starts after its fresh-start token was spent is not
-//! checked.
+//! is not ruled out ([`crate::platform::proc::ProcessHandle`]). A launch in
+//! which no program of the agent's name is started through `PATH` (the
+//! agent called by an absolute path, `PATH` replaced) gets no
+//! acknowledgement, so it is not confirmed (`not-resumed`, `not-fresh`). A
+//! Claude Code start over is confirmed by the new conversation the agent
+//! reports, however it was started; for Codex, OpenCode, Pi and Devin the
+//! check is of the arguments the shim sees, so a script of the user's named
+//! after the agent that selects a conversation itself, or a program a launch
+//! starts after its fresh-start token was spent, is not checked (round-4
+//! F3/B1).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -254,11 +263,16 @@ static REQUESTS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PENDING_RESTORES));
 
 /// What the running restores and start-overs hold: each one's attempt, and
-/// for a restore the conversation it resumes into.
+/// for a restore the conversation it resumes into; and what agents this
+/// daemon could neither prove stopped nor record fence for the rest of its
+/// life ([`keep_fenced`], round-4 B2): conversations, and agent kinds whose
+/// survivor's conversation is not known (`None`: of a kind not known).
 #[derive(Default)]
 struct Held {
     attempts: HashSet<AttemptId>,
     sessions: HashSet<String>,
+    fenced_sessions: HashSet<String>,
+    fenced_kinds: HashSet<Option<AgentType>>,
 }
 
 static IN_FLIGHT: LazyLock<Mutex<Held>> = LazyLock::new(|| Mutex::new(Held::default()));
@@ -267,20 +281,31 @@ static IN_FLIGHT: LazyLock<Mutex<Held>> = LazyLock::new(|| Mutex::new(Held::defa
 /// against a second restore or start-over in this daemon until dropped: of
 /// the same attempt (`already-restoring`), or of any attempt into the same
 /// conversation (`session-in-use`, audit "later slices" 3); and at most
-/// [`MAX_PENDING_RESTORES`] at once (`too-many-pending`). [`claim`] holds the
-/// same against another daemon on the state directory.
+/// [`MAX_PENDING_RESTORES`] at once (`too-many-pending`). A restore of an
+/// agent of `kind` is refused `session-in-use` too while this daemon fences
+/// its conversation or its kind ([`keep_fenced`]). [`claim`] holds the same
+/// against another daemon on the state directory.
 struct InFlight {
     attempt: AttemptId,
     session: Option<String>,
 }
 
 impl InFlight {
-    fn take(attempt: &AttemptId, session: Option<&str>) -> Result<Self, RestoreRefusal> {
+    fn take(
+        attempt: &AttemptId,
+        session: Option<&str>,
+        kind: Option<&AgentType>,
+    ) -> Result<Self, RestoreRefusal> {
         let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
         if held.attempts.contains(attempt) {
             return Err(RestoreRefusal::AlreadyRestoring);
         }
-        if session.is_some_and(|session| held.sessions.contains(session)) {
+        if let Some(session) = session
+            && (held.sessions.contains(session)
+                || held.fenced_sessions.contains(session)
+                || held.fenced_kinds.contains(&None)
+                || held.fenced_kinds.contains(&kind.cloned()))
+        {
             return Err(RestoreRefusal::SessionInUse);
         }
         if held.attempts.len() >= MAX_PENDING_RESTORES {
@@ -360,6 +385,30 @@ pub(crate) mod claim {
         format!("session-{}.lock", hex(session))
     }
 
+    /// Round-4 B2: the file a fence on every conversation of agents of
+    /// `kind` locks (`None`: of every kind), held by a daemon that could
+    /// neither prove an agent of that kind stopped nor record it
+    /// ([`super::keep_fenced`]).
+    pub(crate) fn kind_name(kind: Option<&crate::event::AgentType>) -> String {
+        let key = kind
+            .and_then(|kind| serde_json::to_value(kind).ok())
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "any".to_string());
+        format!("kind-{}.lock", hex(&key))
+    }
+
+    /// Whether another descriptor holds `name`'s lock in `dir` now, looked
+    /// at without taking the claim: the name is left as it was.
+    fn held_elsewhere(dir: &TrustedDir, name: &str) -> std::io::Result<bool> {
+        let file = match dir.open_regular(name) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        // The lock, if taken, goes with `file`; the name stays.
+        Ok(!crate::platform::lock::try_lock_file(&file)?)
+    }
+
     /// Lock `name` in `dir` without waiting: `Ok(None)` when another
     /// descriptor holds it, or the name was removed or replaced after it was
     /// opened (a claim being released then).
@@ -395,12 +444,15 @@ pub(crate) mod claim {
 
     /// Claim `attempt`, then `session` when given, in the state directory
     /// `state_dir`. Refused `already-restoring` or `session-in-use` when
-    /// another daemon holds either; `spawn-failed` when the directory cannot
-    /// be opened or a lock cannot be taken for another reason.
+    /// another daemon holds either, and `session-in-use` for a `session`
+    /// while a daemon fences the conversations of agents of `kind`, or of
+    /// every kind ([`kind_name`]); `spawn-failed` when the directory cannot
+    /// be opened or a lock cannot be taken or looked at for another reason.
     pub(crate) fn take(
         state_dir: &Path,
         attempt: &AttemptId,
         session: Option<&str>,
+        kind: Option<&crate::event::AgentType>,
     ) -> Result<Claims, RestoreRefusal> {
         let failed = |error: std::io::Error| {
             tracing::warn!(%error, "restore: could not take a claim in the state directory");
@@ -419,8 +471,62 @@ pub(crate) mod claim {
                 Some(one) => held.push(one),
                 None => return Err(RestoreRefusal::SessionInUse),
             }
+            for fence in [kind_name(None), kind_name(kind)] {
+                if held_elsewhere(&dir, &fence).map_err(failed)? {
+                    return Err(RestoreRefusal::SessionInUse);
+                }
+            }
         }
         Ok(Claims { _held: held })
+    }
+
+    /// Round-4 B2: hold, for as long as the answer is kept, a claim on each
+    /// of `sessions` and, when `kind` is given, on the fence of every
+    /// conversation of agents of that kind (`Some(None)`: of every kind), in
+    /// `state_dir`. What could not be held is left out; `held_all` says
+    /// whether anything was.
+    pub(crate) fn fence(
+        state_dir: &Path,
+        sessions: &[String],
+        kind: Option<Option<&crate::event::AgentType>>,
+    ) -> Fence {
+        let mut out = Fence {
+            _held: Vec::new(),
+            held_all: true,
+        };
+        let Ok(dir) =
+            TrustedDir::anchor(state_dir).and_then(|anchor| anchor.child(CLAIMS_DIR, true))
+        else {
+            out.held_all = false;
+            return out;
+        };
+        let names = sessions
+            .iter()
+            .map(|session| session_name(session))
+            .chain(kind.map(kind_name));
+        for name in names {
+            // A daemon only looking at a kind's fence holds its lock for a
+            // moment: try again a few times.
+            let mut taken = None;
+            for _ in 0..5 {
+                if let Ok(Some(one)) = lock(&dir, &name) {
+                    taken = Some(one);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            match taken {
+                Some(one) => out._held.push(one),
+                None => out.held_all = false,
+            }
+        }
+        out
+    }
+
+    /// What [`fence`] holds.
+    pub(crate) struct Fence {
+        _held: Vec<One>,
+        pub(crate) held_all: bool,
     }
 }
 
@@ -473,9 +579,10 @@ struct Sessions<'a> {
     /// `attempt_session`.
     edges: Vec<(&'a AttemptId, &'a str)>,
     /// Audit B2: each failed restore's successor whose stop could not be
-    /// proven, and the conversations it may be writing to
-    /// (`restore_failed`'s `sessions`).
-    fences: Vec<(&'a AttemptId, &'a [String])>,
+    /// proven, the conversations it may be writing to (`restore_failed`'s
+    /// `sessions`), and whether the one it is in is not known
+    /// (`unknown_session`, round-4 B2).
+    fences: Vec<(&'a AttemptId, &'a [String], bool)>,
 }
 
 impl<'a> Sessions<'a> {
@@ -493,11 +600,12 @@ impl<'a> Sessions<'a> {
                     attempt,
                     to: Some(to),
                     sessions,
+                    unknown_session,
                     ..
                 } => {
                     successors.entry(attempt).or_default().push(to);
-                    if !sessions.is_empty() {
-                        fences.push((to, sessions.as_slice()));
+                    if !sessions.is_empty() || *unknown_session {
+                        fences.push((to, sessions.as_slice(), *unknown_session));
                     }
                 }
                 Event::AttemptRestored {
@@ -540,20 +648,27 @@ impl<'a> Sessions<'a> {
     }
 
     /// Audit B2: whether an agent a failed restore started, and could not be
-    /// proven to have stopped, may still be writing to `session`: its launch
-    /// record names a process, or a session member, that is not proven gone
-    /// ([`launch_gone`]), or there is no single record to check. Its attempt
-    /// having ended in the journal does not count: what it left running is
-    /// what matters.
-    fn fenced(&self, session: &str, launches: &[LaunchRecord]) -> bool {
-        self.fences.iter().any(|(to, sessions)| {
-            sessions.iter().any(|fenced| fenced == session) && {
-                let mut records = launches.iter().filter(|r| r.attempt == **to);
-                match (records.next(), records.next()) {
-                    (Some(record), None) => launch_gone(record).is_err(),
-                    _ => true,
-                }
-            }
+    /// proven to have stopped, may still be writing to `session`, a
+    /// conversation of an agent of `kind`: its launch record names a
+    /// process, or a session member, that is not proven gone
+    /// ([`launch_gone`]), or there is no single record to check. It may be
+    /// when its failure named `session`, or named no conversation it is
+    /// known to be in (round-4 B2) and it is of `kind` (or either kind is not
+    /// known). Its attempt having ended in the journal does not count: what
+    /// it left running is what matters.
+    fn fenced(&self, session: &str, kind: Option<&AgentType>, launches: &[LaunchRecord]) -> bool {
+        self.fences.iter().any(|(to, sessions, unknown)| {
+            let mut records = launches.iter().filter(|r| r.attempt == **to);
+            let record = match (records.next(), records.next()) {
+                (Some(record), None) => Some(record),
+                _ => None,
+            };
+            let same_kind = match (record.and_then(|r| r.agent_type.as_ref()), kind) {
+                (Some(theirs), Some(ours)) => theirs == ours,
+                _ => true,
+            };
+            (sessions.iter().any(|fenced| fenced == session) || (*unknown && same_kind))
+                && record.is_none_or(|record| launch_gone(record).is_err())
         })
     }
 
@@ -563,8 +678,9 @@ impl<'a> Sessions<'a> {
     /// run beside. Directories are compared by what they are
     /// ([`DirKey`]: the canonical path, or the device and inode), so a
     /// symlink to the folder or a spelling with `..` in it is the same
-    /// folder; a live launch whose folder cannot be read counts as in it.
-    /// Blocking.
+    /// folder; a live launch whose folder cannot be read, or that has none
+    /// recorded (its prepared folder moved, say), counts as in it (round-4
+    /// S1). Blocking.
     fn folder_in_use(
         &self,
         attempt: &AttemptId,
@@ -580,8 +696,9 @@ impl<'a> Sessions<'a> {
             {
                 return false;
             }
+            // Round-4 S1: nothing says it is somewhere else.
             let Some(other_cwd) = other.cwd.as_deref() else {
-                return false;
+                return true;
             };
             if other_cwd == cwd {
                 return true;
@@ -607,10 +724,14 @@ struct DirKey {
 }
 
 impl DirKey {
-    /// `path`'s key, or `None` when it cannot be read.
+    /// `path`'s key, or `None` when it cannot be read or is not a
+    /// directory (round-4 S1).
     fn of(path: &Path) -> Option<Self> {
         let canonical = std::fs::canonicalize(path).ok()?;
         let meta = std::fs::metadata(&canonical).ok()?;
+        if !meta.is_dir() {
+            return None;
+        }
         #[cfg(unix)]
         let inode = {
             use std::os::unix::fs::MetadataExt as _;
@@ -745,6 +866,27 @@ fn launch_gone(record: &LaunchRecord) -> Result<(), ProcessNotGone> {
     })
 }
 
+/// PRD #1790 round-4 F1: whether the agent each attempt names, a successor
+/// a restore's safety evidence names, is proven gone ([`launch_gone`]), for
+/// journal compaction to let that evidence go
+/// ([`crate::work_journal::WorkJournal::compact`]). The launch records in
+/// `state_dir` are read once; a read that fails, stops at its budget or
+/// skips a record, an attempt without exactly one record, or a process that
+/// cannot be checked answers no. Blocking.
+pub(crate) fn successor_gone_check(state_dir: &Path) -> impl Fn(&AttemptId) -> bool + use<> {
+    let records = match crate::launch_records::read_all_with_stats(state_dir) {
+        Ok(read) if !read.truncated && read.skipped == 0 => read.records,
+        _ => Vec::new(),
+    };
+    move |attempt: &AttemptId| {
+        let mut found = records.iter().filter(|r| r.attempt == *attempt);
+        match (found.next(), found.next()) {
+            (Some(record), None) => launch_gone(record).is_ok(),
+            _ => false,
+        }
+    }
+}
+
 /// The checks of one agent of the item.
 fn check_agent(
     sessions: &Sessions<'_>,
@@ -819,7 +961,8 @@ fn check_agent(
             if !resume.valid_session_id(session) {
                 return Err(RestoreRefusal::SessionIdInvalid);
             }
-            if sessions.in_use(&agent.attempt, session, live) || sessions.fenced(session, launches)
+            if sessions.in_use(&agent.attempt, session, live)
+                || sessions.fenced(session, agent_type.as_ref(), launches)
             {
                 return Err(RestoreRefusal::SessionInUse);
             }
@@ -1270,14 +1413,23 @@ async fn start(
     test_barrier(want).await;
     let attempt = target.attempt.clone();
     let refuse = |reason| Started::Refused(RestoreRefused::new(Some(attempt.clone()), reason));
-    let held = match InFlight::take(&target.attempt, target.session.as_deref()) {
+    let held = match InFlight::take(
+        &target.attempt,
+        target.session.as_deref(),
+        target.agent_type.as_ref(),
+    ) {
         Ok(held) => held,
         Err(reason) => return refuse(reason),
     };
     let Some(state_dir) = journal.state_dir() else {
         return refuse(RestoreRefusal::IncompleteRead);
     };
-    let claims = match claim::take(state_dir, &target.attempt, target.session.as_deref()) {
+    let claims = match claim::take(
+        state_dir,
+        &target.attempt,
+        target.session.as_deref(),
+        target.agent_type.as_ref(),
+    ) {
         Ok(claims) => claims,
         Err(reason) => return refuse(reason),
     };
@@ -1419,7 +1571,11 @@ async fn start(
         env.push((token_key.to_string(), minted.clone()));
         token = Some(minted);
     }
-    if target.session.is_some() || new_session.is_some() {
+    // Every start through the shim watches for the conversation the agent
+    // reports first: a restore and a Claude Code start over are confirmed by
+    // it, and any failure keeps it as evidence of where the agent is
+    // (round-4 B2).
+    if target.session.is_some() || token.is_some() {
         daemon.registry.watch_restore_session(&pane_id);
     }
     let opts = SpawnOptions {
@@ -1451,14 +1607,15 @@ async fn start(
         pane_id: pane_id.clone(),
         role_name: None,
     };
-    // Audit F4, F4a: the new agent's session leader, named by its pid and
-    // start time while it runs, so a stop can be proven against everything
-    // it started and a reissued session id is never taken for it.
-    let leader = daemon.registry.child_pid(&agent_id).and_then(|pid| {
-        let start = crate::platform::proc::process_start_of(pid)?;
-        (crate::platform::proc::session_of(pid) == Some(pid))
-            .then_some(crate::platform::proc::SessionMember { pid, start })
-    });
+    // Audit F4, F4a, round-4 F5: the new agent's session leader, named by
+    // the pid and start time the registry read as it spawned it, before
+    // anything could reap it, so a stop is proven against that process's
+    // session only ([`sweep_session`]). No start time read then: no leader,
+    // and no stop can be proven.
+    let leader = daemon
+        .registry
+        .child_identity(&agent_id)
+        .and_then(|(pid, start)| Some(crate::platform::proc::SessionMember { pid, start: start? }));
     let new_attempt = agent_id
         .parse::<u64>()
         .ok()
@@ -1479,28 +1636,34 @@ async fn start(
     }
     // A failed start: stop the agent, proven. Record the failure with the
     // agent it started when `failure` is given, or when the stop could not
-    // be proven, then with the conversations `fenced` it may be writing to,
-    // which no restore enters until that agent is proven gone (audit B2). A
+    // be proven, then with the conversations `fence` says it may be writing
+    // to, which no restore enters until that agent is proven gone (audit
+    // B2); when the deck does not know which conversation it is in, no
+    // restore of an agent of its kind starts until then (round-4 B2). A
     // record that cannot be written leaves the claims held for this daemon's
-    // life instead, the fence it could not write ([`keep_fenced`]).
+    // life instead, with a claim on each of those conversations, or on the
+    // kind, beside them: the fence it could not write ([`keep_fenced`]).
     let held = Mutex::new(Some((held, claims)));
-    let fail =
-        |failure: Option<(RestoreFailure, Option<ShimOutcome>)>, fenced: Vec<String>, reason| {
-            let started = &started;
-            let attempt = &target.attempt;
-            let work = &record.work;
-            let new_attempt = new_attempt.clone();
-            let held = &held;
-            async move {
-                let stopped = stop_proven(daemon, started, leader).await;
-                let failure = match (failure, stopped) {
-                    (Some(failure), _) => Some(failure),
-                    (None, false) => Some((RestoreFailure::Unknown, None)),
-                    (None, true) => None,
-                };
-                let recorded = match failure {
-                    Some((failure, shim)) => {
-                        record_blocking(
+    let kind = target.agent_type.clone();
+    let fail = |failure: Option<(RestoreFailure, Option<ShimOutcome>)>, fence: Fence, reason| {
+        let started = &started;
+        let attempt = &target.attempt;
+        let work = &record.work;
+        let new_attempt = new_attempt.clone();
+        let held = &held;
+        let kind = kind.clone();
+        async move {
+            let stopped = stop_proven(daemon, started, leader).await;
+            let fence = fence.of(kind.as_ref());
+            let failure = match (failure, stopped) {
+                (Some(failure), _) => Some(failure),
+                (None, false) => Some((RestoreFailure::Unknown, None)),
+                (None, true) => None,
+            };
+            let recorded = match failure {
+                Some((failure, shim)) => {
+                    !failure_refused_for_test()
+                        && record_blocking(
                             journal,
                             vec![Event::RestoreFailed {
                                 work: work.clone(),
@@ -1508,26 +1671,36 @@ async fn start(
                                 failure,
                                 shim,
                                 to: new_attempt.clone(),
-                                sessions: if stopped { Vec::new() } else { fenced },
+                                sessions: if stopped {
+                                    Vec::new()
+                                } else {
+                                    fence.sessions.clone()
+                                },
+                                unknown_session: !stopped && fence.unknown,
                             }],
                         )
                         .await
-                    }
-                    None => true,
-                };
-                if !stopped && (!recorded || new_attempt.is_none()) {
-                    keep_fenced(held.lock().unwrap_or_else(|e| e.into_inner()).take());
                 }
-                Started::Refused(RestoreRefused::new(
-                    Some(attempt.clone()),
-                    if stopped {
-                        reason
-                    } else {
-                        RestoreRefusal::NotStopped
-                    },
-                ))
+                None => true,
+            };
+            if !stopped && (!recorded || new_attempt.is_none()) {
+                keep_fenced(
+                    held.lock().unwrap_or_else(|e| e.into_inner()).take(),
+                    journal.state_dir(),
+                    &fence,
+                    kind.as_ref(),
+                );
             }
-        };
+            Started::Refused(RestoreRefused::new(
+                Some(attempt.clone()),
+                if stopped {
+                    reason
+                } else {
+                    RestoreRefusal::NotStopped
+                },
+            ))
+        }
+    };
 
     // The conversation the new agent is confirmed in, for the durable edge.
     let (how, close, first, confirmed_session) = match (&target.session, mode) {
@@ -1556,10 +1729,12 @@ async fn start(
                     seen = ?seen,
                     "restore: the agent did not come back into its conversation; stopping it"
                 );
-                let fenced = std::iter::once(session.clone()).chain(seen).collect();
+                // Round-4 B2: where it went when it reported, else unknown.
+                let fence = Fence::new(std::iter::once(session.clone()).chain(seen.clone()))
+                    .unknown_unless(seen.is_some());
                 return fail(
                     Some((failure, shim_outcome)),
-                    fenced,
+                    fence,
                     RestoreRefusal::NotResumed,
                 )
                 .await;
@@ -1598,8 +1773,10 @@ async fn start(
                         );
                         // Only an unproven stop is recorded: the item stays
                         // as it was, its verdict unchanged.
-                        let fenced = target.old_session.iter().cloned().chain(seen).collect();
-                        return fail(None, fenced, reason).await;
+                        let fence =
+                            Fence::new(target.old_session.iter().cloned().chain(seen.clone()))
+                                .unknown_unless(seen.is_some());
+                        return fail(None, fence, reason).await;
                     }
                 }
             }
@@ -1627,14 +1804,15 @@ async fn start(
             attempt = %target.attempt,
             "restore: the restart note could not be posted; stopping the restored agent"
         );
-        let fenced = confirmed_session.into_iter().collect();
-        return fail(None, fenced, RestoreRefusal::NoteNotDelivered).await;
+        let known = confirmed_session.is_some();
+        let fence = Fence::new(confirmed_session).unknown_unless(known);
+        return fail(None, fence, RestoreRefusal::NoteNotDelivered).await;
     }
     // Audit B1: the successor link, with the conversation it was confirmed
-    // in, is written and waited for before anything else and before the
-    // claims are released: every later check, in any daemon, finds the new
-    // agent in that conversation from it. One that cannot be written is a
-    // safety failure, not a handoff: the agent is stopped again.
+    // in, is written and waited for before the closing events and before
+    // the claims are released: every later check, in any daemon, finds the
+    // new agent in that conversation from it. One that cannot be written is
+    // a safety failure, not a handoff: the agent is stopped again.
     let edge_written = match &new_attempt {
         Some(to) if !edge_refused_for_test() => {
             record_blocking(
@@ -1656,8 +1834,9 @@ async fn start(
             attempt = %target.attempt,
             "restore: the restored agent's successor link could not be recorded; stopping it"
         );
-        let fenced = confirmed_session.into_iter().collect();
-        return fail(None, fenced, RestoreRefusal::NotRecorded).await;
+        let known = confirmed_session.is_some();
+        let fence = Fence::new(confirmed_session).unknown_unless(known);
+        return fail(None, fence, RestoreRefusal::NotRecorded).await;
     }
     let events: Vec<Event> = works
         .iter()
@@ -1678,16 +1857,102 @@ async fn start(
     })
 }
 
-/// Audit B1/B2: the claims an agent's start held, kept for the rest of this
-/// daemon's life when the deck could neither prove that agent stopped nor
-/// write that down: no other restore in this daemon, or in another one on
-/// the state directory, enters its attempt or conversation meanwhile.
-#[cfg(unix)]
-fn keep_fenced(held: Option<(InFlight, claim::Claims)>) {
-    static FENCED: Mutex<Vec<(InFlight, claim::Claims)>> = Mutex::new(Vec::new());
-    if let Some(held) = held {
-        FENCED.lock().unwrap_or_else(|e| e.into_inner()).push(held);
+/// Round-4 B2: the conversations an agent a failed start could not be
+/// proven to have stopped may be writing to: the one asked for, and the one
+/// it reported or was confirmed in, when it did; and whether the one it is
+/// in is not known.
+#[derive(Debug, Clone, Default)]
+struct Fence {
+    sessions: Vec<String>,
+    unknown: bool,
+}
+
+impl Fence {
+    fn new(sessions: impl IntoIterator<Item = String>) -> Self {
+        let mut out: Vec<String> = Vec::new();
+        for session in sessions {
+            if !out.contains(&session) {
+                out.push(session);
+            }
+        }
+        Fence {
+            sessions: out,
+            unknown: false,
+        }
     }
+
+    /// Unknown, unless the agent reported or was confirmed in a
+    /// conversation.
+    fn unknown_unless(mut self, known: bool) -> Self {
+        self.unknown = !known;
+        self
+    }
+
+    /// The fence an agent of `kind` needs: one whose conversation is not
+    /// known fences every conversation of its kind only when a restore of
+    /// that kind exists (no restore of another kind can enter one of its
+    /// conversations); of a kind not known, it does.
+    fn of(mut self, kind: Option<&AgentType>) -> Self {
+        let restorable = kind.is_none_or(|kind| crate::agent_registry::spec(kind).resume.is_some());
+        self.unknown &= restorable;
+        self
+    }
+}
+
+/// Audit B1/B2, round-4 B2: what an agent's start held, kept for the rest of
+/// this daemon's life when the deck could neither prove that agent stopped
+/// nor write that down, and beside it a claim on each conversation `fence`
+/// names and, when the one it is in is not known, on every conversation of
+/// its `kind` (in this daemon, and as a claim file in the state directory
+/// `state_dir`): no other restore in this daemon enters its attempt or one
+/// of those conversations meanwhile, nor one in another daemon on the state
+/// directory, for each claim this one could take. A claim another daemon
+/// held at that moment could not be taken, and is logged.
+#[cfg(unix)]
+fn keep_fenced(
+    held: Option<(InFlight, claim::Claims)>,
+    state_dir: Option<&Path>,
+    fence: &Fence,
+    kind: Option<&AgentType>,
+) {
+    /// One fence kept: the start's own claims, and the ones taken for it.
+    type Kept = (Option<(InFlight, claim::Claims)>, Option<claim::Fence>);
+    static FENCED: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+    {
+        let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        in_flight
+            .fenced_sessions
+            .extend(fence.sessions.iter().cloned());
+        if fence.unknown {
+            in_flight.fenced_kinds.insert(kind.cloned());
+        }
+    }
+    let files = state_dir
+        .map(|state_dir| claim::fence(state_dir, &fence.sessions, fence.unknown.then_some(kind)));
+    if files.as_ref().is_none_or(|files| !files.held_all) {
+        tracing::warn!(
+            sessions = ?fence.sessions,
+            unknown = fence.unknown,
+            "restore: an agent that could not be proven stopped is fenced in this daemon only; \
+             another daemon on the state directory may not see every fence"
+        );
+    }
+    FENCED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((held, files));
+}
+
+/// Whether the failure record's write fails on purpose: in an e2e build
+/// only, when `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE` is `1`, so lane 1
+/// can reach the path an unproven stop whose `restore_failed` cannot be
+/// written takes (round-4 B2).
+fn failure_refused_for_test() -> bool {
+    #[cfg(feature = "e2e")]
+    if std::env::var("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE").as_deref() == Ok("1") {
+        return true;
+    }
+    false
 }
 
 /// Whether the successor link's write fails on purpose: in an e2e build
@@ -1720,11 +1985,14 @@ fn new_conversation_id() -> Option<String> {
     ))
 }
 
-/// Audit F4: stop an agent a restore or start over just started, as
-/// `StopAgent` would ([`crate::spawn::close_started_agents`]), then kill every
-/// process left in the session its `leader` leads ([`sweep_session`]). `true`
-/// only when that session was then seen empty; `false` when the leader was
-/// not known, the session could not be read, or a process stayed in it past
+/// Audit F4, round-4 F5: stop an agent a restore or start over just
+/// started. The processes in the session its `leader` leads are killed
+/// first, while that leader is there to show the session is still the
+/// launch's ([`sweep_session`]), then the agent is closed as `StopAgent`
+/// would close it ([`crate::spawn::close_started_agents`]). `true` only when that session
+/// was seen with no process left that can run; `false` when the leader was
+/// not known, the session could not be read, a process in it could not be
+/// signalled or attributed to the launch, or one stayed in it past
 /// [`STOP_PROOF_BOUND`].
 #[cfg(unix)]
 async fn stop_proven(
@@ -1732,14 +2000,16 @@ async fn stop_proven(
     started: &crate::spawn::SpawnedAgent,
     leader: Option<crate::platform::proc::SessionMember>,
 ) -> bool {
-    crate::spawn::close_started_agents(
-        daemon.registry,
-        Some(daemon.state),
-        Some(daemon.event_tx),
-        std::slice::from_ref(started),
-    )
-    .await;
+    let close = || {
+        crate::spawn::close_started_agents(
+            daemon.registry,
+            Some(daemon.state),
+            Some(daemon.event_tx),
+            std::slice::from_ref(started),
+        )
+    };
     let Some(leader) = leader else {
+        close().await;
         return false;
     };
     // In an e2e build only: `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP=1` leaves
@@ -1747,13 +2017,16 @@ async fn stop_proven(
     // can reach an unproven stop deterministically (audit B2).
     #[cfg(feature = "e2e")]
     if std::env::var("DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP").as_deref() == Ok("1") {
+        close().await;
         return false;
     }
-    tokio::task::spawn_blocking(move || {
+    let swept = tokio::task::spawn_blocking(move || {
         sweep_session(&OsView, leader, STOP_PROOF_BOUND, CONFIRM_POLL)
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(false);
+    close().await;
+    swept
 }
 
 /// Audit F4a: what [`sweep_session`] reads of processes and how it signals
@@ -1763,7 +2036,9 @@ trait ProcessView {
     type Handle;
     /// The session this daemon is in.
     fn own_session(&self) -> Option<u32>;
-    /// What holds `pid` now.
+    /// What holds `pid` now, named by its start time whether it runs, is
+    /// stopped, or exited and waits to be reaped (it holds the pid until
+    /// then).
     fn probe(&self, pid: u32) -> crate::platform::proc::ProcessProbe;
     /// Whether a pid that is a session's id can be handed to another process
     /// only once that session is empty (Linux).
@@ -1771,11 +2046,14 @@ trait ProcessView {
     /// The session's members that can still run, each named by pid and
     /// start time.
     fn members(&self, sid: u32) -> Option<Vec<crate::platform::proc::SessionMember>>;
-    /// A handle on whichever process holds `pid` now.
-    fn open(&self, pid: u32) -> Option<Self::Handle>;
+    /// A handle on whichever process holds `pid` now
+    /// ([`crate::platform::proc::Opened`]).
+    fn open(&self, pid: u32) -> crate::platform::proc::Opened<Self::Handle>;
     /// The start time and session of the process `handle` names, read after
     /// it was opened.
     fn identity(&self, handle: &Self::Handle) -> Option<(u64, u32)>;
+    /// `SIGSTOP` through `handle`.
+    fn stop(&self, handle: &Self::Handle);
     /// `SIGKILL` through `handle`.
     fn kill(&self, handle: &Self::Handle);
 }
@@ -1793,7 +2071,7 @@ impl ProcessView for OsView {
     }
 
     fn probe(&self, pid: u32) -> crate::platform::proc::ProcessProbe {
-        crate::platform::proc::probe_process(pid)
+        crate::platform::proc::probe_process_held(pid)
     }
 
     fn reissue_proves_empty(&self) -> bool {
@@ -1804,7 +2082,7 @@ impl ProcessView for OsView {
         crate::platform::proc::session_members(sid)
     }
 
-    fn open(&self, pid: u32) -> Option<Self::Handle> {
+    fn open(&self, pid: u32) -> crate::platform::proc::Opened<Self::Handle> {
         crate::platform::proc::ProcessHandle::open(pid)
     }
 
@@ -1816,24 +2094,45 @@ impl ProcessView for OsView {
         ))
     }
 
+    fn stop(&self, handle: &Self::Handle) {
+        handle.stop();
+    }
+
     fn kill(&self, handle: &Self::Handle) {
         handle.kill();
     }
 }
 
-/// Audit F4, F4a: kill every process in the session `leader` leads with
-/// `SIGKILL`, until it is seen empty or `bound` passes; `true` when it was
-/// seen empty. Once seen empty it is never swept again, so a session id
-/// handed to a new session later is not taken for it. A member is signalled
-/// only through a handle opened on it whose process still has the start time
-/// it was listed with and is still in the session; on Linux that handle is a
-/// pidfd, so the signal cannot reach a process that took the pid after the
-/// check (elsewhere a pid reissued in that short window is the residual
-/// `docs/develop/agent-restore.md` names). A member that started before the
-/// leader cannot be of this launch, and is never signalled. On Linux, the
-/// leader's pid held by another process means the session emptied before
-/// (the kernel hands out no pid that is still a session's id). The daemon's
-/// own session is never swept.
+/// Audit F4, F4a, round-4 F5: kill every process in the session `leader`
+/// leads, `leader` last, until no process in it can run or `bound` passes;
+/// `true` when it was seen so.
+///
+/// **The launch's own generation of that session is what is signalled**,
+/// outside the bare-pid window below. A
+/// listing of the session's members counts only when the leader, by pid and
+/// start time, was there both before and after it (running, stopped, or
+/// exited and not yet reaped): a session id is not handed out again while
+/// the process it names holds it, so every member listed then is the
+/// launch's. The leader is stopped (`SIGSTOP`) first, so it neither starts
+/// more processes nor exits and is reaped while the others are killed, and
+/// it is killed once it is the only member left. A member is signalled only
+/// through a handle opened on it whose process still has the start time it
+/// was listed with and is still in the session; on Linux that handle is a
+/// pidfd, and a member no pidfd could be opened on (other than a kernel
+/// without the call) is not signalled at all, so the session is not seen
+/// empty. With no pidfd (macOS, a kernel before 5.3) the signal goes to the
+/// pid, and a pid reissued in the short window after that check is the
+/// residual `docs/develop/agent-restore.md` names.
+///
+/// **Once the leader is seen gone, nothing more is signalled**: members still listed
+/// under its number cannot be told from a later session that reused it, so
+/// the sweep only waits for the session to be seen empty, and otherwise
+/// answers unproven. On Linux, the leader's pid held by a process with
+/// another start time means the session emptied before (the kernel hands out
+/// no pid that is still a session's id), which answers stopped without a
+/// signal; elsewhere it answers unproven. A member that started before the
+/// leader cannot be of this launch, and is never signalled. The daemon's own
+/// session is never swept, and a session seen empty is not swept again.
 #[cfg(unix)]
 fn sweep_session<V: ProcessView>(
     view: &V,
@@ -1841,39 +2140,85 @@ fn sweep_session<V: ProcessView>(
     bound: Duration,
     poll: Duration,
 ) -> bool {
-    use crate::platform::proc::ProcessProbe;
+    use crate::platform::proc::{Opened, ProcessProbe};
     let sid = leader.pid;
     if view.own_session() == Some(sid) {
         return false;
     }
     let deadline = Instant::now() + bound;
+    let present =
+        || matches!(view.probe(sid), ProcessProbe::Started(start) if start == leader.start);
+    // The leader, stopped, once a handle on it could be had.
+    let mut held: Option<V::Handle> = None;
+    let mut first = true;
     loop {
-        if let ProcessProbe::Started(start) = view.probe(sid)
-            && start != leader.start
-        {
-            return view.reissue_proves_empty();
+        if !first {
+            if Instant::now() >= deadline {
+                // The stopped leader is not left behind, while it is still
+                // the one that was stopped.
+                if let Some(handle) = &held
+                    && present()
+                {
+                    view.kill(handle);
+                }
+                return false;
+            }
+            std::thread::sleep(poll);
         }
-        match view.members(sid) {
-            Some(members) if members.is_empty() => return true,
-            Some(members) => {
-                for member in members {
-                    if member.start < leader.start {
-                        continue;
-                    }
-                    let Some(handle) = view.open(member.pid) else {
-                        continue;
-                    };
-                    if view.identity(&handle) == Some((member.start, sid)) {
+        first = false;
+        match view.probe(sid) {
+            ProcessProbe::Started(start) if start == leader.start => {}
+            ProcessProbe::Started(_) => return view.reissue_proves_empty(),
+            // Gone: what is listed under its number is not attributable.
+            ProcessProbe::Absent | ProcessProbe::Exited => {
+                if view.members(sid).is_some_and(|members| members.is_empty()) {
+                    return true;
+                }
+                continue;
+            }
+            ProcessProbe::Unknown => continue,
+        }
+        if held.is_none()
+            && let Opened::Handle(handle) = view.open(sid)
+            && view.identity(&handle) == Some((leader.start, sid))
+        {
+            view.stop(&handle);
+            held = Some(handle);
+        }
+        let listed = view.members(sid);
+        if !present() {
+            continue;
+        }
+        let Some(listed) = listed else {
+            continue;
+        };
+        if listed.is_empty() {
+            return true;
+        }
+        let others: Vec<_> = listed.iter().filter(|m| m.pid != sid).collect();
+        if others.is_empty() {
+            match &held {
+                Some(handle) => view.kill(handle),
+                None => {
+                    if let Opened::Handle(handle) = view.open(sid)
+                        && view.identity(&handle) == Some((leader.start, sid))
+                    {
                         view.kill(&handle);
                     }
                 }
             }
-            None => {}
+            continue;
         }
-        if Instant::now() >= deadline {
-            return false;
+        for member in others {
+            if member.start < leader.start {
+                continue;
+            }
+            if let Opened::Handle(handle) = view.open(member.pid)
+                && view.identity(&handle) == Some((member.start, sid))
+            {
+                view.kill(&handle);
+            }
         }
-        std::thread::sleep(poll);
     }
 }
 
@@ -2001,19 +2346,21 @@ async fn confirm_fresh(
     };
     loop {
         let state = ack_state(acks, token);
+        // Round-4 B2: read before any answer, so a refusal keeps where the
+        // agent went.
+        let seen = registry
+            .restore_session_seen(pane)
+            .filter(|(generation, _)| generation == agent_id)
+            .map(|(_, seen)| seen);
         if state == AckState::Refused {
             let reason = match ack_outcome(acks, token) {
                 ShimOutcome::SessionIdInvalid => RestoreRefusal::NotFresh,
                 _ => RestoreRefusal::CommandReopens,
             };
-            return Err(Unfresh { reason, seen: None });
+            return Err(Unfresh { reason, seen });
         }
-        let seen = registry
-            .restore_session_seen(pane)
-            .filter(|(generation, _)| generation == agent_id)
-            .map(|(_, seen)| seen);
         match (state, new_session, seen) {
-            (AckState::Resumed, None, _) => return Ok(None),
+            (AckState::Resumed, None, seen) => return Ok(seen),
             (AckState::Resumed, Some(new), Some(seen)) => {
                 return if seen == new {
                     Ok(Some(seen))
@@ -2122,13 +2469,13 @@ mod tests {
     #[test]
     fn one_attempt_is_held_against_a_second_restore_until_released() {
         let attempt = AttemptId::parse("r-held-test/7").expect("an attempt id");
-        let first = InFlight::take(&attempt, None).expect("free");
+        let first = InFlight::take(&attempt, None, None).expect("free");
         assert_eq!(
-            InFlight::take(&attempt, None).err(),
+            InFlight::take(&attempt, None, None).err(),
             Some(RestoreRefusal::AlreadyRestoring)
         );
         drop(first);
-        assert!(InFlight::take(&attempt, None).is_ok());
+        assert!(InFlight::take(&attempt, None, None).is_ok());
     }
 
     /// PRD #1790 stage 3 (audit "later slices" 3): two different attempts
@@ -2138,13 +2485,13 @@ mod tests {
         const SESSION: &str = "fedcba98-7654-4321-8fab-0123456789ab";
         let one = AttemptId::parse("r-session-test/1").expect("an attempt id");
         let two = AttemptId::parse("r-session-test/2").expect("an attempt id");
-        let first = InFlight::take(&one, Some(SESSION)).expect("free");
+        let first = InFlight::take(&one, Some(SESSION), None).expect("free");
         assert_eq!(
-            InFlight::take(&two, Some(SESSION)).err(),
+            InFlight::take(&two, Some(SESSION), None).err(),
             Some(RestoreRefusal::SessionInUse)
         );
         drop(first);
-        assert!(InFlight::take(&two, Some(SESSION)).is_ok());
+        assert!(InFlight::take(&two, Some(SESSION), None).is_ok());
     }
 
     /// PRD #1790 stage 3 (audit "later slices" 3): an attempt the deck runs
@@ -2260,17 +2607,17 @@ mod tests {
         let state = crate::test_temp::tempdir().unwrap();
         let one = AttemptId::parse("r-claim/1").unwrap();
         let two = AttemptId::parse("r-claim/2").unwrap();
-        let first = claim::take(state.path(), &one, Some(SESSION)).expect("free");
+        let first = claim::take(state.path(), &one, Some(SESSION), None).expect("free");
         assert_eq!(
-            claim::take(state.path(), &one, None).err(),
+            claim::take(state.path(), &one, None, None).err(),
             Some(RestoreRefusal::AlreadyRestoring)
         );
         assert_eq!(
-            claim::take(state.path(), &two, Some(SESSION)).err(),
+            claim::take(state.path(), &two, Some(SESSION), None).err(),
             Some(RestoreRefusal::SessionInUse)
         );
         // The refused claim of `two` released `two`'s attempt again.
-        drop(claim::take(state.path(), &two, None).expect("two's attempt is free"));
+        drop(claim::take(state.path(), &two, None, None).expect("two's attempt is free"));
         drop(first);
         let dir = state.path().join(claim::CLAIMS_DIR);
         assert_eq!(
@@ -2278,7 +2625,7 @@ mod tests {
             0,
             "a released claim leaves nothing behind"
         );
-        assert!(claim::take(state.path(), &two, Some(SESSION)).is_ok());
+        assert!(claim::take(state.path(), &two, Some(SESSION), None).is_ok());
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
@@ -2294,7 +2641,7 @@ mod tests {
     fn a_claim_file_released_after_it_was_opened_claims_nothing() {
         let state = crate::test_temp::tempdir().unwrap();
         let attempt = AttemptId::parse("r-claim/3").unwrap();
-        let held = claim::take(state.path(), &attempt, None).expect("free");
+        let held = claim::take(state.path(), &attempt, None, None).expect("free");
         let path = state
             .path()
             .join(claim::CLAIMS_DIR)
@@ -2305,22 +2652,34 @@ mod tests {
         assert!(!path.exists(), "the released name is gone");
         // A new claimer creates the name afresh, and is not refused by the
         // stale descriptor's lock on the removed file.
-        assert!(claim::take(state.path(), &attempt, None).is_ok());
+        assert!(claim::take(state.path(), &attempt, None, None).is_ok());
     }
 
-    /// A process table a test controls: what each pid holds now, which
-    /// session it is in, and every signal the sweep sent.
+    /// One row of [`FakeView`]'s table: start time, session, zombie.
+    #[cfg(unix)]
+    type Row = (u64, u32, bool);
+
+    /// A process table a test controls: what each pid holds now (its start
+    /// time, its session, and whether it exited and waits to be reaped),
+    /// and every signal the sweep sent. Never a real process.
     #[cfg(unix)]
     struct FakeView {
         own: u32,
         reissue_proves_empty: bool,
-        /// pid -> (start, session), as the table reads now.
-        table: std::cell::RefCell<HashMap<u32, (u64, u32)>>,
-        /// What `members` answers, in turn; the last answer repeats.
+        /// pid -> (start, session, zombie), as the table reads now.
+        table: std::cell::RefCell<HashMap<u32, Row>>,
+        /// What `members` answers, in turn, instead of the table's running
+        /// members, while any is left.
         listings: std::cell::RefCell<Vec<Vec<crate::platform::proc::SessionMember>>>,
+        /// Applied to the table as the first listing is taken: what changes
+        /// while the sweep lists (`None` removes the pid).
+        on_list: std::cell::RefCell<Vec<(u32, Option<Row>)>>,
         /// Applied to the table after a handle is opened, before its
         /// identity is read: a pid reissued in that window.
-        on_open: std::cell::RefCell<HashMap<u32, (u64, u32)>>,
+        on_open: std::cell::RefCell<HashMap<u32, Row>>,
+        /// Pids no pinned handle can be opened on (a full descriptor table).
+        unusable: HashSet<u32>,
+        stopped: std::cell::RefCell<Vec<u32>>,
         killed: std::cell::RefCell<Vec<(u32, u64)>>,
     }
 
@@ -2331,10 +2690,16 @@ mod tests {
                 own: 1,
                 reissue_proves_empty: true,
                 table: std::cell::RefCell::new(
-                    table.iter().map(|&(p, st, sid)| (p, (st, sid))).collect(),
+                    table
+                        .iter()
+                        .map(|&(p, st, sid)| (p, (st, sid, false)))
+                        .collect(),
                 ),
                 listings: std::cell::RefCell::new(Vec::new()),
+                on_list: std::cell::RefCell::new(Vec::new()),
                 on_open: std::cell::RefCell::new(HashMap::new()),
+                unusable: HashSet::new(),
+                stopped: std::cell::RefCell::new(Vec::new()),
                 killed: std::cell::RefCell::new(Vec::new()),
             }
         }
@@ -2348,6 +2713,17 @@ mod tests {
             );
             self
         }
+
+        fn zombie(self, pid: u32) -> Self {
+            if let Some(entry) = self.table.borrow_mut().get_mut(&pid) {
+                entry.2 = true;
+            }
+            self
+        }
+
+        fn signalled(&self) -> bool {
+            !self.killed.borrow().is_empty() || !self.stopped.borrow().is_empty()
+        }
     }
 
     #[cfg(unix)]
@@ -2360,7 +2736,7 @@ mod tests {
 
         fn probe(&self, pid: u32) -> crate::platform::proc::ProcessProbe {
             match self.table.borrow().get(&pid) {
-                Some((start, _)) => crate::platform::proc::ProcessProbe::Started(*start),
+                Some((start, _, _)) => crate::platform::proc::ProcessProbe::Started(*start),
                 None => crate::platform::proc::ProcessProbe::Absent,
             }
         }
@@ -2369,28 +2745,61 @@ mod tests {
             self.reissue_proves_empty
         }
 
-        fn members(&self, _sid: u32) -> Option<Vec<crate::platform::proc::SessionMember>> {
-            let mut listings = self.listings.borrow_mut();
-            if listings.len() > 1 {
-                Some(listings.remove(0))
-            } else {
-                listings.first().cloned()
+        fn members(&self, sid: u32) -> Option<Vec<crate::platform::proc::SessionMember>> {
+            for (pid, now) in self.on_list.borrow_mut().drain(..) {
+                match now {
+                    Some(now) => self.table.borrow_mut().insert(pid, now),
+                    None => self.table.borrow_mut().remove(&pid),
+                };
             }
+            let mut listings = self.listings.borrow_mut();
+            if !listings.is_empty() {
+                return Some(listings.remove(0));
+            }
+            let mut members: Vec<_> = self
+                .table
+                .borrow()
+                .iter()
+                .filter(|(_, (_, s, zombie))| *s == sid && !zombie)
+                .map(|(&pid, &(start, _, _))| crate::platform::proc::SessionMember { pid, start })
+                .collect();
+            members.sort_by_key(|m| m.pid);
+            Some(members)
         }
 
-        fn open(&self, pid: u32) -> Option<u32> {
+        fn open(&self, pid: u32) -> crate::platform::proc::Opened<u32> {
+            use crate::platform::proc::Opened;
             if let Some(now) = self.on_open.borrow_mut().remove(&pid) {
                 self.table.borrow_mut().insert(pid, now);
             }
-            self.table.borrow().contains_key(&pid).then_some(pid)
+            if self.unusable.contains(&pid) {
+                return Opened::Unusable;
+            }
+            if self.table.borrow().contains_key(&pid) {
+                Opened::Handle(pid)
+            } else {
+                Opened::Absent
+            }
         }
 
         fn identity(&self, pid: &u32) -> Option<(u64, u32)> {
-            self.table.borrow().get(pid).copied()
+            self.table
+                .borrow()
+                .get(pid)
+                .map(|&(start, sid, _)| (start, sid))
+        }
+
+        fn stop(&self, pid: &u32) {
+            self.stopped.borrow_mut().push(*pid);
         }
 
         fn kill(&self, pid: &u32) {
-            let start = self.table.borrow_mut().remove(pid).map(|(start, _)| start);
+            // Killed and reaped at once.
+            let start = self
+                .table
+                .borrow_mut()
+                .remove(pid)
+                .map(|(start, _, _)| start);
             self.killed.borrow_mut().push((*pid, start.unwrap_or(0)));
         }
     }
@@ -2403,81 +2812,139 @@ mod tests {
     #[cfg(unix)]
     const TICK: Duration = Duration::from_millis(1);
 
+    #[cfg(unix)]
+    const LONG: Duration = Duration::from_secs(5);
+
     /// PRD #1790 stage 3 (audit F4): the sweep never signals the daemon's
     /// own session, and answers an empty session as stopped.
     #[cfg(unix)]
     #[test]
     fn the_sweep_spares_the_daemons_own_session_and_answers_an_empty_one() {
-        let own = FakeView::new(&[(1, 10, 1)]).listing(&[(1, 10)]);
+        let own = FakeView::new(&[(1, 10, 1)]);
         assert!(!sweep_session(&own, leader(1, 10), TICK, TICK));
-        assert!(own.killed.borrow().is_empty());
-        let empty = FakeView::new(&[]).listing(&[]);
+        assert!(!own.signalled());
+        let empty = FakeView::new(&[]);
         assert!(sweep_session(&empty, leader(50, 100), TICK, TICK));
         let real = crate::platform::proc::session_of(std::process::id()).expect("a session");
         let start = crate::platform::proc::process_start_of(real).unwrap_or(0);
         assert!(!sweep_session(&OsView, leader(real, start), TICK, TICK));
     }
 
-    /// PRD #1790 stage 3 (audit F4a, S2): the sweep kills the launch's own
-    /// members, and nothing that merely carries its numbers: a session id
-    /// reissued to another leader ends the sweep as already empty, a pid
-    /// reissued between the listing and the signal is not signalled, a
-    /// member older than the launch is never signalled, and a session seen
-    /// empty once is not swept again.
+    /// PRD #1790 stage 3 (audit F4a, round-4 F5): with its leader there, the
+    /// sweep stops the leader first, kills the launch's other members, then
+    /// the leader, and answers stopped once nothing in the session can run.
+    /// A leader that exited and waits to be reaped still names the session:
+    /// its members are killed.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_stops_the_leader_and_kills_it_last() {
+        let view = FakeView::new(&[(50, 100, 50), (60, 120, 50), (61, 130, 50)]);
+        assert!(sweep_session(&view, leader(50, 100), LONG, TICK));
+        assert_eq!(*view.stopped.borrow(), vec![50]);
+        assert_eq!(
+            *view.killed.borrow(),
+            vec![(60, 120), (61, 130), (50, 100)],
+            "the leader last"
+        );
+
+        let reaping = FakeView::new(&[(50, 100, 50), (60, 120, 50)]).zombie(50);
+        assert!(sweep_session(&reaping, leader(50, 100), LONG, TICK));
+        assert_eq!(*reaping.killed.borrow(), vec![(60, 120)]);
+    }
+
+    /// PRD #1790 stage 3 (audit F4a, S2, round-4 F5): the sweep signals the
+    /// launch's own generation of the session and nothing that merely
+    /// carries its numbers.
     #[cfg(unix)]
     #[test]
     fn the_sweep_signals_only_the_launchs_own_processes() {
-        // The launch's leader 50 (start 100) and its child 60.
-        let view = FakeView::new(&[(50, 100, 50), (60, 120, 50)]).listing(&[(50, 100), (60, 120)]);
-        view.listings.borrow_mut().push(Vec::new());
-        assert!(sweep_session(
-            &view,
-            leader(50, 100),
-            Duration::from_secs(5),
-            TICK
-        ));
-        assert_eq!(*view.killed.borrow(), vec![(50, 100), (60, 120)]);
+        // The reviewer's counterexample: leader 50 (start 100) is gone, and
+        // 61 (start 950) is in a session numbered 50 again. Not signalled,
+        // and not proven stopped.
+        let recycled = FakeView::new(&[(61, 950, 50)]);
+        assert!(!sweep_session(&recycled, leader(50, 100), TICK, TICK));
+        assert!(!recycled.signalled(), "{:?}", recycled.killed);
 
-        // Pid 50 now leads another session (start 900): the launch's emptied
-        // before, so nothing is listed as its member, nothing is signalled.
-        let reissued =
-            FakeView::new(&[(50, 900, 50), (61, 950, 50)]).listing(&[(50, 900), (61, 950)]);
-        assert!(sweep_session(&reissued, leader(50, 100), TICK, TICK));
-        assert!(reissued.killed.borrow().is_empty());
-        // Where a reissue proves nothing, it is not proven stopped either.
-        let mut elsewhere = FakeView::new(&[(50, 900, 50)]).listing(&[(50, 900)]);
-        elsewhere.reissue_proves_empty = false;
-        assert!(!sweep_session(&elsewhere, leader(50, 100), TICK, TICK));
-        assert!(elsewhere.killed.borrow().is_empty());
+        // Pid 50 is held by another leader (start 900), running or exited
+        // and not reaped: the launch's session emptied before (Linux), so
+        // nothing is signalled and it is stopped.
+        for zombie in [false, true] {
+            let mut reissued = FakeView::new(&[(50, 900, 50), (61, 950, 50)]);
+            if zombie {
+                reissued = reissued.zombie(50);
+            }
+            assert!(sweep_session(&reissued, leader(50, 100), TICK, TICK));
+            assert!(!reissued.signalled());
+            // Where a reissue proves nothing, it is not proven stopped either.
+            let mut elsewhere = FakeView::new(&[(50, 900, 50), (61, 950, 50)]);
+            elsewhere.reissue_proves_empty = false;
+            assert!(!sweep_session(&elsewhere, leader(50, 100), TICK, TICK));
+            assert!(!elsewhere.signalled());
+        }
+
+        // The leader is reaped and its number reused while the members are
+        // listed: that listing is not the launch's, and nothing is signalled.
+        let vanishing = FakeView::new(&[(50, 100, 50), (60, 120, 50)]);
+        vanishing.on_list.borrow_mut().extend([
+            (50, None),
+            (60, None),
+            (61, Some((950, 50, false))),
+        ]);
+        assert!(!sweep_session(&vanishing, leader(50, 100), TICK, TICK));
+        assert!(
+            vanishing.killed.borrow().is_empty(),
+            "{:?}",
+            vanishing.killed
+        );
 
         // Member 60 exits after the listing and its pid is handed to an
         // unrelated process (start 5000, another session) before the handle
         // is opened: the identity check refuses it.
-        let racing = FakeView::new(&[(60, 120, 50)]).listing(&[(60, 120)]);
-        racing.on_open.borrow_mut().insert(60, (5000, 7));
-        assert!(!sweep_session(&racing, leader(50, 100), TICK, TICK));
-        assert!(racing.killed.borrow().is_empty(), "{:?}", racing.killed);
+        let racing = FakeView::new(&[(50, 100, 50)]).listing(&[(50, 100), (60, 120)]);
+        racing.on_open.borrow_mut().insert(60, (5000, 7, false));
+        assert!(sweep_session(&racing, leader(50, 100), LONG, TICK));
+        assert_eq!(*racing.killed.borrow(), vec![(50, 100)], "never 60");
         // Same start, another session: refused too.
-        let moved = FakeView::new(&[(60, 120, 77)]).listing(&[(60, 120)]);
-        assert!(!sweep_session(&moved, leader(50, 100), TICK, TICK));
-        assert!(moved.killed.borrow().is_empty());
+        let moved = FakeView::new(&[(50, 100, 50), (60, 120, 77)]).listing(&[(50, 100), (60, 120)]);
+        assert!(sweep_session(&moved, leader(50, 100), LONG, TICK));
+        assert_eq!(*moved.killed.borrow(), vec![(50, 100)], "never 60");
 
-        // A listed member that started before the leader is not the launch's.
-        let older = FakeView::new(&[(40, 90, 50)]).listing(&[(40, 90)]);
+        // A listed member that started before the leader is not the
+        // launch's: never signalled, so the stop is not proven; the leader is
+        // killed when the bound passes.
+        let older = FakeView::new(&[(50, 100, 50), (40, 90, 50)]);
         assert!(!sweep_session(&older, leader(50, 100), TICK, TICK));
-        assert!(older.killed.borrow().is_empty());
+        assert_eq!(*older.killed.borrow(), vec![(50, 100)], "never 40");
 
-        // Seen empty, then the number shows members again: not swept.
-        let late = FakeView::new(&[(70, 3000, 50)])
+        // Seen empty once (the leader exited, not reaped), then the number
+        // shows members again: not swept.
+        let late = FakeView::new(&[(50, 100, 50)])
+            .zombie(50)
             .listing(&[])
             .listing(&[(70, 3000)]);
-        assert!(sweep_session(
-            &late,
-            leader(50, 100),
-            Duration::from_secs(5),
-            TICK
-        ));
+        assert!(sweep_session(&late, leader(50, 100), LONG, TICK));
         assert!(late.killed.borrow().is_empty());
+    }
+
+    /// PRD #1790 stage 3 (round-4 F5): a member no pinned handle can be
+    /// opened on (a full descriptor table, a refused call) is never
+    /// signalled by its pid: the stop is not proven, and only the stopped
+    /// leader is killed once the bound passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_with_no_pinned_handle_is_not_signalled() {
+        let mut view = FakeView::new(&[(50, 100, 50), (60, 120, 50)]);
+        view.unusable.insert(60);
+        assert!(!sweep_session(&view, leader(50, 100), TICK, TICK));
+        assert_eq!(*view.stopped.borrow(), vec![50]);
+        assert_eq!(*view.killed.borrow(), vec![(50, 100)], "never 60");
+        // A leader no handle can be had on is not stopped, and the session is
+        // still swept while it is there to name it.
+        let mut leaderless = FakeView::new(&[(50, 100, 50), (60, 120, 50)]);
+        leaderless.unusable.insert(50);
+        assert!(!sweep_session(&leaderless, leader(50, 100), TICK, TICK));
+        assert!(leaderless.stopped.borrow().is_empty());
+        assert_eq!(*leaderless.killed.borrow(), vec![(60, 120)]);
     }
 
     /// PRD #1790 stage 3 (audit B1): a restored agent is in the conversation
@@ -2571,6 +3038,7 @@ mod tests {
                         shim: None,
                         to: Some(successor.clone()),
                         sessions: vec![SESSION.into()],
+                        unknown_session: false,
                     },
                 ),
                 line(
@@ -2604,25 +3072,355 @@ mod tests {
             pid,
             pid_start,
         };
-        assert!(sessions.fenced(SESSION, &[]), "no record to check: fenced");
         assert!(
-            sessions.fenced(SESSION, &[record(None, None)]),
+            sessions.fenced(SESSION, None, &[]),
+            "no record to check: fenced"
+        );
+        assert!(
+            sessions.fenced(SESSION, None, &[record(None, None)]),
             "a process it cannot check: fenced"
         );
-        assert!(!sessions.fenced("another", &[record(None, None)]));
+        assert!(!sessions.fenced("another", None, &[record(None, None)]));
         #[cfg(target_os = "linux")]
         {
             let me = std::process::id();
             let start = crate::platform::proc::process_start_of(me);
             assert!(
-                sessions.fenced(SESSION, &[record(Some(me), start)]),
+                sessions.fenced(SESSION, None, &[record(Some(me), start)]),
                 "a process still running: fenced"
             );
             assert!(
-                !sessions.fenced(SESSION, &[record(Some(i32::MAX as u32), Some(1))]),
+                !sessions.fenced(SESSION, None, &[record(Some(i32::MAX as u32), Some(1))]),
                 "a launch proven gone lifts it"
             );
         }
+    }
+
+    /// PRD #1790 stage 3 (round-4 B2): an agent a failed restore could not
+    /// be proven to stop, and whose conversation the deck does not know,
+    /// fences every conversation of agents of its kind, and only of its kind
+    /// (both kinds known), until its launch is proven gone.
+    #[test]
+    fn a_survivor_in_an_unknown_conversation_fences_its_whole_kind() {
+        use crate::event::AgentType;
+        use crate::work_journal::{JournalRead, Line};
+        let work = WorkId::parse("w-abcdefgh-0000000000000001").expect("a work id");
+        let successor = AttemptId::parse("r-live/1").unwrap();
+        let read = JournalRead {
+            lines: vec![Line {
+                v: 1,
+                ts_ms: 1,
+                run: "r-live".into(),
+                seq: 1,
+                event: Event::RestoreFailed {
+                    work: work.clone(),
+                    attempt: AttemptId::parse("r-old/1").unwrap(),
+                    failure: RestoreFailure::Refused,
+                    shim: None,
+                    to: Some(successor.clone()),
+                    sessions: vec!["asked-for".into()],
+                    unknown_session: true,
+                },
+            }],
+            ..JournalRead::default()
+        };
+        let sessions = Sessions::of(&read);
+        let record = |agent_type: Option<AgentType>| LaunchRecord {
+            v: crate::launch_records::SCHEMA_VERSION,
+            work: work.clone(),
+            attempt: successor.clone(),
+            command: None,
+            shell: None,
+            agent_type,
+            cwd: Some("/w".into()),
+            cwd_moved_from: None,
+            name: None,
+            role: None,
+            orchestration: None,
+            orchestration_id: None,
+            ts_ms: 1,
+            pid: None,
+            pid_start: None,
+        };
+        let claude = Some(&AgentType::ClaudeCode);
+        let claude_record = [record(Some(AgentType::ClaudeCode))];
+        assert!(sessions.fenced("any-other", claude, &claude_record));
+        assert!(
+            !sessions.fenced("any-other", Some(&AgentType::Codex), &claude_record),
+            "another kind's conversation is not its"
+        );
+        assert!(
+            sessions.fenced("asked-for", Some(&AgentType::Codex), &claude_record),
+            "a conversation it named is fenced whatever the kind"
+        );
+        assert!(
+            sessions.fenced("any-other", claude, &[record(None)]),
+            "its kind unknown"
+        );
+        assert!(
+            sessions.fenced("any-other", None, &claude_record),
+            "ours unknown"
+        );
+        assert!(
+            sessions.fenced("any-other", claude, &[]),
+            "no record to check"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let mut gone = record(Some(AgentType::ClaudeCode));
+            gone.pid = Some(i32::MAX as u32);
+            gone.pid_start = Some(1);
+            assert!(
+                !sessions.fenced("any-other", claude, &[gone]),
+                "proven gone"
+            );
+        }
+    }
+
+    /// PRD #1790 stage 3 (round-4 B2): what a failed start fences: the
+    /// conversations it named, and its kind only when where it went is not
+    /// known and a restore of that kind exists.
+    #[test]
+    fn a_fence_covers_its_kind_only_when_its_conversation_is_unknown() {
+        use crate::event::AgentType;
+        let known = Fence::new(["s".to_string(), "u".to_string(), "s".to_string()])
+            .unknown_unless(true)
+            .of(Some(&AgentType::ClaudeCode));
+        assert_eq!(known.sessions, ["s", "u"]);
+        assert!(!known.unknown);
+        let lost = Fence::new(["s".to_string()]).unknown_unless(false);
+        assert!(lost.clone().of(Some(&AgentType::ClaudeCode)).unknown);
+        assert!(lost.clone().of(None).unknown, "a kind not known");
+        assert!(
+            !lost.of(Some(&AgentType::OpenCode)).unknown,
+            "no restore of its kind exists to fence"
+        );
+    }
+
+    /// PRD #1790 stage 3 (round-4 B2): what [`keep_fenced`] holds when a
+    /// failure could be neither proven stopped nor recorded: every
+    /// conversation it names and, for an unknown one, its kind, against a
+    /// restore in this daemon ([`InFlight`]) and in another one on the state
+    /// directory ([`claim`]).
+    #[cfg(unix)]
+    #[test]
+    fn a_fence_that_could_not_be_recorded_holds_its_conversations_and_kind() {
+        use crate::event::AgentType;
+        let state = crate::test_temp::tempdir().unwrap();
+        // Two kinds no other test fences, so the daemon-wide set this test
+        // fills does not refuse another test's restores.
+        let fenced_kind = AgentType::Pi;
+        let other_kind = AgentType::Devin;
+        const KEPT: &str = "a7000000-89ab-4cde-8fab-0123456789ab";
+        let attempt = AttemptId::parse("r-fence/1").unwrap();
+        let other = AttemptId::parse("r-fence/2").unwrap();
+        keep_fenced(
+            None,
+            Some(state.path()),
+            &Fence {
+                sessions: vec![KEPT.into()],
+                unknown: true,
+            },
+            Some(&fenced_kind),
+        );
+        assert_eq!(
+            InFlight::take(&other, Some(KEPT), Some(&other_kind)).err(),
+            Some(RestoreRefusal::SessionInUse),
+            "its conversation, in this daemon"
+        );
+        assert_eq!(
+            claim::take(state.path(), &other, Some(KEPT), Some(&other_kind)).err(),
+            Some(RestoreRefusal::SessionInUse),
+            "its conversation, from another daemon"
+        );
+        assert_eq!(
+            InFlight::take(&other, Some("elsewhere"), Some(&fenced_kind)).err(),
+            Some(RestoreRefusal::SessionInUse),
+            "its kind, in this daemon"
+        );
+        assert_eq!(
+            claim::take(state.path(), &other, Some("elsewhere"), Some(&fenced_kind)).err(),
+            Some(RestoreRefusal::SessionInUse),
+            "its kind, from another daemon"
+        );
+        // Another kind's restore elsewhere, and a start over, go on.
+        assert!(claim::take(state.path(), &other, Some("elsewhere"), Some(&other_kind)).is_ok());
+        assert!(claim::take(state.path(), &attempt, None, Some(&fenced_kind)).is_ok());
+        assert!(InFlight::take(&attempt, None, Some(&fenced_kind)).is_ok());
+    }
+
+    /// PRD #1790 stage 3 (round-4 F1): journal retention keeps a restore's
+    /// safety evidence while the successor it names is not proven gone.
+    /// Small limits and a compaction of the sealed segment between the first
+    /// restore and a second request: a confirmed successor's link (the
+    /// `journal/restore/026` shape, its own session report withheld) and an
+    /// unproven stop's fence (the `/027` shape, the successor's attempt ended
+    /// in the journal) survive with the work that started the successor, and
+    /// the second request's read still finds the conversation in use. Once
+    /// the successor is proven gone, they go like any finished work.
+    #[test]
+    fn compaction_keeps_restore_evidence_while_its_successor_may_run() {
+        use crate::deck_identity::DeckId;
+        use crate::work_journal::{
+            EndHow, JournalOptions, Launch, Line, Refs, Retention, WorkJournal,
+        };
+        const SESSION: &str = "c0000000-89ab-4cde-8fab-0123456789ab";
+        const OTHER: &str = "c1000000-89ab-4cde-8fab-0123456789ab";
+        const NOW: u64 = 1_800_000_000_000;
+        let old = NOW - 40 * 24 * 60 * 60 * 1000;
+        let state = crate::test_temp::tempdir().unwrap();
+        let home = std::path::PathBuf::from("/home/someone");
+        let work = |n: u64| WorkId::parse(&format!("w-abcdefgh-{n:016x}")).unwrap();
+        let attempt = |n: u64| AttemptId::new("r-dead", n).unwrap();
+        let mut events = Vec::new();
+        let opened = |w: WorkId| Event::Opened {
+            work: w,
+            launch: Launch::Pane,
+            parent: None,
+            refs: Box::new(Refs::default()),
+            workspace: None,
+        };
+        let started = |w: WorkId, n: u64| Event::AttemptStarted {
+            work: w,
+            attempt: attempt(n),
+            pane: "3".into(),
+            agent: n,
+            role: None,
+        };
+        let ended = |w: WorkId, n: u64| Event::AttemptEnded {
+            work: w,
+            attempt: attempt(n),
+            how: EndHow::Exited,
+            code: None,
+            cause: None,
+        };
+        // The /026 shape: work 1's attempt 1 was restored as attempt 2, in
+        // work 2, which still runs and has reported no session.
+        events.extend([
+            opened(work(1)),
+            started(work(1), 1),
+            ended(work(1), 1),
+            Event::AttemptRestored {
+                work: work(1),
+                from: attempt(1),
+                to: attempt(2),
+                how: RestoredHow::Resumed,
+                session: Some(SESSION.into()),
+            },
+            Event::Closed {
+                work: work(1),
+                how: CloseHow::Restored,
+            },
+            opened(work(2)),
+            started(work(2), 2),
+        ]);
+        // The /027 shape: work 3's attempt 3 failed to restore as attempt 4,
+        // in work 4, whose stop was not proven; attempt 4 ended.
+        events.extend([
+            opened(work(3)),
+            started(work(3), 3),
+            ended(work(3), 3),
+            Event::RestoreFailed {
+                work: work(3),
+                attempt: attempt(3),
+                failure: RestoreFailure::SessionMismatch,
+                shim: None,
+                to: Some(attempt(4)),
+                sessions: vec![OTHER.into()],
+                unknown_session: false,
+            },
+            opened(work(4)),
+            started(work(4), 4),
+            ended(work(4), 4),
+        ]);
+        // An unrelated finished work, which these limits let go.
+        events.extend([
+            opened(work(5)),
+            Event::Closed {
+                work: work(5),
+                how: CloseHow::PaneClosed,
+            },
+        ]);
+        let dir = state.path().join(crate::work_journal::DIR_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut text = String::new();
+        for (seq, event) in events.into_iter().enumerate() {
+            let seq = seq as u64 + 1;
+            let line = Line {
+                v: 1,
+                ts_ms: old + seq,
+                run: "r-dead".into(),
+                seq,
+                event,
+            };
+            text.push_str(
+                std::str::from_utf8(
+                    &crate::work_journal::encode_line_with_home(&line, &home).unwrap(),
+                )
+                .unwrap(),
+            );
+            text.push('\n');
+        }
+        std::fs::write(dir.join("run-r-dead.jsonl"), text).unwrap();
+        let journal = WorkJournal::try_open_with(
+            state.path(),
+            "r-now",
+            &DeckId::parse("abcdefgh").unwrap(),
+            JournalOptions {
+                home,
+                ..JournalOptions::default()
+            },
+        )
+        .unwrap();
+        let small = Retention {
+            max_age: Duration::from_secs(1),
+            max_finished_works: 0,
+        };
+        let kept = |state: &Path| {
+            let read = crate::work_journal::read_journal(state).unwrap();
+            let mut works: Vec<WorkId> =
+                read.lines.iter().map(|l| l.event.work().clone()).collect();
+            works.sort();
+            works.dedup();
+            (read, works)
+        };
+
+        let report = journal
+            .compact_guarded(NOW, small, &|_: &AttemptId| false)
+            .unwrap();
+        assert!(
+            report.consumed_files > 0,
+            "the sealed segment was folded: {report:?}"
+        );
+        let (read, works) = kept(state.path());
+        assert_eq!(
+            works,
+            vec![work(1), work(2), work(3), work(4)],
+            "only the unrelated finished work went"
+        );
+        let sessions = Sessions::of(&read);
+        let second = AttemptId::parse("r-dead/9").unwrap();
+        assert!(
+            sessions.in_use(&second, SESSION, &|_: &str| true),
+            "the confirmed successor still owns its conversation"
+        );
+        assert!(
+            sessions.fenced(OTHER, Some(&crate::event::AgentType::ClaudeCode), &[]),
+            "the unproven stop still fences its conversation"
+        );
+
+        // Proven gone: the evidence goes with its finished works. Work 2
+        // still runs, so it stays.
+        journal
+            .compact_guarded(NOW, small, &|_: &AttemptId| true)
+            .unwrap();
+        let (_, works) = kept(state.path());
+        assert_eq!(works, vec![work(2)]);
     }
 
     /// PRD #1790 stage 3 (review R#3, audit S1/F7): a launch of a live run,
@@ -2707,6 +3505,27 @@ mod tests {
             sessions.folder_in_use(&target, &w, &with(gone.to_str().unwrap()), &live),
             "a live launch's unreadable folder counts as this one"
         );
+        // Round-4 S1: a file is no folder to tell this one apart from.
+        let file = root.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(
+            sessions.folder_in_use(&target, &w, &with(file.to_str().unwrap()), &live),
+            "a live launch whose recorded folder is not a directory counts as this one"
+        );
+        // Round-4 S1: a live launch with no folder recorded, its prepared
+        // folder moved or never resolved, counts as in this one too.
+        for moved in [None, Some("/somewhere/else".to_string())] {
+            let mut launches = base.clone();
+            let mut unknown = record(&newer, &w);
+            unknown.cwd = None;
+            unknown.cwd_moved_from = moved;
+            launches.push(unknown);
+            assert!(
+                sessions.folder_in_use(&target, &w, &launches, &live),
+                "a live launch with no recorded folder counts as this one"
+            );
+            assert!(!sessions.folder_in_use(&target, &w, &launches, &|_: &str| false));
+        }
     }
 
     /// PRD #1790 stage 3 (audit "later slices" 2): a pid no process holds and

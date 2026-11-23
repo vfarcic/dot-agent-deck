@@ -2097,8 +2097,14 @@ fn spawn_with_dir(
     // spawns, and with the shim on their `PATH` the first of them to start
     // the named agent would be resumed into a conversation meant for another
     // pane. The restore spawn is the one caller that supplies a request, in
-    // `opts.env` below.
-    for key in crate::telemetry::shim::RESUME_ENV_KEYS {
+    // `opts.env` below. A Start over's fresh-start request likewise (audit
+    // S2, round 4): an inherited one could spend another launch's token, put
+    // its chosen conversation id on an unrelated Claude Code, or ride along
+    // with a restore's own resume request.
+    for key in crate::telemetry::shim::RESUME_ENV_KEYS
+        .into_iter()
+        .chain(crate::telemetry::shim::FRESH_ENV_KEYS)
+    {
         cmd.env_remove(key);
     }
 
@@ -27385,24 +27391,31 @@ mod spawn_tests {
         );
     }
 
-    /// PRD #1790 stage 3 (audit S4): a resume request in the daemon's own
-    /// environment reaches no spawned agent, whether or not the spawn's
-    /// `PATH` leads with a shim directory (telemetry on or off); a request the
-    /// spawn itself supplies, as a restore does, does.
+    /// PRD #1790 stage 3 (audit S4, round-4 S2): a resume request or a
+    /// Start over's fresh-start request in the daemon's own environment
+    /// reaches no spawned agent, whether or not the spawn's `PATH` leads with
+    /// a shim directory (telemetry on or off); a request the spawn itself
+    /// supplies, as a restore or a start over does, does, and a restore does
+    /// not carry an inherited fresh-start request beside its own.
     #[test]
     fn spawn_scrubs_an_inherited_resume_request_and_keeps_an_explicit_one() {
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let keys = crate::telemetry::shim::RESUME_ENV_KEYS;
+        let resume = crate::telemetry::shim::RESUME_ENV_KEYS;
+        let fresh = crate::telemetry::shim::FRESH_ENV_KEYS;
+        let keys: Vec<&str> = resume.iter().chain(fresh.iter()).copied().collect();
         let prior: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
         // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
         // prior values are restored before the lock is released.
         unsafe {
-            std::env::set_var(keys[0], "claude");
-            std::env::set_var(keys[1], "01234567-89ab-4cde-8fab-0123456789ab");
-            std::env::set_var(keys[2], "inherited-token");
+            for family in [resume, fresh] {
+                std::env::set_var(family[0], "claude");
+                std::env::set_var(family[1], "01234567-89ab-4cde-8fab-0123456789ab");
+                std::env::set_var(family[2], "inherited-token");
+            }
         }
-        // Exit 1 when any of the three is set, else 0.
-        let probe = "sh -c 'exit ${DOT_AGENT_DECK_RESUME_AGENT:+1}${DOT_AGENT_DECK_RESUME_SESSION:+1}${DOT_AGENT_DECK_RESUME_TOKEN:+1}0'";
+        // Exit 1 when any resume variable is set, 2 when any fresh one is,
+        // 3 for both, else 0.
+        let probe = "sh -c 'r=${DOT_AGENT_DECK_RESUME_AGENT:+1}${DOT_AGENT_DECK_RESUME_SESSION:+1}${DOT_AGENT_DECK_RESUME_TOKEN:+1}; f=${DOT_AGENT_DECK_FRESH_AGENT:+1}${DOT_AGENT_DECK_FRESH_SESSION:+1}${DOT_AGENT_DECK_FRESH_TOKEN:+1}; exit $(( ${r:+1}+0 + ${f:+2}+0 ))'";
         let status_of = |env: Vec<(String, String)>| {
             let pty = spawn(SpawnOptions {
                 command: Some(probe),
@@ -27417,9 +27430,12 @@ mod spawn_tests {
         let shim_path = vec![("PATH".to_string(), format!("/state/telemetry/bin:{path}"))];
         let without_shim = status_of(Vec::new());
         let with_shim = status_of(shim_path.clone());
-        let mut explicit = shim_path;
-        explicit.push((keys[2].to_string(), "restore-token".to_string()));
-        let restore = status_of(explicit);
+        let mut restore_env = shim_path.clone();
+        restore_env.push((resume[2].to_string(), "restore-token".to_string()));
+        let restore = status_of(restore_env);
+        let mut start_over_env = shim_path;
+        start_over_env.push((fresh[2].to_string(), "start-over-token".to_string()));
+        let start_over = status_of(start_over_env);
         unsafe {
             for (key, value) in keys.iter().zip(prior) {
                 match value {
@@ -27436,7 +27452,14 @@ mod spawn_tests {
             with_shim, 0,
             "telemetry on: an inherited request reached the child"
         );
-        assert_ne!(restore, 0, "the restore's own request must reach its agent");
+        assert_eq!(
+            restore, 1,
+            "a restore carries its own resume request and no inherited fresh-start one"
+        );
+        assert_eq!(
+            start_over, 2,
+            "a start over carries its own fresh-start request and no inherited resume one"
+        );
     }
 
     #[test]

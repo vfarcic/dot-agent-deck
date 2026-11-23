@@ -1534,7 +1534,7 @@ pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
         }
         RestoreRefusal::NoSavedTask => "Refused: the unit's saved task is not there.",
         RestoreRefusal::SessionInUse => {
-            "Refused: another agent the deck runs is in this conversation now, or is being restored into it, so two agents would write to one conversation."
+            "Refused: another agent the deck runs is in this conversation now, or is being restored into it, or an agent the deck could not confirm it stopped may be in it, so two agents would write to one conversation."
         }
         RestoreRefusal::TooManyPending => {
             "Refused: too many restores are waiting for their agents to start. Try again in a minute."

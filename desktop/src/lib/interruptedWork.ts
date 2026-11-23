@@ -686,7 +686,7 @@ const RESTORE_REFUSAL_SENTENCES: Record<string, string> = {
   "not-resumed": "The agent started but did not come back into its conversation, so the deck stopped it before sending it anything. You can start it over in this worktree instead.",
   "task-unsafe": "Refused: the saved task file cannot be trusted (it is a link, not a plain file, another account's, open to other accounts, or too large).",
   "no-saved-task": "Refused: the unit's saved task is not there.",
-  "session-in-use": "Refused: another agent the deck runs is in this conversation now, or is being restored into it, so two agents would write to one conversation.",
+  "session-in-use": "Refused: another agent the deck runs is in this conversation now, or is being restored into it, or an agent the deck could not confirm it stopped may be in it, so two agents would write to one conversation.",
   "too-many-pending": "Refused: too many restores are waiting for their agents to start. Try again in a minute.",
   "bad-selection": "Refused: the request named an agent twice, named too many agents, or used an id that is too long.",
   "command-reopens": "Refused: the agent's command reopens an earlier conversation, so starting it over would not start fresh. Start it yourself without that option.",

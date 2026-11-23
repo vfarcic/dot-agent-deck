@@ -394,7 +394,9 @@ pub struct AgentSpec {
 /// Audit B3/F3: one agent's fresh-start contract. A Start over asks the
 /// launch shim, through a one-shot request in the spawn's environment
 /// ([`crate::telemetry::shim::FRESH_ENV_KEYS`]), to check the arguments the
-/// agent is really started with: arguments that select an existing
+/// program of the agent's name found on `PATH` is started with (a script of
+/// the user's by that name included, whose own additions it does not see):
+/// arguments that select an existing
 /// conversation ([`Self::selects`]) are refused, and the daemon stops the
 /// agent before it posts anything; otherwise, for an agent with
 /// [`Self::new_id_option`], the shim starts it under a new id the daemon
@@ -896,31 +898,171 @@ fn codex_inspects(args: &[std::ffi::OsString]) -> bool {
     false
 }
 
+/// Audit F4 (round 4): the options of one level of Codex's command line, as
+/// its own parser reads them: `codex --help` for the top level, `codex exec
+/// --help` after `exec` (codex-cli 0.169). `values` take a value, as the
+/// next argument or attached (`--color=never`, `-mgpt`); `variadic` ones
+/// among them take every argument after them that does not start with `-`
+/// (`-i a.png b.png`); `flags` take none.
+struct CodexLevel {
+    values: &'static [&'static str],
+    variadic: &'static [&'static str],
+    flags: &'static [&'static str],
+}
+
+/// `codex --help`, codex-cli 0.169.
+const CODEX_TOP_LEVEL: CodexLevel = CodexLevel {
+    values: &CODEX_VALUE_OPTIONS,
+    variadic: &["-i", "--image"],
+    flags: &[
+        "--strict-config",
+        "--oss",
+        "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--worktree",
+        "--search",
+        "--no-alt-screen",
+        "--no-daemon",
+        "-h",
+        "--help",
+        "-V",
+        "--version",
+    ],
+};
+
+/// `codex exec --help`, codex-cli 0.169: `--color never` and
+/// `--output-schema schema.json` before `resume` are exec's own options, so
+/// `codex exec --color never resume --last` resumes.
+const CODEX_EXEC_LEVEL: CodexLevel = CodexLevel {
+    values: &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "--thread-source",
+        "--cyber-access-program",
+        "--output-schema",
+        "--color",
+        "-o",
+        "--output-last-message",
+    ],
+    variadic: &["-i", "--image"],
+    flags: &[
+        "--strict-config",
+        "--oss",
+        "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--worktree",
+        "--skip-git-repo-check",
+        "--trust",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--json",
+        "-h",
+        "--help",
+        "-V",
+        "--version",
+    ],
+};
+
+/// What [`codex_positional`] found at one level of Codex's command line.
+enum CodexWord {
+    /// The level's first positional argument, at this index.
+    At(usize),
+    /// None: the arguments ended, or `--` made the rest a prompt.
+    Nothing,
+    /// An argument the level's grammar does not settle: an option it does
+    /// not list, a short-option cluster, a flag given a value, or `-`,
+    /// which Codex's parser does not read as a prompt (`codex - resume
+    /// --last` resumes).
+    Uncertain,
+}
+
+/// The first positional argument of `args` from `at`, reading options as
+/// `level` lists them.
+fn codex_positional(args: &[String], mut at: usize, level: &CodexLevel) -> CodexWord {
+    while let Some(arg) = args.get(at) {
+        at += 1;
+        if arg == "--" {
+            return CodexWord::Nothing;
+        }
+        if arg == "-" {
+            return CodexWord::Uncertain;
+        }
+        let takes_next = if let Some(long) = arg.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, _)) if level.values.contains(&format!("--{name}").as_str()) => false,
+                Some(_) => return CodexWord::Uncertain,
+                None if level.values.contains(&arg.as_str()) => true,
+                None if level.flags.contains(&arg.as_str()) => false,
+                None => return CodexWord::Uncertain,
+            }
+        } else if let Some(short) = arg.strip_prefix('-') {
+            let name = short.chars().next().map(|c| format!("-{c}"));
+            let attached = short.chars().count() > 1;
+            match name.as_deref() {
+                // `-mgpt`, `-i=a.png`: the value is attached.
+                Some(name) if level.values.contains(&name) => !attached,
+                Some(name) if level.flags.contains(&name) && !attached => false,
+                _ => return CodexWord::Uncertain,
+            }
+        } else {
+            return CodexWord::At(at - 1);
+        };
+        if takes_next {
+            if level.variadic.contains(&arg.as_str()) {
+                while args.get(at).is_some_and(|value| !value.starts_with('-')) {
+                    at += 1;
+                }
+            } else {
+                at += 1;
+            }
+        }
+    }
+    CodexWord::Nothing
+}
+
 /// Whether Codex's own `args` select an existing conversation: a first
 /// positional argument `resume` or `fork` (`codex resume --last`,
 /// `codex fork <id>`), the same after `exec`/`e` (`codex exec resume
-/// --last`), or `agents`, which opens the session browser (`codex --help`,
-/// codex-cli 0.169). Option values are skipped as
-/// [`codex_resume_conflicts`] skips them.
+/// --last`), or `agents`, which opens the session browser. Options are read
+/// as each level's own parser reads them ([`CODEX_TOP_LEVEL`],
+/// [`CODEX_EXEC_LEVEL`]), and an argument that grammar does not settle
+/// counts as selecting ([`CodexWord::Uncertain`], audit F4): a Start over
+/// is refused rather than let through on a guess.
 fn codex_selects(args: &[std::ffi::OsString]) -> bool {
-    let mut args = args.iter().map(|arg| arg.to_string_lossy());
-    let mut after_exec = false;
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            return false;
-        }
-        if !arg.starts_with('-') || arg == "-" {
-            if !after_exec && matches!(arg.as_ref(), "exec" | "e") {
-                after_exec = true;
-                continue;
-            }
-            return matches!(arg.as_ref(), "resume" | "fork") || (!after_exec && arg == "agents");
-        }
-        if !arg.contains('=') && CODEX_VALUE_OPTIONS.contains(&arg.as_ref()) {
-            let _ = args.next();
-        }
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    match codex_positional(&args, 0, &CODEX_TOP_LEVEL) {
+        CodexWord::Uncertain => true,
+        CodexWord::Nothing => false,
+        CodexWord::At(at) => match args[at].as_str() {
+            "resume" | "fork" | "agents" => true,
+            "exec" | "e" => match codex_positional(&args, at + 1, &CODEX_EXEC_LEVEL) {
+                CodexWord::Uncertain => true,
+                CodexWord::Nothing => false,
+                CodexWord::At(sub) => matches!(args[sub].as_str(), "resume" | "fork"),
+            },
+            _ => false,
+        },
     }
-    false
 }
 
 /// Whether `args`, up to a `--`, hold one of `long` (alone or as
@@ -2600,6 +2742,25 @@ mod tests {
             vec!["exec", "resume", "--last"],
             vec!["e", "fork", ID],
             vec!["agents"],
+            // Round 4 (audit F4): exec's own value options, which `codex
+            // exec --help` lists and its parser reads as resume.
+            vec!["exec", "--color", "never", "resume", "--last"],
+            vec!["exec", "--output-schema", "schema.json", "resume", "--last"],
+            vec!["exec", "-o", "out.txt", "resume", "--last"],
+            vec!["exec", "--json", "resume", "--last"],
+            vec!["exec", "-mgpt", "resume", "--last"],
+            vec!["-mgpt", "resume", "--last"],
+            vec!["--image=a.png", "resume", "--last"],
+            vec!["-i", "a.png", "b.png", "--oss", "resume", "--last"],
+            // What the grammar does not settle refuses: `-` (Codex resumes
+            // `codex - resume --last`), an option it does not list, a flag
+            // given a value, a short cluster.
+            vec!["-", "resume", "--last"],
+            vec!["exec", "-", "resume", "--last"],
+            vec!["exec", "--not-an-option", "never", "resume"],
+            vec!["--not-an-option"],
+            vec!["exec", "--json=1"],
+            vec!["-hV"],
         ] {
             assert!(codex.selects(&os(&args)), "Codex: {args:?}");
         }
@@ -2609,6 +2770,14 @@ mod tests {
             vec!["exec", "fix the tests"],
             vec!["-c", "resume"],
             vec!["--", "resume"],
+            vec!["exec", "--", "resume"],
+            vec!["exec", "--color", "never", "fix the tests"],
+            vec!["exec", "--color=never", "review"],
+            // `-i` takes every value up to the next option, `resume` among
+            // them (`codex exec -i a.png resume --last --help` prints exec's
+            // own usage).
+            vec!["exec", "-i", "a.png", "resume"],
+            vec!["-c", "shell_environment_policy.set={}", "--model", "mini"],
         ] {
             assert!(!codex.selects(&os(&args)), "Codex: {args:?}");
         }
@@ -2682,6 +2851,8 @@ mod tests {
             "true;codex resume --last",
             "true&&codex fork --last",
             "codex exec resume --last",
+            "exec codex exec --color never resume --last",
+            "codex exec --output-schema schema.json resume --last",
         ] {
             assert!(codex.command_reopens(command), "{command}");
         }

@@ -557,7 +557,10 @@ fn resume_args(
 /// in front of that is started meanwhile with arguments that select a
 /// conversation claims the token too, and refuses it: the launch reached an
 /// agent's old conversation, whichever agent it is. A program started after
-/// the token was claimed finds it spent and is not checked.
+/// the token was claimed finds it spent and is not checked. `name` is the
+/// program found on `PATH` (it may be a script of the user's named after the
+/// agent): arguments such a script adds before it starts the agent by
+/// another path are not seen here (round-4 F3/B1).
 #[cfg(unix)]
 fn fresh_args(name: &str, dir: &Path, args: &[OsString], request: &ResumeRequest) -> Vec<OsString> {
     let Some(token) = request.token.as_deref().filter(|t| is_resume_token(t)) else {
@@ -2134,6 +2137,15 @@ mod tests {
             ("claude", vec!["--continue"]),
             ("codex", vec!["resume", "--last"]),
             ("codex", vec!["exec", "resume", "--last"]),
+            // Round 4 (audit F4): exec's own value options before `resume`.
+            (
+                "codex",
+                vec!["exec", "--color", "never", "resume", "--last"],
+            ),
+            (
+                "codex",
+                vec!["exec", "--output-schema", "schema.json", "resume", "--last"],
+            ),
             ("opencode", vec!["--continue"]),
             ("opencode", vec!["--session", "ses_1"]),
             ("pi", vec!["--resume"]),

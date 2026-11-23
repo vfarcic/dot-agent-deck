@@ -359,10 +359,12 @@ pub struct SessionMember {
 
 /// Audit F4a/S2: a handle on one process that a signal sent through it
 /// reaches only that process, never one that holds its pid after it. Linux
-/// holds a pidfd (`pidfd_open(2)`); a kernel without one, and every other
-/// Unix, holds the bare pid, so there a pid reissued between the last check
-/// and the signal is the documented residual window
-/// (`docs/develop/agent-restore.md`).
+/// holds a pidfd (`pidfd_open(2)`); a kernel without the call (`ENOSYS`,
+/// before 5.3), and every other Unix, holds the bare pid, so there a pid
+/// reissued between the last check and the signal is the documented
+/// residual window (`docs/develop/agent-restore.md`). On a kernel that has
+/// the call, any other failure to open one leaves the process unopened
+/// ([`Opened::Unusable`], round-4 F5): it is not signalled by its bare pid.
 #[cfg(unix)]
 pub struct ProcessHandle {
     pid: u32,
@@ -370,12 +372,38 @@ pub struct ProcessHandle {
     fd: Option<std::os::fd::OwnedFd>,
 }
 
+/// What opening a handle on a process found ([`ProcessHandle::open`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Opened<H> {
+    /// A handle on the process that held the pid when it was opened.
+    Handle(H),
+    /// No process holds the pid, or it is not one a process can hold.
+    Absent,
+    /// A process may hold it, but no handle that pins it could be had (a
+    /// full descriptor table, a refused call): it must not be signalled.
+    Unusable,
+}
+
+/// Round-4 F5: what a failed `pidfd_open(2)`, its `errno` `errno`, leaves
+/// [`ProcessHandle::open`] with: `ESRCH` names no process; `ENOSYS`, a
+/// kernel without the call, falls back to the bare pid (`Handle(())`, the
+/// documented window); anything else is [`Opened::Unusable`].
+#[cfg(unix)]
+pub fn pidfd_open_failure(errno: Option<i32>) -> Opened<()> {
+    match errno {
+        Some(libc::ESRCH) => Opened::Absent,
+        Some(libc::ENOSYS) => Opened::Handle(()),
+        _ => Opened::Unusable,
+    }
+}
+
 #[cfg(unix)]
 impl ProcessHandle {
-    /// Open a handle on the process holding `pid` now; `None` when no
-    /// process holds it or the pid is not one a process can hold.
-    pub fn open(pid: u32) -> Option<Self> {
-        let raw = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0)?;
+    /// Open a handle on the process holding `pid` now ([`Opened`]).
+    pub fn open(pid: u32) -> Opened<Self> {
+        let Some(raw) = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0) else {
+            return Opened::Absent;
+        };
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::FromRawFd as _;
@@ -386,18 +414,18 @@ impl ProcessHandle {
                 // SAFETY: a descriptor the kernel just returned to us, owned
                 // by nothing else.
                 let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
-                return Some(ProcessHandle { pid, fd: Some(fd) });
+                return Opened::Handle(ProcessHandle { pid, fd: Some(fd) });
             }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ESRCH) => None,
-                // A kernel before 5.3, or a filter refusing the call.
-                _ => Some(ProcessHandle { pid, fd: None }),
+            match pidfd_open_failure(std::io::Error::last_os_error().raw_os_error()) {
+                Opened::Handle(()) => Opened::Handle(ProcessHandle { pid, fd: None }),
+                Opened::Absent => Opened::Absent,
+                Opened::Unusable => Opened::Unusable,
             }
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = raw;
-            Some(ProcessHandle { pid })
+            Opened::Handle(ProcessHandle { pid })
         }
     }
 
@@ -421,6 +449,15 @@ impl ProcessHandle {
 
     /// Send `SIGKILL` through the handle. `true` when it was delivered.
     pub fn kill(&self) -> bool {
+        self.signal(libc::SIGKILL)
+    }
+
+    /// Send `SIGSTOP` through the handle. `true` when it was delivered.
+    pub fn stop(&self) -> bool {
+        self.signal(libc::SIGSTOP)
+    }
+
+    fn signal(&self, signal: libc::c_int) -> bool {
         #[cfg(target_os = "linux")]
         if let Some(fd) = &self.fd {
             use std::os::fd::AsRawFd as _;
@@ -430,7 +467,7 @@ impl ProcessHandle {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
                     fd.as_raw_fd(),
-                    libc::SIGKILL,
+                    signal,
                     std::ptr::null::<libc::siginfo_t>(),
                     0,
                 )
@@ -442,8 +479,15 @@ impl ProcessHandle {
         };
         // SAFETY: a positive pid the caller checked was the listed process
         // just now; see the type's docs for the window that remains.
-        unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
+        unsafe { libc::kill(pid, signal) == 0 }
     }
+}
+
+/// Round-4 F5: [`probe_process`] without its reading of a zombie as
+/// [`ProcessProbe::Exited`]: a process that exited and waits to be reaped
+/// still holds its pid, and is named by its start time like a running one.
+pub fn probe_process_held(pid: u32) -> ProcessProbe {
+    probe_process_with(pid, process_start_of, pid_is_free)
 }
 
 /// Whether `pid` has exited and only waits to be reaped (Linux: state `Z`
@@ -1027,5 +1071,35 @@ mod tests {
             "an already-exited child must not cost the full grace window (took {:?})",
             started.elapsed()
         );
+    }
+
+    /// PRD #1790 stage 3 (round-4 F5): a `pidfd_open` that fails says the
+    /// process is gone only on `ESRCH`; a kernel without the call falls back
+    /// to the bare pid; every other failure (a full descriptor table, a
+    /// refused call) leaves nothing that may be signalled.
+    #[cfg(unix)]
+    #[test]
+    fn a_pidfd_that_cannot_be_opened_is_not_signalled_by_its_pid() {
+        assert_eq!(pidfd_open_failure(Some(libc::ESRCH)), Opened::Absent);
+        assert_eq!(pidfd_open_failure(Some(libc::ENOSYS)), Opened::Handle(()));
+        for errno in [
+            Some(libc::EMFILE),
+            Some(libc::ENFILE),
+            Some(libc::EPERM),
+            Some(libc::EINVAL),
+            Some(libc::ENOMEM),
+            None,
+        ] {
+            assert_eq!(pidfd_open_failure(errno), Opened::Unusable, "{errno:?}");
+        }
+        // A pid no process can hold opens nothing.
+        assert!(matches!(ProcessHandle::open(0), Opened::Absent));
+        assert!(matches!(ProcessHandle::open(u32::MAX), Opened::Absent));
+        // This process, which the test may name, is held, never absent.
+        match ProcessHandle::open(std::process::id()) {
+            Opened::Handle(handle) => assert_eq!(handle.pid(), std::process::id()),
+            Opened::Unusable => {}
+            Opened::Absent => panic!("this process reads as absent"),
+        }
     }
 }

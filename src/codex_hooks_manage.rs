@@ -1056,8 +1056,9 @@ fn list_hooks_in_within(
 /// environment, and this one would reach the user's backend as a
 /// `codex-app-server` service the user never ran. For the same reason it
 /// never carries a restore's one-shot resume request
-/// ([`crate::telemetry::shim::RESUME_ENV_KEYS`], PRD #1790 stage 3): the
-/// wrapper probes in the restored pane's environment, before the agent
+/// ([`crate::telemetry::shim::RESUME_ENV_KEYS`], PRD #1790 stage 3), nor a
+/// Start over's fresh-start request ([`crate::telemetry::shim::FRESH_ENV_KEYS`]):
+/// the wrapper probes in the restored pane's environment, before the agent
 /// starts, and the request is the agent's launch's to claim, not this call's.
 fn probe_command(
     codex: &Path,
@@ -1071,7 +1072,10 @@ fn probe_command(
             command.env_remove(key);
         }
     }
-    for key in crate::telemetry::shim::RESUME_ENV_KEYS {
+    for key in crate::telemetry::shim::RESUME_ENV_KEYS
+        .into_iter()
+        .chain(crate::telemetry::shim::FRESH_ENV_KEYS)
+    {
         command.env_remove(key);
     }
     command
@@ -2813,6 +2817,10 @@ mod tests {
             "DOT_AGENT_DECK_RESUME_AGENT",
             "DOT_AGENT_DECK_RESUME_SESSION",
             "DOT_AGENT_DECK_RESUME_TOKEN",
+            // Round 4 (audit S2): a Start over's fresh-start request too.
+            "DOT_AGENT_DECK_FRESH_AGENT",
+            "DOT_AGENT_DECK_FRESH_SESSION",
+            "DOT_AGENT_DECK_FRESH_TOKEN",
         ] {
             assert!(
                 envs.contains(&(removed.to_string(), None)),

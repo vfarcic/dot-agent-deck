@@ -1725,6 +1725,7 @@ fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list
             shim: None,
             to: None,
             sessions: Vec::new(),
+            unknown_session: false,
         },
     );
     let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
