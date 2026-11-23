@@ -6,8 +6,17 @@ import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import type { CardBatchOutcome } from "../types";
 import { ExactText, ExactTextNote, SourceBadge } from "./AgentCard";
 
-/** What one agent's row says it got, after Send. */
-const RESULT_WORD: Record<string, string> = { delivered: "Delivered", closed: "Closed", failed: "Failed" };
+/** What one agent's row says it got, after Send. `unknown` is a daemon that did not answer in time: it may still act, so it is neither a failure nor a delivery. */
+const RESULT_WORD: Record<string, string> = { delivered: "Delivered", closed: "Closed", failed: "Failed", unknown: "No answer" };
+
+/** The headline of the results. Unanswered agents are not counted as sent or as failed: either may still be true. */
+function resultsHeadline(total: number, failed: number, unknown: number): string {
+  if (unknown === 0) return failed === 0 ? `Sent to all ${total}` : `${total - failed} of ${total} sent; ${failed} failed`;
+  const parts = [`${total - failed - unknown} of ${total} confirmed sent`];
+  if (failed > 0) parts.push(`${failed} failed`);
+  parts.push(`${unknown} not answered, may still be delivered`);
+  return parts.join("; ");
+}
 
 /**
  * One agent's row, with the daemon it is on. Pane and agent ids are the
@@ -40,7 +49,9 @@ function rowName(row: BatchRow, names: ReadonlyMap<string, string>): string {
  * the reason. Every batch stops here, whatever the action's own `confirm`
  * says, and only Send sends; voice opens this and never presses it (PRD #802
  * D5). After Send it says, for each agent, whether its text was delivered or
- * why it failed — a partial failure reads as one, never as a success.
+ * why it failed — a partial failure reads as one, never as a success. A daemon
+ * that did not answer before the desktop stopped waiting leaves its agents
+ * "No answer": the daemon may still deliver, so they read as neither.
  *
  * Every row keeps its daemon (#2399 review 1), and names it when the batch
  * reaches more than one. Cancel, Close, `Escape` and voice's `close` dismiss
@@ -63,6 +74,7 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
   const done = view.stage === "done";
   const results = rowsOf(view.results);
   const failed = results.filter((row) => row.entry.outcome === "failed").length;
+  const unknown = results.filter((row) => row.entry.outcome === "unknown").length;
   /* Which daemon each agent is on, said only when the batch reaches more than one. */
   const severalDaemons = new Set([...view.groups, ...view.results].map((group) => group.deckId)).size > 1;
   const who = (row: BatchRow, extra?: ReactNode) => (
@@ -134,12 +146,13 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
           )}
           {done && (
             <>
-              <h3 role="status">{failed === 0 ? `Sent to all ${results.length}` : `${results.length - failed} of ${results.length} sent; ${failed} failed`}</h3>
+              <h3 role="status">{resultsHeadline(results.length, failed, unknown)}</h3>
               <ul className="agent-cards-batch-list">
                 {results.map((row) => { const { entry } = row; return (
-                  <li key={rowKey(row)} className={`agent-cards-batch-entry is-${entry.outcome === "failed" ? "failed" : "done"}`} data-testid="agent-cards-batch-entry" data-outcome={entry.outcome}>
+                  <li key={rowKey(row)} className={`agent-cards-batch-entry is-${entry.outcome === "failed" ? "failed" : entry.outcome === "unknown" ? "unknown" : "done"}`} data-testid="agent-cards-batch-entry" data-outcome={entry.outcome}>
                     {who(row, <span className="agent-cards-batch-outcome">{RESULT_WORD[entry.outcome] ?? displayText(entry.outcome, DISPLAY_LIMITS.name)}</span>)}
                     {entry.outcome === "failed" && <p className="agent-cards-batch-reason">{displayText(entry.message ?? "the deck did not act on this agent", DISPLAY_LIMITS.message)}</p>}
+                    {entry.outcome === "unknown" && <p className="agent-cards-batch-reason">{displayText(entry.message ?? "the deck did not answer, so it is not known whether this agent got it", DISPLAY_LIMITS.message)}</p>}
                   </li>
                 ); })}
               </ul>

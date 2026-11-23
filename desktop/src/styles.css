@@ -2327,6 +2327,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-batch-outcome { font-size: var(--text-sm); font-weight: 700; }
 .agent-cards-batch-entry.is-failed .agent-cards-batch-outcome { color: var(--red); }
 .agent-cards-batch-entry.is-done .agent-cards-batch-outcome { color: var(--teal); }
+.agent-cards-batch-entry.is-unknown { border-color: var(--amber-rim); }
+.agent-cards-batch-entry.is-unknown .agent-cards-batch-outcome { color: var(--amber); }
 .agent-cards-batch-reason, .agent-cards-batch-what { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .agent-cards-batch-prompt { min-width: 0; }
 .agent-cards-batch-error { margin: 0; color: var(--red); overflow-wrap: anywhere; }

@@ -46,6 +46,11 @@ struct Script {
     generate_reply: Option<AttachResponse>,
     silent_generate: bool,
     generate_requests: Vec<serde_json::Value>,
+    /// Issue #2399 re-review: an `invoke-card-action-batch` is read and never
+    /// answered, the connection held open.
+    silent_batch: bool,
+    /// Every `invoke-card-action-batch` request, as sent.
+    batch_requests: Vec<serde_json::Value>,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -185,6 +190,12 @@ impl RestartingDeck {
                                     .generate_requests
                                     .push(request.clone());
                                 if script.lock().unwrap().silent_generate {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            if op == "invoke-card-action-batch" {
+                                script.lock().unwrap().batch_requests.push(request.clone());
+                                if script.lock().unwrap().silent_batch {
                                     std::future::pending::<()>().await;
                                 }
                             }
@@ -1350,4 +1361,120 @@ async fn handshake_013_a_start_result_names_the_process_that_answered_it() {
     let bound = client.bound_to(Some("a".to_string()).into());
     assert_eq!(bound.launch_incarnation().as_deref(), Some("a"));
     assert!(client.launch_incarnation().is_unnamed());
+}
+
+/// Scenario (issue #2399 re-review): the user sends "Go ahead" to two agents
+/// on a deck that takes the batch request and never answers it. When the
+/// batch's bound runs out each agent's result is "unknown", with a sentence
+/// saying the deck may still deliver it, never "failed"; the request was sent
+/// once and not again. A preview the deck never answers fails at the ordinary
+/// round-trip bound instead, since a preview sends nothing.
+#[tokio::test]
+async fn a_card_batch_the_deck_never_answers_ends_unknown_at_its_bound_and_is_not_resent() {
+    use dot_agent_deck::agent_cards::{CardBatchEntry, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-silent", "a");
+    deck.script.lock().unwrap().silent_batch = true;
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let entries: Vec<_> = ["1", "2"]
+        .iter()
+        .map(|id| CardBatchEntry {
+            pane_id: format!("pane-{id}"),
+            agent_id: (*id).to_string(),
+            action_token: "token".into(),
+            instance_id: "a".into(),
+        })
+        .collect();
+    let deadline = crate::card_batch_reply_timeout(CardBatchMode::Execute, entries.len());
+    assert_eq!(
+        deadline,
+        crate::daemon_bridge::DECK_REPLY_TIMEOUT + crate::CARD_BATCH_ENTRY_ALLOWANCE * 2,
+        "an execution's bound grows with its entries"
+    );
+
+    // Paused, so the bound elapses as soon as nothing but the silent batch is
+    // left to wait on.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let sent = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-silent-1",
+        entries.clone(),
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+
+    let result = sent.expect("an unanswered execution still answers each entry");
+    assert_eq!(result.request_id, "batch-silent-1");
+    let agents: Vec<_> = result
+        .entries
+        .iter()
+        .map(|entry| entry.agent_id.as_str())
+        .collect();
+    assert_eq!(agents, ["1", "2"], "every entry sent is answered");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_ne!(entry.outcome, dot_agent_deck::agent_cards::BATCH_FAILED);
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_NO_ANSWER)
+        );
+        assert_eq!(
+            entry.message.as_deref(),
+            Some(crate::card_batch_no_answer_message(deadline).as_str())
+        );
+    }
+    assert!(
+        crate::card_batch_no_answer_message(deadline).contains("may still deliver"),
+        "the sentence does not claim nothing was sent"
+    );
+    assert!(
+        waited >= deadline && waited < deadline + crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+        "the answer comes from the batch's bound: {waited:?}"
+    );
+    {
+        let script = deck.script.lock().unwrap();
+        assert_eq!(
+            script.batch_requests.len(),
+            1,
+            "the batch is not sent again"
+        );
+        assert_eq!(script.batch_requests[0]["mode"], "execute");
+    }
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let previewed = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Preview,
+        "batch-silent-2",
+        entries,
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    let failure = previewed.expect_err("an unanswered preview fails: it sent nothing");
+    assert!(failure.contains("did not answer the preview"), "{failure}");
+    let bound = crate::card_batch_reply_timeout(CardBatchMode::Preview, 2);
+    assert_eq!(bound, crate::daemon_bridge::DECK_REPLY_TIMEOUT);
+    assert!(
+        waited >= bound && waited < bound * 2,
+        "the preview's bound is the round trip's: {waited:?}"
+    );
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 2);
 }

@@ -262,4 +262,46 @@ describe("batch card actions (#2399)", () => {
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });
+
+  /// Scenario: Send a reviewed batch to a daemon that takes it and never answers, so the dialog stays in Sending and Escape is refused. When the desktop stops waiting, each agent's row says "No answer" with the sentence that the deck may still deliver it, never "Failed" or "Nothing was sent"; nothing is sent again, Escape closes the results, and a new batch can be started.
+  it("desktop/agent-cards/038: a batch the daemon never answers ends as no answer and the dialog can be closed", async () => {
+    const calls = setup();
+    const dialog = await startSelectedBatch();
+    let answer: (value: unknown) => void = () => undefined;
+    calls.invokeCardActionBatch.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }) as never);
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    expect(screen.getByTestId("agent-cards-batch-confirm")).toHaveAttribute("data-stage", "sending");
+    fireEvent.keyDown(screen.getByTestId("agent-cards-batch-confirm"), { key: "Escape" });
+    expect(screen.getByTestId("agent-cards-batch-confirm")).toHaveAttribute("data-stage", "sending");
+    expect(screen.getByTestId("agent-cards-batch-refusal")).toBeInTheDocument();
+
+    // What the desktop bridge answers for every entry it sent once its bound for the batch runs out.
+    const NO_ANSWER = "the deck did not answer within 35s, so it is not known whether this agent got it; the deck may still deliver it. Check the agent before sending again";
+    await act(async () => {
+      answer({ request_id: "rid", entries: INCLUDED.map(({ pane_id, agent_id }) => ({ pane_id, agent_id, outcome: "unknown", code: "no_answer", message: NO_ANSWER })) });
+    });
+    const results = screen.getByTestId("agent-cards-batch-results");
+    const rows = within(results).getAllByTestId("agent-cards-batch-entry");
+    expect(rows).toHaveLength(2);
+    for (const name of ["root", "child"]) {
+      const row = rows.find((each) => within(each).queryByText(name, { exact: true }));
+      expect(row, name).toBeDefined();
+      expect(row).toHaveAttribute("data-outcome", "unknown");
+      expect(within(row!).getByText("No answer", { exact: true })).toBeInTheDocument();
+      expect(within(row!).getByText(NO_ANSWER)).toBeInTheDocument();
+      expect(within(row!).queryByText("Failed", { exact: true })).toBeNull();
+    }
+    expect(within(results).getByRole("status")).toHaveTextContent("0 of 2 confirmed sent; 2 not answered, may still be delivered");
+    expect(within(results).queryByText(/Nothing was sent/)).toBeNull();
+    expect(within(results).queryByText(/Sent to all/)).toBeNull();
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
+
+    fireEvent.keyDown(results, { key: "Escape" });
+    expect(screen.queryByTestId("agent-cards-batch-results")).toBeNull();
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    expect(screen.getByTestId("agent-cards-batch-confirm")).toHaveAttribute("data-stage", "review");
+    expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "preview" }));
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
 });

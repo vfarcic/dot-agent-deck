@@ -2124,7 +2124,8 @@ async fn agent_card_invoke(
 /// execution's `entries` carry the token and instance their preview
 /// answered, and the daemon checks each as a single press. The answer is the
 /// daemon's, one outcome per entry; a replaced or older daemon answers every
-/// entry `failed` with `daemon_replaced` / `unsupported`, nothing sent.
+/// entry `failed` with `daemon_replaced` / `unsupported`, nothing sent. The
+/// wait is bounded ([`card_batch_reply_timeout`]).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn agent_card_invoke_batch(
@@ -2138,40 +2139,140 @@ async fn agent_card_invoke_batch(
     entries: Vec<dot_agent_deck::agent_cards::CardBatchEntry>,
 ) -> Result<dot_agent_deck::agent_cards::CardBatchResult, String> {
     ensure_main_webview(&webview)?;
-    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    agent_card_invoke_batch_on(
+        &state,
+        &deck_id,
+        &instance_id,
+        &action_id,
+        mode,
+        &request_id,
+        entries,
+    )
+    .await
+}
+
+/// Issue #2399 re-review: the outcome of an executed entry the daemon did not
+/// answer before [`card_batch_reply_timeout`] ran out. Only this bridge says
+/// it, never a daemon: the request was sent, so the entry may have been
+/// delivered, may still be, or may not be. It is neither `failed` ("not sent")
+/// nor `delivered`.
+pub(crate) const CARD_BATCH_UNKNOWN: &str = "unknown";
+/// The code an unanswered entry carries beside [`CARD_BATCH_UNKNOWN`].
+pub(crate) const CODE_CARD_BATCH_NO_ANSWER: &str = "no_answer";
+
+/// The extra time an executed batch is allowed for each entry it names.
+///
+/// A daemon runs an execution's entries one after another and answers once,
+/// after the last, so the wait grows with the batch. A prompt entry is an
+/// in-memory post; a close waits for its agent to stop, which the daemon gives
+/// a termination grace of seconds before it removes the agent's pane. Ten
+/// seconds an entry is headroom over that, not a tuned value: the bound is
+/// there so a daemon that took the request and went quiet does not hold the
+/// dialog forever, not to hurry a daemon that is working.
+pub(crate) const CARD_BATCH_ENTRY_ALLOWANCE: Duration = Duration::from_secs(10);
+
+/// How long the desktop waits for a daemon's answer to one batch request.
+///
+/// A preview reads the cards and sends nothing, so it is any round trip
+/// ([`crate::daemon_bridge::DECK_REPLY_TIMEOUT`]). An execution is that plus
+/// [`CARD_BATCH_ENTRY_ALLOWANCE`] for each entry it names (a repeated entry
+/// counts, which only lengthens the wait).
+pub(crate) fn card_batch_reply_timeout(
+    mode: dot_agent_deck::agent_cards::CardBatchMode,
+    entries: usize,
+) -> Duration {
+    match mode {
+        dot_agent_deck::agent_cards::CardBatchMode::Preview => {
+            crate::daemon_bridge::DECK_REPLY_TIMEOUT
+        }
+        dot_agent_deck::agent_cards::CardBatchMode::Execute => {
+            let entries = u32::try_from(entries).unwrap_or(u32::MAX);
+            crate::daemon_bridge::DECK_REPLY_TIMEOUT
+                .saturating_add(CARD_BATCH_ENTRY_ALLOWANCE.saturating_mul(entries))
+        }
+    }
+}
+
+/// What an executed entry the daemon did not answer in `waited` says.
+pub(crate) fn card_batch_no_answer_message(waited: Duration) -> String {
+    format!(
+        "the deck did not answer within {}s, so it is not known whether this agent got it; the deck may still deliver it. Check the agent before sending again",
+        waited.as_secs()
+    )
+}
+
+/// [`agent_card_invoke_batch`] minus the webview.
+///
+/// The daemon's answer is waited for at most [`card_batch_reply_timeout`].
+/// When that runs out, a preview fails (it sent nothing), and an execution
+/// answers every entry it sent [`CARD_BATCH_UNKNOWN`]: the request reached the
+/// daemon, which may be delivering it still, so "not sent" would be a claim
+/// nobody can make. Nothing is sent again: the user decides, from the cards,
+/// whether to.
+async fn agent_card_invoke_batch_on(
+    state: &DesktopState,
+    deck_id: &str,
+    instance_id: &str,
+    action_id: &str,
+    mode: dot_agent_deck::agent_cards::CardBatchMode,
+    request_id: &str,
+    entries: Vec<dot_agent_deck::agent_cards::CardBatchEntry>,
+) -> Result<dot_agent_deck::agent_cards::CardBatchResult, String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
-    let every = |code: &str, message: &str| dot_agent_deck::agent_cards::CardBatchResult {
-        request_id: request_id.clone(),
-        entries: entries
-            .iter()
-            .map(|entry| dot_agent_deck::agent_cards::CardBatchOutcome {
-                pane_id: entry.pane_id.clone(),
-                agent_id: entry.agent_id.clone(),
-                outcome: dot_agent_deck::agent_cards::BATCH_FAILED.into(),
-                code: Some(code.into()),
-                message: Some(message.into()),
-                ..Default::default()
-            })
-            .collect(),
-    };
-    let answer = match daemon
-        .client
-        .invoke_card_action_batch(&instance_id, mode, &action_id, &request_id, entries.clone())
-        .await
-    {
-        Ok(answer) => answer,
-        Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed) => {
+    let every =
+        |outcome: &str, code: &str, message: &str| dot_agent_deck::agent_cards::CardBatchResult {
+            request_id: request_id.to_string(),
+            entries: entries
+                .iter()
+                .map(|entry| dot_agent_deck::agent_cards::CardBatchOutcome {
+                    pane_id: entry.pane_id.clone(),
+                    agent_id: entry.agent_id.clone(),
+                    outcome: outcome.into(),
+                    code: Some(code.into()),
+                    message: Some(message.into()),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+    let failed = dot_agent_deck::agent_cards::BATCH_FAILED;
+    let deadline = card_batch_reply_timeout(mode, entries.len());
+    let reply = daemon.client.invoke_card_action_batch(
+        instance_id,
+        mode,
+        action_id,
+        request_id,
+        entries.clone(),
+    );
+    let answer = match tokio::time::timeout(deadline, reply).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed)) => {
             return Ok(every(
+                failed,
                 dot_agent_deck::agent_cards::CODE_DAEMON_REPLACED,
                 "the deck's daemon was restarted after these cards were read; nothing was sent",
             ));
         }
-        Err(error) => return Err(safe_message(error.to_string())),
+        Ok(Err(error)) => return Err(safe_message(error.to_string())),
+        Err(_) => {
+            return match mode {
+                dot_agent_deck::agent_cards::CardBatchMode::Preview => Err(safe_message(format!(
+                    "the daemon took the connection but did not answer the preview within {}s",
+                    deadline.as_secs()
+                ))),
+                dot_agent_deck::agent_cards::CardBatchMode::Execute => Ok(every(
+                    CARD_BATCH_UNKNOWN,
+                    CODE_CARD_BATCH_NO_ANSWER,
+                    &card_batch_no_answer_message(deadline),
+                )),
+            };
+        }
     };
     Ok(match answer {
         GatedQuery::Answered(result) => result,
         GatedQuery::Unsupported => every(
+            failed,
             "unsupported",
             "this deck's daemon does not support batch card actions; upgrade it to act on several cards at once",
         ),

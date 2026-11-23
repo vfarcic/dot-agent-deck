@@ -16908,6 +16908,13 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** `Escape` in an open confirmation closes it and sends nothing, as Cancel does (#2399 review 4).
 - **Does not assert:** the sending case (desktop/agent-cards/035).
 
+##### desktop/agent-cards/038 — A batch the daemon never answers ends as "No answer", and the dialog can be closed.
+
+- **Test:** vitest `desktop/agent-cards/038: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed batch bridge whose execution is held, then answered with what the desktop bridge returns when its bound for the batch runs out (`unknown` / `no_answer` for every entry).
+- **Asserts:** while held, the dialog stays in Sending and `Escape` is refused; after the bound's answer, each agent's row reads "No answer" with the sentence that the deck may still deliver it, never "Failed", "Nothing was sent" or "Sent to all"; the execution is not sent again; `Escape` closes the results and a new batch's preview can start (#2399 re-review).
+- **Does not assert:** the bound itself, which the Rust transport test `a_card_batch_the_deck_never_answers_ends_unknown_at_its_bound_and_is_not_resent` in `desktop/src-tauri/src/restart_binding_tests.rs` pins against a fake deck that takes the request and never answers.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
