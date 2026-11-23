@@ -220,9 +220,13 @@ fn install(
 /// and delivers nothing; a repeat while an update is being saved waits for
 /// it; a different report is admitted as the next update while fewer than
 /// [`MAX_REPORT_UPDATES`] were taken, and refused after that. The first
-/// report is never replaced: an update is a post of its own.
+/// report is never replaced: an update is a post of its own. An update
+/// numbered past [`USUAL_REPORT_UPDATES`] is admitted like any other; its
+/// number, which the claim carries to the post, is what makes the post say the
+/// unit may be looping (issue #2485).
 ///
 /// [`MAX_REPORT_UPDATES`]: crate::report_recovery::MAX_REPORT_UPDATES
+/// [`USUAL_REPORT_UPDATES`]: crate::report_recovery::USUAL_REPORT_UPDATES
 fn admit_update(
     st: &mut HubState,
     reports: &mut ReportState,
