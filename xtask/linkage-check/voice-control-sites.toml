@@ -311,6 +311,12 @@ reason = "Dismisses the dashboard's Generate config result notice (PRD #2119): a
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
+code = "cards.dismissNotice"
+reason = "Dismisses the dashboard's notice saying why a press on a card did nothing, such as a checked reference that did not open (issue #2418): a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
 code = "onUpgrade"
 reason = "A daemon card's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
 

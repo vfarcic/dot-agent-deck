@@ -93,14 +93,17 @@ desktopScenario("dashboard-filter", async (page) => {
 // PRD #2374 — desktop-only: the TUI has no cards view. The `docs` state's
 // four agents as the daemon's cards (`docsAgentCards` in the fixture), served
 // only with `cards=1`, shown through the Dashboard's Table | Cards switch.
+// Issue #2418: two roots, the orchestrator's tree opened to show its two roles.
 desktopScenario("agent-cards", async (page) => {
   await page.goto("/?fixture=1&state=docs&cards=1");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await page.getByTestId("overview-mode-cards").click();
-  await expect(page.getByTestId("agent-cards-group")).toHaveCount(2);
+  await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(2);
+  await page.getByRole("button", { name: "Open Plan / architecture's tree" }).click();
   await expect(page.locator("article[data-card-key]")).toHaveCount(4);
-  await expect(page.getByTestId("agent-card-primary").first()).toHaveText("Go ahead");
+  await expect(page.getByTestId("agent-card-issue-label").first()).toHaveText("enhancement");
+  await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
 });
 
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows

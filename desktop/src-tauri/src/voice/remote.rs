@@ -901,6 +901,10 @@ mod tests {
                 "next_needs_you_card",
                 "filter_needs_you_cards",
                 "close_agent_card",
+                "open_card_tree",
+                "close_card_tree",
+                "open_card_pull_request",
+                "open_card_issue",
                 "run_card_action",
                 "reply_to_agent_card",
                 "none"

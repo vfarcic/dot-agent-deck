@@ -6,7 +6,7 @@ import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRunt
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
-import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceActionContext, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type AgentViewTarget, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceActionContext, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
@@ -27,7 +27,7 @@ import { AddDaemonOpener } from "./AddDaemonDialog";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
 import { PullRequestBadge } from "./PullRequestBadge";
-import { OpenPullRequest } from "../lib/prBrowser";
+import { OpenCardReference, OpenPullRequest } from "../lib/prBrowser";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
 import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
@@ -38,7 +38,7 @@ import { INTERRUPTED_COVERED, listedCount, mayHaveInterrupted, NOTHING_INTERRUPT
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
-import { ENDED_ROLE_WORDS, endedRolesOf } from "../lib/endedRoles";
+import { ENDED_ROLE_WORDS, endedRoleOfCard, endedRolesOf } from "../lib/endedRoles";
 import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import { needsYouSentence, type PlacedCard } from "../lib/agentCards";
@@ -1880,9 +1880,34 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} endedRoles={deck.snapshot.endedRoles} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} openTarget={cardOpenTarget} endedRoles={deck.snapshot.endedRoles} />;
   };
-  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent });
+  const openCardReference = useContext(OpenCardReference);
+  /* Issue #2418 — whether the dashboard filter keeps a card off the Cards
+     view, so a spoken open of its tree can say so. */
+  const cardHiddenByFilter = useMemo(() => {
+    if (!filtering) return undefined;
+    return (card: PlacedCard) => {
+      const deck = decks.find((candidate) => candidate.snapshot.connection.deckId === card.deckId);
+      return deck !== undefined && !cardMatchesFilter(card, deck.matchingAgents);
+    };
+  }, [decks, filtering]);
+  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
+  /* Issue #1965 — the exited role the open card is for, from its own deck's reply: the overlay says why in full. */
+  const overlayCard = cards.overlay?.card;
+  const overlayEnded = overlayCard
+    ? endedRoleOfCard(decks.find((deck) => deck.snapshot.connection.deckId === overlayCard.deckId)?.snapshot.endedRoles, overlayCard.entry)
+    : undefined;
+  /* Issue #2418 (D12) — a card's name opens its agent through `openAgent`
+     with the same members a table row's click uses, so the two cannot open
+     different things. */
+  const cardControls = useMemo(() => ({ ...cards.clickControls, navigate: voiceContext.navigate, revealAgent: voiceContext.revealAgent }), [cards.clickControls, voiceContext]);
+  const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
+    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => candidate.id === card.entry.agent_id);
+    return agent
+      ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
+      : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
+  }, [decks]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   /* The confirmation on screen as of the last render, read by an answer that
      arrives after it: a Generate config the user dismissed with No must not
@@ -2344,6 +2369,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               <button type="button" aria-label="Dismiss" onClick={() => setGenerationNotice(undefined)}><X size={13} /></button>
             </div>
           )}
+          {cards.notice && (
+            <div className="overview-banner" role="status" data-testid="overview-card-notice">
+              <span>{displayText(cards.notice, DISPLAY_LIMITS.message)}</span>
+              <button type="button" aria-label="Dismiss" onClick={cards.dismissNotice}><X size={13} /></button>
+            </div>
+          )}
           {daemonNotice && (
             <div className="overview-banner" role="status" data-testid="overview-daemon-notice">
               <span>{displayText(daemonNotice, DISPLAY_LIMITS.message)}</span>
@@ -2410,7 +2441,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           ))}
         </section>
       </main>
-      {cards.overlay && <AgentCardOverlay {...cards.overlay} controls={cards.controls} />}
+      {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} ended={overlayEnded} />}
       {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}

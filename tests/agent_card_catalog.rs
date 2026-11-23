@@ -76,10 +76,8 @@ fn catalog_001_merge_validation_and_report_validation() {
             "links"
         ]
     );
-    assert_eq!(
-        names(&defaults, "actions"),
-        ["go-ahead", "merge", "explain"]
-    );
+    // Issue #2418 (D15): Explain is no longer a default action.
+    assert_eq!(names(&defaults, "actions"), ["go-ahead", "merge"]);
     assert_eq!(errors(&defaults), Vec::<String>::new());
     let progress = entry(&defaults, "fields", "progress");
     assert_eq!(progress["type"], "text");
@@ -107,7 +105,7 @@ fn catalog_001_merge_validation_and_report_validation() {
         "Merge it, following this project's own merge procedure, then update your card."
     );
     assert_eq!(merge["always"], false);
-    assert_eq!(entry(&defaults, "actions", "explain")["always"], true);
+    assert_eq!(entry(&defaults, "actions", "go-ahead")["always"], false);
     assert_eq!(
         entry(&defaults, "actions", "go-ahead")["prompt"],
         "Go ahead."
@@ -161,7 +159,7 @@ confirm = true
         "replaced whole, not merged key by key"
     );
     assert_eq!(replaced["label"], "Progress");
-    assert_eq!(names(&user, "actions"), ["merge", "explain", "ship"]);
+    assert_eq!(names(&user, "actions"), ["merge", "ship"]);
     let ship = entry(&user, "actions", "ship");
     assert_eq!(ship["confirm"], true);
     assert_eq!(ship["label"], "Ship", "default label from the name");
@@ -260,12 +258,12 @@ description = "x"
         "number",
         "first of a duplicate wins"
     );
-    assert_eq!(names(&bad, "actions"), ["go-ahead", "merge", "explain"]);
+    assert_eq!(names(&bad, "actions"), ["go-ahead", "merge"]);
 
     // A file that does not parse: defaults and one error.
     let broken = as_json(&resolve(Some("[catalog\nremove = [")));
     assert_eq!(errors(&broken).len(), 1, "{broken:#}");
-    assert_eq!(names(&broken, "actions"), ["go-ahead", "merge", "explain"]);
+    assert_eq!(names(&broken, "actions"), ["go-ahead", "merge"]);
 
     // Reports against the defaults.
     let catalog = resolve(None);
