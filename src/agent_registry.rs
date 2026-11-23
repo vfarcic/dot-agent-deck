@@ -1037,19 +1037,26 @@ fn codex_positional(args: &[String], mut at: usize, level: &CodexLevel) -> Codex
     CodexWord::Nothing
 }
 
-/// Whether Codex's own `args` select an existing conversation: a first
-/// positional argument `resume` or `fork` (`codex resume --last`,
-/// `codex fork <id>`), the same after `exec`/`e` (`codex exec resume
-/// --last`), or `agents`, which opens the session browser. Options are read
+/// Whether Codex's own `args` select an existing conversation: any argument
+/// that is exactly `resume` or `fork`, wherever it stands (round-5 R3: Codex
+/// reads `codex exec hello resume --last` and `codex hello resume --last` as
+/// a resume, so a subcommand after a prompt word selects too); a first
+/// positional argument `agents`, which opens the session browser, at the
+/// top level; and an argument the grammar does not settle. Options are read
 /// as each level's own parser reads them ([`CODEX_TOP_LEVEL`],
-/// [`CODEX_EXEC_LEVEL`]), and an argument that grammar does not settle
-/// counts as selecting ([`CodexWord::Uncertain`], audit F4): a Start over
-/// is refused rather than let through on a guess.
+/// [`CODEX_EXEC_LEVEL`]), and what that grammar does not settle counts as
+/// selecting ([`CodexWord::Uncertain`], audit F4): a Start over is refused
+/// rather than let through on a guess. The price is a false positive: a
+/// prompt, option value or argument after `--` that is the bare word
+/// `resume` or `fork` refuses a Start over too.
 fn codex_selects(args: &[std::ffi::OsString]) -> bool {
     let args: Vec<String> = args
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+    if args.iter().any(|arg| arg == "resume" || arg == "fork") {
+        return true;
+    }
     match codex_positional(&args, 0, &CODEX_TOP_LEVEL) {
         CodexWord::Uncertain => true,
         CodexWord::Nothing => false,
@@ -2761,6 +2768,19 @@ mod tests {
             vec!["--not-an-option"],
             vec!["exec", "--json=1"],
             vec!["-hV"],
+            // Round 5 (R3): `resume` or `fork` after a prompt word, which
+            // Codex still reads as the subcommand.
+            vec!["exec", "hello", "resume", "--last"],
+            vec!["exec", "--color", "never", "hello", "resume", "--last"],
+            vec!["hello", "resume", "--last"],
+            vec!["hello", "exec", "resume", "--last"],
+            vec!["exec", "hello", "fork", ID],
+            // The known false positives of failing closed: the bare word as
+            // an option value, after `--`, or as an image path.
+            vec!["-c", "resume"],
+            vec!["--", "resume"],
+            vec!["exec", "--", "resume"],
+            vec!["exec", "-i", "a.png", "resume"],
         ] {
             assert!(codex.selects(&os(&args)), "Codex: {args:?}");
         }
@@ -2768,15 +2788,9 @@ mod tests {
             vec![],
             vec!["--model", "mini"],
             vec!["exec", "fix the tests"],
-            vec!["-c", "resume"],
-            vec!["--", "resume"],
-            vec!["exec", "--", "resume"],
+            vec!["exec", "resume the tests"],
             vec!["exec", "--color", "never", "fix the tests"],
             vec!["exec", "--color=never", "review"],
-            // `-i` takes every value up to the next option, `resume` among
-            // them (`codex exec -i a.png resume --last --help` prints exec's
-            // own usage).
-            vec!["exec", "-i", "a.png", "resume"],
             vec!["-c", "shell_environment_policy.set={}", "--model", "mini"],
         ] {
             assert!(!codex.selects(&os(&args)), "Codex: {args:?}");

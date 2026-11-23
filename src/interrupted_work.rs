@@ -1472,6 +1472,9 @@ pub enum RestoreRefusal {
     /// one that took the old one's place, so it stopped the agent again
     /// and the item stays listed.
     NotRecorded,
+    /// Round 5: another restore or start over is acting now, in this deck or
+    /// in another one on the same state folder; one acts at a time.
+    RestoreBusy,
     /// A refusal of a newer daemon's.
     #[serde(other)]
     Unknown,
@@ -1565,6 +1568,9 @@ pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
         }
         RestoreRefusal::NotRecorded => {
             "The agent started, but the deck could not record it in its work journal, so it stopped the agent again. The item is still listed; try again."
+        }
+        RestoreRefusal::RestoreBusy => {
+            "Refused: another restore or start over is in progress. Try again in a moment."
         }
         RestoreRefusal::Unknown => REFUSED_UNKNOWN,
     }

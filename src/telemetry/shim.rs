@@ -2146,6 +2146,23 @@ mod tests {
                 "codex",
                 vec!["exec", "--output-schema", "schema.json", "resume", "--last"],
             ),
+            // Round 5 (R3): the subcommand after a prompt word.
+            ("codex", vec!["exec", "hello", "resume", "--last"]),
+            (
+                "codex",
+                vec!["exec", "--color", "never", "hello", "resume", "--last"],
+            ),
+            ("codex", vec!["hello", "resume", "--last"]),
+            ("codex", vec!["hello", "exec", "resume", "--last"]),
+            (
+                "codex",
+                vec![
+                    "exec",
+                    "hello",
+                    "fork",
+                    "12345678-1234-4234-8234-123456789abc",
+                ],
+            ),
             ("opencode", vec!["--continue"]),
             ("opencode", vec!["--session", "ses_1"]),
             ("pi", vec!["--resume"]),

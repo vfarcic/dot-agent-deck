@@ -11253,6 +11253,74 @@ pub enum DispatchDirRefusal {
     BeingRemoved(PathBuf),
 }
 
+/// PRD #1790 round 5 (N1): a child whose signals are retired
+/// ([`AgentPtyRegistry::disarm_child`]). It answers no process id and its
+/// `kill` sends nothing, so every teardown path that would signal it — a
+/// close, a retried close of an unconfirmed child, a shutdown — signals
+/// nothing (`signal_child_pgroup_or_fallback` falls back to `kill` without a
+/// pid); waiting for and reaping it go to the child it wraps.
+#[cfg(unix)]
+#[derive(Debug)]
+struct SignalsRetired(Box<dyn portable_pty::Child + Send + Sync>);
+
+/// A killer that sends nothing: [`SignalsRetired`]'s, and the stand-in
+/// [`AgentPtyRegistry::disarm_child`] holds for the moment it swaps a child.
+#[cfg(unix)]
+#[derive(Debug)]
+struct NoSignal;
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for NoSignal {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(NoSignal)
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::Child for NoSignal {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        Ok(None)
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        Err(std::io::Error::other("no child"))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for SignalsRetired {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(NoSignal)
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::Child for SignalsRetired {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        self.0.try_wait()
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        self.0.wait()
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+}
+
 /// PRD #1589 test seam: a child that has already exited and needs nothing to
 /// reap it — the process behind [`AgentPtyRegistry::insert_idle_member_for_test`].
 #[cfg(test)]
@@ -19657,6 +19725,35 @@ impl AgentPtyRegistry {
     /// PRD #1666 part 3, round 5-wake: the pid of `id`'s child and when that
     /// child started, read as it was spawned ([`RunningAgent::child_started`]),
     /// so a caller can tell the child from a later process reusing its pid.
+    /// PRD #1790 round 5 (N1): retire every signal this registry would send
+    /// `id`'s child from now on ([`SignalsRetired`]), whether it is running or
+    /// its close left its exit unconfirmed. A restore's stop calls this once
+    /// its identity-checked sweep has ended, so the close after it reaps and
+    /// retires the agent without signalling a process group by a number the
+    /// sweep may have seen pass to another process. `false` when the registry
+    /// holds no child for `id` now.
+    #[cfg(unix)]
+    pub(crate) fn disarm_child(&self, id: &str) -> bool {
+        fn disarm(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+            let wrapped = std::mem::replace(child, Box::new(NoSignal));
+            *child = Box::new(SignalsRetired(wrapped));
+        }
+        let mut inner = self.inner.lock();
+        if let Some(agent) = inner.agents.get_mut(id) {
+            disarm(&mut agent.child);
+            return true;
+        }
+        if let Some(pending) = inner
+            .unconfirmed_agents
+            .get_mut(id)
+            .and_then(|entry| entry.child.as_mut())
+        {
+            disarm(&mut pending.child);
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn child_identity(&self, id: &str) -> Option<(u32, Option<u64>)> {
         let inner = self.inner.lock();
         inner

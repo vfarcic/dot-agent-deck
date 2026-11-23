@@ -697,6 +697,7 @@ const RESTORE_REFUSAL_SENTENCES: Record<string, string> = {
   "note-refused": "Refused: the deck's inbox cannot take the restart note now, so nothing was started. Try again in a minute.",
   "note-not-delivered": "The agent came back into its conversation, but the deck could not give it its restart note, so it stopped the agent again. The item is still listed; try again.",
   "not-recorded": "The agent started, but the deck could not record it in its work journal, so it stopped the agent again. The item is still listed; try again.",
+  "restore-busy": "Refused: another restore or start over is in progress. Try again in a moment.",
 };
 
 /** `restore_refusal_sentence`: a refusal of a newer daemon's reads as {@link REFUSED_UNKNOWN}. */

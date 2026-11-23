@@ -74,14 +74,19 @@ fn signal_child_pgroup_or_fallback(
     phase: &'static str,
 ) -> bool {
     let raw_pid = child.process_id();
-    let pgid = raw_pid.and_then(pid_to_pgid);
+    let Some(raw) = raw_pid else {
+        // PRD #1790 round 5 (N1): a child with no pid is one whose signals
+        // were retired (`AgentPtyRegistry::disarm_child`), whose `kill`
+        // sends nothing. Nothing is signalled by number.
+        tracing::debug!(signal, phase = %phase, "no pid: the child's signals are retired");
+        let _ = child.kill();
+        return true;
+    };
+    let pgid = pid_to_pgid(raw);
     let Some(pgid) = pgid else {
         // PRD #92 F8 followup (auditor #2 — option b documented):
-        // pid_to_pgid rejected the raw pid (either `process_id()` returned
-        // `None` or the pid was outside the safe `(0, i32::MAX]` range). The
-        // portable-pty `Child` trait allows `None` here, but the Unix backend
-        // used by this codebase always returns `Some` in practice. The
-        // `(0, i32::MAX]` boundary check is defense-in-depth against a future
+        // pid_to_pgid rejected the raw pid (it was outside the safe
+        // `(0, i32::MAX]` range). The `(0, i32::MAX]` boundary check is defense-in-depth against a future
         // portable-pty bug; on real Linux/macOS PIDs it never fails. The
         // fallback below uses `portable_pty::Child::kill`, which sends SIGHUP
         // — strictly weaker than the requested `signal` (typically SIGTERM or
@@ -95,7 +100,7 @@ fn signal_child_pgroup_or_fallback(
             ?raw_pid,
             signal,
             phase = %phase,
-            reason = if raw_pid.is_none() { "process_id-returned-none" } else { "pid_to_pgid-rejected" },
+            reason = "pid_to_pgid-rejected",
             "signal_child_pgroup_or_fallback: pgid unavailable — falling back to portable_pty::Child::kill (SIGHUP, single-PID; descendants will leak)"
         );
         let _ = child.kill();

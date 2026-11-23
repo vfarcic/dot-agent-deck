@@ -78,20 +78,25 @@
 //! the whole request (`bad-selection`), and at most [`MAX_PENDING_RESTORES`]
 //! requests are prepared or running at once (`too-many-pending`).
 //!
-//! **One writer per conversation** (audit F1, F2). Before an agent is
-//! started, its attempt and the conversation a restore resumes into are
-//! claimed, in this daemon ([`InFlight`]) and across every daemon sharing the
-//! state directory ([`claim`]: a `flock`ed file per attempt and per
-//! conversation in an owner-only directory of it). With the claims held,
-//! every check above runs again from a fresh read ([`revalidate`]). A
-//! started agent's claims are released once its successor link,
-//! `attempt_restored` with the conversation it was confirmed in, has been
-//! written and waited for (audit B1), or once it was stopped after a
-//! failure. A link that cannot be written stops the agent (`not-recorded`);
-//! a failure whose stop can be neither proven nor recorded keeps the claims
-//! for this daemon's life ([`keep_fenced`]). A second request meanwhile is
-//! refused (`already-restoring`, `session-in-use`); one after it finds the
-//! item closed, or the new agent in the conversation.
+//! **One restore at a time, one writer per conversation** (audit F1, F2,
+//! round 5). A restore or start over that acts holds the state directory's
+//! one restore lock ([`claim::restore_lock`]) from just after its first read
+//! to its answer; another one meanwhile, from this daemon or another on the
+//! state directory, is refused whole (`restore-busy`). A dry run takes no
+//! lock. Before an agent is started, its attempt and the conversation a
+//! restore resumes into are claimed too, in this daemon ([`InFlight`]) and
+//! across every daemon sharing the state directory ([`claim`]: a `flock`ed
+//! file per attempt and per conversation in an owner-only directory of it).
+//! With them held, every check above runs again from a fresh read
+//! ([`revalidate`]), fences included. A started agent's claims are released
+//! once its successor link, `attempt_restored` with the conversation it was
+//! confirmed in, has been written and waited for (audit B1), or once it was
+//! stopped after a failure. A link that cannot be written stops the agent
+//! (`not-recorded`); a failure whose stop can be neither proven nor recorded
+//! writes a durable fence marker instead ([`keep_fenced`]). Every fence is
+//! written with the lock held, so no restore that acts is between its checks
+//! and its spawn when one appears. A request after it finds the item closed,
+//! the new agent in the conversation, or the fence.
 //!
 //! **Restore.** The restart note is admitted to the inbox first
 //! (`note-refused`, review R#4). The agent is started as a dashboard pane of
@@ -138,8 +143,9 @@
 //! leader stopped first and killed last, while that leader, named by the
 //! pid and start time read as it was spawned, shows the session is still
 //! the launch's ([`sweep_session`]: identity-checked, through a pidfd on
-//! Linux); then closes it as `StopAgent` would. It answers stopped only once
-//! no process in that session can run.
+//! Linux); then retires the agent's signals and closes it as `StopAgent`
+//! would, without a signal (round 5, N1). It answers stopped only once no
+//! process in that session can run.
 //!
 //! **What this does not guard against.** Another process can change the
 //! folder between the last check and the spawn, as for reclaim, and GitHub
@@ -150,12 +156,15 @@
 //! which no program of the agent's name is started through `PATH` (the
 //! agent called by an absolute path, `PATH` replaced) gets no
 //! acknowledgement, so it is not confirmed (`not-resumed`, `not-fresh`). A
-//! Claude Code start over is confirmed by the new conversation the agent
-//! reports, however it was started; for Codex, OpenCode, Pi and Devin the
-//! check is of the arguments the shim sees, so a script of the user's named
-//! after the agent that selects a conversation itself, or a program a launch
-//! starts after its fresh-start token was spent, is not checked (round-4
-//! F3/B1).
+//! Claude Code start over is confirmed by the first conversation the launch
+//! reports; for Codex, OpenCode, Pi and Devin the check is of the arguments
+//! the shim sees, so a script of the user's named after the agent that
+//! selects a conversation itself is not checked (round-4 F3/B1). For every
+//! agent, a program the user's command or script starts after the first one
+//! (a second Claude Code in a conversation it chose, say) is not checked: the
+//! deck verifies the first conversation the launch reports (round 5, B3). An
+//! agent started some other way than a restore or start over takes no
+//! restore lock and reads no fence.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -230,18 +239,18 @@ fn note_post_refused_for_test() -> bool {
     false
 }
 
-/// In an e2e build only: a start over waits here, after its request was
-/// read and checked and before anything of [`start`], while the file
-/// `DOT_AGENT_DECK_TEST_RESTORE_BARRIER` names exists (at most two minutes),
-/// having first created that path with the extension `reached`. Lane 1's
-/// `journal/restore/020` restores the agent meanwhile, to show a request
-/// prepared before another acted reads everything again (audit F1).
+/// In an e2e build only: a start over that acts waits here, after its
+/// request was read and checked and before it takes the restore lock or
+/// anything of [`start`], while the file `DOT_AGENT_DECK_TEST_RESTORE_BARRIER`
+/// names exists (at most two minutes), having first created that path with
+/// the extension `reached`. Lane 1's `journal/restore/020` restores the agent
+/// meanwhile, to show a request prepared before another acted reads
+/// everything again (audit F1). With `DOT_AGENT_DECK_TEST_RESTORE_LOCK_BARRIER`
+/// instead, a restore or start over that acts waits the same way just after
+/// it took the restore lock (round 5, `journal/restore/033`).
 #[cfg(feature = "e2e")]
-async fn test_barrier(want: Want) {
-    if want != Want::StartOver {
-        return;
-    }
-    let Some(path) = std::env::var_os("DOT_AGENT_DECK_TEST_RESTORE_BARRIER") else {
+async fn test_barrier(var: &str) {
+    let Some(path) = std::env::var_os(var) else {
         return;
     };
     let path = std::path::PathBuf::from(path);
@@ -263,16 +272,11 @@ static REQUESTS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_PENDING_RESTORES));
 
 /// What the running restores and start-overs hold: each one's attempt, and
-/// for a restore the conversation it resumes into; and what agents this
-/// daemon could neither prove stopped nor record fence for the rest of its
-/// life ([`keep_fenced`], round-4 B2): conversations, and agent kinds whose
-/// survivor's conversation is not known (`None`: of a kind not known).
+/// for a restore the conversation it resumes into.
 #[derive(Default)]
 struct Held {
     attempts: HashSet<AttemptId>,
     sessions: HashSet<String>,
-    fenced_sessions: HashSet<String>,
-    fenced_kinds: HashSet<Option<AgentType>>,
 }
 
 static IN_FLIGHT: LazyLock<Mutex<Held>> = LazyLock::new(|| Mutex::new(Held::default()));
@@ -281,30 +285,23 @@ static IN_FLIGHT: LazyLock<Mutex<Held>> = LazyLock::new(|| Mutex::new(Held::defa
 /// against a second restore or start-over in this daemon until dropped: of
 /// the same attempt (`already-restoring`), or of any attempt into the same
 /// conversation (`session-in-use`, audit "later slices" 3); and at most
-/// [`MAX_PENDING_RESTORES`] at once (`too-many-pending`). A restore of an
-/// agent of `kind` is refused `session-in-use` too while this daemon fences
-/// its conversation or its kind ([`keep_fenced`]). [`claim`] holds the same
-/// against another daemon on the state directory.
+/// [`MAX_PENDING_RESTORES`] at once (`too-many-pending`). [`claim`] holds
+/// the same against another daemon on the state directory. A dry run takes
+/// these too, so it answers `already-restoring` while one acts; what keeps
+/// two restores that act from interleaving is [`claim::restore_lock`].
 struct InFlight {
     attempt: AttemptId,
     session: Option<String>,
 }
 
 impl InFlight {
-    fn take(
-        attempt: &AttemptId,
-        session: Option<&str>,
-        kind: Option<&AgentType>,
-    ) -> Result<Self, RestoreRefusal> {
+    fn take(attempt: &AttemptId, session: Option<&str>) -> Result<Self, RestoreRefusal> {
         let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
         if held.attempts.contains(attempt) {
             return Err(RestoreRefusal::AlreadyRestoring);
         }
         if let Some(session) = session
-            && (held.sessions.contains(session)
-                || held.fenced_sessions.contains(session)
-                || held.fenced_kinds.contains(&None)
-                || held.fenced_kinds.contains(&kind.cloned()))
+            && held.sessions.contains(session)
         {
             return Err(RestoreRefusal::SessionInUse);
         }
@@ -338,16 +335,38 @@ impl Drop for InFlight {
 /// conversation; a claim is an exclusive `flock` on that file, taken without
 /// waiting, so a second daemon's claim of either is refused. The lock goes
 /// with the descriptor, so a daemon that dies releases what it held.
+///
+/// Round 5 (R1, R2): the same directory holds the state directory's one
+/// [`RESTORE_LOCK`], which every restore and start over that acts holds from
+/// before its claims to its answer ([`restore_lock`]), and the durable
+/// [`Marker`]s of agents a failed start could neither prove stopped nor
+/// record ([`super::keep_fenced`]).
 #[cfg(unix)]
 pub(crate) mod claim {
+    use std::io::{Read as _, Write as _};
     use std::path::Path;
 
+    use serde::{Deserialize, Serialize};
+
+    use crate::event::AgentType;
     use crate::interrupted_work::RestoreRefusal;
     use crate::platform::trusted_dir::TrustedDir;
     use crate::work_journal::AttemptId;
 
     /// The claims directory, under the state directory.
     pub(crate) const CLAIMS_DIR: &str = "restore-claims";
+
+    /// Round 5: the file the state directory's one restore lock locks. It
+    /// is never removed, so every daemon locks the same file.
+    pub(crate) const RESTORE_LOCK: &str = "restore.lock";
+
+    /// Round 5: what a fence marker's name starts and ends with.
+    const MARKER_PREFIX: &str = "fence-";
+    const MARKER_SUFFIX: &str = ".json";
+
+    /// The most a marker file is read; a longer one fences like one that
+    /// cannot be read.
+    const MARKER_MAX_BYTES: u64 = 64 * 1024;
 
     /// One claimed name. Dropping it removes the name while the lock is
     /// still held, then closes the file, which releases the lock: a claimer
@@ -385,28 +404,10 @@ pub(crate) mod claim {
         format!("session-{}.lock", hex(session))
     }
 
-    /// Round-4 B2: the file a fence on every conversation of agents of
-    /// `kind` locks (`None`: of every kind), held by a daemon that could
-    /// neither prove an agent of that kind stopped nor record it
-    /// ([`super::keep_fenced`]).
-    pub(crate) fn kind_name(kind: Option<&crate::event::AgentType>) -> String {
-        let key = kind
-            .and_then(|kind| serde_json::to_value(kind).ok())
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| "any".to_string());
-        format!("kind-{}.lock", hex(&key))
-    }
-
-    /// Whether another descriptor holds `name`'s lock in `dir` now, looked
-    /// at without taking the claim: the name is left as it was.
-    fn held_elsewhere(dir: &TrustedDir, name: &str) -> std::io::Result<bool> {
-        let file = match dir.open_regular(name) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        // The lock, if taken, goes with `file`; the name stays.
-        Ok(!crate::platform::lock::try_lock_file(&file)?)
+    /// The claims directory under `state_dir`, created owner-only when
+    /// `create`.
+    fn claims_dir(state_dir: &Path, create: bool) -> std::io::Result<TrustedDir> {
+        TrustedDir::anchor(state_dir).and_then(|anchor| anchor.child(CLAIMS_DIR, create))
     }
 
     /// Lock `name` in `dir` without waiting: `Ok(None)` when another
@@ -444,23 +445,18 @@ pub(crate) mod claim {
 
     /// Claim `attempt`, then `session` when given, in the state directory
     /// `state_dir`. Refused `already-restoring` or `session-in-use` when
-    /// another daemon holds either, and `session-in-use` for a `session`
-    /// while a daemon fences the conversations of agents of `kind`, or of
-    /// every kind ([`kind_name`]); `spawn-failed` when the directory cannot
-    /// be opened or a lock cannot be taken or looked at for another reason.
+    /// another daemon holds either; `spawn-failed` when the directory cannot
+    /// be opened or a lock cannot be taken for another reason.
     pub(crate) fn take(
         state_dir: &Path,
         attempt: &AttemptId,
         session: Option<&str>,
-        kind: Option<&crate::event::AgentType>,
     ) -> Result<Claims, RestoreRefusal> {
         let failed = |error: std::io::Error| {
             tracing::warn!(%error, "restore: could not take a claim in the state directory");
             RestoreRefusal::SpawnFailed
         };
-        let dir = TrustedDir::anchor(state_dir)
-            .and_then(|anchor| anchor.child(CLAIMS_DIR, true))
-            .map_err(failed)?;
+        let dir = claims_dir(state_dir, true).map_err(failed)?;
         let mut held = Vec::new();
         match lock(&dir, &attempt_name(attempt)).map_err(failed)? {
             Some(one) => held.push(one),
@@ -471,62 +467,262 @@ pub(crate) mod claim {
                 Some(one) => held.push(one),
                 None => return Err(RestoreRefusal::SessionInUse),
             }
-            for fence in [kind_name(None), kind_name(kind)] {
-                if held_elsewhere(&dir, &fence).map_err(failed)? {
-                    return Err(RestoreRefusal::SessionInUse);
-                }
-            }
         }
         Ok(Claims { _held: held })
     }
 
-    /// Round-4 B2: hold, for as long as the answer is kept, a claim on each
-    /// of `sessions` and, when `kind` is given, on the fence of every
-    /// conversation of agents of that kind (`Some(None)`: of every kind), in
-    /// `state_dir`. What could not be held is left out; `held_all` says
-    /// whether anything was.
-    pub(crate) fn fence(
-        state_dir: &Path,
-        sessions: &[String],
-        kind: Option<Option<&crate::event::AgentType>>,
-    ) -> Fence {
-        let mut out = Fence {
-            _held: Vec::new(),
-            held_all: true,
-        };
-        let Ok(dir) =
-            TrustedDir::anchor(state_dir).and_then(|anchor| anchor.child(CLAIMS_DIR, true))
-        else {
-            out.held_all = false;
-            return out;
-        };
-        let names = sessions
-            .iter()
-            .map(|session| session_name(session))
-            .chain(kind.map(kind_name));
-        for name in names {
-            // A daemon only looking at a kind's fence holds its lock for a
-            // moment: try again a few times.
-            let mut taken = None;
-            for _ in 0..5 {
-                if let Ok(Some(one)) = lock(&dir, &name) {
-                    taken = Some(one);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            match taken {
-                Some(one) => out._held.push(one),
-                None => out.held_all = false,
-            }
-        }
-        out
+    /// Round 5 (R1, R2): the state directory's one restore lock, held while
+    /// a restore or start over acts. The file stays when it is dropped; only
+    /// the lock goes, with the descriptor (and with a daemon that dies).
+    pub(crate) struct RestoreLock {
+        _file: std::fs::File,
     }
 
-    /// What [`fence`] holds.
-    pub(crate) struct Fence {
-        _held: Vec<One>,
-        pub(crate) held_all: bool,
+    /// Take the state directory's restore lock without waiting. Refused
+    /// `restore-busy` while any descriptor holds it, in this daemon or in
+    /// another one on the state directory (an `flock` belongs to the open
+    /// file, not the process); `spawn-failed` when the directory or the file
+    /// cannot be opened or locked for another reason.
+    pub(crate) fn restore_lock(state_dir: &Path) -> Result<RestoreLock, RestoreRefusal> {
+        let failed = |error: std::io::Error| {
+            tracing::warn!(%error, "restore: could not take the restore lock");
+            RestoreRefusal::SpawnFailed
+        };
+        let dir = claims_dir(state_dir, true).map_err(failed)?;
+        let file = match dir.create_new_owner_only(RESTORE_LOCK) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                dir.open_regular(RESTORE_LOCK).map_err(failed)?
+            }
+            Err(e) => return Err(failed(e)),
+        };
+        if !crate::platform::lock::try_lock_file(&file).map_err(failed)? {
+            return Err(RestoreRefusal::RestoreBusy);
+        }
+        Ok(RestoreLock { _file: file })
+    }
+
+    /// Round 5 (R1, R2): a durable fence on what an agent a failed restore or
+    /// start over started may be writing to, written when the deck could
+    /// neither prove that agent stopped nor record its failure in the
+    /// journal. Every restore's checks read every marker
+    /// ([`Markers::read`]); one is lifted only once the agent it names is
+    /// proven gone.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub(crate) struct Marker {
+        /// The attempt whose restore or start over started the agent.
+        pub(crate) from: AttemptId,
+        /// The agent's own attempt, when the journal gave it one.
+        #[serde(default)]
+        pub(crate) to: Option<AttemptId>,
+        /// The agent's session leader, named by pid and start time as it was
+        /// spawned, when those were read.
+        #[serde(default)]
+        pub(crate) pid: Option<u32>,
+        #[serde(default)]
+        pub(crate) pid_start: Option<u64>,
+        /// The conversations it may be writing to.
+        #[serde(default)]
+        pub(crate) sessions: Vec<String>,
+        /// Whether the one it is in is not known: then every conversation of
+        /// agents of `kind` is fenced (`kind` not known: of every kind).
+        #[serde(default)]
+        pub(crate) unknown: bool,
+        #[serde(default)]
+        pub(crate) kind: Option<AgentType>,
+    }
+
+    impl Marker {
+        /// Whether this marker fences `session`, a conversation of an agent
+        /// of `kind`, the way a journal fence does
+        /// ([`super::Sessions::fenced`]).
+        fn covers(&self, session: &str, kind: Option<&AgentType>) -> bool {
+            let same_kind = match (&self.kind, kind) {
+                (Some(theirs), Some(ours)) => theirs == ours,
+                _ => true,
+            };
+            self.sessions.iter().any(|fenced| fenced == session) || (self.unknown && same_kind)
+        }
+    }
+
+    /// Write `marker` to the claims directory of `state_dir` under a name
+    /// of its own, durably: written to a temporary name, synced, renamed,
+    /// and the directory synced.
+    pub(crate) fn write_marker(state_dir: &Path, marker: &Marker) -> std::io::Result<()> {
+        let dir = claims_dir(state_dir, true)?;
+        let mut id = [0u8; 8];
+        getrandom::fill(&mut id).map_err(std::io::Error::other)?;
+        let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        let name = format!("{MARKER_PREFIX}{id}{MARKER_SUFFIX}");
+        let tmp = format!("{MARKER_PREFIX}{id}.tmp");
+        let body = serde_json::to_vec(marker).map_err(std::io::Error::other)?;
+        let written = (|| {
+            let mut file = dir.create_new_owner_only(&tmp)?;
+            file.write_all(&body)?;
+            file.sync_all()?;
+            dir.rename(&tmp, &name)?;
+            dir.sync()
+        })();
+        if written.is_err() {
+            let _ = dir.remove_file(&tmp);
+        }
+        written
+    }
+
+    /// One marker as read: what it says, or that it could not be read.
+    #[derive(Debug)]
+    enum Read {
+        Marker(String, Marker),
+        /// A marker that cannot be read, or a claims directory that cannot
+        /// be listed: it fences every conversation (it fails closed).
+        Unreadable,
+    }
+
+    /// Round 5: every fence marker of a state directory, as one read found
+    /// them.
+    #[derive(Debug, Default)]
+    pub(crate) struct Markers {
+        read: Vec<Read>,
+    }
+
+    impl Markers {
+        /// Read every marker of `state_dir`. No claims directory: none. A
+        /// directory that cannot be opened or listed, or a marker that
+        /// cannot be opened, read or parsed, reads as one that fences every
+        /// conversation, and is logged.
+        pub(crate) fn read(state_dir: &Path) -> Self {
+            let unreadable = |what: &str, error: &dyn std::fmt::Display| {
+                tracing::warn!(%error, what, "restore: a fence marker could not be read; every restore is refused until it can");
+                Markers {
+                    read: vec![Read::Unreadable],
+                }
+            };
+            let dir = match claims_dir(state_dir, false) {
+                Ok(dir) => dir,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Markers::default(),
+                Err(e) => return unreadable("the claims directory", &e),
+            };
+            let mut stream = match dir.stream() {
+                Ok(stream) => stream,
+                Err(e) => return unreadable("the claims directory", &e),
+            };
+            let mut out = Markers::default();
+            while let Some(name) = stream.next_name() {
+                let name = match name {
+                    Ok(name) => name,
+                    Err(e) => return unreadable("the claims directory", &e),
+                };
+                let Some(name) = name.to_str() else { continue };
+                if !(name.starts_with(MARKER_PREFIX) && name.ends_with(MARKER_SUFFIX)) {
+                    continue;
+                }
+                let parsed = dir.open_regular(name).and_then(|file| {
+                    let mut body = Vec::new();
+                    file.take(MARKER_MAX_BYTES + 1).read_to_end(&mut body)?;
+                    if body.len() as u64 > MARKER_MAX_BYTES {
+                        return Err(std::io::Error::other("too long"));
+                    }
+                    serde_json::from_slice::<Marker>(&body).map_err(std::io::Error::other)
+                });
+                match parsed {
+                    Ok(marker) => out.read.push(Read::Marker(name.to_string(), marker)),
+                    // Lifted between the listing and the open.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(%e, name, "restore: a fence marker could not be read; every restore is refused until it can");
+                        out.read.push(Read::Unreadable);
+                    }
+                }
+            }
+            out
+        }
+
+        /// Whether a marker could not be read (or the directory listed):
+        /// every restore and start over is refused while one cannot.
+        pub(crate) fn unreadable(&self) -> bool {
+            self.read
+                .iter()
+                .any(|read| matches!(read, Read::Unreadable))
+        }
+
+        /// Whether a marker fences `session`, a conversation of an agent of
+        /// `kind`, and the agent it names is not proven gone (`gone`).
+        pub(crate) fn fenced(
+            &self,
+            session: &str,
+            kind: Option<&AgentType>,
+            gone: &dyn Fn(&Marker) -> bool,
+        ) -> bool {
+            self.read.iter().any(|read| match read {
+                Read::Unreadable => true,
+                Read::Marker(_, marker) => marker.covers(session, kind) && !gone(marker),
+            })
+        }
+
+        /// Whether a marker names an agent a failed start of `from` started
+        /// that is not proven gone (`gone`): what the journal's
+        /// `restore_failed` `to` says when it could be written (audit F4).
+        /// An unreadable marker counts.
+        pub(crate) fn left_by(&self, from: &AttemptId, gone: &dyn Fn(&Marker) -> bool) -> bool {
+            self.read.iter().any(|read| match read {
+                Read::Unreadable => true,
+                Read::Marker(_, marker) => marker.from == *from && !gone(marker),
+            })
+        }
+
+        /// Remove, from `state_dir`, every marker this read found whose
+        /// agent is proven gone (`gone`). Answers how many were removed.
+        pub(crate) fn lift_gone(&self, state_dir: &Path, gone: &dyn Fn(&Marker) -> bool) -> usize {
+            let Ok(dir) = claims_dir(state_dir, false) else {
+                return 0;
+            };
+            let mut lifted = 0;
+            for read in &self.read {
+                if let Read::Marker(name, marker) = read
+                    && gone(marker)
+                    && dir.remove_file(name).is_ok()
+                {
+                    lifted += 1;
+                }
+            }
+            if lifted > 0 {
+                let _ = dir.sync();
+            }
+            lifted
+        }
+    }
+}
+
+/// Off Unix nothing is restored ([`restore`] refuses `unsupported`): what
+/// the shared checks name of [`claim`], and nothing more.
+#[cfg(not(unix))]
+pub(crate) mod claim {
+    use crate::event::AgentType;
+    use crate::work_journal::AttemptId;
+
+    pub(crate) struct Marker;
+
+    #[derive(Default)]
+    pub(crate) struct Markers;
+
+    impl Markers {
+        pub(crate) fn read(_: &std::path::Path) -> Self {
+            Markers
+        }
+        pub(crate) fn unreadable(&self) -> bool {
+            false
+        }
+        pub(crate) fn fenced(
+            &self,
+            _: &str,
+            _: Option<&AgentType>,
+            _: &dyn Fn(&Marker) -> bool,
+        ) -> bool {
+            false
+        }
+        pub(crate) fn left_by(&self, _: &AttemptId, _: &dyn Fn(&Marker) -> bool) -> bool {
+            false
+        }
     }
 }
 
@@ -797,6 +993,8 @@ fn prepare(
         Ok(read) if !read.truncated && read.skipped == 0 => read.records,
         _ => return Err(refuse(RestoreRefusal::IncompleteRead)),
     };
+    // Round 5 (R1, R2): the fences the journal could not hold.
+    let markers = claim::Markers::read(state_dir);
     let works = CloseSets::build(&snap.read).works_under(&item.id);
     let sessions = Sessions::of(&snap.read);
     let live = |run: &str| journal.run_is_live(run);
@@ -830,8 +1028,10 @@ fn prepare(
         .into_iter()
         .map(|agent| {
             let agent = agent?;
-            check_agent(&sessions, &live, &launches, &works, &item, agent, want)
-                .map_err(|reason| RestoreRefused::new(Some(agent.attempt.clone()), reason))
+            check_agent(
+                &sessions, &markers, &live, &launches, &works, &item, agent, want,
+            )
+            .map_err(|reason| RestoreRefused::new(Some(agent.attempt.clone()), reason))
         })
         .collect();
     drop(sessions);
@@ -887,9 +1087,54 @@ pub(crate) fn successor_gone_check(state_dir: &Path) -> impl Fn(&AttemptId) -> b
     }
 }
 
+/// Round 5: whether the agent a fence `marker` names is proven gone
+/// ([`launch_gone`]): by the session leader it names, or else by the launch
+/// record of its attempt in `launches`. Neither known: never.
+fn marker_gone(marker: &claim::Marker, launches: &[LaunchRecord]) -> bool {
+    #[cfg(unix)]
+    {
+        if let (Some(pid), Some(start)) = (marker.pid, marker.pid_start) {
+            return leader_gone(pid, start).is_ok();
+        }
+        marker.to.as_ref().is_some_and(|to| {
+            let mut records = launches.iter().filter(|r| r.attempt == *to);
+            match (records.next(), records.next()) {
+                (Some(record), None) => launch_gone(record).is_ok(),
+                _ => false,
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (marker, launches);
+        false
+    }
+}
+
+/// [`launch_gone`] for a session leader named by `pid` and its start time
+/// `start` rather than by a launch record.
+#[cfg(unix)]
+fn leader_gone(pid: u32, start: u64) -> Result<(), ProcessNotGone> {
+    use crate::platform::proc::{ProcessProbe, probe_process};
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(ProcessNotGone::OldProcessUnknown);
+    }
+    if i32::try_from(pid).is_err() {
+        return Ok(());
+    }
+    match probe_process(pid) {
+        ProcessProbe::Started(now) if now == start => return Err(ProcessNotGone::StillRunning),
+        ProcessProbe::Started(_) | ProcessProbe::Absent | ProcessProbe::Exited => {}
+        ProcessProbe::Unknown => return Err(ProcessNotGone::OldProcessUnknown),
+    }
+    old_session_left(pid)
+}
+
 /// The checks of one agent of the item.
+#[allow(clippy::too_many_arguments)]
 fn check_agent(
     sessions: &Sessions<'_>,
+    markers: &claim::Markers,
     live: &dyn Fn(&str) -> bool,
     launches: &[LaunchRecord],
     works: &[WorkId],
@@ -910,6 +1155,11 @@ fn check_agent(
     if !offers(agent.restore, want) {
         return Err(RestoreRefusal::NotRestorable);
     }
+    // Round 5: a fence marker that cannot be read fails closed.
+    if markers.unreadable() {
+        return Err(RestoreRefusal::IncompleteRead);
+    }
+    let gone = |marker: &claim::Marker| marker_gone(marker, launches);
     let mut records = launches.iter().filter(|r| r.attempt == agent.attempt);
     let record = match (records.next(), records.next()) {
         (None, _) => return Err(RestoreRefusal::NoLaunchRecord),
@@ -963,6 +1213,7 @@ fn check_agent(
             }
             if sessions.in_use(&agent.attempt, session, live)
                 || sessions.fenced(session, agent_type.as_ref(), launches)
+                || markers.fenced(session, agent_type.as_ref(), &gone)
             {
                 return Err(RestoreRefusal::SessionInUse);
             }
@@ -1001,6 +1252,10 @@ fn check_agent(
                 return Err(RestoreRefusal::OldProcessUnknown);
             }
         }
+    }
+    // Round 5: the same for one whose failure only a marker holds.
+    if markers.left_by(&agent.attempt, &gone) {
+        return Err(RestoreRefusal::StillRunning);
     }
     Ok(Target {
         attempt: agent.attempt.clone(),
@@ -1242,6 +1497,17 @@ pub async fn restore(
         targets,
     } = prepared;
     outcome.item = Some(item.id.to_string());
+    // Round 5 (R1, R2): a restore that acts holds the state directory's one
+    // restore lock from here to its answer; one is refused whole while
+    // another holds it. A dry run does not take it.
+    let lock = if dry_run {
+        Mutex::new(None)
+    } else {
+        match acting_lock(&journal).await {
+            Ok(lock) => Mutex::new(Some(lock)),
+            Err(reason) => return whole(outcome, reason),
+        }
+    };
     // §4 item 10 and review R#3: what Git and GitHub say of the item. A dry
     // run carries it, an open pull request above all, so the question can
     // show it; it refuses a restore only when the worktree is gone, since a
@@ -1270,7 +1536,17 @@ pub async fn restore(
                 .push(RestoreRefused::new(Some(target.attempt), reason));
             continue;
         }
-        match start(&daemon, &journal, &item.id, target, Some(mode), dry_run).await {
+        match start(
+            &daemon,
+            &journal,
+            &item.id,
+            target,
+            Some(mode),
+            dry_run,
+            &lock,
+        )
+        .await
+        {
             Started::Would(attempt) => outcome.would_restore.push(attempt),
             Started::Done(agent) => outcome.restored.push(agent),
             Started::Refused(refused) => outcome.refused.push(refused),
@@ -1345,7 +1621,19 @@ pub async fn start_over(
     {
         return refused(RestoreRefused::new(Some(target.attempt), reason), item_id);
     }
-    match start(&daemon, &journal, &item.id, target, None, dry_run).await {
+    // Round 5 (R1, R2): as a restore, a start over that acts holds the
+    // restore lock to its answer.
+    let lock = if dry_run {
+        Mutex::new(None)
+    } else {
+        #[cfg(feature = "e2e")]
+        test_barrier("DOT_AGENT_DECK_TEST_RESTORE_BARRIER").await;
+        match acting_lock(&journal).await {
+            Ok(lock) => Mutex::new(Some(lock)),
+            Err(reason) => return refused(RestoreRefused::new(None, reason), item_id),
+        }
+    };
+    match start(&daemon, &journal, &item.id, target, None, dry_run, &lock).await {
         Started::Would(_) => StartOverOutcome {
             dry_run,
             would_start: true,
@@ -1361,6 +1649,45 @@ pub async fn start_over(
         },
         Started::Refused(refusal) => refused(refusal, item_id),
     }
+}
+
+/// Round 5 (R1, R2): the state directory's restore lock for a request that
+/// acts ([`claim::restore_lock`]), taken without waiting; once it is held,
+/// the fence markers whose agent is proven gone are lifted. Refused
+/// `restore-busy` while another request, in this daemon or another one on
+/// the state directory, holds it.
+#[cfg(unix)]
+async fn acting_lock(journal: &WorkJournal) -> Result<claim::RestoreLock, RestoreRefusal> {
+    let Some(state_dir) = journal.state_dir().map(Path::to_path_buf) else {
+        return Err(RestoreRefusal::IncompleteRead);
+    };
+    let lock = tokio::task::spawn_blocking(move || {
+        let lock = claim::restore_lock(&state_dir)?;
+        let launches = match crate::launch_records::read_all_with_stats(&state_dir) {
+            Ok(read) if !read.truncated && read.skipped == 0 => read.records,
+            _ => Vec::new(),
+        };
+        let lifted = claim::Markers::read(&state_dir)
+            .lift_gone(&state_dir, &|marker| marker_gone(marker, &launches));
+        if lifted > 0 {
+            tracing::info!(
+                lifted,
+                "restore: lifted fences whose agents are proven gone"
+            );
+        }
+        Ok(lock)
+    })
+    .await
+    .unwrap_or(Err(RestoreRefusal::SpawnFailed))?;
+    #[cfg(feature = "e2e")]
+    test_barrier("DOT_AGENT_DECK_TEST_RESTORE_LOCK_BARRIER").await;
+    Ok(lock)
+}
+
+/// Off Unix nothing acts ([`restore`] refuses `unsupported` first).
+#[cfg(not(unix))]
+async fn acting_lock(_journal: &WorkJournal) -> Result<(), RestoreRefusal> {
+    Err(RestoreRefusal::Unsupported)
 }
 
 /// What starting one agent came to.
@@ -1381,6 +1708,7 @@ async fn start(
     target: Target,
     _mode: Option<RestoreMode>,
     _dry_run: bool,
+    _lock: &Mutex<Option<()>>,
 ) -> Started {
     Started::Refused(RestoreRefused::new(
         Some(target.attempt),
@@ -1389,11 +1717,12 @@ async fn start(
 }
 
 /// Start `target`, an agent of the item `item`: resumed when `mode` is set,
-/// started over otherwise. Its claims are taken first and every check runs
-/// again with them held ([`revalidate`]), Git and GitHub among them for a
-/// start that acts (audit S5); the folder is checked here, last before the
-/// spawn, and a dispatched unit's saved task is read through the held
-/// folder.
+/// started over otherwise. A start that acts runs with the request's restore
+/// lock held in `lock` ([`acting_lock`]); its claims are taken first and
+/// every check runs again with them held ([`revalidate`]), Git and GitHub
+/// among them for a start that acts (audit S5); the folder is checked here,
+/// last before the spawn, and a dispatched unit's saved task is read through
+/// the held folder.
 #[cfg(unix)]
 async fn start(
     daemon: &Daemon<'_>,
@@ -1402,6 +1731,7 @@ async fn start(
     target: Target,
     mode: Option<RestoreMode>,
     dry_run: bool,
+    lock: &Mutex<Option<claim::RestoreLock>>,
 ) -> Started {
     use std::os::fd::AsFd as _;
     let want = if mode.is_some() {
@@ -1409,27 +1739,16 @@ async fn start(
     } else {
         Want::StartOver
     };
-    #[cfg(feature = "e2e")]
-    test_barrier(want).await;
     let attempt = target.attempt.clone();
     let refuse = |reason| Started::Refused(RestoreRefused::new(Some(attempt.clone()), reason));
-    let held = match InFlight::take(
-        &target.attempt,
-        target.session.as_deref(),
-        target.agent_type.as_ref(),
-    ) {
+    let held = match InFlight::take(&target.attempt, target.session.as_deref()) {
         Ok(held) => held,
         Err(reason) => return refuse(reason),
     };
     let Some(state_dir) = journal.state_dir() else {
         return refuse(RestoreRefusal::IncompleteRead);
     };
-    let claims = match claim::take(
-        state_dir,
-        &target.attempt,
-        target.session.as_deref(),
-        target.agent_type.as_ref(),
-    ) {
+    let claims = match claim::take(state_dir, &target.attempt, target.session.as_deref()) {
         Ok(claims) => claims,
         Err(reason) => return refuse(reason),
     };
@@ -1640,9 +1959,11 @@ async fn start(
     // to, which no restore enters until that agent is proven gone (audit
     // B2); when the deck does not know which conversation it is in, no
     // restore of an agent of its kind starts until then (round-4 B2). A
-    // record that cannot be written leaves the claims held for this daemon's
-    // life instead, with a claim on each of those conversations, or on the
-    // kind, beside them: the fence it could not write ([`keep_fenced`]).
+    // record that cannot be written leaves a fence marker in the claims
+    // directory instead, the same fence, read by every later restore's
+    // checks ([`keep_fenced`], round 5). Both are written with the restore
+    // lock held, so no restore that acts is between its checks and its
+    // spawn meanwhile.
     let held = Mutex::new(Some((held, claims)));
     let kind = target.agent_type.clone();
     let fail = |failure: Option<(RestoreFailure, Option<ShimOutcome>)>, fence: Fence, reason| {
@@ -1686,9 +2007,17 @@ async fn start(
             if !stopped && (!recorded || new_attempt.is_none()) {
                 keep_fenced(
                     held.lock().unwrap_or_else(|e| e.into_inner()).take(),
+                    lock,
                     journal.state_dir(),
-                    &fence,
-                    kind.as_ref(),
+                    claim::Marker {
+                        from: attempt.clone(),
+                        to: new_attempt.clone(),
+                        pid: leader.map(|leader| leader.pid),
+                        pid_start: leader.map(|leader| leader.start),
+                        sessions: fence.sessions.clone(),
+                        unknown: fence.unknown,
+                        kind: kind.clone(),
+                    },
                 );
             }
             Started::Refused(RestoreRefused::new(
@@ -1899,48 +2228,49 @@ impl Fence {
     }
 }
 
-/// Audit B1/B2, round-4 B2: what an agent's start held, kept for the rest of
-/// this daemon's life when the deck could neither prove that agent stopped
-/// nor write that down, and beside it a claim on each conversation `fence`
-/// names and, when the one it is in is not known, on every conversation of
-/// its `kind` (in this daemon, and as a claim file in the state directory
-/// `state_dir`): no other restore in this daemon enters its attempt or one
-/// of those conversations meanwhile, nor one in another daemon on the state
-/// directory, for each claim this one could take. A claim another daemon
-/// held at that moment could not be taken, and is logged.
+/// Round 5 (R1, R2): fence, durably, an agent a start could neither prove
+/// stopped nor record: write `marker` to the claims directory of
+/// `state_dir`, which every later restore's checks, in any daemon on the
+/// state directory and after a restart, read and refuse on until the agent
+/// it names is proven gone ([`claim::Markers`]). A marker is a file of its
+/// own, so no claim another request holds can keep it from being written.
+/// The start's claims (`held`) are released once it is written. A marker
+/// that cannot be written keeps them, and the request's restore `lock`,
+/// for the rest of this daemon's life: no restore or start over acts in any
+/// daemon on the state directory meanwhile (`restore-busy`).
 #[cfg(unix)]
 fn keep_fenced(
     held: Option<(InFlight, claim::Claims)>,
+    lock: &Mutex<Option<claim::RestoreLock>>,
     state_dir: Option<&Path>,
-    fence: &Fence,
-    kind: Option<&AgentType>,
+    marker: claim::Marker,
 ) {
-    /// One fence kept: the start's own claims, and the ones taken for it.
-    type Kept = (Option<(InFlight, claim::Claims)>, Option<claim::Fence>);
-    static FENCED: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
-    {
-        let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        in_flight
-            .fenced_sessions
-            .extend(fence.sessions.iter().cloned());
-        if fence.unknown {
-            in_flight.fenced_kinds.insert(kind.cloned());
+    /// What a fence that could not be written keeps.
+    type Kept = (
+        Option<(InFlight, claim::Claims)>,
+        Option<claim::RestoreLock>,
+    );
+    static KEPT: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+    let written = match state_dir {
+        Some(state_dir) => claim::write_marker(state_dir, &marker),
+        None => Err(std::io::Error::other("no state directory")),
+    };
+    match written {
+        Ok(()) => drop(held),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                sessions = ?marker.sessions,
+                unknown = marker.unknown,
+                "restore: an agent that could not be proven stopped could not be fenced on disk; \
+                 no restore or start over acts on this state directory until this daemon stops"
+            );
+            let lock = lock.lock().unwrap_or_else(|e| e.into_inner()).take();
+            KEPT.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((held, lock));
         }
     }
-    let files = state_dir
-        .map(|state_dir| claim::fence(state_dir, &fence.sessions, fence.unknown.then_some(kind)));
-    if files.as_ref().is_none_or(|files| !files.held_all) {
-        tracing::warn!(
-            sessions = ?fence.sessions,
-            unknown = fence.unknown,
-            "restore: an agent that could not be proven stopped is fenced in this daemon only; \
-             another daemon on the state directory may not see every fence"
-        );
-    }
-    FENCED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((held, files));
 }
 
 /// Whether the failure record's write fails on purpose: in an e2e build
@@ -1988,12 +2318,16 @@ fn new_conversation_id() -> Option<String> {
 /// Audit F4, round-4 F5: stop an agent a restore or start over just
 /// started. The processes in the session its `leader` leads are killed
 /// first, while that leader is there to show the session is still the
-/// launch's ([`sweep_session`]), then the agent is closed as `StopAgent`
-/// would close it ([`crate::spawn::close_started_agents`]). `true` only when that session
+/// launch's ([`sweep_session`]), then the agent is retired as `StopAgent`
+/// would close it ([`crate::spawn::close_started_agents`]), with its
+/// signals retired first (round 5, N1: [`sweep_then_retire`]): the sweep is
+/// the only thing that signals, so nothing is sent by the bare number of a
+/// leader the sweep may have seen replaced. `true` only when that session
 /// was seen with no process left that can run; `false` when the leader was
 /// not known, the session could not be read, a process in it could not be
 /// signalled or attributed to the launch, or one stayed in it past
-/// [`STOP_PROOF_BOUND`].
+/// [`STOP_PROOF_BOUND`]. Without a known leader there is no sweep, and the
+/// close is the stop.
 #[cfg(unix)]
 async fn stop_proven(
     daemon: &Daemon<'_>,
@@ -2020,12 +2354,36 @@ async fn stop_proven(
         close().await;
         return false;
     }
+    let registry = daemon.registry.clone();
+    let id = started.id.clone();
     let swept = tokio::task::spawn_blocking(move || {
-        sweep_session(&OsView, leader, STOP_PROOF_BOUND, CONFIRM_POLL)
+        sweep_then_retire(&OsView, leader, STOP_PROOF_BOUND, CONFIRM_POLL, || {
+            registry.disarm_child(&id);
+        })
     })
     .await
     .unwrap_or(false);
+    // Whatever became of the sweep task, nothing is signalled after it.
+    daemon.registry.disarm_child(&started.id);
     close().await;
+    swept
+}
+
+/// Round 5 (N1): the stop of an agent whose session `leader` is known:
+/// [`sweep_session`], then `disarm`, which retires every signal the registry
+/// would still send the agent ([`AgentPtyRegistry::disarm_child`]), whether
+/// the sweep proved the stop or not (an unproven one stays unproven:
+/// `not-stopped` and a fence). Answers the sweep's answer.
+#[cfg(unix)]
+fn sweep_then_retire<V: ProcessView>(
+    view: &V,
+    leader: crate::platform::proc::SessionMember,
+    bound: Duration,
+    poll: Duration,
+    disarm: impl FnOnce(),
+) -> bool {
+    let swept = sweep_session(view, leader, bound, poll);
+    disarm();
     swept
 }
 
@@ -2469,13 +2827,13 @@ mod tests {
     #[test]
     fn one_attempt_is_held_against_a_second_restore_until_released() {
         let attempt = AttemptId::parse("r-held-test/7").expect("an attempt id");
-        let first = InFlight::take(&attempt, None, None).expect("free");
+        let first = InFlight::take(&attempt, None).expect("free");
         assert_eq!(
-            InFlight::take(&attempt, None, None).err(),
+            InFlight::take(&attempt, None).err(),
             Some(RestoreRefusal::AlreadyRestoring)
         );
         drop(first);
-        assert!(InFlight::take(&attempt, None, None).is_ok());
+        assert!(InFlight::take(&attempt, None).is_ok());
     }
 
     /// PRD #1790 stage 3 (audit "later slices" 3): two different attempts
@@ -2485,13 +2843,13 @@ mod tests {
         const SESSION: &str = "fedcba98-7654-4321-8fab-0123456789ab";
         let one = AttemptId::parse("r-session-test/1").expect("an attempt id");
         let two = AttemptId::parse("r-session-test/2").expect("an attempt id");
-        let first = InFlight::take(&one, Some(SESSION), None).expect("free");
+        let first = InFlight::take(&one, Some(SESSION)).expect("free");
         assert_eq!(
-            InFlight::take(&two, Some(SESSION), None).err(),
+            InFlight::take(&two, Some(SESSION)).err(),
             Some(RestoreRefusal::SessionInUse)
         );
         drop(first);
-        assert!(InFlight::take(&two, Some(SESSION), None).is_ok());
+        assert!(InFlight::take(&two, Some(SESSION)).is_ok());
     }
 
     /// PRD #1790 stage 3 (audit "later slices" 3): an attempt the deck runs
@@ -2607,17 +2965,17 @@ mod tests {
         let state = crate::test_temp::tempdir().unwrap();
         let one = AttemptId::parse("r-claim/1").unwrap();
         let two = AttemptId::parse("r-claim/2").unwrap();
-        let first = claim::take(state.path(), &one, Some(SESSION), None).expect("free");
+        let first = claim::take(state.path(), &one, Some(SESSION)).expect("free");
         assert_eq!(
-            claim::take(state.path(), &one, None, None).err(),
+            claim::take(state.path(), &one, None).err(),
             Some(RestoreRefusal::AlreadyRestoring)
         );
         assert_eq!(
-            claim::take(state.path(), &two, Some(SESSION), None).err(),
+            claim::take(state.path(), &two, Some(SESSION)).err(),
             Some(RestoreRefusal::SessionInUse)
         );
         // The refused claim of `two` released `two`'s attempt again.
-        drop(claim::take(state.path(), &two, None, None).expect("two's attempt is free"));
+        drop(claim::take(state.path(), &two, None).expect("two's attempt is free"));
         drop(first);
         let dir = state.path().join(claim::CLAIMS_DIR);
         assert_eq!(
@@ -2625,7 +2983,7 @@ mod tests {
             0,
             "a released claim leaves nothing behind"
         );
-        assert!(claim::take(state.path(), &two, Some(SESSION), None).is_ok());
+        assert!(claim::take(state.path(), &two, Some(SESSION)).is_ok());
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
@@ -2641,7 +2999,7 @@ mod tests {
     fn a_claim_file_released_after_it_was_opened_claims_nothing() {
         let state = crate::test_temp::tempdir().unwrap();
         let attempt = AttemptId::parse("r-claim/3").unwrap();
-        let held = claim::take(state.path(), &attempt, None, None).expect("free");
+        let held = claim::take(state.path(), &attempt, None).expect("free");
         let path = state
             .path()
             .join(claim::CLAIMS_DIR)
@@ -2652,7 +3010,7 @@ mod tests {
         assert!(!path.exists(), "the released name is gone");
         // A new claimer creates the name afresh, and is not refused by the
         // stale descriptor's lock on the removed file.
-        assert!(claim::take(state.path(), &attempt, None, None).is_ok());
+        assert!(claim::take(state.path(), &attempt, None).is_ok());
     }
 
     /// One row of [`FakeView`]'s table: start time, session, zombie.
@@ -2947,6 +3305,130 @@ mod tests {
         assert_eq!(*leaderless.killed.borrow(), vec![(60, 120)]);
     }
 
+    /// What a [`RecordingChild`] was asked: its pid (what a signal by number
+    /// starts from) and its own `kill`.
+    #[cfg(unix)]
+    #[derive(Debug, Default)]
+    struct Asked {
+        pid: std::sync::atomic::AtomicUsize,
+        kill: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl Asked {
+        fn counts(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.pid.load(SeqCst), self.kill.load(SeqCst))
+        }
+    }
+
+    /// A registry child that records every pid lookup and `kill` and has
+    /// already exited. Its pid is one no process can hold (above every
+    /// `pid_max`), standing in for the leader number, so even a regression
+    /// that signalled it would reach no process.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct RecordingChild(Arc<Asked>);
+
+    #[cfg(unix)]
+    impl portable_pty::ChildKiller for RecordingChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.0
+                .kill
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(RecordingChild(self.0.clone()))
+        }
+    }
+
+    #[cfg(unix)]
+    impl portable_pty::Child for RecordingChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            self.0.pid.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(i32::MAX as u32)
+        }
+    }
+
+    /// PRD #1790 stage 3 (round 5, N1): the whole stop of a restored agent,
+    /// its sweep and then its retirement from the registry (the close
+    /// `StopAgent` runs), records no signal to a leader number that passed to
+    /// another process: neither when the launch's leader (50, start 100) was
+    /// already replaced by an unrelated leader (50, start 900) before the
+    /// sweep, nor when the sweep killed the launch's leader and its number
+    /// was reused before the retirement. The sweep's own kills are the only
+    /// signals.
+    #[cfg(unix)]
+    #[test]
+    fn the_whole_stop_signals_nothing_after_its_sweep() {
+        // Replaced before the sweep.
+        let view = FakeView::new(&[(50, 900, 50), (61, 950, 50)]);
+        let registry = AgentPtyRegistry::new();
+        let asked = Arc::new(Asked::default());
+        let id = registry.insert_test_member_for_test(
+            Box::new(RecordingChild(asked.clone())),
+            "restored-stop-1",
+            "stop-1",
+            true,
+        );
+        let before = asked.counts();
+        let stopped = sweep_then_retire(&view, leader(50, 100), TICK, TICK, || {
+            assert!(registry.disarm_child(&id));
+        });
+        assert!(stopped);
+        registry.close_agent(&id).expect("closed");
+        assert!(!view.signalled(), "{:?}", view.killed);
+        assert_eq!(asked.counts(), before, "nothing aimed at pid 50 by number");
+
+        // Replaced between the sweep and the retirement.
+        let view = FakeView::new(&[(50, 100, 50), (60, 120, 50)]);
+        let asked = Arc::new(Asked::default());
+        let id = registry.insert_test_member_for_test(
+            Box::new(RecordingChild(asked.clone())),
+            "restored-stop-2",
+            "stop-2",
+            true,
+        );
+        let before = asked.counts();
+        let stopped = sweep_then_retire(&view, leader(50, 100), LONG, TICK, || {
+            // The launch's leader was reaped and its number reused.
+            view.table.borrow_mut().insert(50, (900, 50, false));
+            assert!(registry.disarm_child(&id));
+        });
+        assert!(stopped);
+        registry.close_agent(&id).expect("closed");
+        assert_eq!(
+            *view.killed.borrow(),
+            vec![(60, 120), (50, 100)],
+            "the sweep's kills, and nothing of (50, 900)"
+        );
+        assert_eq!(asked.counts(), before, "nothing aimed at pid 50 by number");
+        // Without the retirement the close would have asked for the pid.
+        let undisarmed = Arc::new(Asked::default());
+        let id = registry.insert_test_member_for_test(
+            Box::new(RecordingChild(undisarmed.clone())),
+            "restored-stop-3",
+            "stop-3",
+            true,
+        );
+        let before = undisarmed.counts();
+        registry.close_agent(&id).expect("closed");
+        assert!(
+            undisarmed.counts().0 > before.0,
+            "premise: an ordinary close signals by the child's pid"
+        );
+    }
+
     /// PRD #1790 stage 3 (audit B1): a restored agent is in the conversation
     /// its restore confirmed, from the durable successor link alone, before
     /// its own session report exists; it stops being so once it ended, its
@@ -3197,56 +3679,169 @@ mod tests {
         );
     }
 
-    /// PRD #1790 stage 3 (round-4 B2): what [`keep_fenced`] holds when a
-    /// failure could be neither proven stopped nor recorded: every
-    /// conversation it names and, for an unknown one, its kind, against a
-    /// restore in this daemon ([`InFlight`]) and in another one on the state
-    /// directory ([`claim`]).
+    /// A fence marker of a survivor that cannot be proven gone: a leader
+    /// pid no process holds would be, so the test's own process stands in
+    /// for the survivor.
+    #[cfg(unix)]
+    fn survivor_marker(from: &AttemptId, sessions: &[&str], unknown: bool) -> claim::Marker {
+        let me = std::process::id();
+        claim::Marker {
+            from: from.clone(),
+            to: None,
+            pid: Some(me),
+            pid_start: crate::platform::proc::process_start_of(me),
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+            unknown,
+            kind: Some(AgentType::Pi),
+        }
+    }
+
+    /// PRD #1790 stage 3 (round 5, R1/R2): the state directory's restore
+    /// lock is held by one request at a time, from this daemon or another
+    /// (a second descriptor stands in for the other daemon), and is free
+    /// again once dropped; its file stays.
     #[cfg(unix)]
     #[test]
-    fn a_fence_that_could_not_be_recorded_holds_its_conversations_and_kind() {
-        use crate::event::AgentType;
+    fn one_restore_acts_at_a_time_per_state_directory() {
         let state = crate::test_temp::tempdir().unwrap();
-        // Two kinds no other test fences, so the daemon-wide set this test
-        // fills does not refuse another test's restores.
-        let fenced_kind = AgentType::Pi;
-        let other_kind = AgentType::Devin;
-        const KEPT: &str = "a7000000-89ab-4cde-8fab-0123456789ab";
-        let attempt = AttemptId::parse("r-fence/1").unwrap();
-        let other = AttemptId::parse("r-fence/2").unwrap();
+        let first = claim::restore_lock(state.path()).expect("free");
+        assert_eq!(
+            claim::restore_lock(state.path()).err(),
+            Some(RestoreRefusal::RestoreBusy)
+        );
+        let other = crate::test_temp::tempdir().unwrap();
+        assert!(
+            claim::restore_lock(other.path()).is_ok(),
+            "another state directory has its own"
+        );
+        drop(first);
+        let again = claim::restore_lock(state.path()).expect("free again");
+        assert!(
+            state
+                .path()
+                .join(claim::CLAIMS_DIR)
+                .join(claim::RESTORE_LOCK)
+                .is_file()
+        );
+        drop(again);
+    }
+
+    /// PRD #1790 stage 3 (round 5, R1): a fence that could not be recorded
+    /// is written as a marker even while another request (a dry run in
+    /// another daemon, say) holds the claim on the conversation it fences:
+    /// the marker is a file of its own, not a claim. Every later read fences
+    /// that conversation, and, for a survivor whose conversation is not
+    /// known, every conversation of its kind; the claim being released does
+    /// not lift it, nor does a claim on the conversation being free.
+    #[cfg(unix)]
+    #[test]
+    fn a_fence_marker_is_written_while_another_request_holds_its_conversation() {
+        const U: &str = "a7000000-89ab-4cde-8fab-0123456789ab";
+        let state = crate::test_temp::tempdir().unwrap();
+        let from = AttemptId::parse("r-fence/1").unwrap();
+        let dry_run = AttemptId::parse("r-fence/2").unwrap();
+        // The other request's claim on U, held across the failure.
+        let held = claim::take(state.path(), &dry_run, Some(U)).expect("free");
+        let lock = Mutex::new(Some(claim::restore_lock(state.path()).unwrap()));
         keep_fenced(
             None,
+            &lock,
             Some(state.path()),
-            &Fence {
-                sessions: vec![KEPT.into()],
-                unknown: true,
-            },
-            Some(&fenced_kind),
+            survivor_marker(&from, &[U], true),
         );
-        assert_eq!(
-            InFlight::take(&other, Some(KEPT), Some(&other_kind)).err(),
-            Some(RestoreRefusal::SessionInUse),
-            "its conversation, in this daemon"
+        assert!(
+            lock.lock().unwrap().is_some(),
+            "a written marker keeps nothing past the request"
         );
-        assert_eq!(
-            claim::take(state.path(), &other, Some(KEPT), Some(&other_kind)).err(),
-            Some(RestoreRefusal::SessionInUse),
-            "its conversation, from another daemon"
+        let running = |_: &claim::Marker| false;
+        let markers = claim::Markers::read(state.path());
+        assert!(!markers.unreadable());
+        assert!(markers.fenced(U, Some(&AgentType::Codex), &running));
+        assert!(
+            markers.fenced("elsewhere", Some(&AgentType::Pi), &running),
+            "its kind, its conversation not known"
         );
-        assert_eq!(
-            InFlight::take(&other, Some("elsewhere"), Some(&fenced_kind)).err(),
-            Some(RestoreRefusal::SessionInUse),
-            "its kind, in this daemon"
+        assert!(!markers.fenced("elsewhere", Some(&AgentType::Codex), &running));
+        assert!(markers.left_by(&from, &running));
+        assert!(!markers.left_by(&dry_run, &running));
+        drop(held);
+        assert!(claim::take(state.path(), &dry_run, Some(U)).is_ok());
+        let markers = claim::Markers::read(state.path());
+        assert!(
+            markers.fenced(U, Some(&AgentType::Codex), &running),
+            "the claim's release does not lift it"
         );
-        assert_eq!(
-            claim::take(state.path(), &other, Some("elsewhere"), Some(&fenced_kind)).err(),
-            Some(RestoreRefusal::SessionInUse),
-            "its kind, from another daemon"
+        // A marker on the survivor this test is: not gone.
+        let read = claim::Markers::read(state.path());
+        assert!(read.fenced(U, None, &|m| marker_gone(m, &[])));
+        assert_eq!(read.lift_gone(state.path(), &|m| marker_gone(m, &[])), 0);
+    }
+
+    /// PRD #1790 stage 3 (round 5, R1): a marker outlives the daemon that
+    /// wrote it, and is lifted only once the agent it names is proven gone;
+    /// one that cannot be read fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn a_fence_marker_lifts_only_once_its_agent_is_gone_and_an_unreadable_one_fences() {
+        const U: &str = "a8000000-89ab-4cde-8fab-0123456789ab";
+        let state = crate::test_temp::tempdir().unwrap();
+        let from = AttemptId::parse("r-lift/1").unwrap();
+        let mut gone = survivor_marker(&from, &[U], false);
+        // No process holds this pid.
+        gone.pid = Some(i32::MAX as u32);
+        gone.pid_start = Some(1);
+        claim::write_marker(state.path(), &gone).unwrap();
+        let unknown = claim::Marker {
+            pid: None,
+            pid_start: None,
+            to: None,
+            ..survivor_marker(&from, &[U], false)
+        };
+        claim::write_marker(state.path(), &unknown).unwrap();
+        let read = claim::Markers::read(state.path());
+        let check = |m: &claim::Marker| marker_gone(m, &[]);
+        assert!(
+            read.fenced(U, None, &check),
+            "an agent never named stays fenced"
         );
-        // Another kind's restore elsewhere, and a start over, go on.
-        assert!(claim::take(state.path(), &other, Some("elsewhere"), Some(&other_kind)).is_ok());
-        assert!(claim::take(state.path(), &attempt, None, Some(&fenced_kind)).is_ok());
-        assert!(InFlight::take(&attempt, None, Some(&fenced_kind)).is_ok());
+        assert_eq!(read.lift_gone(state.path(), &check), 1, "only the gone one");
+        let dir = state.path().join(claim::CLAIMS_DIR);
+        let names = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("fence-"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names().len(), 1);
+        std::fs::remove_file(dir.join(&names()[0])).unwrap();
+        assert!(!claim::Markers::read(state.path()).fenced(U, None, &check));
+        // A marker that cannot be parsed fences everything.
+        std::fs::write(dir.join("fence-0000000000000000.json"), b"{not json").unwrap();
+        let read = claim::Markers::read(state.path());
+        assert!(read.unreadable());
+        assert!(read.fenced("anything", None, &|_| true));
+    }
+
+    /// PRD #1790 stage 3 (round 5, R1): a request's checks refuse a
+    /// conversation a marker fences (`session-in-use`) and a restore or
+    /// start over of the attempt whose failure the marker holds
+    /// (`still-running`), as they do for the journal's own fence.
+    #[cfg(unix)]
+    #[test]
+    fn a_fence_marker_refuses_like_a_recorded_failure() {
+        let from = AttemptId::parse("r-mark/1").unwrap();
+        let state = crate::test_temp::tempdir().unwrap();
+        claim::write_marker(state.path(), &survivor_marker(&from, &["u"], false)).unwrap();
+        let markers = claim::Markers::read(state.path());
+        let running = |_: &claim::Marker| false;
+        let proven = |_: &claim::Marker| true;
+        assert!(markers.left_by(&from, &running));
+        assert!(!markers.left_by(&from, &proven));
+        assert!(markers.fenced("u", None, &running));
+        assert!(!markers.fenced("u", None, &proven));
+        assert!(!markers.fenced("v", None, &running), "known: only its own");
     }
 
     /// PRD #1790 stage 3 (round-4 F1): journal retention keeps a restore's
