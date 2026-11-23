@@ -1429,6 +1429,64 @@ fn force_kill_and_wait(pty: &mut AgentPty) {
     crate::platform::proc::force_kill_child_and_wait(&mut pty.child, &pty.process_group);
 }
 
+/// PRD #1790 round 7: what a spawn on this thread forked, as
+/// [`spawn_with_dir`] saw it right after `spawn_command` returned: the
+/// child's pid and its start time, read before anything could reap it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Forked {
+    /// No child was started: the spawn failed before `spawn_command`, or
+    /// `spawn_command` failed, which leaves no child (a child whose `exec`
+    /// failed has exited and been reaped by the time it returns).
+    Nothing,
+    /// A child was started, named by pid and start time when both were read.
+    Child(Option<crate::platform::proc::SessionMember>),
+}
+
+thread_local! {
+    static FORK_WATCH: std::cell::Cell<Option<Forked>> = const { std::cell::Cell::new(None) };
+}
+
+/// PRD #1790 round 7: watches the spawns this thread runs while it is held,
+/// so a caller whose spawn returned an error can tell whether a child was
+/// started all the same. A spawn that fails after its fork kills and reaps
+/// the child it started, but not what that child already moved out of its
+/// process group.
+pub(crate) struct ForkWatch(());
+
+impl ForkWatch {
+    /// Start watching. Dropping the watch stops it.
+    pub(crate) fn arm() -> Self {
+        FORK_WATCH.with(|watch| watch.set(Some(Forked::Nothing)));
+        ForkWatch(())
+    }
+
+    /// What the spawns since [`Self::arm`] forked; the last one wins.
+    pub(crate) fn forked(self) -> Forked {
+        FORK_WATCH
+            .with(|watch| watch.get())
+            .unwrap_or(Forked::Nothing)
+    }
+
+    /// Record a fork, when a watch is armed on this thread.
+    fn note(pid: Option<u32>) {
+        FORK_WATCH.with(|watch| {
+            if watch.get().is_some() {
+                let member = pid.and_then(|pid| {
+                    crate::platform::proc::process_start_of(pid)
+                        .map(|start| crate::platform::proc::SessionMember { pid, start })
+                });
+                watch.set(Some(Forked::Child(member)));
+            }
+        });
+    }
+}
+
+impl Drop for ForkWatch {
+    fn drop(&mut self) {
+        FORK_WATCH.with(|watch| watch.set(None));
+    }
+}
+
 /// RAII guard that owns a freshly-spawned child between the `spawn_command`
 /// call and the point at which ownership is handed off to an [`AgentPty`].
 /// If the guard is dropped while still holding the child (e.g. because a
@@ -2212,6 +2270,7 @@ fn spawn_with_dir(
         .slave
         .spawn_command(cmd)
         .map_err(|e| AgentPtyError::Spawn(e.to_string()))?;
+    ForkWatch::note(child.process_id());
     let (launch_dir, launch_dir_moved_from) = if pathname_start {
         confirm_launch_dir(launch_dir, launch_identity, child.process_id())
     } else {
@@ -9557,6 +9616,40 @@ fn test_spawn_delay() -> Option<Duration> {
     None
 }
 
+/// TEST knob, read only by a build with the `e2e` feature (PRD #1790 round
+/// 7): the path of a file that arms the refusal, after its fork, of the next
+/// spawn a restore starts. That spawn removes the file, waits up to 30
+/// seconds for the path the file names (when it names one) to exist, and is
+/// refused, its child killed as a refused spawn's is.
+pub const ENV_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK: &str =
+    "DOT_AGENT_DECK_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK";
+
+#[cfg(feature = "e2e")]
+fn restore_spawn_refused_after_fork_for_test() -> bool {
+    let Some(armed) = std::env::var_os(ENV_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK) else {
+        return false;
+    };
+    let Ok(wait_for) = std::fs::read_to_string(&armed) else {
+        return false;
+    };
+    if std::fs::remove_file(&armed).is_err() {
+        return false;
+    }
+    let wait_for = wait_for.trim();
+    if !wait_for.is_empty() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !std::path::Path::new(wait_for).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    true
+}
+
+#[cfg(not(feature = "e2e"))]
+fn restore_spawn_refused_after_fork_for_test() -> bool {
+    false
+}
+
 /// PRD #1666 part 3, round 5: the replacement's abort fault point: `Fail`
 /// drops its ticket with no transition ((f5a)'s seam).
 pub(crate) const FAULT_ABORT_SKIPPED: &str = "abort-skipped";
@@ -11261,6 +11354,9 @@ pub enum DispatchDirRefusal {
 /// holds it across its identity-checked sweep and then retires it
 /// ([`Self::retire_after`]), so a concurrent teardown either signalled
 /// before the sweep began or finds the signals retired and sends nothing.
+/// That is an order, not an identity check: a signal sent before the sweep
+/// goes to the pid the child holds, unchecked, as an ordinary teardown's
+/// does.
 #[cfg(unix)]
 #[derive(Debug, Default)]
 pub(crate) struct SignalAuthority {
@@ -16038,6 +16134,14 @@ impl AgentPtyRegistry {
                 spool.to_string_lossy().into_owned(),
             ));
         }
+        // PRD #1790 round 7: a restore's launch nonce goes to this
+        // generation's launch record and nowhere else: taken out of the
+        // environment before the fork, so the agent does not see it and a
+        // respawn replaying `spawn_env` does not carry it.
+        let launch_nonce =
+            overlay_value(&opts.env, crate::launch_records::ENV_LAUNCH_NONCE).map(str::to_string);
+        opts.env
+            .retain(|(k, _)| k != crate::launch_records::ENV_LAUNCH_NONCE);
         // PRD #211: an agent that reports its status through OSC 7501 is asked
         // to on every pane the deck starts, whatever the pane's command, so
         // one started from a shell there reports it too. The daemon reads it
@@ -16330,8 +16434,12 @@ impl AgentPtyRegistry {
         // the lock is released.
         let _abandoned_turns = ReleaseAbandonedTurns(self);
         // PRD #1666 part 3, round 5 test seam: a panic after the fork and
-        // before the record is published, with the reservation armed.
-        let _ = self.fault_point(FAULT_SPAWN_BEFORE_PUBLISH);
+        // before the record is published, with the reservation armed. PRD
+        // #1790 round 7: `Fail` there, or in an e2e build a restore's spawn
+        // armed by `ENV_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK`, refuses the
+        // spawn after its fork the way a shutdown below does.
+        let refused_after_fork = self.fault_point(FAULT_SPAWN_BEFORE_PUBLISH)
+            || (launch_nonce.is_some() && restore_spawn_refused_after_fork_for_test());
         let mut inner = self.inner.lock();
         // Issue #454: hand ownership over from the reservation to `agents`
         // WITHOUT releasing the lock in between — each early return below gives
@@ -16355,6 +16463,12 @@ impl AgentPtyRegistry {
         if self.shutting_down.load(Ordering::SeqCst) {
             reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+        if refused_after_fork {
+            reservation.abandon_locked(&mut inner);
+            return Err(AgentPtyError::Spawn(
+                "refused after the fork for a test".into(),
+            ));
         }
         // PRD #1487 audit A2: the same re-check for a restart's reservation,
         // and atomic with the insert for the same reason. A spawn that was
@@ -16676,7 +16790,7 @@ impl AgentPtyRegistry {
                 // PRD #1790 stage 3: the child's identity, so a restore can
                 // tell whether this agent is gone.
                 child.process_id().map(|pid| (pid, child_started)),
-                journal_pane.clone(),
+                launch_nonce.clone(),
             )
         });
         let agent = RunningAgent {
@@ -16812,7 +16926,7 @@ impl AgentPtyRegistry {
                 name,
                 membership,
                 identity,
-                pane,
+                launch_nonce,
             )),
         ) = (&work, &launch_record)
         {
@@ -16829,7 +16943,7 @@ impl AgentPtyRegistry {
                     membership: membership.as_ref(),
                     pid: identity.map(|(pid, _)| pid),
                     pid_start: identity.and_then(|(_, started)| started),
-                    pane: pane.as_deref(),
+                    launch_nonce: launch_nonce.as_deref(),
                 },
             );
         }

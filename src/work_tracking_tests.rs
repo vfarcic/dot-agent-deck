@@ -1896,7 +1896,7 @@ fn launch_records_are_kept_while_the_read_skipped_an_unknown_kind() {
         ts_ms: 0,
         pid: None,
         pid_start: None,
-        pane: None,
+        launch_nonce: None,
     };
     crate::launch_records::write(state.path(), &record).unwrap();
     let planted = state
@@ -1961,6 +1961,52 @@ async fn a_spawn_without_a_folder_records_the_home_it_started_in() {
     assert_eq!(
         listed.cwd, None,
         "the registry's cwd is what the caller gave"
+    );
+    registry.shutdown_all();
+}
+
+/// PRD #1790 round 7 (B1): a restore's launch nonce, handed to the spawn in
+/// its environment, is written to the agent's launch record and taken out of
+/// the environment the registry keeps for a respawn, so a later generation
+/// of the pane does not carry it. A spawn without one records none.
+#[tokio::test]
+async fn a_launch_nonce_goes_to_the_launch_record_and_not_to_a_respawn() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let nonce = "00112233445566778899aabbccddeeff";
+    let agent = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), "nonce-pane".to_string()),
+                (
+                    crate::launch_records::ENV_LAUNCH_NONCE.to_string(),
+                    nonce.to_string(),
+                ),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "plain-pane".to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+    let records = crate::launch_records::read_all(state.path()).unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let with: Vec<_> = records
+        .iter()
+        .filter_map(|r| r.launch_nonce.as_deref())
+        .collect();
+    assert_eq!(with, vec![nonce], "only the restore's start carries it");
+    let kept = registry.spawn_env_of_for_test(&agent).expect("the agent");
+    assert!(
+        kept.iter()
+            .all(|(k, _)| k != crate::launch_records::ENV_LAUNCH_NONCE),
+        "not replayed by a respawn: {kept:?}"
     );
     registry.shutdown_all();
 }
@@ -2576,7 +2622,7 @@ fn pending_cleanup_reads_real_held_free_and_missing_run_locks() {
             ts_ms: crate::launch_records::now_ms(),
             pid: None,
             pid_start: None,
-            pane: None,
+            launch_nonce: None,
         },
     )
     .unwrap();

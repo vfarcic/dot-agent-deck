@@ -509,7 +509,7 @@ fn record(w: &WorkId, a: &AttemptId, name: &str, cwd: Option<&str>) -> LaunchRec
         ts_ms: 5,
         pid: None,
         pid_start: None,
-        pane: None,
+        launch_nonce: None,
     }
 }
 

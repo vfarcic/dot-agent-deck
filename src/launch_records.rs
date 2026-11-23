@@ -100,6 +100,12 @@ pub const MAX_LISTED: usize = 65_536;
 
 const EXTENSION: &str = ".json";
 
+/// PRD #1790 round 7: the spawn environment entry carrying a restore's
+/// launch nonce ([`LaunchRecord::launch_nonce`]). The daemon takes it out of
+/// the environment before the child is started, so the agent does not see it
+/// and a respawn, which replays the environment, does not carry it.
+pub const ENV_LAUNCH_NONCE: &str = "DOT_AGENT_DECK_LAUNCH_NONCE";
+
 /// How one attempt was launched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchRecord {
@@ -148,12 +154,13 @@ pub struct LaunchRecord {
     /// reads it, so a later process given the same pid is not taken for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start: Option<u64>,
-    /// PRD #1790 round 6: the pane the agent was started in, so a restore's
-    /// fence placed before the spawn can find the agent it started.
-    /// Absent from the file when unknown, and from every record written
-    /// before it existed (still schema v1).
+    /// PRD #1790 round 7: the launch nonce a restore drew for this start and
+    /// handed the spawn as [`ENV_LAUNCH_NONCE`], so the fence it placed
+    /// before the spawn can find this record, rather than an older launch's
+    /// in the same pane, once the agent exists. Absent for a start no restore made, and from every record
+    /// written before it existed (still schema v1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pane: Option<String>,
+    pub launch_nonce: Option<String>,
 }
 
 /// PRD #1790 stage 3: why [`process_gone`] cannot say the agent a record
@@ -690,7 +697,7 @@ mod tests {
             ts_ms,
             pid: None,
             pid_start: None,
-            pane: None,
+            launch_nonce: None,
         }
     }
 

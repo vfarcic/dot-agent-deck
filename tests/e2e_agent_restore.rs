@@ -2240,6 +2240,7 @@ fn journal_restore_035_a_fence_written_before_the_spawn_survives_every_later_wri
         "premise: never narrowed to the agent it started: {marker}"
     );
     assert!(marker["pane"].is_string(), "{marker}");
+    assert!(marker["launch_nonce"].is_string(), "{marker}");
     assert_eq!(marker["unknown"], true, "{marker}");
     assert_eq!(marker["sessions"], json!([SESSION]), "{marker}");
     // The daemon that ran the restore goes away; the fence does not.
@@ -2270,4 +2271,71 @@ fn journal_restore_035_a_fence_written_before_the_spawn_survives_every_later_wri
     );
     assert!(fence_markers(&decks.state).is_empty(), "and is removed");
     drop(other);
+}
+
+/// Scenario: A scripted Claude ran in a conversation of its own. After a restart into a daemon whose next restore spawn is refused after its fork, as a shutdown winning the race to add the agent would refuse it, restoring it starts the agent, which leaves a child in its session, and the deck kills the agent but cannot see that session empty, so it is refused not-stopped and its fence stays, narrowed to that agent. Restoring it again is refused session-in-use while the child runs, and restores once the child is gone.
+#[cfg(target_os = "linux")]
+#[spec("journal/restore/036")]
+#[test]
+fn journal_restore_036_a_spawn_refused_after_its_fork_keeps_its_fence() {
+    let mut decks = Decks::start();
+    let first = decks.start_pane("restore-forkfail-036");
+    assert_eq!(first["session"], SESSION, "premise: {first}");
+    let attempt = string(&decks.attempt(&string(&first, "agent")), "attempt");
+    let armed = decks.root.join("spawn-fails-after-fork");
+    let armed_text = armed.to_string_lossy().into_owned();
+    decks.restart_with(&[(
+        dot_agent_deck::agent_pty::ENV_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK,
+        armed_text.as_str(),
+    )]);
+    let id = string(&decks.item_for(&attempt), "id");
+    // The next restore spawn is refused once the agent's child reported
+    // itself.
+    std::fs::write(decks.root.join("survive-stop"), "").unwrap();
+    std::fs::write(
+        &armed,
+        decks
+            .root
+            .join("survivor.json")
+            .to_string_lossy()
+            .as_bytes(),
+    )
+    .unwrap();
+    let reply = final_reply(&decks, restore_request(&id, &attempt));
+    assert_refused(&reply, &attempt, "not-stopped");
+    assert!(!armed.exists(), "premise: the refusal was the injected one");
+    let survivor = survivor(&decks, "survivor.json");
+    std::fs::remove_file(decks.root.join("survive-stop")).unwrap();
+    let child: Value =
+        serde_json::from_slice(&std::fs::read(decks.root.join("survivor.json")).unwrap()).unwrap();
+    let markers = fence_markers(&decks.state);
+    assert_eq!(markers.len(), 1, "the fence stays: {markers:?}");
+    let marker = &markers[0];
+    assert_eq!(
+        marker["pid"], child["sid"],
+        "narrowed to the agent whose session the child is in: {marker}"
+    );
+    assert!(marker["pid_start"].is_u64(), "{marker}");
+    assert!(marker["to"].is_null(), "no attempt was published: {marker}");
+    assert!(marker["launch_nonce"].is_string(), "{marker}");
+    let started = decks.starts().len();
+    let reply = final_reply(&decks, restore_request(&id, &attempt));
+    assert_refused(&reply, &attempt, "session-in-use");
+    assert_eq!(decks.starts().len(), started, "nothing more started");
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    let (pid, start) = (survivor.pid, survivor.start);
+    drop(survivor);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !running(pid, start)
+        }),
+        "the test's own child is gone"
+    );
+    let reply = final_reply(&decks, restore_request(&id, &attempt));
+    assert_eq!(
+        restored_count(&reply),
+        1,
+        "the fence lifts once its agent's session is gone: {reply}"
+    );
+    assert!(fence_markers(&decks.state).is_empty(), "and is removed");
 }

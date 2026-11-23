@@ -2339,6 +2339,18 @@ fn surface_spawned_orchestration(
 /// therefore produce ids that differ only in the counter, which is exactly what
 /// the counter is for.
 pub(crate) fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
+    next_pane_id_keeping(task_name, "", role_index)
+}
+
+/// [`next_pane_id`] with `kept` placed after the name and before the counter,
+/// never truncated: the name gives way first (PRD #1790 round 7, a restored
+/// pane's random part). `kept` must be made of `[A-Za-z0-9_-]` and short
+/// enough to leave the counter its room.
+pub(crate) fn next_pane_id_keeping(
+    task_name: &str,
+    kept: &str,
+    role_index: Option<usize>,
+) -> String {
     let n = PANE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let sanitized: String = task_name
         .chars()
@@ -2351,8 +2363,8 @@ pub(crate) fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String
         })
         .collect();
     let suffix = match role_index {
-        Some(idx) => format!("-{n}-r{idx}"),
-        None => format!("-{n}"),
+        Some(idx) => format!("{kept}-{n}-r{idx}"),
+        None => format!("{kept}-{n}"),
     };
     // Every byte here is ASCII (the prefix is a literal, the counter and role
     // index are decimal, and the sanitizer maps every non-`[A-Za-z0-9_-]` char

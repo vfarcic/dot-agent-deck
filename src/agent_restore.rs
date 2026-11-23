@@ -520,11 +520,15 @@ pub(crate) mod claim {
         /// The agent's own attempt, when the journal gave it one.
         #[serde(default)]
         pub(crate) to: Option<AttemptId>,
-        /// Round 6: the pane the agent was to be started in, chosen before
-        /// the spawn, which its launch record names
-        /// ([`crate::launch_records::LaunchRecord::pane`]).
+        /// Round 6: the pane the agent was to be started in, for the log
+        /// only: a pane id is no launch's identity (round 7).
         #[serde(default)]
         pub(crate) pane: Option<String>,
+        /// Round 7: the launch nonce drawn before the spawn, which the
+        /// agent's launch record carries
+        /// ([`crate::launch_records::LaunchRecord::launch_nonce`]).
+        #[serde(default)]
+        pub(crate) launch_nonce: Option<String>,
         /// The agent's session leader, named by pid and start time as it was
         /// spawned, when those were read.
         #[serde(default)]
@@ -1155,20 +1159,25 @@ pub(crate) fn successor_gone_check(state_dir: &Path) -> impl Fn(&AttemptId) -> b
     }
 }
 
-/// Round 5, round 6 (B1): whether the agent a fence `marker` names is
-/// proven gone ([`launch_gone`]): by the session leader it names, or else by
-/// its launch record in `launches`, the one record of its attempt or of the
-/// pane it was started in. Neither known, or no single such record: never.
+/// Round 5, round 6 (B1), round 7: whether the agent a fence `marker` names
+/// is proven gone ([`launch_gone`]): by the session leader it names, or else
+/// by its launch record in `launches`: the one record of its attempt when
+/// the marker names one, and otherwise the one record carrying its launch
+/// nonce. A pane id does not identify the record: one can repeat across
+/// daemons. None of these known, or no single such record: never.
 fn marker_gone(marker: &claim::Marker, launches: &[LaunchRecord]) -> bool {
     #[cfg(unix)]
     {
         if let (Some(pid), Some(start)) = (marker.pid, marker.pid_start) {
             return leader_gone(pid, start).is_ok();
         }
-        let mut records = launches.iter().filter(|r| {
-            marker.to.as_ref() == Some(&r.attempt)
-                || (marker.pane.is_some() && r.pane == marker.pane)
-        });
+        let mut records = launches
+            .iter()
+            .filter(|r| match (&marker.to, &marker.launch_nonce) {
+                (Some(to), _) => r.attempt == *to,
+                (None, Some(nonce)) => r.launch_nonce.as_ref() == Some(nonce),
+                (None, None) => false,
+            });
         match (records.next(), records.next()) {
             (Some(record), None) => launch_gone(record).is_ok(),
             _ => false,
@@ -1442,17 +1451,31 @@ fn verified_folder(
 
 /// The pane id a restored or started-over agent runs in: `restored-`, its
 /// name and six random hex characters, through
-/// [`crate::spawn::next_pane_id`]. The daemon's pane counter starts again in
+/// [`crate::spawn::next_pane_id_keeping`], which shortens a long name rather
+/// than the random part (round 7). The daemon's pane counter starts again in
 /// each daemon, so without the random part a restore would reuse the pane id
-/// the agent it brings back had under the daemon before.
+/// the agent it brings back had under the daemon before. A pane id names no
+/// launch for a fence: the launch nonce does ([`launch_nonce`]).
 fn restored_pane_id(name: Option<&str>) -> String {
     let mut bytes = [0u8; 3];
     let _ = getrandom::fill(&mut bytes);
     let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    crate::spawn::next_pane_id(
-        &format!("restored-{}-{suffix}", name.unwrap_or("agent")),
+    crate::spawn::next_pane_id_keeping(
+        &format!("restored-{}", name.unwrap_or("agent")),
+        &format!("-{suffix}"),
         None,
     )
+}
+
+/// Round 7: a fresh launch nonce, 128 random bits as hex, that the fence
+/// placed before a spawn and the launch record of the agent it starts both
+/// carry ([`crate::launch_records::LaunchRecord::launch_nonce`]). `None` when
+/// no randomness could be had: the fence then lifts only by the leader or
+/// attempt it is narrowed to.
+fn launch_nonce() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The handles a restore needs beyond the registry, to stop an agent the way
@@ -1905,6 +1928,16 @@ async fn start(
     let record = &target.record;
     let pane_id = restored_pane_id(record.name.as_deref());
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
+    // Round 7: the launch this start makes, named before it exists, in the
+    // fence below and in the agent's launch record (the daemon takes it out
+    // of the environment the agent sees).
+    let nonce = launch_nonce();
+    if let Some(nonce) = &nonce {
+        env.push((
+            crate::launch_records::ENV_LAUNCH_NONCE.to_string(),
+            nonce.clone(),
+        ));
+    }
     if let Some(shell) = &record.shell {
         env.push(("SHELL".to_string(), shell.clone()));
     }
@@ -1973,9 +2006,9 @@ async fn start(
     // wide as this start could need: the conversations it is asked into or
     // leaves, and, for an agent of a kind a restore exists for (or of a kind
     // not known), every conversation of its kind, since where it ends up is
-    // not known yet. It names the pane chosen for the agent, which the
-    // agent's launch record will name, so a later daemon can find that agent
-    // and lift the fence once it is gone. Later writes only narrow it.
+    // not known yet. It names the launch nonce, which the agent's launch
+    // record will carry, so a later daemon can find that agent and lift the
+    // fence once it is gone (round 7). Later writes only narrow it.
     let kind = target.agent_type.clone();
     let planned = match want {
         Want::Resume => Fence::new(target.session.iter().cloned()),
@@ -1993,6 +2026,7 @@ async fn start(
         from: target.attempt.clone(),
         to: None,
         pane: Some(pane_id.clone()),
+        launch_nonce: nonce,
         pid: None,
         pid_start: None,
         sessions: planned.sessions,
@@ -2000,16 +2034,32 @@ async fn start(
         kind: kind.clone(),
     };
     let fenced = fenced_spawn(state_dir, &marker, || {
-        daemon.registry.spawn_agent_in(opts, &dir)
+        let watch = crate::agent_pty::ForkWatch::arm();
+        let spawned = daemon.registry.spawn_agent_in(opts, &dir);
+        (spawned, watch.forked())
     });
     drop(dir);
     let (placed, agent_id) = match fenced {
-        Ok((placed, Ok(id))) => (placed, id),
-        Ok((placed, Err(error))) => {
+        Ok((placed, (Ok(id), _))) => (placed, id),
+        Ok((placed, (Err(error), forked))) => {
             daemon.registry.unwatch_restore_session(&pane_id);
             tracing::warn!(%error, attempt = %target.attempt, "restore: the agent could not be started");
-            lift_marker(placed, state_dir, &target.attempt);
-            return refuse(RestoreRefusal::SpawnFailed);
+            // Round 7 (B2): an error is no proof that nothing was left
+            // running. A spawn refused after its fork killed the child it
+            // started, but not what that child moved out of its process
+            // group: the fence lifts only when no child was started, or when
+            // the session the child led is seen empty; otherwise it stays,
+            // narrowed to that leader so it lifts once the session is gone.
+            if failed_spawn_left_nothing(forked).await {
+                lift_marker(placed, state_dir, &target.attempt);
+                return refuse(RestoreRefusal::SpawnFailed);
+            }
+            if let crate::agent_pty::Forked::Child(Some(leader)) = forked {
+                marker.pid = Some(leader.pid);
+                marker.pid_start = Some(leader.start);
+                narrow_marker(&placed, state_dir, &marker);
+            }
+            return refuse(RestoreRefusal::NotStopped);
         }
         Err(reason) => {
             daemon.registry.unwatch_restore_session(&pane_id);
@@ -2339,6 +2389,35 @@ impl Fence {
     }
 }
 
+/// Round 7 (B2): whether a spawn that returned an error left nothing
+/// running: it started no child (`forked`), or the session the child it
+/// started led is seen empty ([`sweep_session`], which signals nothing once
+/// that leader is gone, as it is after a refused spawn reaped it). A child
+/// whose pid or start time was not read proves nothing.
+#[cfg(unix)]
+async fn failed_spawn_left_nothing(forked: crate::agent_pty::Forked) -> bool {
+    tokio::task::spawn_blocking(move || {
+        spawn_left_nothing(&OsView, forked, STOP_PROOF_BOUND, CONFIRM_POLL)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// [`failed_spawn_left_nothing`] through `view`, blocking.
+#[cfg(unix)]
+fn spawn_left_nothing<V: ProcessView>(
+    view: &V,
+    forked: crate::agent_pty::Forked,
+    bound: Duration,
+    poll: Duration,
+) -> bool {
+    match forked {
+        crate::agent_pty::Forked::Nothing => true,
+        crate::agent_pty::Forked::Child(None) => false,
+        crate::agent_pty::Forked::Child(Some(leader)) => sweep_session(view, leader, bound, poll),
+    }
+}
+
 /// Round 6 (B1): place `marker` in the claims directory of `state_dir`,
 /// durably, and only then `spawn`. A marker that cannot be placed starts
 /// nothing: refused `spawn-failed`, so no restore or start over starts an
@@ -2459,9 +2538,11 @@ fn new_conversation_id() -> Option<String> {
 /// letting go ([`sweep_then_retire`]), so from the moment the sweep begins
 /// none of the registry's teardowns sends that child a signal by number,
 /// whether it is in the registry or a concurrent close or shutdown has
-/// already taken it out: one
-/// that signalled before the sweep did so to the launch's own process group,
-/// and one after finds the signals retired. `true` only when that session
+/// already taken it out. The authority orders those signals against the
+/// sweep: a teardown signals before the sweep takes it, or finds the signals
+/// retired after. It does not check the identity of a signal sent before
+/// the sweep, which goes to the child's pid as the registry holds it, as an
+/// ordinary close's does. `true` only when that session
 /// was seen with no process left that can run; `false` when the leader was
 /// not known, the session could not be read, a process in it could not be
 /// signalled or attributed to the launch, or one stayed in it past
@@ -3749,7 +3830,7 @@ mod tests {
             ts_ms: 1,
             pid,
             pid_start,
-            pane: None,
+            launch_nonce: None,
         };
         assert!(
             sessions.fenced(SESSION, None, &[]),
@@ -3820,7 +3901,7 @@ mod tests {
             ts_ms: 1,
             pid: None,
             pid_start: None,
-            pane: None,
+            launch_nonce: None,
         };
         let claude = Some(&AgentType::ClaudeCode);
         let claude_record = [record(Some(AgentType::ClaudeCode))];
@@ -3887,6 +3968,7 @@ mod tests {
             from: from.clone(),
             to: None,
             pane: None,
+            launch_nonce: None,
             pid: Some(me),
             pid_start: crate::platform::proc::process_start_of(me),
             sessions: sessions.iter().map(|s| s.to_string()).collect(),
@@ -4066,21 +4148,52 @@ mod tests {
         assert!(!claim::Markers::read(state.path()).fenced("u", None, &|_| false));
     }
 
-    /// PRD #1790 stage 3 (round 6, B1): a placed marker is narrowed in
-    /// place (one file, its new content), and a marker that names only the
-    /// pane its agent was started in lifts by that agent's launch record:
-    /// the one record of that pane, proven gone. A record still running, no
-    /// record, or two records of the pane keep it.
+    /// A launch record for the marker tests: attempt `attempt`, process
+    /// `pid` started at `start`, carrying the launch nonce `nonce`.
+    #[cfg(unix)]
+    fn nonce_record(
+        attempt: &str,
+        nonce: Option<&str>,
+        pid: u32,
+        start: Option<u64>,
+    ) -> LaunchRecord {
+        LaunchRecord {
+            v: crate::launch_records::SCHEMA_VERSION,
+            work: WorkId::parse("w-abcdefgh-0000000000000001").expect("a work id"),
+            attempt: AttemptId::parse(attempt).unwrap(),
+            command: None,
+            shell: None,
+            agent_type: None,
+            cwd: None,
+            cwd_moved_from: None,
+            name: None,
+            role: None,
+            orchestration: None,
+            orchestration_id: None,
+            ts_ms: 0,
+            pid: Some(pid),
+            pid_start: start,
+            launch_nonce: nonce.map(str::to_string),
+        }
+    }
+
+    /// PRD #1790 stage 3 (round 6, B1; round 7): a placed marker is narrowed
+    /// in place (one file, its new content), and a marker that names only
+    /// the launch nonce drawn for its start lifts by that agent's launch
+    /// record: the one record carrying the nonce, proven gone. A record
+    /// still running, no record, a record of another nonce, or two records
+    /// of the nonce keep it.
     #[cfg(unix)]
     #[test]
-    fn a_pre_spawn_marker_narrows_in_place_and_lifts_by_its_panes_record() {
-        const PANE: &str = "restored-pane-1";
+    fn a_pre_spawn_marker_narrows_in_place_and_lifts_by_its_launch_nonce() {
+        const NONCE: &str = "00112233445566778899aabbccddeeff";
         let state = crate::test_temp::tempdir().unwrap();
         let from = AttemptId::parse("r-pane/1").unwrap();
         let wide = claim::Marker {
             pid: None,
             pid_start: None,
-            pane: Some(PANE.to_string()),
+            pane: Some("restored-pane-1".to_string()),
+            launch_nonce: Some(NONCE.to_string()),
             ..survivor_marker(&from, &["u"], true)
         };
         let placed = claim::place_marker(state.path(), &wide).unwrap();
@@ -4104,38 +4217,167 @@ mod tests {
         assert_eq!(files, 1, "narrowed in place");
 
         let me = std::process::id();
-        let record = |pane: &str, pid: u32, start: Option<u64>| LaunchRecord {
-            v: crate::launch_records::SCHEMA_VERSION,
-            work: WorkId::parse("w-abcdefgh-0000000000000001").expect("a work id"),
-            attempt: AttemptId::parse("r-later/7").unwrap(),
-            command: None,
-            shell: None,
-            agent_type: None,
-            cwd: None,
-            cwd_moved_from: None,
-            name: None,
-            role: None,
-            orchestration: None,
-            orchestration_id: None,
-            ts_ms: 0,
-            pid: Some(pid),
-            pid_start: start,
-            pane: Some(pane.to_string()),
-        };
-        let gone = record(PANE, i32::MAX as u32, Some(1));
-        let alive = record(PANE, me, crate::platform::proc::process_start_of(me));
-        let other = record("restored-other", i32::MAX as u32, Some(1));
+        let mine = crate::platform::proc::process_start_of(me);
+        let gone = nonce_record("r-later/7", Some(NONCE), i32::MAX as u32, Some(1));
+        let alive = nonce_record("r-later/7", Some(NONCE), me, mine);
+        let other = nonce_record("r-later/7", Some("ff"), i32::MAX as u32, Some(1));
         assert!(marker_gone(&narrow, std::slice::from_ref(&gone)));
         assert!(!marker_gone(&narrow, std::slice::from_ref(&alive)));
         assert!(!marker_gone(&narrow, std::slice::from_ref(&other)));
         assert!(!marker_gone(&narrow, &[]));
         assert!(!marker_gone(&narrow, &[gone.clone(), gone.clone()]));
+        let no_nonce = claim::Marker {
+            launch_nonce: None,
+            ..narrow.clone()
+        };
+        assert!(
+            !marker_gone(&no_nonce, std::slice::from_ref(&gone)),
+            "no nonce, no attempt, no leader: never"
+        );
         assert_eq!(
             claim::Markers::read(state.path()).lift_gone(state.path(), &|m| marker_gone(
                 m,
                 std::slice::from_ref(&gone)
             )),
             1
+        );
+    }
+
+    /// PRD #1790 stage 3 (round 7, B1): pane ids repeat across daemons (the
+    /// counter starts again in each, and a long name used to cut off the
+    /// random part), so a retained launch record of an older, finished
+    /// launch in the same pane does not lift a new launch's marker; only the
+    /// record carrying the new launch's nonce does. Once the marker names
+    /// its attempt, the lookup is by that attempt alone, and a gone record
+    /// sharing the pane or the nonce makes it neither ambiguous nor lifts
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_launch_in_the_same_pane_does_not_lift_a_new_marker() {
+        const PANE: &str = "sched-restored-a-long-name-0";
+        const NEW: &str = "0123456789abcdef0123456789abcdef";
+        let from = AttemptId::parse("r-old/3").unwrap();
+        let marker = claim::Marker {
+            pid: None,
+            pid_start: None,
+            pane: Some(PANE.to_string()),
+            launch_nonce: Some(NEW.to_string()),
+            ..survivor_marker(&from, &["u"], true)
+        };
+        let me = std::process::id();
+        let mine = crate::platform::proc::process_start_of(me);
+        // The older launch in this pane: written before nonces, finished.
+        let older = nonce_record("r-old/3", None, i32::MAX as u32, Some(1));
+        assert!(
+            !marker_gone(&marker, std::slice::from_ref(&older)),
+            "an older launch in the same pane proves nothing"
+        );
+        // The new launch's record: running keeps it, gone lifts it.
+        let new_running = nonce_record("r-new/1", Some(NEW), me, mine);
+        let new_gone = nonce_record("r-new/1", Some(NEW), i32::MAX as u32, Some(1));
+        assert!(!marker_gone(&marker, &[older.clone(), new_running.clone()]));
+        assert!(marker_gone(&marker, &[older.clone(), new_gone.clone()]));
+        // Narrowed to its attempt: that attempt's record alone decides.
+        let to = claim::Marker {
+            to: Some(AttemptId::parse("r-new/1").unwrap()),
+            ..marker.clone()
+        };
+        assert!(!marker_gone(&to, &[older.clone(), new_running.clone()]));
+        assert!(marker_gone(&to, &[older.clone(), new_gone.clone()]));
+        let unrelated = nonce_record("r-other/2", Some(NEW), i32::MAX as u32, Some(1));
+        assert!(
+            !marker_gone(&to, &[unrelated.clone(), new_running]),
+            "a gone record of another attempt does not lift it"
+        );
+        assert!(
+            marker_gone(&to, &[unrelated, new_gone]),
+            "nor makes the attempt's own record ambiguous"
+        );
+
+        // The pane id a restore draws keeps its random part, whatever the
+        // name's length.
+        let long = "n".repeat(120);
+        let ids: Vec<_> = (0..2).map(|_| restored_pane_id(Some(&long))).collect();
+        for id in &ids {
+            assert!(crate::agent_pty::is_valid_pane_id_env(id), "{id}");
+            let random = id
+                .rsplit('-')
+                .nth(1)
+                .expect("a random part before the counter");
+            assert_eq!(random.len(), 6, "{id}");
+            assert!(random.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        }
+    }
+
+    /// PRD #1790 stage 3 (round 7, B2): a spawn refused after its fork (the
+    /// race a shutdown or an admission freeze wins, injected here) returns
+    /// an error, and the fork watch armed around it reports the child it
+    /// started, by pid and start time. A spawn that fails before its fork
+    /// reports nothing started.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_refused_after_its_fork_reports_the_child_it_started() {
+        use crate::agent_pty::{FAULT_SPAWN_BEFORE_PUBLISH, ForkWatch, Forked, TestFault};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.inject_fault_for_test(FAULT_SPAWN_BEFORE_PUBLISH, TestFault::Fail);
+        let watch = ForkWatch::arm();
+        let spawned = registry.spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            ..SpawnOptions::default()
+        });
+        let forked = watch.forked();
+        assert!(spawned.is_err(), "refused after its fork");
+        let Forked::Child(Some(leader)) = forked else {
+            panic!("the child it started is reported: {forked:?}");
+        };
+        assert!(leader.pid > 0);
+        assert!(registry.agent_ids().is_empty(), "nothing published");
+
+        let watch = ForkWatch::arm();
+        let spawned = registry.spawn_agent(SpawnOptions {
+            command: Some("sleep 30"),
+            cwd: Some("/nonexistent/dot-agent-deck-round-7"),
+            ..SpawnOptions::default()
+        });
+        assert!(spawned.is_err(), "refused before its fork");
+        assert_eq!(watch.forked(), Forked::Nothing);
+    }
+
+    /// PRD #1790 stage 3 (round 7, B2): a failed spawn's fence lifts only
+    /// when the spawn is known to have left nothing running: it started no
+    /// child, or the session the child led is seen empty. A child of the
+    /// launch left in that session after the leader was reaped keeps it,
+    /// and is not signalled; a child whose identity was not read keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_spawn_lifts_its_marker_only_once_nothing_was_left_running() {
+        use crate::agent_pty::Forked;
+        let nobody = FakeView::new(&[]);
+        assert!(spawn_left_nothing(&nobody, Forked::Nothing, TICK, TICK));
+        assert!(!spawn_left_nothing(
+            &nobody,
+            Forked::Child(None),
+            TICK,
+            TICK
+        ));
+        // The leader was reaped by the refused spawn; its session is empty.
+        assert!(spawn_left_nothing(
+            &nobody,
+            Forked::Child(Some(leader(50, 100))),
+            LONG,
+            TICK
+        ));
+        // A same-session child in another process group survived.
+        let survivor = FakeView::new(&[(61, 130, 50)]);
+        assert!(!spawn_left_nothing(
+            &survivor,
+            Forked::Child(Some(leader(50, 100))),
+            TICK,
+            TICK
+        ));
+        assert!(
+            !survivor.signalled(),
+            "nothing signalled once the leader is gone"
         );
     }
 
@@ -4347,7 +4589,7 @@ mod tests {
             ts_ms: 1,
             pid: None,
             pid_start: None,
-            pane: None,
+            launch_nonce: None,
         };
         let read = JournalRead {
             lines: vec![Line {

@@ -100,7 +100,7 @@ fn journal_restore_018_saved_panes_defer_only_an_exact_restorable_launch() {
         ts_ms: 1795400000000,
         pid: Some(u32::MAX),
         pid_start: Some(1),
-        pane: None,
+        launch_nonce: None,
     };
     let mut interrupted: InterruptedList = serde_json::from_value(json!({
         "items":[{
