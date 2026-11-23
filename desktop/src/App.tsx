@@ -47,7 +47,8 @@ import { AddDaemonDialog, AddDaemonOpener } from "./components/AddDaemonDialog";
 import { HandoffRail } from "./components/HandoffRail";
 import { DeckAttention } from "./components/DeckAttention";
 import { SelectDeckNote } from "./components/SelectDeckNote";
-import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
+import { ProfilesPanel, ProjectsPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
+import { PromptLibraryOverlay, useShellPromptLibrary } from "./components/PromptLibraryOverlay";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
@@ -69,7 +70,6 @@ import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { stopDaemonConfirmCopy, stopDaemonOffer } from "./lib/stopDaemon";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
-import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useQuestionNotifications } from "./hooks/useQuestionNotifications";
 import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
@@ -106,7 +106,7 @@ import { chooseShownAntigravityNotice, useAntigravityNotice } from "./lib/antigr
 import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
-import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
+import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckPrompt, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bridge";
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
@@ -472,12 +472,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const screen: RailScreen = base === "overview" ? "overview" : "deck";
   const { open: overlaysOpen, setOverlay, closeOverlays, deck: deckOverlays } = useShellOverlays(screen);
+  const promptLibrary = useShellPromptLibrary(runtime, settings, Boolean(overlaysOpen.prompts));
   const railContext = useMemo<RailContext>(() => ({
     navigate: setView,
-    // Settings opens over whichever screen is up; the deck's own panels exist
-    // only on the deck, so asking for one elsewhere goes there first.
+    // Settings and the prompt library (issue #1310) open over whichever screen
+    // is up; the deck's own panels exist only on the deck, so asking for one
+    // elsewhere goes there first.
     openOverlay: (overlay) => {
-      if (overlay === "settings") return setOverlay(screen, overlay, true);
+      if (overlay === "settings" || overlay === "prompts") return setOverlay(screen, overlay, true);
       if (screen !== "deck") setView({ kind: "deck" });
       setOverlay("deck", overlay, true);
     },
@@ -493,18 +495,22 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const openAddDaemon = useCallback(() => setOverlay(screen, "addDaemon", true), [screen, setOverlay]);
   const closeAddDaemon = useCallback(() => setOverlay(screen, "addDaemon", false), [screen, setOverlay]);
   /**
-   * `Escape` closes Settings over the overview. The deck's own blanket
-   * dismissal covers it there, and the overview has no such handler.
+   * `Escape` closes Settings, and the prompt library (issue #1310), over the
+   * overview. The deck's own blanket dismissal covers them there, and the
+   * overview has no such handler.
    */
   const overviewSettingsOpen = screen === "overview" && Boolean(overlaysOpen.settings);
+  const overviewPromptsOpen = screen === "overview" && Boolean(overlaysOpen.prompts);
   useEffect(() => {
-    if (!overviewSettingsOpen) return;
+    if (!overviewSettingsOpen && !overviewPromptsOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOverlay("overview", "settings", false);
+      if (event.key !== "Escape") return;
+      if (overviewSettingsOpen) setOverlay("overview", "settings", false);
+      if (overviewPromptsOpen) setOverlay("overview", "prompts", false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [overviewSettingsOpen, setOverlay]);
+  }, [overviewPromptsOpen, overviewSettingsOpen, setOverlay]);
   const selectedDeckId = runtime.snapshot.connection.deckId;
   /** The fleet entry the open pane's agent lives on, if the app is observing it. */
   const paneDeck = agentView ? runtime.fleet.find((entry) => entry.connection.deckId === agentView.deckId) : undefined;
@@ -1372,7 +1378,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           return undefined;
         } }
         : overviewVoiceContext.current?.scrollDashboard
-          ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
+          ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || overlaysOpen.prompts || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
           : {}),
       /* PRD #1401 — the browser's members; `closePullRequest` only while the
          browser is open and nothing is drawn over it, so `close` reads its
@@ -1515,7 +1521,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} generateConfig={paneGenerateConfig} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} restartInterrupted={restartInterrupted} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} antigravityNotice={antigravityToast} onDismissAntigravityNotice={dismissAntigravityToast} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} generateConfig={paneGenerateConfig} voiceChannel={deckVoiceContext} overlays={deckOverlays} prompts={promptLibrary.prompts} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} restartInterrupted={restartInterrupted} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} antigravityNotice={antigravityToast} onDismissAntigravityNotice={dismissAntigravityToast} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1552,7 +1558,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
      the overlay stack rather than listed one by one (`StarPromptGate`); and
      while the connection banner is up, which its backdrop would cover. */
   const connectionBanner = runtime.snapshot.connection.status !== "connected" || Boolean(runtime.snapshot.connection.buildStampMismatchOnly) || Boolean(runtime.snapshot.connection.selectionFallback);
-  const starReady = !connectionBanner && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !prBrowser;
+  const starReady = !connectionBanner && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !overlaysOpen.prompts && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>
@@ -1571,6 +1577,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
         <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} addDaemonOpen={overlaysOpen.addDaemon ?? false} onCloseAddDaemon={closeAddDaemon} />
+        {/* Issue #1310 — the prompt library opens over either screen, as Settings does. */}
+        <PromptLibraryOverlay library={promptLibrary} open={overlaysOpen.prompts ?? false} onClose={() => setOverlay(screen, "prompts", false)} />
         {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
         {/* PRD #211: one reminder at a time — the star reminder waits while the Antigravity notice is due, and the notice waits behind the star reminder on screen (it is drawn above the pane). */}
         <StarPromptGate due={star.due} ready={starReady && !antigravityNotice.due} onChoose={star.choose} />
@@ -1840,6 +1848,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   // Issue #1197: the rail and the Settings sheet are the shell's, so a deck
   // rendered on its own carries the same pair {@link DeckShell} does.
   const { open, setOverlay, closeOverlays, deck } = useShellOverlays("deck");
+  const promptLibrary = useShellPromptLibrary(props.runtime, settings, Boolean(open.prompts));
   const context: RailContext = {
     navigate: (view) => props.onNavigate?.(view),
     openOverlay: (overlay) => setOverlay("deck", overlay, true),
@@ -1852,8 +1861,9 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
     <AddDaemonOpener.Provider value={openAddDaemon}>
       {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
       <NavigationRail screen="deck" overlays={open} context={context} connection={props.runtime.snapshot.connection} features={desktopFeaturesOf(props.runtime)} onShowShortcuts={() => setOverlay("deck", "shortcuts", true)} />
-      <DeckSurface {...props} settings={settings} overlays={deck} />
+      <DeckSurface {...props} settings={settings} overlays={deck} prompts={promptLibrary.prompts} />
       <ShellSettings runtime={props.runtime} settings={settings} open={open.settings ?? false} onClose={() => setOverlay("deck", "settings", false)} addDaemonOpen={open.addDaemon ?? false} onCloseAddDaemon={closeAddDaemon} />
+      <PromptLibraryOverlay library={promptLibrary} open={open.prompts ?? false} onClose={() => setOverlay("deck", "prompts", false)} />
     </AddDaemonOpener.Provider>
   );
 }
@@ -1863,7 +1873,10 @@ function tileKey(agent: { daemonId: string; id: string; incarnation?: string }):
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, generateConfig, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, restartInterrupted, starNotice, onDismissStarNotice, antigravityNotice, onDismissAntigravityNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; restartInterrupted?: RestartInterrupted; starNotice?: string; onDismissStarNotice?: () => void; antigravityNotice?: string; onDismissAntigravityNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
+/** What a deck rendered without the shell's prompt library inserts from. */
+const NO_PROMPTS: DeckPrompt[] = [];
+
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, generateConfig, voiceChannel, overlays: shellOverlays, prompts = NO_PROMPTS, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, restartInterrupted, starNotice, onDismissStarNotice, antigravityNotice, onDismissAntigravityNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; /** Issue #1310 — the shell's prompt library, which the orchestration editor inserts from. */ prompts?: DeckPrompt[]; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; restartInterrupted?: RestartInterrupted; starNotice?: string; onDismissStarNotice?: () => void; antigravityNotice?: string; onDismissAntigravityNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -1981,8 +1994,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const projectsOpen = overlays.open.projects ?? false;
   const profilesOpen = overlays.open.profiles ?? false;
-  const promptsOpen = overlays.open.prompts ?? false;
-  const [selectedPromptId, setSelectedPromptId] = useState(""); // voice-registry-exempt: which stored prompt the library panel is editing — a selection within that panel
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
   const orchestrationOpen = overlays.open.orchestration ?? false;
   const [paletteOpen, setPaletteOpen] = useState(false); // voice-registry-exempt: the command palette is the registry's own surface: it lists entries and runs them, and opening it runs none
@@ -2106,22 +2117,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   // sit open while another run takes the title (PR #1333 review).
   const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
   orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
-  // Issue #824 — the prompt library is the selected daemon's, so it follows
-  // the deck: none under All Decks or while no deck is connected.
-  const promptDeckId = !allDecks && snapshot.connection.status === "connected" ? orchestrationDeckId : undefined;
-  const { prompts, source: promptSource, notice: promptNotice, addPrompt, updatePrompt, removePrompt, flushPending: flushPromptSaves } = usePromptLibrary({
-    deckId: promptDeckId,
-    listPrompts: runtime.listPrompts,
-    savePrompt: runtime.savePrompt,
-    deletePrompt: runtime.deletePrompt,
-    seedPrompts: runtime.seedPrompts,
-  });
-  // Issue #824 — however the Prompts panel closes (its button, Escape, a voice
-  // action that dismisses every overlay), a pending edit is saved now rather
-  // than on its timer.
-  useEffect(() => {
-    if (!promptsOpen) flushPromptSaves();
-  }, [promptsOpen, flushPromptSaves]);
   const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
@@ -2153,12 +2148,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       setSelectedEvidenceId(snapshot.evidence[0]?.id ?? "");
     }
   }, [selectedEvidenceId, snapshot.evidence]);
-
-  useEffect(() => {
-    if (!selectedPromptId || !prompts.some((prompt) => prompt.id === selectedPromptId)) {
-      setSelectedPromptId(prompts[0]?.id ?? "");
-    }
-  }, [prompts, selectedPromptId]);
 
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
@@ -2789,10 +2778,12 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
        in-deck doors — the run graph's Edit loop, the empty deck's Configure
        agents, and the Projects ↔ Orchestrations cross-links inside those panels.
        Each sits inside a surface that is itself hidden with the flag off, and
-       all five fields follow the one flag today; if they ever diverge, those
-       doors need gates of their own. */
+       the remaining fields all follow the one flag today; if they ever diverge,
+       those doors need gates of their own. The prompt library graduated from
+       the flag (issue #1310), so its entry is always offered; the panel holds
+       no door to another panel. */
     ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose projects & orchestrations", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
-    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
+    { label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) },
     ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
     ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
@@ -2995,18 +2986,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         onClose={() => setOverlay("projects", false)}
         onConfigureOrchestration={() => { setOverlay("projects", false); VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext); }}
         allDecks={allDecks}
-      />
-      <PromptLibraryPanel
-        open={promptsOpen}
-        prompts={prompts}
-        selectedId={selectedPromptId}
-        onSelect={setSelectedPromptId}
-        onClose={() => setOverlay("prompts", false)}
-        source={promptSource}
-        notice={promptNotice}
-        onAdd={() => { const id = addPrompt(); if (id) setSelectedPromptId(id); }}
-        onUpdate={updatePrompt}
-        onRemove={(id) => { removePrompt(id); setNotice(promptSource.kind === "deck" ? "Prompt removed from this daemon's library." : "Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setOverlay("profiles", false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
       <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />

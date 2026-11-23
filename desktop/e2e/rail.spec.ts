@@ -17,7 +17,7 @@ test.describe("desktop navigation rail", () => {
     await page.goto("/?fixture=1&state=connected");
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
-    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Settings"]);
+    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Prompts", "Settings"]);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Dashboard");
     await expect(page.getByTestId("overview-open-deck")).toHaveCount(0);
   });
@@ -49,6 +49,21 @@ test.describe("desktop navigation rail", () => {
   });
 
   /**
+   * Scenario: on the shipped overview, click the Prompts entry in the rail.
+   * The prompt library opens over the overview, and Escape closes it.
+   */
+  test("opens the prompt library directly from the overview", async ({ page }) => {
+    await page.goto("/?fixture=1&state=connected");
+    await expect(page.getByTestId("overview-table-region")).toBeVisible();
+    await rail(page).getByRole("button", { name: "Prompts" }).click();
+    await expect(page.getByTestId("prompt-library-panel")).toBeVisible();
+    await expect(rail(page).locator("[aria-current='page']")).toHaveText("Prompts");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("prompt-library-panel")).toHaveCount(0);
+    await expect(page.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /**
    * Scenario: on the overview, click the Settings entry in the rail. The
    * Settings sheet opens directly over the overview.
    */
@@ -73,6 +88,6 @@ test.describe("desktop navigation rail", () => {
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
-    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Settings"]);
+    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Prompts", "Settings"]);
   });
 });

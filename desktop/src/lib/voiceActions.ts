@@ -1127,7 +1127,7 @@ export const VOICE_ACTIONS = {
 
   openPromptLibrary: {
     label: "Open the prompt library",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4)",
+    no_voice: "a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4). It left the experimental flag in issue #1310, which removed only the other half of the old reason",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
   },

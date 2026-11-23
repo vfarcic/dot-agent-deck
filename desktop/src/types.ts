@@ -687,7 +687,6 @@ export type NewAgentOptions =
 export interface DesktopFeatures {
   showDeck: boolean;
   showProjects: boolean;
-  showPrompts: boolean;
   showOrchestrations: boolean;
   showAgentProfiles: boolean;
   /**
@@ -701,7 +700,6 @@ export interface DesktopFeatures {
 export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showDeck: false,
   showProjects: false,
-  showPrompts: false,
   showOrchestrations: false,
   showAgentProfiles: false,
   showAgentDetails: false,

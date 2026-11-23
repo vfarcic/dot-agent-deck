@@ -28,9 +28,11 @@ export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | 
  * there, since those panels exist only on the deck; Settings opens over
  * whichever screen is up.
  *
- * Issue #1198 — the deck and its four panels are experimental surfaces, so
- * each entry renders only while its own `features` field says so. With the
- * flag off — the shipped default — the rail is Dashboard and Settings. Nothing
+ * Issue #1198 — the deck and three of its panels are experimental surfaces,
+ * so each of those entries renders only while its own `features` field says
+ * so. Prompts graduated from the flag (issue #1310) and always renders. With
+ * the flag off — the shipped default — the rail is Dashboard, Prompts and
+ * Settings. Nothing
  * else here reads the flag: the entries that remain dispatch exactly as they
  * did.
  */
@@ -48,7 +50,7 @@ export function NavigationRail({ screen, overlays, context, connection, features
         <RailButton icon={LayoutList} label="Dashboard" active={screen === "overview" && !overlayOpen} onClick={() => VOICE_ACTIONS.openOverview.run(context)} testId="open-overview" />
         {features.showDeck && <RailButton icon={SquareTerminal} label="Daemons" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />}
         {features.showProjects && <RailButton icon={FolderGit2} label="Projects" active={overlays.projects} onClick={() => VOICE_ACTIONS.openProjects.run(context)} testId="open-projects" />}
-        {features.showPrompts && <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />}
+        <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />
         {features.showOrchestrations && <RailButton icon={Network} label="Orchestrations" active={overlays.orchestration} onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(context)} />}
         {features.showAgentProfiles && <RailButton icon={Bot} label="Agent Profiles" active={overlays.profiles} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(context)} testId="open-agent-profiles" />}
         <RailButton icon={Settings2} label="Settings" active={overlays.settings} onClick={() => VOICE_ACTIONS.openSettings.run(context)} testId="open-settings" />

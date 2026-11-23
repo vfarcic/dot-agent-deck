@@ -2487,13 +2487,13 @@ describe("DeckShell", () => {
 
   /**
    * Scenario: launch the shipped desktop with the experimental flag absent.
-   * The dashboard is the landing screen and the only rail destinations are Dashboard and Settings.
+   * The dashboard is the landing screen and the only rail destinations are Dashboard, Prompts and Settings.
    */
   it("hides every experimental destination from the shipped rail", async () => {
     window.history.replaceState({}, "", "/?fixture=1");
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Prompts", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
     expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
@@ -2501,14 +2501,14 @@ describe("DeckShell", () => {
 
   /**
    * Scenario: an older or incomplete desktop bridge returns no feature answer
-   * at startup. The visible app uses the shipped two-destination rail.
+   * at startup. The visible app uses the shipped three-destination rail.
    */
   it("keeps the shipped rail when the feature answer is missing", async () => {
     window.history.replaceState({}, "", "/?fixture=1&experimental=1");
     const state = runtime({ snapshot: createFixtureSnapshot("connected"), ...{ desktopFeatures: undefined } });
     render(<DeckShell runtime={state} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Prompts", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
   });
 
@@ -2539,6 +2539,26 @@ describe("DeckShell", () => {
     expect(screen.queryByRole("button", { name: "Open daemons" })).not.toBeInTheDocument();
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     expect(screen.queryByRole("dialog", { name: "Command menu" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /**
+   * Scenario: with the shipped flag off, press Prompts in the rail on the dashboard.
+   * The prompt library opens over the dashboard rather than leading to the hidden deck, and Escape closes it.
+   */
+  it("opens the prompt library over the shipped dashboard", async () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
+    await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
+
+    fireEvent.click(screen.getByTestId("open-prompts"));
+    expect(screen.getByTestId("prompt-library-panel")).toBeVisible();
+    expect(screen.getByTestId("overview-table-region")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("open-prompts")).toHaveAttribute("aria-current", "page");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("prompt-library-panel")).not.toBeInTheDocument();
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
   });
 

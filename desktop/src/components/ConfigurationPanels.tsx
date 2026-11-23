@@ -191,7 +191,7 @@ export function PromptLibraryPanel({ open, prompts, source = { kind: "device", r
     <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
       <section ref={sheet.ref} tabIndex={-1} className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="prompts-title" data-testid="prompt-library-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
-          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the orchestration task prompt and for messaging a running agent.</p></div>
+          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text to insert into an orchestration's task prompt.</p></div>
           <button className="icon-button" aria-label="Close prompt library" onClick={onClose}><X size={18} /></button>
         </header>
         <div className="local-only-notice project-notice" data-testid="prompt-library-source" data-source={source.kind}><BookMarked size={15} /><span><strong>{promptSourceNotice(source).title}</strong> — {promptSourceNotice(source).text}</span></div>
