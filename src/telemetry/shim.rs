@@ -451,7 +451,7 @@ fn resume_args(
     };
     let spec = crate::agent_registry::ALL
         .iter()
-        .filter_map(|spec| spec.resume)
+        .filter_map(|spec| spec.session_args)
         .find(|resume| resume.program == name);
     if spec.is_some_and(|spec| spec.inspects(args)) {
         return Vec::new();

@@ -179,6 +179,7 @@ describe("the interrupted work wording", () => {
     ["IncompleteRead", "incomplete-read", "The deck could not read its whole work journal or all its records of how agents were started."],
     ["NotInterrupted", "not-interrupted", "The restart did not stop this agent."],
     ["NotResumed", "not-resumed", "The deck tried to restore the agent's conversation and could not."],
+    ["OldProcessUnknown", "old-process-unknown", "An older version of the deck started this agent, so the deck cannot tell whether its old process is gone."],
     ["Unknown", "unknown", "The agent cannot be restored."],
   ] as const;
 
@@ -203,7 +204,10 @@ describe("the interrupted work wording", () => {
   it("journal/restore/009 copies the action refusal sentences word for word", () => {
     const body = rust.split("pub fn restore_refusal_sentence(")[1]?.split("\n}\n")[0] ?? "";
     const arms = [...body.matchAll(/RestoreRefusal::([A-Za-z]+)\s*=>\s*\{?\s*(?:"((?:[^"\\]|\\.)*)"|([A-Z_]+))/g)];
-    expect(arms).toHaveLength(28);
+    // 28 + the 8 refusals of the full review and audit (bad-selection,
+    // command-reopens, not-fresh, not-stopped, pr-open, directory-in-use,
+    // note-refused, note-not-delivered).
+    expect(arms).toHaveLength(36);
     for (const [, variant, literal, constant] of arms) {
       const code = variant.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
       const sentence = literal === undefined ? rustStrings().get(constant) : JSON.parse(`"${literal}"`) as string;

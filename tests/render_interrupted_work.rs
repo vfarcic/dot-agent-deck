@@ -2235,7 +2235,7 @@ fn no_restore_hint(frame: &str) {
     }
 }
 
-/// Scenario: Open the interrupted list and press s on a resumable Claude, then on an agent that can only start over, inspecting both the list and details entry points. A non-restorable or newer verdict offers no confirmation; with experimental features off, s opens no question and neither view draws a restore hint.
+/// Scenario: Open the interrupted list and press s on a resumable Claude, on an agent that can only start over, and on a Claude an older deck started without recording its process, inspecting both the list and details entry points. The older-deck Claude is offered Start over only, and w sends exactly that; a non-restorable or newer verdict offers no confirmation; with experimental features off, s opens no question and neither view draws a restore hint.
 #[spec("journal/restore/007")]
 #[test]
 fn journal_restore_007_the_question_offers_only_the_selected_agents_choices() {
@@ -2286,6 +2286,44 @@ fn journal_restore_007_the_question_offers_only_the_selected_agents_choices() {
                 insta::assert_snapshot!(snapshot, question);
             }
         }
+    }
+
+    // Review R#2: a Claude whose launch record an older deck wrote, without
+    // the old process's identity, is offered Start over and nothing else.
+    let mut legacy = restore_fixture(AGENT_ID, RESTORE_ATTEMPT_A, "restore-legacy", true);
+    legacy.agents[0].restore = RestoreVerdict::StartOver {
+        reason: RestoreReason::OldProcessUnknown,
+    };
+    for details in [false, true] {
+        let mut steps = vec![InterruptedSeamStep::RestoreCapability(true), ch('I')];
+        if details {
+            steps.push(key(KeyCode::Enter));
+        }
+        steps.extend([ch('s'), ch('c'), ch('o')]);
+        let (shown, sent) = run(&only(legacy.clone()), &steps);
+        let question = shown.last().unwrap();
+        at(question, &start_over_question("restore-legacy"));
+        // The sentence wraps at the dialog's width; both halves are shown.
+        let sentence = restore_reason_sentence(RestoreReason::OldProcessUnknown);
+        let (head, tail) = sentence.split_at(sentence.find(" process is gone").unwrap());
+        at(question, head);
+        at(question, tail.trim_start());
+        at(question, START_OVER);
+        assert!(
+            !question.contains(RESTORE_AND_CONTINUE) && !question.contains(RESTORE_ONLY),
+            "an older deck's agent is not offered a restore:\n{question}"
+        );
+        assert!(
+            restore_actions(&sent).is_empty(),
+            "c and o act on nothing: {sent:?}"
+        );
+        steps.push(ch('w'));
+        let (_, sent) = run(&only(legacy.clone()), &steps);
+        assert_eq!(
+            restore_actions(&sent),
+            vec![expected_start_over(AGENT_ID, RESTORE_ATTEMPT_A)],
+            "w starts the older deck's agent over"
+        );
     }
 
     for verdict in [

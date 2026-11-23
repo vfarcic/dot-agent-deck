@@ -721,12 +721,16 @@ pub async fn run_restore(
     confirm: Confirm<'_>,
 ) -> CliOutput {
     let mut question = words::restore_question(&shown(&args.id));
+    // What the person confirms: the item, agents and daemon process its dry
+    // run resolved, so the action reaches exactly them (audit suggestion:
+    // CLI confirmation binding). `None` without a dry run that answered.
+    let mut bound: Option<Bound> = None;
     // §4 item 10: ask with what a dry run says of an open pull request. Best
     // effort: a dry run that cannot answer leaves the question as it is, and
     // the request itself reports why.
     if asks(args.dry_run, args.yes, &confirm)
-        && let Ok(GatedQuery::Answered(outcome)) = client
-            .restore_interrupted(
+        && let Ok(PinnedQuery::Answered { value, instance }) = client
+            .restore_interrupted_pinned(
                 &args.id,
                 args.agents.clone(),
                 args.mode,
@@ -736,7 +740,22 @@ pub async fn run_restore(
             )
             .await
     {
-        question = with_git_note(question, outcome.git.as_ref());
+        question = with_git_note(question, value.git.as_ref());
+        bound = value.item.map(|item| Bound {
+            item,
+            instance,
+            // Only what the dry run said it would restore: an empty
+            // selection must not grow to agents nobody was asked about.
+            agents: if args.agents.is_empty() && !value.would_restore.is_empty() {
+                value
+                    .would_restore
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            } else {
+                args.agents.clone()
+            },
+        });
     }
     if let Some(refused) = restore_gate(
         args.dry_run,
@@ -747,21 +766,38 @@ pub async fn run_restore(
     ) {
         return refused;
     }
+    let (id, agents, pinned) = match &bound {
+        Some(bound) => (
+            bound.item.as_str(),
+            bound.agents.clone(),
+            bound.instance.as_deref(),
+        ),
+        None => (args.id.as_str(), args.agents.clone(), None),
+    };
     match client
-        .restore_interrupted(
-            &args.id,
-            args.agents.clone(),
+        .restore_interrupted_pinned(
+            id,
+            agents,
             args.mode,
             args.dry_run,
             identity.claim(),
-            None,
+            pinned,
         )
         .await
     {
-        Ok(GatedQuery::Answered(outcome)) => render_restore(&outcome),
-        Ok(GatedQuery::Unsupported) => restore_unsupported(),
+        Ok(PinnedQuery::Answered { value, .. }) => render_restore(&value),
+        Ok(PinnedQuery::Unsupported) => restore_unsupported(),
+        Ok(PinnedQuery::OtherInstance) => failed(words::RESTORE_DAEMON_REPLACED, EXIT_REFUSED),
         Err(e) => client_error(e),
     }
+}
+
+/// What a confirmed restore or start over acts on: the item its dry run
+/// resolved, the daemon process that answered it, and the agents.
+struct Bound {
+    item: String,
+    instance: Option<String>,
+    agents: Vec<String>,
 }
 
 /// [`run_restore`]'s text and exit code: 0 when something was (or, in a dry
@@ -823,12 +859,18 @@ pub async fn run_start_over(
     confirm: Confirm<'_>,
 ) -> CliOutput {
     let mut question = words::start_over_question(&shown(&args.agent));
+    let mut bound: Option<Bound> = None;
     if asks(args.dry_run, args.yes, &confirm)
-        && let Ok(GatedQuery::Answered(outcome)) = client
-            .start_over_interrupted(&args.id, &args.agent, true, identity.claim(), None)
+        && let Ok(PinnedQuery::Answered { value, instance }) = client
+            .start_over_interrupted_pinned(&args.id, &args.agent, true, identity.claim(), None)
             .await
     {
-        question = with_git_note(question, outcome.git.as_ref());
+        question = with_git_note(question, value.git.as_ref());
+        bound = value.item.map(|item| Bound {
+            item,
+            instance,
+            agents: vec![args.agent.clone()],
+        });
     }
     if let Some(refused) = restore_gate(
         args.dry_run,
@@ -839,12 +881,17 @@ pub async fn run_start_over(
     ) {
         return refused;
     }
+    let (id, pinned) = match &bound {
+        Some(bound) => (bound.item.as_str(), bound.instance.as_deref()),
+        None => (args.id.as_str(), None),
+    };
     match client
-        .start_over_interrupted(&args.id, &args.agent, args.dry_run, identity.claim(), None)
+        .start_over_interrupted_pinned(id, &args.agent, args.dry_run, identity.claim(), pinned)
         .await
     {
-        Ok(GatedQuery::Answered(outcome)) => render_start_over(&outcome),
-        Ok(GatedQuery::Unsupported) => restore_unsupported(),
+        Ok(PinnedQuery::Answered { value, .. }) => render_start_over(&value),
+        Ok(PinnedQuery::Unsupported) => restore_unsupported(),
+        Ok(PinnedQuery::OtherInstance) => failed(words::RESTORE_DAEMON_REPLACED, EXIT_REFUSED),
         Err(e) => client_error(e),
     }
 }

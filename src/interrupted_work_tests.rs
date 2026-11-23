@@ -12,9 +12,13 @@ use spec::spec;
 
 const RESTORE_SESSION: &str = "01234567-89ab-4cde-8fab-0123456789ab";
 
+/// A launch record as this build writes it: with the process identity a
+/// restore checks first (review R#2 makes a record without one Start over).
 fn restore_record(w: &WorkId, a: &AttemptId, agent: crate::event::AgentType) -> LaunchRecord {
     let mut r = record(w, a, "saved agent", Some("/home/someone/code/p"));
     r.agent_type = Some(agent);
+    r.pid = Some(4242);
+    r.pid_start = Some(7);
     r
 }
 
@@ -41,7 +45,7 @@ fn restore_verdict(agent: &ItemAgent) -> serde_json::Value {
     serde_json::to_value(verdict).unwrap()
 }
 
-/// Scenario: List an interrupted Claude or Codex pane, or a dispatched single agent, with a recorded conversation. The list names that agent and offers resume using its latest session, without checking whether its folder exists.
+/// Scenario: List an interrupted Claude pane, or a dispatched single Claude agent, with a recorded conversation. The list names that agent and offers resume using its latest session, without checking whether its folder exists.
 #[spec("journal/restore/001")]
 #[test]
 fn journal_restore_001_single_agents_offer_resume_from_the_latest_session() {
@@ -51,7 +55,10 @@ fn journal_restore_001_single_agents_offer_resume_from_the_latest_session() {
         (Launch::Dispatch, ItemKind::Unit),
         (Launch::IssueDispatch, ItemKind::IssueDispatch),
     ] {
-        for agent_type in [AgentType::ClaudeCode, AgentType::Codex] {
+        // PRD #1790 stage 3 (#2492): Codex is a documented gap, listed with
+        // the other gaps in `journal/restore/002`.
+        {
+            let agent_type = AgentType::ClaudeCode;
             let mut j = Journal::default();
             let (w, a) = (work(1), attempt(OLD, 1));
             j.opened(
@@ -122,12 +129,13 @@ fn journal_restore_001_agent_lists_are_bounded_with_an_omitted_count() {
     assert_eq!(attempts.len(), 16, "distinct attempts, not duplicate rows");
 }
 
-/// Scenario: List interrupted agents that cannot resume, including a default shell, and list a team's roles and multi-attempt units. Fresh starts are offered for the unsupported single agents; team roles and units outside the single-agent scope say orchestration-later.
+/// Scenario: List interrupted agents that cannot resume, Codex and a default shell among them, and list a team's roles and multi-attempt units. Fresh starts are offered for the unsupported single agents; team roles and units outside the single-agent scope say orchestration-later.
 #[spec("journal/restore/002")]
 #[test]
 fn journal_restore_002_gaps_start_over_and_teams_wait_for_orchestration_restore() {
     use crate::event::AgentType;
     for agent_type in [
+        AgentType::Codex,
         AgentType::Pi,
         AgentType::OpenCode,
         AgentType::Devin,
@@ -226,7 +234,7 @@ fn journal_restore_002_gaps_start_over_and_teams_wait_for_orchestration_restore(
     );
 }
 
-/// Scenario: List interrupted panes with ambiguous, absent or moved launch records, an invalid or absent conversation id, and incomplete reads. Each agent remains visible with a specific refusal or fresh-start reason instead of being offered resume.
+/// Scenario: List interrupted panes with ambiguous, absent or moved launch records, a record an older deck wrote without the old process's identity, an invalid or absent conversation id, and incomplete reads. Each agent remains visible with a specific refusal or fresh-start reason instead of being offered resume.
 #[spec("journal/restore/003")]
 #[test]
 fn journal_restore_003_bad_evidence_never_offers_resume() {
@@ -239,6 +247,8 @@ fn journal_restore_003_bad_evidence_never_offers_resume() {
         ("missing", "none", "no-launch-record"),
         ("invalid", "start_over", "session-id-invalid"),
         ("no-session", "start_over", "no-session-id"),
+        ("legacy", "start_over", "old-process-unknown"),
+        ("legacy-no-start", "start_over", "old-process-unknown"),
         ("journal-incomplete", "none", "incomplete-read"),
         ("launch-incomplete", "none", "incomplete-read"),
         ("launch-skipped", "none", "incomplete-read"),
@@ -262,6 +272,13 @@ fn journal_restore_003_bad_evidence_never_offers_resume() {
         }
         j.ended(&w, &a, EndHow::Interrupted);
         let mut r = restore_record(&w, &a, AgentType::ClaudeCode);
+        if case == "legacy" {
+            r.pid = None;
+            r.pid_start = None;
+        }
+        if case == "legacy-no-start" {
+            r.pid_start = None;
+        }
         if case == "moved" {
             r.cwd = None;
             r.cwd_moved_from = Some("/home/someone/code/p".into());
@@ -1706,6 +1723,7 @@ fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list
             attempt: a.clone(),
             failure: RestoreFailure::SessionMismatch,
             shim: None,
+            to: None,
         },
     );
     let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);

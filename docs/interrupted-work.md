@@ -187,14 +187,14 @@ dot-agent-deck interrupted start-over <id> --agent <attempt>      # start the ag
 | Agent | Restored with its conversation | What is missing |
 |---|---|---|
 | Claude Code | Yes | — |
-| Codex | Yes, when the deck's Codex hooks are installed and trusted ([Installation → Agent hooks](installation.md#agent-hooks)) and its command has no subcommand and no prompt, such as plain `codex` or `codex -m <model>` | Without its hooks the deck never learns which conversation Codex was in. A command with a subcommand or a prompt is offered Start over |
+| Codex | Not yet | Codex does not tell the deck which conversation it reopened until it is sent a message, so the deck cannot confirm it came back. Start over is offered |
 | OpenCode | Not yet | The deck does not yet learn reliably which conversation the agent was in, so it could bring back an older conversation or a blank one. Start over is offered |
 | Pi | Not yet | The deck does not yet learn which conversation the agent was in. Start over is offered |
 | Devin | Not yet | It is not yet confirmed that the conversation the deck hears about is the one Devin can resume. Start over is offered |
 | Antigravity | Not yet | The deck knows no way to resume an Antigravity conversation by its id. Start over is offered |
 | A pane started without an agent, such as a plain shell | No | There is no conversation to restore. Start over is offered |
 
-Some ways of starting an agent cannot be restored, even for Claude Code and Codex. The deck then stops the agent it started before sending it anything, and the item stays listed with Start over offered:
+Some ways of starting an agent cannot be restored, even for Claude Code. The deck then stops the agent it started before sending it anything, and the item stays listed with Start over offered:
 
 - a command that calls the agent by its full path, such as `/usr/local/bin/claude`, rather than by its name;
 - a script that sets its own `PATH` before it starts the agent, or a wrapper that drops the arguments it is given;
@@ -205,9 +205,13 @@ Some ways of starting an agent cannot be restored, even for Claude Code and Code
 
 - **A restored unit no longer reports to its dispatcher.** A dispatched unit or issue dispatch comes back as an agent of its own: the dispatcher that started it is not told when it finishes. Read what it did in its pane, and tell the dispatcher yourself if it needs to know.
 - **Claude Code may ask for permissions it did not ask for before.** An agent started to skip permission prompts can ask for them again after it is restored. Answer them in its pane.
-- **A prompt in the agent's command is sent again.** If the agent was started with a prompt on its command line, such as `claude "fix the login tests"`, Claude Code receives that prompt again as a new message when it is restored. Agents the deck starts normally take their task as a message instead, so this applies only to a command you wrote that way. Codex with a prompt on its command line is not restored; Start over is offered.
+- **A prompt in the agent's command is sent again.** If the agent was started with a prompt on its command line, such as `claude "fix the login tests"`, Claude Code receives that prompt again as a new message when it is restored. Agents the deck starts normally take their task as a message instead, so this applies only to a command you wrote that way.
 - **Starting the TUI again does not start a restorable agent blank.** When the TUI starts with a daemon that runs no agents, it normally starts the panes of your last session again. With restore on, a saved pane whose agent can be restored with its conversation, in the same folder with the same command, is not started again: restore it from **Interrupted work** instead, so you do not get a blank copy beside the restored one. A saved pane whose agent can only start over starts as before.
-- **The old agent must be gone.** The deck restores an agent only when it can confirm the agent it stopped is no longer running, so that two copies of it do not write to one conversation.
+- **The old agent must be gone.** The deck restores an agent only when it can confirm the agent it stopped is no longer running, so that two copies of it do not write to one conversation. An agent an older version of the deck started cannot be checked that way, so it is offered Start over instead.
+- **The deck checks again when you choose.** Restore and Start over each check the item again at the moment they act, not only when the list was read: the worktree must still be there, and no newer agent may be working in the same folder. Start over is also refused while the item's branch has an open pull request, since the new agent would repeat its task beside it; Restore only mentions the pull request, since the restored agent may be the one working on it.
+- **Start over starts a new conversation.** Start over is refused when the agent's recorded command itself continues or resumes a conversation, such as `claude --continue` or `claude --resume <id>`. For Claude Code, the deck also checks that the new agent reports a new conversation before it sends it the saved task, which catches a wrapper script that adds such an option; an agent whose old conversation comes back is stopped before it is sent anything. For the agents marked "Not yet" above, the deck can check only the recorded command.
+- **One agent per conversation, even with two decks.** Restoring the same agent, or two agents that were in one conversation, at the same time from two clients, or from two decks that share a state folder, brings back one of them; the other is refused.
+- **If the restart note cannot be sent, nothing is restored.** The deck checks that the restored agent's message can be delivered before it starts the agent. If the message still cannot be sent once the agent is back, the deck stops the agent again, and the item stays listed so you can try again.
 
 ### When an agent is not restored
 
@@ -216,8 +220,9 @@ The deck checks again when you confirm. When a check fails it starts nothing, an
 | What it says | What it means | What to do |
 |---|---|---|
 | The agent cannot be restored with its conversation yet | The agent is one the table above marks "Not yet", or a plain shell. | Use **Start over in this worktree**. |
-| The deck does not know which conversation the agent was in | The agent stopped before it reported its conversation, or a Codex agent ran without the deck's hooks. | Use Start over. For Codex, install and trust the hooks so later agents can be restored. |
-| The deck has no record of how the agent was started | The agent was started by an earlier version of the deck. | Use Start over, or dismiss the item. |
+| The deck does not know which conversation the agent was in | The agent stopped before it reported its conversation. | Use Start over. |
+| The deck has no record of how the agent was started | The agent was started by an earlier version of the deck, which did not record its command. | Dismiss the item, and start the agent yourself in the folder it was working in. |
+| An older version of the deck started this agent | That version did not record what the deck needs to check that the old agent has stopped, so it is not brought back with its conversation. | Use Start over, or dismiss the item. |
 | The deck cannot confirm the old agent has stopped | The agent was started by an earlier version of the deck, which did not record what the deck needs to check, or your system did not let the deck look at the old agent's processes. | Use Start over, or dismiss the item. |
 | The old agent is still running | A process of the stopped agent is still running, and a second copy would write to the same conversation. | Stop that process, then restore again. |
 | The agent's folder was moved, is gone, or others can write to it | The deck starts an agent only in the folder it was working in, and only when no other user can change that folder. | Put the folder back, or remove the write access others have, then restore again. Otherwise dismiss the item. |
@@ -228,6 +233,15 @@ The deck checks again when you confirm. When a check fails it starts nothing, an
 | Another agent is in this conversation now | An agent the deck runs, such as a copy of this one you restored from another item, is in the same conversation, or is being restored into it. | Stop that agent first, or use Start over. |
 | Too many restores are waiting | Many restores are running at once, or are waiting for their agents to start. | Try again in a minute. |
 | The unit's saved task is not there | Start over gives a dispatched unit its saved task again, and the file in the worktree's `.dot-agent-deck` folder is gone. | Start the agent yourself and give it the task, or dismiss the item. |
+| The deck could not confirm that the agent started a new conversation | Start over started the agent, and it came back in its old conversation, or reported none in time: a script around the agent may add `--continue` or `--resume`. The deck stopped it before sending it anything. | Start the agent yourself without that option, or dismiss the item. |
+| The agent's recorded command reopens an earlier conversation | The command the agent was started with continues or resumes a conversation, such as `claude --continue`, so starting it again would not start fresh. | Start the agent yourself without that option, or dismiss the item. |
+| The deck could not confirm that all of it stopped | The deck stopped an agent it had just started (a restore that did not take, or a start over in the old conversation), and part of it may still be running. | Find and stop that agent's processes, then try again. Until they are gone, the deck refuses to restore or start over this agent. |
+| Newer work is running in this agent's folder | Another agent the deck runs now was started in the same folder. | Stop that agent first, so two agents do not work in one folder, then try again. |
+| Its branch has an open pull request | Start over would start the agent's task again beside the pull request it already opened. | Restore the agent with its conversation instead, or close the pull request first. |
+| The deck's inbox cannot take the restart note now | The deck's message queue is full or its size limit is smaller than the restart note, so it started nothing. | Try again in a minute. |
+| The agent came back, but the deck could not give it its restart note | The agent did not get the message telling it the deck restarted, so the deck stopped it again. | Try again. The item is still listed. |
+| The request named an agent twice, named too many agents, or used an id that is too long | The `--agent` options repeat an agent, or name more agents than an item has. | Name each agent once. |
+| The deck daemon was restarted or replaced while you were answering | From a shell, the deck that answered the question is not the one running now, so nothing was started. | Run the command again. |
 | The agent came back without its conversation | The agent started, but not in its earlier conversation: its command calls it by full path, a script replaced `PATH` or dropped the arguments, the agent could not find the conversation, or it exited. The deck stopped it before sending it anything. | See the list of ways of starting an agent that cannot be restored, above. Use Start over. If none of those applies and the [deck log](troubleshooting.md#enabling-debug-logs) was on, it says why the agent did not come back; include it when you report the problem. |
 | The worktree is no longer there | Start over runs in the item's worktree, which is gone. | Dismiss the item. |
 | The saved task cannot be read safely | A dispatched unit's saved task file was replaced by a link, or others can read or change it. | Check the file in the worktree's `.dot-agent-deck` folder, or start the agent yourself. |

@@ -376,6 +376,40 @@ test.describe("journal/restore/009 — desktop restore in the browser", () => {
     }
   });
 
+  /** Scenario: in a window too short for the whole restore question, select fix-login and press s: c is ignored while part of the question has never been on screen. Scroll through the question with j; once every part of it has been shown, c restores the agent and the dialog closes. */
+  test("journal/restore/009 a question taller than the window is presented once scrolled through", async ({ page }) => {
+    const dialog = await openRestorePreview(page);
+    await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+    await page.setViewportSize({ width: 900, height: 120 });
+    await page.keyboard.press("s");
+    const question = dialog.getByTestId("interrupted-restore-question");
+    await expect(question).toContainText("Restore fix-login with its conversation?");
+    const body = question.locator(":scope > div").first();
+    const taller = await body.evaluate((element) => {
+      const box = element.closest(".interrupted-dialog")!;
+      return element.getBoundingClientRect().height > box.clientHeight;
+    });
+    expect(taller, "premise: the question does not fit in the dialog at once").toBe(true);
+    await dialog.evaluate((element) => { element.scrollTop = 0; });
+    // Longer than the presentation delay: a question never wholly on screen
+    // is still not presented, and its keys act on nothing.
+    await page.waitForTimeout(800);
+    await expect(question).not.toHaveAttribute("data-presented", "true");
+    await page.keyboard.press("c");
+    await page.waitForTimeout(300);
+    await expect(question).toBeVisible();
+    await expect(page.getByTestId("interrupted-banner")).toContainText("2 interrupted items from before the restart");
+    for (let step = 0; step < 30; step += 1) {
+      if ((await question.getAttribute("data-presented")) === "true") break;
+      await page.keyboard.press("j");
+      await page.waitForTimeout(450);
+    }
+    await expect(question).toHaveAttribute("data-presented", "true");
+    await page.keyboard.press("c");
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByTestId("interrupted-banner")).toContainText("1 interrupted item from before the restart");
+  });
+
   /** Scenario: without experimental features, the stopped agents remain listed but list and details have no Restore button. Pressing s opens no question and leaves the list unchanged. */
   test("journal/restore/009 hides Restore and ignores s without experimental features", async ({ page }) => {
     const dialog = await openRestorePreview(page, false);

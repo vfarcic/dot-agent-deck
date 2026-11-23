@@ -305,6 +305,58 @@ pub fn session_has_members_in(
     (!unknown).then_some(false)
 }
 
+/// PRD #1790 stage 3 (audit F4): the processes in the session `sid` names,
+/// as [`session_has_members`] finds them; `None` when that cannot be
+/// established. A pid listed was in the session when it was read: a session
+/// keeps its id while any process is in it, so the id is not handed to a new
+/// session meanwhile.
+pub fn session_members(sid: u32) -> Option<Vec<u32>> {
+    session_members_in(sid, all_pids()?, |pid| {
+        if is_zombie(pid) {
+            Some(None)
+        } else {
+            session_of_checked(pid)
+        }
+    })
+}
+
+/// Whether `pid` has exited and only waits to be reaped (Linux: state `Z`
+/// or `X` in `/proc/<pid>/stat`): a process that holds nothing and runs
+/// nothing, which [`session_members`] does not count. `false` wherever that
+/// cannot be read.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, rest) = stat.rsplit_once(')')?;
+            rest.trim_start().chars().next()
+        })
+        .is_some_and(|state| matches!(state, 'Z' | 'X'))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// [`session_members`] over `pids`, with `session_of` as for
+/// [`session_has_members_in`].
+pub fn session_members_in(
+    sid: u32,
+    pids: impl IntoIterator<Item = u32>,
+    session_of: impl Fn(u32) -> Option<Option<u32>>,
+) -> Option<Vec<u32>> {
+    let mut members = Vec::new();
+    for pid in pids {
+        match session_of(pid)? {
+            Some(found) if found == sid => members.push(pid),
+            _ => {}
+        }
+    }
+    Some(members)
+}
+
 /// `getsid(pid)`: `Some(Some(sid))`, `Some(None)` on `ESRCH` (or a pid no
 /// process can hold), `None` on any other error.
 #[cfg(unix)]

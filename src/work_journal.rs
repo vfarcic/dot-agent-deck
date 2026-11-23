@@ -714,6 +714,13 @@ pub enum Event {
         /// a build before it was recorded. Additive under `v:1`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shim: Option<ShimOutcome>,
+        /// Audit F4: the attempt the failed restore started, which it then
+        /// stopped. A later restore or start over of `attempt` checks that
+        /// no process of it is left before starting another. Absent when
+        /// nothing was started, and from a build before it was recorded.
+        /// Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<AttemptId>,
     },
 }
 

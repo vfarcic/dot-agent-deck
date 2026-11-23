@@ -51,6 +51,18 @@ if '--resume' in args:
     source = 'resume'
     if os.path.exists(os.path.join(root, 'wrong-session')):
         session = __WRONG_SESSION__
+elif '--continue' in args:
+    # Reopens the last conversation: the fixture's one.
+    source = 'resume'
+elif not os.path.exists(os.path.join(root, 'fixed-session')):
+    # The first fresh start in this fixture is in SESSION; every later fresh
+    # start, a start over among them, is in a conversation of its own.
+    try:
+        os.close(os.open(os.path.join(root, 'session-taken'),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        import uuid
+        session = str(uuid.uuid4())
 record = {'agent':agent, 'pane':pane, 'pid':os.getpid(), 'cwd':os.getcwd(),
           'argv':args, 'session':session,
           'resume_env':[k for k in ['DOT_AGENT_DECK_RESUME_AGENT',
@@ -77,6 +89,24 @@ if os.path.exists(os.path.join(root, 'survive-stop')):
                    {'pid':os.getpid(), 'sid':os.getsid(0)})
         while True:
             time.sleep(0.1)
+if os.path.exists(os.path.join(root, 'ignore-term-child')):
+    child = os.fork()
+    if child == 0:
+        # Stays in the launch's process group, and ignores SIGTERM.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
+        signal.alarm(180)
+        for fd in (0, 1, 2):
+            os.close(fd)
+        write_json(os.path.join(root, 'term-survivor.json'),
+                   {'pid':os.getpid(), 'sid':os.getsid(0)})
+        while True:
+            time.sleep(0.1)
+slow = os.path.join(root, 'slow-start')
+if os.path.exists(slow):
+    # Hold the SessionStart report, so a restore waits on its confirmation.
+    time.sleep(float(open(slow).read().strip() or '4'))
 payload = {'hook_event_name':'SessionStart', 'session_id':session,
            'source':source, 'cwd':os.getcwd()}
 hook = subprocess.run([deck, 'hook', '--agent', 'claude-code'],
@@ -98,16 +128,23 @@ struct Decks {
     state: PathBuf,
     repo: PathBuf,
     root: PathBuf,
+    bin: PathBuf,
     path: String,
     _scratch: tempfile::TempDir,
 }
 
 fn daemon(state: &Path, path: &str) -> common::DaemonProc {
-    inbox::daemon_unbound(&[
+    daemon_with(state, path, &[])
+}
+
+fn daemon_with(state: &Path, path: &str, extra: &[(&str, &str)]) -> common::DaemonProc {
+    let mut env = vec![
         ("DOT_AGENT_DECK_STATE_DIR", state.to_str().unwrap()),
         ("PATH", path),
         ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ])
+    ];
+    env.extend_from_slice(extra);
+    inbox::daemon_unbound(&env)
 }
 
 impl Decks {
@@ -151,6 +188,7 @@ impl Decks {
             state,
             repo,
             root,
+            bin,
             path,
             _scratch: scratch,
         }
@@ -161,10 +199,15 @@ impl Decks {
     }
 
     fn start_pane(&self, name: &str) -> Value {
+        self.start_pane_with(name, &self.repo, &self.command())
+    }
+
+    /// A pane named `name` running `command` in `cwd`, on the live daemon.
+    fn start_pane_with(&self, name: &str, cwd: &Path, command: &str) -> Value {
         let reply = inbox::attach(
             &self.live,
             json!({
-                "op":"start-agent", "command":self.command(), "cwd":self.repo,
+                "op":"start-agent", "command":command, "cwd":cwd,
                 "display_name":name, "agent_type":"claude_code", "rows":40, "cols":140,
                 "env":[["DOT_AGENT_DECK_PANE_ID", name]]
             }),
@@ -204,6 +247,12 @@ impl Decks {
     }
 
     fn restart(&mut self) {
+        self.restart_with(&[]);
+    }
+
+    /// [`Self::restart`], the new daemon started with `extra` in its
+    /// environment.
+    fn restart_with(&mut self, extra: &[(&str, &str)]) {
         // SAFETY: signal only the daemon pid this fixture owns, never a pattern.
         assert_eq!(
             unsafe { libc::kill(self.live.pid() as libc::pid_t, libc::SIGTERM) },
@@ -214,9 +263,25 @@ impl Decks {
                 .wait_for_exit(common::load_scaled(Duration::from_secs(20))),
             "daemon did not stop"
         );
-        let mut next = daemon(&self.state, &self.path);
+        let mut next = daemon_with(&self.state, &self.path, extra);
         assert!(next.is_alive_public());
         self.gone.push(std::mem::replace(&mut self.live, next));
+    }
+
+    /// Another daemon on the same state directory, with sockets of its own.
+    fn another_daemon(&self) -> common::DaemonProc {
+        let mut other = daemon(&self.state, &self.path);
+        assert!(other.is_alive_public());
+        other
+    }
+
+    /// A private directory beside the repository, for a second agent's
+    /// folder.
+    fn folder(&self, name: &str) -> PathBuf {
+        let dir = self.repo.parent().unwrap().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
     }
 
     fn person(&self, args: &[&str]) -> Output {
@@ -354,8 +419,12 @@ fn restore_request(id: &str, attempt: &str) -> Value {
 // newly spawned process to confirm its session. This is a bounded final
 // response, not a pending reply or an arbitrary sleep.
 fn final_reply(decks: &Decks, request: Value) -> Value {
+    final_reply_on(&decks.live, request)
+}
+
+fn final_reply_on(daemon: &common::DaemonProc, request: Value) -> Value {
     use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
-    let mut socket = UnixStream::connect(&decks.live.attach_socket).unwrap();
+    let mut socket = UnixStream::connect(&daemon.attach_socket).unwrap();
     let budget = common::load_scaled(Duration::from_secs(60));
     socket.set_read_timeout(Some(budget)).unwrap();
     socket.set_write_timeout(Some(budget)).unwrap();
@@ -824,4 +893,485 @@ fn journal_restore_014_start_over_replays_only_a_safely_saved_dispatch_task() {
         );
     }
     decks.assert_gone_from_list(&id);
+}
+
+fn start_over_request(id: &str, attempt: &str) -> Value {
+    json!({"op":"start-over-interrupted", "id":id, "agent":attempt, "dry_run":false})
+}
+
+/// The single refusal of a whole restore request (no attempt named).
+fn assert_whole_refusal(reply: &Value, reason: &str) {
+    let outcome = &reply["interrupted_restore"];
+    assert_eq!(outcome["restored"], json!([]), "{reply}");
+    let refused = outcome["refused"].as_array().expect("an outcome");
+    assert_eq!(
+        refused.len(),
+        1,
+        "one bounded whole-request refusal: {reply}"
+    );
+    assert!(refused[0]["attempt"].is_null(), "{reply}");
+    assert_eq!(refused[0]["reason"], reason, "{reply}");
+}
+
+/// The reason a start-over request was refused for.
+fn start_over_refusal(reply: &Value) -> String {
+    let outcome = &reply["interrupted_start_over"];
+    assert!(outcome["started"].is_null(), "refused: {reply}");
+    string(&outcome["refused"], "reason")
+}
+
+/// Scenario: Restart a scripted Claude and ask the CLI to restore it with the same --agent twice, then send restore requests naming 17 agents, an over-long id, and five thousand agents. Each is refused whole as bad-selection with one small answer, and nothing is started or sent.
+#[spec("journal/restore/019")]
+#[test]
+fn journal_restore_019_a_repeated_or_oversized_selection_is_refused_whole() {
+    let mut decks = Decks::start();
+    let original = decks.start_pane("restore-select-019");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    decks.restart();
+    let id = string(&decks.item_for(&attempt), "id");
+
+    let twice = decks.person(&[
+        "interrupted",
+        "restore",
+        &id,
+        "--continue",
+        "--yes",
+        "--agent",
+        &attempt,
+        "--agent",
+        &attempt,
+    ]);
+    exit(&twice, 1);
+    assert!(
+        text(&twice).contains("named an agent twice"),
+        "{}",
+        text(&twice)
+    );
+
+    let long = "x".repeat(129);
+    let many: Vec<String> = (0..17).map(|n| format!("{attempt}{n}")).collect();
+    let flood: Vec<String> = (0..5000).map(|n| format!("x{n}")).collect();
+    for agents in [
+        json!([attempt.clone(), attempt.clone()]),
+        json!(many),
+        json!([long]),
+        json!(flood),
+    ] {
+        let reply = final_reply(
+            &decks,
+            json!({"op":"restore-interrupted", "id":id, "agents":agents, "mode":"continue", "dry_run":false}),
+        );
+        assert_whole_refusal(&reply, "bad-selection");
+        assert!(
+            serde_json::to_vec(&reply).unwrap().len() < 4096,
+            "a small answer, not one refusal per selector: {reply}"
+        );
+    }
+    assert_eq!(
+        decks.starts().len(),
+        1,
+        "a refused selection starts nothing"
+    );
+    assert!(decks.inbox(None).is_empty(), "and sends nothing");
+    assert_eq!(decks.item_for(&attempt)["id"], id);
+}
+
+/// Scenario: Restart a scripted Claude, then hold a Start over request after it has read the item but before it starts anything. Restore and continue brings the agent back meanwhile; released, the held Start over reads the item again, finds it no longer interrupted, and starts nothing, so exactly one agent and one restart note exist.
+#[spec("journal/restore/020")]
+#[test]
+fn journal_restore_020_a_request_prepared_before_a_restore_rechecks_before_it_starts() {
+    let mut decks = Decks::start();
+    let original = decks.start_pane("restore-stale-020");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    let barrier = decks.root.join("start-over-barrier");
+    let reached = barrier.with_extension("reached");
+    decks.restart_with(&[(
+        "DOT_AGENT_DECK_TEST_RESTORE_BARRIER",
+        barrier.to_str().unwrap(),
+    )]);
+    let id = string(&decks.item_for(&attempt), "id");
+    std::fs::write(&barrier, "").unwrap();
+    let socket = decks.live.attach_socket.clone();
+    let held = std::thread::spawn({
+        let request = start_over_request(&id, &attempt);
+        move || {
+            let mut socket = UnixStream::connect(socket).unwrap();
+            let budget = common::load_scaled(Duration::from_secs(120));
+            socket.set_read_timeout(Some(budget)).unwrap();
+            let body = serde_json::to_vec(&request).unwrap();
+            socket
+                .write_all(&[dot_agent_deck::daemon_protocol::KIND_REQ])
+                .unwrap();
+            socket
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(&body).unwrap();
+            let mut header = [0; 5];
+            socket.read_exact(&mut header).unwrap();
+            let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+            let mut body = vec![0; len];
+            socket.read_exact(&mut body).unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()
+        }
+    });
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || reached
+            .is_file()),
+        "the Start over request must reach its barrier after reading the item"
+    );
+    let restored = final_reply(&decks, restore_request(&id, &attempt));
+    assert_eq!(
+        restored["interrupted_restore"]["restored"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the restore goes ahead: {restored}"
+    );
+    std::fs::remove_file(&barrier).unwrap();
+    let late = held.join().unwrap();
+    assert_eq!(
+        start_over_refusal(&late),
+        "not-listed",
+        "the held request reads again before starting: {late}"
+    );
+    assert_eq!(
+        decks.starts().len(),
+        2,
+        "one restored agent, no second writer"
+    );
+    let resumed = decks
+        .starts()
+        .into_iter()
+        .find(|s| s["pane"] != original["pane"])
+        .unwrap();
+    decks.assert_first_message(&resumed, "restart note", CONTINUE_NOTE);
+}
+
+/// Run `requests` at once, each on its own daemon, and answer every reply.
+fn at_once(requests: Vec<(&common::DaemonProc, Value)>) -> Vec<Value> {
+    let start = std::sync::Barrier::new(requests.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = requests
+            .into_iter()
+            .map(|(daemon, request)| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    final_reply_on(daemon, request)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Scenario: Two daemons with sockets of their own share one state directory after a restart, and the scripted Claude reports its conversation only after a delay. Restoring one agent from both daemons at once, and restoring two agents that were in one conversation from the two daemons at once, each brings back exactly one agent and refuses the other request.
+#[spec("journal/restore/021")]
+#[test]
+fn journal_restore_021_two_daemons_on_one_state_directory_start_one_writer() {
+    // The same attempt, from both daemons.
+    let mut decks = Decks::start();
+    let original = decks.start_pane("restore-twice-021");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    decks.restart();
+    let other = decks.another_daemon();
+    let id = string(&decks.item_for(&attempt), "id");
+    std::fs::write(decks.root.join("slow-start"), "3").unwrap();
+    let replies = at_once(vec![
+        (&decks.live, restore_request(&id, &attempt)),
+        (&other, restore_request(&id, &attempt)),
+    ]);
+    let restored: usize = replies
+        .iter()
+        .map(|r| {
+            r["interrupted_restore"]["restored"]
+                .as_array()
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert_eq!(restored, 1, "exactly one restore: {replies:?}");
+    let refused: Vec<&Value> = replies
+        .iter()
+        .flat_map(|r| r["interrupted_restore"]["refused"].as_array().unwrap())
+        .collect();
+    assert_eq!(refused.len(), 1, "{replies:?}");
+    assert!(
+        matches!(
+            refused[0]["reason"].as_str(),
+            Some("already-restoring" | "session-in-use" | "directory-in-use" | "not-listed")
+        ),
+        "{replies:?}"
+    );
+    assert_eq!(decks.starts().len(), 2, "one writer: {:?}", decks.starts());
+    drop(other);
+
+    // Two attempts that were in one conversation, one from each daemon.
+    let mut decks = Decks::start();
+    std::fs::write(decks.root.join("fixed-session"), "").unwrap();
+    let first = decks.start_pane("restore-shared-a-021");
+    let second_folder = decks.folder("restore-shared-b-021");
+    let second = decks.start_pane_with("restore-shared-b-021", &second_folder, &decks.command());
+    let first_attempt = string(&decks.attempt(&string(&first, "agent")), "attempt");
+    let second_attempt = string(&decks.attempt(&string(&second, "agent")), "attempt");
+    assert_eq!(
+        first["session"], second["session"],
+        "premise: one conversation"
+    );
+    decks.restart();
+    let other = decks.another_daemon();
+    let first_id = string(&decks.item_for(&first_attempt), "id");
+    let second_id = string(&decks.item_for(&second_attempt), "id");
+    assert_ne!(first_id, second_id);
+    std::fs::write(decks.root.join("slow-start"), "3").unwrap();
+    let replies = at_once(vec![
+        (&decks.live, restore_request(&first_id, &first_attempt)),
+        (&other, restore_request(&second_id, &second_attempt)),
+    ]);
+    let restored: usize = replies
+        .iter()
+        .map(|r| {
+            r["interrupted_restore"]["restored"]
+                .as_array()
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert_eq!(restored, 1, "one writer into the conversation: {replies:?}");
+    let refused: Vec<&Value> = replies
+        .iter()
+        .flat_map(|r| r["interrupted_restore"]["refused"].as_array().unwrap())
+        .collect();
+    assert_eq!(refused.len(), 1, "{replies:?}");
+    assert_eq!(refused[0]["reason"], "session-in-use", "{replies:?}");
+    assert_eq!(decks.starts().len(), 3, "{:?}", decks.starts());
+    drop(other);
+}
+
+/// Scenario: Start scripted Claudes whose recorded commands continue or resume their conversation directly, and one through a wrapper that adds --continue. After a restart, Start over refuses the direct ones without starting anything; the wrapper's agent comes back in its old conversation, so the deck stops it, sends it nothing, and keeps the item listed.
+#[spec("journal/restore/022")]
+#[test]
+fn journal_restore_022_start_over_refuses_a_launch_that_reopens_the_old_conversation() {
+    let mut decks = Decks::start();
+    let wrapper = decks.bin.join("claude-continue");
+    std::fs::write(&wrapper, "#!/bin/sh\nexec claude --continue \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut attempts = Vec::new();
+    for (name, command) in [
+        (
+            "restore-continue-022",
+            "exec claude --continue --model restore-synthetic".to_string(),
+        ),
+        (
+            "restore-resume-022",
+            format!("exec claude --resume {SESSION} --model restore-synthetic"),
+        ),
+        (
+            "restore-wrapper-022",
+            "exec claude-continue --model restore-synthetic".to_string(),
+        ),
+    ] {
+        let started = decks.start_pane_with(
+            name,
+            &decks.repo,
+            &common::capability_export_command(&command),
+        );
+        assert_eq!(started["session"], SESSION, "premise: {started}");
+        attempts.push(string(
+            &decks.attempt(&string(&started, "agent")),
+            "attempt",
+        ));
+    }
+    decks.restart();
+    for attempt in &attempts[..2] {
+        let id = string(&decks.item_for(attempt), "id");
+        let cli = decks.person(&[
+            "interrupted",
+            "start-over",
+            &id,
+            "--agent",
+            attempt,
+            "--yes",
+        ]);
+        exit(&cli, 1);
+        assert!(
+            text(&cli).contains("reopens an earlier conversation"),
+            "{}",
+            text(&cli)
+        );
+        let reply = final_reply(&decks, start_over_request(&id, attempt));
+        assert_eq!(start_over_refusal(&reply), "command-reopens");
+    }
+    assert_eq!(decks.starts().len(), 3, "a refused command starts nothing");
+
+    let id = string(&decks.item_for(&attempts[2]), "id");
+    let reply = final_reply(&decks, start_over_request(&id, &attempts[2]));
+    assert_eq!(start_over_refusal(&reply), "not-fresh", "{reply}");
+    let starts = decks.starts();
+    assert_eq!(starts.len(), 4, "the wrapper started once: {starts:?}");
+    let originals = [
+        "restore-continue-022",
+        "restore-resume-022",
+        "restore-wrapper-022",
+    ];
+    let blank = starts
+        .iter()
+        .find(|s| !originals.contains(&s["pane"].as_str().unwrap()))
+        .expect("the started-over pane");
+    assert_eq!(
+        blank["session"], SESSION,
+        "premise: it reopened the old one"
+    );
+    let blank_id = string(blank, "agent");
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !common::agent_records_on(&decks.live.attach_socket)
+                .iter()
+                .any(|r| r.id == blank_id)
+        }),
+        "the agent that reopened its conversation is stopped"
+    );
+    assert!(decks.inbox(None).is_empty(), "nothing was sent to it");
+    assert_eq!(
+        decks.item_for(&attempts[2])["id"],
+        id,
+        "the item stays listed"
+    );
+}
+
+/// Whether `pid` is still the process that started at `start`, and has not
+/// merely exited waiting to be reaped.
+#[cfg(target_os = "linux")]
+fn running(pid: u32, start: u64) -> bool {
+    dot_agent_deck::platform::proc::process_start_of(pid) == Some(start)
+        && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.trim_start().chars().next())
+            })
+            .is_some_and(|state| !matches!(state, 'Z' | 'X'))
+}
+
+/// Scenario: After a restart, a scripted Claude restored with its conversation starts a child in another process group and a child in its own group that ignores SIGTERM, then reports a different conversation. The failed restore answers not-resumed only once both children are gone; Start over afterwards starts the agent again.
+#[cfg(target_os = "linux")]
+#[spec("journal/restore/023")]
+#[test]
+fn journal_restore_023_a_failed_restore_stops_every_process_it_started() {
+    let mut decks = Decks::start();
+    let original = decks.start_pane("restore-teardown-023");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    decks.restart();
+    for sentinel in ["wrong-session", "survive-stop", "ignore-term-child"] {
+        std::fs::write(decks.root.join(sentinel), "").unwrap();
+    }
+    let id = string(&decks.item_for(&attempt), "id");
+    let reply = final_reply(&decks, restore_request(&id, &attempt));
+    assert_refused(&reply, &attempt, "not-resumed");
+    let mut children = Vec::new();
+    for file in ["survivor.json", "term-survivor.json"] {
+        let path = decks.root.join(file);
+        assert!(path.is_file(), "premise: the restored agent started {file}");
+        let child: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        children.push(child["pid"].as_u64().unwrap() as u32);
+    }
+    // Cleanup for a failure: only the exact children, while they are theirs.
+    let _guards: Vec<Survivor> = children
+        .iter()
+        .filter_map(|&pid| {
+            dot_agent_deck::platform::proc::process_start_of(pid)
+                .map(|start| Survivor { pid, start })
+        })
+        .collect();
+    for guard in &_guards {
+        assert!(
+            !running(guard.pid, guard.start),
+            "a child of the failed restore survived its stop: {}",
+            guard.pid
+        );
+    }
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    for sentinel in ["wrong-session", "survive-stop", "ignore-term-child"] {
+        std::fs::remove_file(decks.root.join(sentinel)).unwrap();
+    }
+    let started = decks.person(&[
+        "interrupted",
+        "start-over",
+        &id,
+        "--agent",
+        &attempt,
+        "--yes",
+    ]);
+    exit(&started, 0);
+    common::wait_until(common::child_boot_budget(), || decks.starts().len() >= 3);
+    assert_eq!(
+        decks.starts().len(),
+        3,
+        "restore once, then start over once"
+    );
+}
+
+/// Scenario: After a restart into a daemon whose inbox takes no message as long as the restart note, Restore is refused note-refused before anything starts. After a restart into a daemon whose restart-note post fails once the agent confirmed, the restored agent is stopped again, nothing is sent, and the item stays listed for a restore.
+#[spec("journal/restore/024")]
+#[test]
+fn journal_restore_024_a_restart_note_that_cannot_be_delivered_restores_nothing() {
+    let mut decks = Decks::start();
+    let original = decks.start_pane("restore-note-024");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    decks.restart_with(&[("DOT_AGENT_DECK_INBOX_MAX_BODY_BYTES", "200")]);
+    let id = string(&decks.item_for(&attempt), "id");
+    let reply = final_reply(&decks, restore_request(&id, &attempt));
+    assert_refused(&reply, &attempt, "note-refused");
+    assert_eq!(decks.starts().len(), 1, "admitted first: nothing started");
+
+    let mut decks = Decks::start();
+    let original = decks.start_pane("restore-note-024");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    decks.restart_with(&[("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NOTE", "1")]);
+    let id = string(&decks.item_for(&attempt), "id");
+    let reply = final_reply(&decks, restore_request(&id, &attempt));
+    assert_refused(&reply, &attempt, "note-not-delivered");
+    let starts = decks.starts();
+    assert_eq!(starts.len(), 2, "the agent came back once: {starts:?}");
+    let resumed = starts
+        .iter()
+        .find(|s| s["pane"] != original["pane"])
+        .unwrap();
+    assert_eq!(resumed["session"], SESSION, "premise: it confirmed");
+    let resumed_id = string(resumed, "agent");
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !common::agent_records_on(&decks.live.attach_socket)
+                .iter()
+                .any(|r| r.id == resumed_id)
+        }),
+        "an agent without its restart note is stopped again"
+    );
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    let kept = decks.item_for(&attempt);
+    assert_eq!(kept["id"], id);
+    assert_eq!(
+        kept["agents"][0]["restore"],
+        json!({"kind":"resume"}),
+        "the item stays as it was, for a restore: {kept}"
+    );
+}
+
+/// Scenario: Restart a scripted Claude, then start a newer agent in the same folder on the new daemon. Start over and Restore of the stopped agent are both refused directory-in-use, nothing more starts, and the item stays listed.
+#[spec("journal/restore/025")]
+#[test]
+fn journal_restore_025_newer_work_in_the_folder_refuses_start_over_and_restore() {
+    let mut decks = Decks::start();
+    let original = decks.start_pane("restore-folder-025");
+    let attempt = string(&decks.attempt(&string(&original, "agent")), "attempt");
+    decks.restart();
+    let id = string(&decks.item_for(&attempt), "id");
+    decks.start_pane("restore-newer-025");
+    assert_eq!(decks.starts().len(), 2);
+    let reply = final_reply(&decks, start_over_request(&id, &attempt));
+    assert_eq!(start_over_refusal(&reply), "directory-in-use", "{reply}");
+    let reply = final_reply(&decks, restore_request(&id, &attempt));
+    assert_refused(&reply, &attempt, "directory-in-use");
+    assert_eq!(decks.starts().len(), 2, "nothing more started");
+    assert_eq!(decks.item_for(&attempt)["id"], id);
 }

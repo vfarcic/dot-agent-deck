@@ -817,6 +817,12 @@ fn journal_restore_016_real_claude_recalls_its_conversation_after_tui_restore() 
 /// Scenario: A real interactive Codex on the harness's cheap mini model remembers a unique word under an attached TUI before its daemon is stopped by pid. After restart, a human CLI restore with --continue --yes brings back the same native session, delivers the restart note before the recall request, and recalls the word into a new file while leaving the first acknowledgement unchanged and showing a live named card.
 #[spec("journal/restore/017")]
 #[test]
+// Quarantined (CLAUDE.md rule 6): Codex sends its first hook only with its
+// first prompt, so a restore cannot confirm the conversation came back before
+// the restart note, and every run timed out. Stage 3 ships Codex as a
+// documented gap (its registry `resume` is `None`); #2492 is the design change
+// that brings it back, and lifts this quarantine with the body unchanged.
+#[ignore = "quarantined: vfarcic, #2492"]
 fn journal_restore_017_real_codex_recalls_its_conversation_after_cli_restore() {
     // Existing helper checks persisted auth and a bounded live model probe.
     // skip_unless converts an unavailable login to failure under REQUIRE=1.

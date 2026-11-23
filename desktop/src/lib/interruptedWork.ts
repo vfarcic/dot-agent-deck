@@ -643,6 +643,7 @@ const RESTORE_REASON_SENTENCES: Record<string, string> = {
   "incomplete-read": "The deck could not read its whole work journal or all its records of how agents were started.",
   "not-interrupted": "The restart did not stop this agent.",
   "not-resumed": "The deck tried to restore the agent's conversation and could not.",
+  "old-process-unknown": "An older version of the deck started this agent, so the deck cannot tell whether its old process is gone.",
 };
 const RESTORE_REASON_UNKNOWN = "The agent cannot be restored.";
 
@@ -687,6 +688,14 @@ const RESTORE_REFUSAL_SENTENCES: Record<string, string> = {
   "no-saved-task": "Refused: the unit's saved task is not there.",
   "session-in-use": "Refused: another agent the deck runs is in this conversation now, or is being restored into it, so two agents would write to one conversation.",
   "too-many-pending": "Refused: too many restores are waiting for their agents to start. Try again in a minute.",
+  "bad-selection": "Refused: the request named an agent twice, named too many agents, or used an id that is too long.",
+  "command-reopens": "Refused: the agent's recorded command reopens an earlier conversation, so starting it over would not start fresh. Start it yourself without that option.",
+  "not-fresh": "The deck could not confirm that the agent started a new conversation rather than its old one, so it stopped the agent before sending it anything.",
+  "not-stopped": "The deck stopped the agent it had just started, but could not confirm that all of it stopped. Make sure it is not running before you try again.",
+  "pr-open": "Refused: its branch has an open pull request, and starting the agent over would repeat its task beside it. Restore it with its conversation instead, or close the pull request first.",
+  "directory-in-use": "Refused: newer work is running in this agent's folder now. Stop it first, so two agents do not work in one folder.",
+  "note-refused": "Refused: the deck's inbox cannot take the restart note now, so nothing was started. Try again in a minute.",
+  "note-not-delivered": "The agent came back into its conversation, but the deck could not give it its restart note, so it stopped the agent again. The item is still listed; try again.",
 };
 
 /** `restore_refusal_sentence`: a refusal of a newer daemon's reads as {@link REFUSED_UNKNOWN}. */

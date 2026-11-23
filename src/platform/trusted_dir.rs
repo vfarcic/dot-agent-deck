@@ -473,6 +473,30 @@ mod unix {
             })
         }
 
+        /// The device and inode `name` names now, without following a link:
+        /// a lock file's holder compares it with its open file's, so a name
+        /// unlinked and created again since it was opened is told apart.
+        pub(crate) fn identity(&self, name: impl AsRef<OsStr>) -> io::Result<(u64, u64)> {
+            let name = name.as_ref();
+            plain(name)?;
+            let c = cstr(name)?;
+            let mut st = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: a live descriptor, a valid name and storage for one
+            // `stat`, initialised by a successful call.
+            cvt(unsafe {
+                libc::fstatat(
+                    self.fd.as_raw_fd(),
+                    c.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })?;
+            // SAFETY: fstatat succeeded and filled it.
+            let st = unsafe { st.assume_init() };
+            #[allow(clippy::unnecessary_cast)]
+            Ok((st.st_dev as u64, st.st_ino as u64))
+        }
+
         /// Open a regular file for reading: no link followed, no open that
         /// blocks on a FIFO, and refused when it is not a regular file.
         pub(crate) fn open_regular(&self, name: impl AsRef<OsStr>) -> io::Result<File> {

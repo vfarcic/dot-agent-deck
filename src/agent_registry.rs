@@ -371,8 +371,18 @@ pub struct AgentSpec {
     /// was in, by the id the deck holds for it. `None` for an agent the deck
     /// cannot resume today (a documented gap: OpenCode, Pi, Devin,
     /// Antigravity) and the placeholder; such an agent's restore offers a
-    /// fresh start instead.
+    /// fresh start instead. Codex is a gap too for now (#2492): it reports
+    /// the conversation it reopened only with its first prompt, so a restore
+    /// cannot confirm it came back before the restart note is due.
     pub resume: Option<&'static ResumeSpec>,
+    /// PRD #1790 stage 3: how this agent's own arguments choose or reopen a
+    /// conversation, read even where [`Self::resume`] is `None`: by the
+    /// launch shim, which resumes by id only when the daemon asked it to
+    /// (it asks only for an agent with [`Self::resume`]), and by Start over,
+    /// which refuses a recorded command that would reopen an old
+    /// conversation ([`ResumeSpec::reopens`], audit F3). Codex keeps its
+    /// table here for #2492.
+    pub session_args: Option<&'static ResumeSpec>,
 }
 
 /// PRD #1790 stage 3 ([`AgentSpec::resume`]): where an agent's resume
@@ -399,6 +409,7 @@ pub struct ResumeSpec {
     valid_id: fn(&str) -> bool,
     conflicting: fn(&[std::ffi::OsString]) -> bool,
     inspecting: fn(&[std::ffi::OsString]) -> bool,
+    reopening: fn(&[std::ffi::OsString]) -> bool,
 }
 
 impl ResumeSpec {
@@ -420,6 +431,48 @@ impl ResumeSpec {
     /// agent; the shim leaves its resume request for that later call.
     pub fn inspects(&self, args: &[std::ffi::OsString]) -> bool {
         (self.inspecting)(args)
+    }
+
+    /// Audit F3: whether the agent's own `args` reopen an earlier
+    /// conversation (continue the last one, resume or fork one by id, start
+    /// one under a chosen id), so a launch with them is not a fresh start.
+    /// Narrower than [`Self::conflicts`], which also refuses modes a resume
+    /// cannot be combined with.
+    pub fn reopens(&self, args: &[std::ffi::OsString]) -> bool {
+        (self.reopening)(args)
+    }
+
+    /// Whether the shell command `command` runs [`Self::program`] with
+    /// arguments that [`Self::reopens`]: each place the program is named, its
+    /// arguments up to the next shell separator. A command the deck cannot
+    /// read that way (the program reached through a wrapper or a variable)
+    /// is not caught here; Start over then confirms the new conversation is
+    /// not the old one where the agent reports it before its prompt.
+    pub fn command_reopens(&self, command: &str) -> bool {
+        let tokens = crate::event::tokenize_command(command);
+        let separator = |t: &str| matches!(t, ";" | "&&" | "||" | "|" | "&" | ")" | "(");
+        tokens.iter().enumerate().any(|(at, token)| {
+            let name = token.trim_end_matches(';');
+            let base = name.rsplit('/').next().unwrap_or(name);
+            if base != self.program {
+                return false;
+            }
+            if name.len() != token.len() {
+                return false;
+            }
+            let args: Vec<std::ffi::OsString> = tokens[at + 1..]
+                .iter()
+                .take_while(|t| !separator(t))
+                .scan(false, |ended, t| {
+                    if *ended {
+                        return None;
+                    }
+                    *ended = t.ends_with(';') || t.ends_with(')');
+                    Some(t.trim_end_matches([';', ')']).into())
+                })
+                .collect();
+            self.reopens(&args)
+        })
     }
 
     /// The arguments that resume `id`, as separate argv entries.
@@ -461,6 +514,18 @@ const CLAUDE_CONFLICTS: [&str; 13] = [
     "--background",
     "--desktop",
     "--no-session-persistence",
+];
+
+/// Of [`CLAUDE_CONFLICTS`], the options that reopen an earlier
+/// conversation, or start one under an id chosen in advance (audit F3); the
+/// short forms are `-c` and `-r`.
+const CLAUDE_REOPENS: [&str; 6] = [
+    "--continue",
+    "--resume",
+    "--session-id",
+    "--fork-session",
+    "--from-pr",
+    "--teleport",
 ];
 
 /// Claude Code's short options of the same kind: `-c`, `-p`, `-r`.
@@ -570,6 +635,8 @@ struct ClaudeArgs {
     /// They start no conversation: a version or help query, or a managing
     /// subcommand (review R3).
     inspect: bool,
+    /// They reopen an earlier conversation (audit F3).
+    reopen: bool,
 }
 
 fn classify_claude(args: &[std::ffi::OsString]) -> ClaudeArgs {
@@ -594,6 +661,7 @@ fn classify_claude(args: &[std::ffi::OsString]) -> ClaudeArgs {
             };
             let name = name.as_str();
             out.conflict |= CLAUDE_CONFLICTS.contains(&name);
+            out.reopen |= CLAUDE_REOPENS.contains(&name);
             out.inspect |= name == "--help" || name == "--version";
             if !inline {
                 if CLAUDE_VALUE_OPTIONS.contains(&name) {
@@ -609,6 +677,7 @@ fn classify_claude(args: &[std::ffi::OsString]) -> ClaudeArgs {
             variadic = false;
             for (offset, flag) in cluster.char_indices() {
                 out.conflict |= CLAUDE_SHORT_CONFLICTS.contains(&flag);
+                out.reopen |= flag == 'c' || flag == 'r';
                 out.inspect |= flag == 'h' || flag == 'v';
                 let rest_empty = offset + flag.len_utf8() == cluster.len();
                 match flag {
@@ -649,6 +718,10 @@ fn claude_resume_conflicts(args: &[std::ffi::OsString]) -> bool {
 
 fn claude_inspects(args: &[std::ffi::OsString]) -> bool {
     classify_claude(args).inspect
+}
+
+fn claude_reopens(args: &[std::ffi::OsString]) -> bool {
+    classify_claude(args).reopen
 }
 
 /// Codex's options that take a value as the next argument (`codex --help`,
@@ -755,6 +828,25 @@ fn codex_inspects(args: &[std::ffi::OsString]) -> bool {
     false
 }
 
+/// Whether Codex's own `args` reopen a conversation: a first positional
+/// argument `resume` or `fork` (`codex resume --last`, `codex fork <id>`).
+/// Option values are skipped as [`codex_resume_conflicts`] skips them.
+fn codex_reopens(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return false;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            return matches!(arg.as_ref(), "resume" | "fork");
+        }
+        if !arg.contains('=') && CODEX_VALUE_OPTIONS.contains(&arg.as_ref()) {
+            let _ = args.next();
+        }
+    }
+    false
+}
+
 /// Claude Code: `claude --resume <id> <its own arguments>`.
 pub static CLAUDE_RESUME: ResumeSpec = ResumeSpec {
     program: "claude",
@@ -762,6 +854,7 @@ pub static CLAUDE_RESUME: ResumeSpec = ResumeSpec {
     valid_id: is_canonical_uuid,
     conflicting: claude_resume_conflicts,
     inspecting: claude_inspects,
+    reopening: claude_reopens,
 };
 
 /// Codex: `codex resume <id> <its own options>`.
@@ -771,6 +864,7 @@ pub static CODEX_RESUME: ResumeSpec = ResumeSpec {
     valid_id: is_canonical_uuid,
     conflicting: codex_resume_conflicts,
     inspecting: codex_inspects,
+    reopening: codex_reopens,
 };
 
 /// PRD #211 ([`AgentSpec::status_osc7501`]): how one agent reports its status
@@ -1369,6 +1463,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     questions: Some(&CLAUDE_CODE_QUESTIONS),
     status_osc7501: None,
     resume: Some(&CLAUDE_RESUME),
+    session_args: Some(&CLAUDE_RESUME),
 };
 
 /// PRD #1666 part 2 (`inbox/doorbell/008`): do `rows`, one trimmed screen row
@@ -1450,6 +1545,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     questions: Some(&OPEN_CODE_QUESTIONS),
     status_osc7501: None,
     resume: None,
+    session_args: None,
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -1494,6 +1590,7 @@ pub static PI: AgentSpec = AgentSpec {
     questions: None,
     status_osc7501: None,
     resume: None,
+    session_args: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -1554,7 +1651,11 @@ pub static CODEX: AgentSpec = AgentSpec {
     first_hook: FirstHook::WithFirstPrompt,
     questions: Some(&CODEX_QUESTIONS),
     status_osc7501: None,
-    resume: Some(&CODEX_RESUME),
+    // PRD #1790 stage 3: a documented gap (#2492). Codex sends its first
+    // hook only with its first prompt, resumed or not, so a restore can never
+    // confirm the conversation came back before the restart note.
+    resume: None,
+    session_args: Some(&CODEX_RESUME),
 };
 
 /// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
@@ -1771,6 +1872,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     questions: Some(&DEVIN_QUESTIONS),
     status_osc7501: None,
     resume: None,
+    session_args: None,
 };
 
 /// Google's Antigravity CLI (`agy`, PRD #211) — native-hooks strategy, like
@@ -1852,6 +1954,7 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
         enable_env: ("AGY_CLI_OSC7501", "on"),
     }),
     resume: None,
+    session_args: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -1883,6 +1986,7 @@ pub static NONE: AgentSpec = AgentSpec {
     questions: None,
     status_osc7501: None,
     resume: None,
+    session_args: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -2075,7 +2179,10 @@ mod tests {
         use std::ffi::OsString;
         const ID: &str = "01234567-89ab-4cde-8fab-0123456789ab";
         let claude: &ResumeSpec = spec(&AgentType::ClaudeCode).resume.as_ref().unwrap();
-        let codex: &ResumeSpec = spec(&AgentType::Codex).resume.as_ref().unwrap();
+        // PRD #1790 stage 3 (#2492): the deck does not resume Codex yet, but
+        // keeps its table for the shim and for Start over.
+        assert!(spec(&AgentType::Codex).resume.is_none(), "Codex is a gap");
+        let codex: &ResumeSpec = spec(&AgentType::Codex).session_args.unwrap();
         assert_eq!(claude.program, "claude");
         assert_eq!(claude.placement, ResumePlacement::Flag(&["--resume"]));
         assert_eq!(codex.program, "codex");
@@ -2145,6 +2252,86 @@ mod tests {
                 "{agent:?} is a documented gap"
             );
         }
+        for agent in ALL {
+            if let Some(resume) = agent.resume {
+                assert!(
+                    agent
+                        .session_args
+                        .is_some_and(|args| std::ptr::eq(args, resume)),
+                    "an agent the deck resumes reads its arguments with the same table"
+                );
+            }
+        }
+    }
+
+    /// PRD #1790 stage 3 (audit F3): the arguments that reopen an earlier
+    /// conversation are told from a fresh start, in a recorded shell command
+    /// too, so Start over refuses a command that would resume.
+    #[test]
+    fn reopening_arguments_and_commands_are_told_from_a_fresh_start() {
+        use std::ffi::OsString;
+        const ID: &str = "01234567-89ab-4cde-8fab-0123456789ab";
+        let claude = spec(&AgentType::ClaudeCode).session_args.unwrap();
+        let codex = spec(&AgentType::Codex).session_args.unwrap();
+        let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        let attached = format!("-r{ID}");
+        for args in [
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["-pc"],
+            vec!["--resume", ID],
+            vec![attached.as_str()],
+            vec!["--session-id", ID],
+            vec!["--fork-session"],
+            vec!["--model", "haiku", "--continue"],
+        ] {
+            assert!(claude.reopens(&os(&args)), "Claude: {args:?}");
+        }
+        for args in [
+            vec![],
+            vec!["--model", "haiku"],
+            vec!["-p", "hello"],
+            vec!["-dc"],
+            vec!["--append-system-prompt", "--continue"],
+            vec!["fix the -c flag"],
+        ] {
+            assert!(!claude.reopens(&os(&args)), "Claude: {args:?}");
+        }
+        for args in [
+            vec!["resume", ID],
+            vec!["resume", "--last"],
+            vec!["fork", ID],
+            vec!["-m", "mini", "resume", "--last"],
+        ] {
+            assert!(codex.reopens(&os(&args)), "Codex: {args:?}");
+        }
+        for args in [
+            vec![],
+            vec!["--model", "mini"],
+            vec!["exec", "resume"],
+            vec!["-c", "resume"],
+            vec!["--", "resume"],
+        ] {
+            assert!(!codex.reopens(&os(&args)), "Codex: {args:?}");
+        }
+        for command in [
+            "claude --continue",
+            "exec claude --resume 01234567-89ab-4cde-8fab-0123456789ab --model x",
+            "(umask 077; printf x > f); exec /usr/local/bin/claude -c",
+            "cd /w && claude --model haiku --continue; echo done",
+        ] {
+            assert!(claude.command_reopens(command), "{command}");
+        }
+        for command in [
+            "exec claude --model haiku",
+            "claude --model x; echo --continue",
+            "claude-wrapper --continue",
+            "echo claude --continue-not",
+        ] {
+            assert!(!claude.command_reopens(command), "{command}");
+        }
+        assert!(codex.command_reopens("exec codex resume --last"));
+        assert!(!codex.command_reopens("exec codex --model mini"));
     }
 
     /// PRD #1790 stage 3 (review R4): Claude Code's conflicting options are
@@ -2200,7 +2387,7 @@ mod tests {
     fn version_help_and_managing_subcommands_start_no_conversation() {
         use std::ffi::OsString;
         let claude = spec(&AgentType::ClaudeCode).resume.unwrap();
-        let codex = spec(&AgentType::Codex).resume.unwrap();
+        let codex = spec(&AgentType::Codex).session_args.unwrap();
         let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
         for args in [
             vec!["--version"],
@@ -2257,7 +2444,7 @@ mod tests {
     #[test]
     fn codex_restore_launch_resumes_and_its_app_server_probe_inspects() {
         use std::ffi::OsString;
-        let codex = spec(&AgentType::Codex).resume.unwrap();
+        let codex = spec(&AgentType::Codex).session_args.unwrap();
         let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
         let launch = os(&[
             "--model",

@@ -4151,6 +4151,31 @@ impl DaemonClient {
         caller: Option<crate::daemon_protocol::CallerClaim>,
         pinned_instance: Option<&str>,
     ) -> Result<GatedQuery<crate::interrupted_work::RestoreOutcome>, ClientError> {
+        Ok(
+            match self
+                .restore_interrupted_pinned(id, agents, mode, dry_run, caller, pinned_instance)
+                .await?
+            {
+                PinnedQuery::Answered { value, .. } => GatedQuery::Answered(value),
+                PinnedQuery::Unsupported | PinnedQuery::OtherInstance => GatedQuery::Unsupported,
+            },
+        )
+    }
+
+    /// [`Self::restore_interrupted`], telling a daemon that is not
+    /// `pinned_instance` from one that does not support the request, and
+    /// answering the daemon process that answered, so a confirmed action can
+    /// be pinned to the process its dry run asked (audit suggestion: CLI
+    /// confirmation binding).
+    pub async fn restore_interrupted_pinned(
+        &self,
+        id: &str,
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::RestoreOutcome>, ClientError> {
         let request = AttachRequest::RestoreInterrupted {
             id: id.to_string(),
             agents,
@@ -4158,7 +4183,7 @@ impl DaemonClient {
             dry_run,
             caller,
         };
-        let response = match self
+        let (response, instance) = match self
             .interrupted_work_needing(
                 &request,
                 pinned_instance,
@@ -4166,13 +4191,14 @@ impl DaemonClient {
             )
             .await?
         {
-            InterruptedAnswer::Answered { response, .. } => response,
-            InterruptedAnswer::Unsupported | InterruptedAnswer::OtherInstance => {
-                return Ok(GatedQuery::Unsupported);
-            }
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
         };
         match response.interrupted_restore {
-            Some(outcome) => Ok(GatedQuery::Answered(outcome)),
+            Some(value) => Ok(PinnedQuery::Answered { value, instance }),
             None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
                 "the daemon answered RestoreInterrupted with no outcome".into()
             }))),
@@ -4191,13 +4217,34 @@ impl DaemonClient {
         caller: Option<crate::daemon_protocol::CallerClaim>,
         pinned_instance: Option<&str>,
     ) -> Result<GatedQuery<crate::interrupted_work::StartOverOutcome>, ClientError> {
+        Ok(
+            match self
+                .start_over_interrupted_pinned(id, agent, dry_run, caller, pinned_instance)
+                .await?
+            {
+                PinnedQuery::Answered { value, .. } => GatedQuery::Answered(value),
+                PinnedQuery::Unsupported | PinnedQuery::OtherInstance => GatedQuery::Unsupported,
+            },
+        )
+    }
+
+    /// [`Self::start_over_interrupted`], answering as
+    /// [`Self::restore_interrupted_pinned`] does.
+    pub async fn start_over_interrupted_pinned(
+        &self,
+        id: &str,
+        agent: &str,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::StartOverOutcome>, ClientError> {
         let request = AttachRequest::StartOverInterrupted {
             id: id.to_string(),
             agent: agent.to_string(),
             dry_run,
             caller,
         };
-        let response = match self
+        let (response, instance) = match self
             .interrupted_work_needing(
                 &request,
                 pinned_instance,
@@ -4205,13 +4252,14 @@ impl DaemonClient {
             )
             .await?
         {
-            InterruptedAnswer::Answered { response, .. } => response,
-            InterruptedAnswer::Unsupported | InterruptedAnswer::OtherInstance => {
-                return Ok(GatedQuery::Unsupported);
-            }
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
         };
         match response.interrupted_start_over {
-            Some(outcome) => Ok(GatedQuery::Answered(outcome)),
+            Some(value) => Ok(PinnedQuery::Answered { value, instance }),
             None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
                 "the daemon answered StartOverInterrupted with no outcome".into()
             }))),

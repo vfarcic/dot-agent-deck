@@ -1302,7 +1302,8 @@ describe("a request to show interrupted work that the person moved on from (PR #
 const RESTORE_ATTEMPT = "restore-desktop/8";
 const RESTORE_OTHER = "restore-desktop/7";
 const DESKTOP_RESTORE_STILL_RUNNING = "Refused: the agent's old process, or a process it started, is still running. Stop it first, so two agents do not write to one conversation.";
-type DesktopRestoreKind = "resume" | "start_over" | "none";
+/** `legacy`: a Claude whose launch record an older deck wrote, without its process (review R#2). */
+type DesktopRestoreKind = "resume" | "start_over" | "none" | "legacy";
 
 function desktopRestoreItem(kind: DesktopRestoreKind = "resume", first = false): InterruptedItem {
   const base = first ? unit() : agent();
@@ -1312,9 +1313,9 @@ function desktopRestoreItem(kind: DesktopRestoreKind = "resume", first = false):
     agents: [{
       attempt: first ? RESTORE_OTHER : RESTORE_ATTEMPT,
       name: first ? "restore-first" : "restore-second",
-      agent_type: kind === "resume" ? "claude_code" : "pi",
+      agent_type: kind === "resume" || kind === "legacy" ? "claude_code" : "pi",
       folder: base.worktree,
-      restore: kind === "resume" ? { kind } : {
+      restore: kind === "resume" ? { kind } : kind === "legacy" ? { kind: "start_over", reason: "old-process-unknown" } : {
         kind, reason: kind === "none" ? "orchestration-later" : "agent-cannot-resume",
       },
     }],
@@ -1468,6 +1469,28 @@ describe("journal/restore/009 — the desktop restore question", () => {
       expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
     }
     expect(recorded.actions()).toEqual([]);
+  });
+
+  /** Scenario: select a Claude that an older deck started without recording its process, and press s. The question explains that and offers Start over only: c and o send nothing, and w sends one start over of that attempt. */
+  it("journal/restore/009 offers only Start over for an agent an older deck started", async () => {
+    const recorded = desktopRestoreBridge("legacy");
+    render(<RestoreOverview bridge={recorded.bridge} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await restoreKey(dialog, "s");
+    const question = within(dialog).getByTestId("interrupted-restore-question");
+    expect(question).toHaveTextContent("Start restore-second over in this worktree, without its conversation?");
+    expect(question).toHaveTextContent("An older version of the deck started this agent, so the deck cannot tell whether its old process is gone.");
+    expect(within(question).getByTestId("interrupted-start-over")).toHaveTextContent("Start over in this worktree");
+    expect(within(question).queryByTestId("interrupted-restore-continue")).toBeNull();
+    expect(within(question).queryByTestId("interrupted-restore-only")).toBeNull();
+    await waitFor(() => expect(question).toHaveAttribute("data-presented", "true"));
+    for (const unavailable of ["c", "o"]) await restoreKey(dialog, unavailable);
+    expect(recorded.actions()).toEqual([]);
+    await restoreKey(dialog, "w");
+    await waitFor(() => expect(recorded.actions()).toHaveLength(1));
+    expect(recorded.actions()[0]).toMatchObject({ verb: "start-over", args: [AGENT_ID, RESTORE_ATTEMPT, false] });
+    await act(async () => { recorded.release(); });
   });
 
   /** Scenario: the dialog lists an orchestration agent that cannot yet come back. Its reason is visible in details, and s never offers a resume or Start-over confirm for that agent. */

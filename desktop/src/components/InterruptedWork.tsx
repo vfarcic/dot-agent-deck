@@ -77,27 +77,58 @@ function fullyShown(element: HTMLElement): boolean {
   return shown.top >= top - 1 && shown.bottom <= bottom + 1;
 }
 
+/** Whether `element` fills its dialog's whole visible box: a part taller than the box, seen as far as it can be at once. */
+function coversBox(element: HTMLElement): boolean {
+  const shown = element.getBoundingClientRect();
+  const box = element.closest(".interrupted-dialog")?.getBoundingClientRect();
+  const top = Math.max(box?.top ?? 0, 0);
+  const bottom = Math.min(box?.bottom ?? window.innerHeight, window.innerHeight);
+  return shown.top <= top + 1 && shown.bottom >= bottom - 1;
+}
+
+/** The parts of a question that must each have been seen: its child elements, or the question itself when it has none. */
+function partsOf(element: HTMLElement): HTMLElement[] {
+  const parts = Array.from(element.children).filter((child): child is HTMLElement => child instanceof HTMLElement);
+  return parts.length > 0 ? parts : [element];
+}
+
 /**
  * Whether the y/n question `key` names has been presented: scrolled into
  * view, painted, and fully shown for {@link QUESTION_PRESENTED_MS}. A new
  * `key` (another question) starts over; `undefined` is no question.
+ *
+ * With `acrossScroll` (the restore question, review R#5), each of the
+ * question's parts ({@link partsOf}) counts once it has been fully shown for
+ * that long, at any scroll position, as the TUI counts the rows it has drawn
+ * across frames: a question taller than the dialog is presented once every
+ * part has been scrolled through, instead of never.
  */
-function usePresented(key: string | undefined, question: RefObject<HTMLElement | null>): boolean {
+function usePresented(key: string | undefined, question: RefObject<HTMLElement | null>, acrossScroll = false): boolean {
   const [presented, setPresented] = useState<string | undefined>();
   useEffect(() => {
     if (key === undefined) return;
     question.current?.scrollIntoView?.({ block: "nearest" });
     let frame = 0;
     let timer: number | undefined;
+    const seen = new Set<Element>();
+    const shownNow = (part: HTMLElement) => fullyShown(part) || (acrossScroll && coversBox(part));
     const look = () => {
       frame = window.requestAnimationFrame(() => {
         const element = question.current;
-        if (!element || !fullyShown(element)) {
+        if (!element) {
+          look();
+          return;
+        }
+        const parts = acrossScroll ? partsOf(element) : [element];
+        const candidates = parts.filter((part) => !seen.has(part) && shownNow(part));
+        if (candidates.length === 0) {
           look();
           return;
         }
         timer = window.setTimeout(() => {
-          if (question.current && fullyShown(question.current)) setPresented(key);
+          for (const part of candidates) if (part.isConnected && shownNow(part)) seen.add(part);
+          const now = question.current;
+          if (now && (acrossScroll ? partsOf(now) : [now]).every((part) => seen.has(part))) setPresented(key);
           else look();
         }, QUESTION_PRESENTED_MS);
       });
@@ -110,7 +141,7 @@ function usePresented(key: string | undefined, question: RefObject<HTMLElement |
       /* The same question asked again is presented again, from the start. */
       setPresented(undefined);
     };
-  }, [key, question]);
+  }, [key, question, acrossScroll]);
   return key !== undefined && presented === key;
 }
 
@@ -478,7 +509,7 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
   /* PRD #1790 stage 3 — the restore question, while it offers a choice and nothing is in flight: its choices act only once it has been presented, as `y` does. */
   const restoreAsk = useRef<HTMLDivElement>(null);
   const restoreAsking = view.kind === "restore" && offersChoice(view.verdict) && !busy ? `restore:${view.id}:${view.attempt ?? ""}` : undefined;
-  const restorePresented = usePresented(restoreAsking, restoreAsk);
+  const restorePresented = usePresented(restoreAsking, restoreAsk, true);
 
   const registry = { interruptedDialog: controls };
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {

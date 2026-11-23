@@ -882,7 +882,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/restore/001 — A single interrupted agent offers conversation restore.
 
 - **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
-- **Agent:** none; in-memory Claude and Codex journal records.
+- **Agent:** none; in-memory Claude journal records (Codex is a documented gap since #2492 and is listed in 002).
 - **Asserts:** single pane, dispatch and issue-dispatch items list their attempt, name, type and folder with a `resume` verdict; the latest session by sequence wins even when the reader order differs; older replies without the additive fields still read; a team with twenty attempts lists sixteen distinct agents and reports four omitted.
 - **Does not assert:** filesystem checks, process liveness, or starting an agent.
 - **Platform coverage:** mac+linux.
@@ -891,7 +891,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
 - **Agent:** none; synthetic records for the supported agent types.
-- **Asserts:** Pi, OpenCode, Devin and Antigravity yield `start_over` with `agent-cannot-resume`; a default shell yields `default-shell`; orchestration roles, multi-attempt dispatches and a single-attempt unit with a delegation yield `none` with `orchestration-later`, listing each distinct attempt once.
+- **Asserts:** Codex, Pi, OpenCode, Devin and Antigravity yield `start_over` with `agent-cannot-resume`; a default shell yields `default-shell`; orchestration roles, multi-attempt dispatches and a single-attempt unit with a delegation yield `none` with `orchestration-later`, listing each distinct attempt once.
 - **Does not assert:** start-over execution or saved-task delivery.
 - **Platform coverage:** mac+linux.
 
@@ -899,7 +899,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
 - **Agent:** none.
-- **Asserts:** duplicate or wrongly joined records and an attempt shared between plain works yield `ambiguous-record`; moved folders and missing records yield `folder-moved` and `no-launch-record`; absent and invalid session ids offer Start over with `no-session-id` and `session-id-invalid`; journal truncation, launch truncation and skipped launch records yield `incomplete-read` and mark the list incomplete.
+- **Asserts:** duplicate or wrongly joined records and an attempt shared between plain works yield `ambiguous-record`; moved folders and missing records yield `folder-moved` and `no-launch-record`; absent and invalid session ids offer Start over with `no-session-id` and `session-id-invalid`; a record an older deck wrote without `pid`/`pid_start` (or without `pid_start` alone) offers Start over with `old-process-unknown` (review R#2); journal truncation, launch truncation and skipped launch records yield `incomplete-read` and mark the list incomplete.
 - **Does not assert:** restore-time safety checks or filesystem ownership.
 - **Platform coverage:** mac+linux.
 
@@ -907,7 +907,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L1 unit (`src/telemetry/shim.rs`), real temporary files, no child launched; registry inputs also pinned by `journal_restore_resume_specs_define_literal_arguments_and_safe_inputs` in `src/agent_registry.rs`.
 - **Agent:** synthetic executable files and shell-script launchers named Claude or Codex.
-- **Asserts:** Claude gets `--resume <uuid>` and Codex gets `resume <uuid>` before user and embedded args; matching requests remove their one-shot variables from the child plan; private acknowledgement creation is exclusive; unmatched and absent requests pass through, and ordinary Claude gets no telemetry args. The existing installation tests also require Claude, Codex and Devin shims with telemetry on or off, while ordinary spawn PATH remains conditional on telemetry.
+- **Asserts:** Claude gets `--resume <uuid>` and Codex gets `resume <uuid>` before user and embedded args (the shim reads each agent's `session_args`, which Codex keeps although the daemon does not resume it yet, #2492); matching requests remove their one-shot variables from the child plan; private acknowledgement creation is exclusive; unmatched and absent requests pass through, and ordinary Claude gets no telemetry args. The existing installation tests also require Claude, Codex and Devin shims with telemetry on or off, while ordinary spawn PATH remains conditional on telemetry.
 - **Does not assert:** `exec` applying the child plan, agent session confirmation, or a real conversation.
 - **Platform coverage:** mac+linux.
 
@@ -930,8 +930,8 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/restore/007 — The TUI asks with the offered restore choices and hides the surface when disabled.
 
 - **Layer:** L1 `TestBackend` and insta through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); list and details entry points.
-- **Agent:** none; injected Claude resume and Pi Start-over verdicts.
-- **Asserts:** `s` opens the question for the selected name without acting; a resumable agent shows exactly `Restore and continue` and `Restore only`; a gap agent offers `Start over in this worktree` instead; wording equals the shared Rust constants. With experimental features off, the same key leaves the rendered list/details unchanged, no restore hint or choice is drawn in the dashboard/footer/details, and no action request is recorded.
+- **Agent:** none; injected Claude resume, Pi Start-over and older-deck Claude (`start_over`, `old-process-unknown`) verdicts.
+- **Asserts:** `s` opens the question for the selected name without acting; a resumable agent shows exactly `Restore and continue` and `Restore only`; a gap agent offers `Start over in this worktree` instead; a Claude an older deck started shows the `old-process-unknown` sentence and Start over only, `c`/`o` send nothing and `w` sends one StartOverInterrupted for its attempt (review R#2); wording equals the shared Rust constants. With experimental features off, the same key leaves the rendered list/details unchanged, no restore hint or choice is drawn in the dashboard/footer/details, and no action request is recorded.
 - **Does not assert:** daemon execution or genuine conversation recall; the resulting snapshots need review at promotion.
 - **Platform coverage:** mac+linux.
 
@@ -997,6 +997,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** real Codex on `common::codex_test_model()`, the harness's auth-appropriate cheap mini model, with workspace-write sandbox, low reasoning effort and approvals set to never. Existing `check_codex_available` verifies the installed CLI, persisted auth and a bounded live model request; `skip_unless!` produces a clean skip when unauthenticated and a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`. A refused configured model remains the harness's deliberate hard failure.
 - **Asserts:** the same unique conversation-memory, unchanged acknowledgement, first acknowledged restart-note, new-attempt/same-native-session, exactly-one-agent and attached live-card checks as 016, exercising Codex's `resume <session>` launch through the saved command. Native SessionStart, UserPromptSubmit and Stop hooks must be trusted before startup, and both lifetimes share the scratch CODEX_HOME and HOME.
 - **Does not assert:** Claude resume syntax (016), Codex picker navigation, remote state, orchestration/report-route recovery, or a start-over fallback. A passing 017 is required before Codex graduates from conditional support; the test's existence alone is no graduation evidence.
+- **Quarantined** (`#[ignore = "quarantined: vfarcic, #2492"]`): every run timed out because Codex sends its first hook only with its first prompt, so the restore never confirmed before the restart note. Stage 3 ships Codex as a documented gap (registry `resume: None`); #2492 is the design change that lifts this, with the body unchanged.
 - **Platform coverage:** mac+linux intended; lane 2 is run locally. The real CLI must preserve its native thread id and reach the composer after resume; no unmeasured `tui.resume_cwd` setting is added.
 
 ##### journal/restore/018 — Saved-workspace startup leaves a matching resumable agent for the question.
@@ -1005,6 +1006,62 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** none; in-memory saved pane, interrupted list and launch records.
 - **Asserts:** on a daemon-empty startup with experimental features on, a saved pane is deferred exactly when its directory and verbatim command match a launch record joined by both item work id and resumable attempt id; name changes do not defeat the match. Flag off, Start-over verdict, different directory or command, missing item/record, or wrong-work/wrong-attempt record preserves ordinary saved-pane startup. The existing daemon-hydration-wins gate remains structural.
 - **Does not assert:** an actual PTY launch on this predicate (the production call site must use it); remote transport of the daemon's matching launch data; process liveness or the agent's actual resume (006/011/015).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/019 — A repeated or oversized selection is refused whole before anything is read.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI and raw attach requests. Unit companion: `a_repeated_or_oversized_selection_is_refused_before_anything_is_read` (`src/agent_restore.rs`).
+- **Agent:** synthetic `claude` of the 011 fixture.
+- **Asserts:** `interrupted restore … --agent A --agent A --yes` exits 1 naming the repeated agent; raw requests with a repeated attempt, 17 agents, a 129-byte id and 5,000 agents each answer one whole-request `bad-selection` refusal (no attempt) in under 4 KiB; nothing starts, nothing is sent and the item stays listed (audit F5, review/audit F1).
+- **Does not assert:** the concurrent-request permit (`too-many-pending`), which needs sixteen held requests.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/020 — A request prepared before a restore reads everything again before it starts.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests and the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_BARRIER` pause between a start over's preparation and its start.
+- **Agent:** synthetic `claude` of the 011 fixture.
+- **Asserts:** a Start over held at the barrier after reading the item lets Restore and continue bring the agent back; released, it answers `not-listed` and starts nothing, so there are two launches in all (the original and the restored) and the restored agent's first and only inbox message is the Continue note (audit F1).
+- **Does not assert:** the cross-daemon claim (021).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/021 — Two daemons on one state directory start one writer.
+
+- **Layer:** L2 two headless `daemon serve` processes with separate sockets and one state directory, lane 1 (`tests/e2e_agent_restore.rs`); concurrent raw attach requests, one per daemon. Unit companions: `a_claim_holds_its_attempt_and_conversation_against_a_second_claimer`, `a_claim_file_released_after_it_was_opened_claims_nothing`.
+- **Agent:** synthetic `claude` that delays its SessionStart report three seconds (`slow-start`), so a restore holds its claims while it confirms.
+- **Asserts:** restoring one attempt from both daemons at once restores it once, the other refused (`already-restoring`, `session-in-use`, `directory-in-use` or `not-listed`), two launches in all; restoring two attempts that were in one conversation, in different folders, one from each daemon at once, restores one and refuses the other `session-in-use`, three launches in all (audit F2).
+- **Does not assert:** a daemon that dies while holding a claim (the lock goes with its descriptor).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/022 — Start over refuses a launch that reopens the old conversation.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI and raw attach requests. Unit companion: `reopening_arguments_and_commands_are_told_from_a_fresh_start` (`src/agent_registry.rs`).
+- **Agent:** synthetic `claude`; one recorded command runs `claude --continue`, one `claude --resume <uuid>`, one a wrapper script that adds `--continue`.
+- **Asserts:** the two direct commands are refused `command-reopens` by the CLI (naming it) and by the raw request, starting nothing; the wrapper's Start over starts once, the agent reports the old conversation, and the answer is `not-fresh`: its card goes, nothing is posted and the item stays listed (audit F3).
+- **Does not assert:** agents whose hooks report no conversation before their prompt (documented gap: they are checked by their recorded command only).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/023 — A failed restore stops every process it started.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan.
+- **Agent:** synthetic `claude` restored with `wrong-session`, `survive-stop` (a child in its session but another process group, ignoring TERM/HUP) and `ignore-term-child` (a child in its own group ignoring TERM); each child caps itself at 180 seconds and fixture cleanup signals only its exact pid while its start identity matches.
+- **Asserts:** the restore answers `not-resumed` only after both children are gone (exited, or waiting only to be reaped); nothing is sent; with the sentinels removed, a Start over then starts the agent again, so the failed restore's own launch no longer blocks it (audit F4).
+- **Does not assert:** a child that left the session (`setsid`), which no session scan finds; the `not-stopped` answer when the stop cannot be proven.
+- **Platform coverage:** linux.
+
+##### journal/restore/024 — A restart note that cannot be delivered restores nothing.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); `DOT_AGENT_DECK_INBOX_MAX_BODY_BYTES` and the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NOTE` on the restarted daemon.
+- **Agent:** synthetic `claude` of the 011 fixture.
+- **Asserts:** an inbox that takes no body as long as the restart note refuses the restore `note-refused` before anything starts; a note post that fails after the agent confirmed its conversation answers `note-not-delivered`, stops the confirmed agent again, posts nothing, and keeps the item listed with its `resume` verdict (review R#4).
+- **Does not assert:** a full inbox reached by real traffic between admission and post.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/025 — Newer work in the folder refuses Start over and restore.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests. Unit companion: `newer_live_work_in_the_same_folder_makes_it_in_use`.
+- **Agent:** synthetic `claude`; a newer one started in the same folder on the restarted daemon.
+- **Asserts:** Start over and Restore of the stopped agent are both refused `directory-in-use`, nothing more starts and the item stays listed (review R#3).
+- **Does not assert:** the act-time Git and GitHub refusals (`folder-missing` for a gone worktree, `pr-open` for a Start over beside an open pull request), covered by `act_time_git_facts_refuse_a_gone_worktree_and_an_open_pr_start_over`.
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

@@ -243,6 +243,10 @@ pub enum RestoreReason {
     /// A restore with its conversation was tried and did not take, so it
     /// can only be started over.
     NotResumed,
+    /// Review R#2: its launch record does not say which process it was (a
+    /// build before stage 3 wrote it), so the deck cannot tell the old agent
+    /// is gone and will not resume its conversation; it can be started over.
+    OldProcessUnknown,
     /// A reason of a newer daemon's.
     #[serde(other)]
     Unknown,
@@ -1270,6 +1274,9 @@ pub fn restore_reason_sentence(reason: RestoreReason) -> &'static str {
         RestoreReason::NotResumed => {
             "The deck tried to restore the agent's conversation and could not."
         }
+        RestoreReason::OldProcessUnknown => {
+            "An older version of the deck started this agent, so the deck cannot tell whether its old process is gone."
+        }
         RestoreReason::Unknown => "The agent cannot be restored.",
     }
 }
@@ -1347,6 +1354,9 @@ pub const START_OVER_NEEDS_YES: &str =
     "Refused: there is no terminal to confirm on, so nothing was started. Add --yes to start over.";
 /// The restore surfaces are experimental and the flag is off.
 pub const RESTORE_NEEDS_EXPERIMENTAL: &str = "Restoring agents is experimental and turned off. Turn it on with `[features] experimental = true` in .dot-agent-deck.toml, or set DOT_AGENT_DECK_EXPERIMENTAL=1.";
+/// Audit suggestion (CLI confirmation binding): the daemon that answered the
+/// question was replaced before the confirmed action reached it.
+pub const RESTORE_DAEMON_REPLACED: &str = "Refused: the deck daemon was restarted or replaced while you were answering, so nothing was started. Ask again.";
 /// The running daemon does not advertise the restore verbs.
 pub const RESTORE_UNSUPPORTED: &str = "The running deck daemon does not support restoring agents. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
 
@@ -1434,6 +1444,30 @@ pub enum RestoreRefusal {
     SessionInUse,
     /// Too many restores are running or waiting for their agents to confirm.
     TooManyPending,
+    /// Audit F5: the request named an agent twice, more agents than an item
+    /// lists, or an id longer than any the deck makes.
+    BadSelection,
+    /// Audit F3: the agent's recorded command reopens an earlier
+    /// conversation, so starting it over would not start fresh.
+    CommandReopens,
+    /// Audit F3: the started-over agent reported its old conversation, or
+    /// no conversation in time, so it was stopped before anything was sent.
+    NotFresh,
+    /// Audit F4: the deck stopped the agent it had just started, and could
+    /// not confirm that every process of it is gone.
+    NotStopped,
+    /// Review R#3: the item's branch has an open pull request, which a
+    /// start over would replay its task beside.
+    PrOpen,
+    /// Review R#3: newer work is running in the agent's folder now.
+    DirectoryInUse,
+    /// Review R#4: the deck's inbox cannot take the restart note now, so
+    /// nothing was started.
+    NoteRefused,
+    /// Review R#4: the agent came back into its conversation, but its
+    /// restart note could not be posted, so it was stopped again and the
+    /// item stays listed.
+    NoteNotDelivered,
     /// A refusal of a newer daemon's.
     #[serde(other)]
     Unknown,
@@ -1501,6 +1535,30 @@ pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
         RestoreRefusal::TooManyPending => {
             "Refused: too many restores are waiting for their agents to start. Try again in a minute."
         }
+        RestoreRefusal::BadSelection => {
+            "Refused: the request named an agent twice, named too many agents, or used an id that is too long."
+        }
+        RestoreRefusal::CommandReopens => {
+            "Refused: the agent's recorded command reopens an earlier conversation, so starting it over would not start fresh. Start it yourself without that option."
+        }
+        RestoreRefusal::NotFresh => {
+            "The deck could not confirm that the agent started a new conversation rather than its old one, so it stopped the agent before sending it anything."
+        }
+        RestoreRefusal::NotStopped => {
+            "The deck stopped the agent it had just started, but could not confirm that all of it stopped. Make sure it is not running before you try again."
+        }
+        RestoreRefusal::PrOpen => {
+            "Refused: its branch has an open pull request, and starting the agent over would repeat its task beside it. Restore it with its conversation instead, or close the pull request first."
+        }
+        RestoreRefusal::DirectoryInUse => {
+            "Refused: newer work is running in this agent's folder now. Stop it first, so two agents do not work in one folder."
+        }
+        RestoreRefusal::NoteRefused => {
+            "Refused: the deck's inbox cannot take the restart note now, so nothing was started. Try again in a minute."
+        }
+        RestoreRefusal::NoteNotDelivered => {
+            "The agent came back into its conversation, but the deck could not give it its restart note, so it stopped the agent again. The item is still listed; try again."
+        }
         RestoreRefusal::Unknown => REFUSED_UNKNOWN,
     }
 }
@@ -1561,9 +1619,16 @@ pub struct RestoreOutcome {
     pub would_restore: Vec<AttemptId>,
     /// With `dry_run`: what Git and GitHub say of the item's worktree and
     /// branch now (§4 item 10), so a client can show an open pull request
-    /// in its question. Absent otherwise, and from a daemon before it.
+    /// in its question. A restore that acted carries the facts it checked.
+    /// Absent otherwise, and from a daemon before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitFacts>,
+    /// The full id of the item the request's `id` resolved to, so a client
+    /// that asked with a short name can act on exactly the item it asked
+    /// about (audit suggestion: CLI confirmation binding). Absent when the
+    /// request was refused before resolving, and from a daemon before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
 }
 
 /// PRD #1790 stage 3: the answer to a start-over
@@ -1584,6 +1649,9 @@ pub struct StartOverOutcome {
     /// branch now, as [`RestoreOutcome::git`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitFacts>,
+    /// As [`RestoreOutcome::item`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
 }
 
 /// The list.
@@ -2544,6 +2612,11 @@ impl<'a> Index<'a> {
                     }
                     Some(_) if self.restore_failed.contains(attempt) => {
                         start_over(RestoreReason::NotResumed)
+                    }
+                    // Review R#2: a record a build before stage 3 wrote,
+                    // without the process identity a restore checks first.
+                    Some(_) if record.pid.is_none() || record.pid_start.is_none() => {
+                        start_over(RestoreReason::OldProcessUnknown)
                     }
                     Some((id, _)) => {
                         resumed = Some(id);
