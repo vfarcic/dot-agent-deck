@@ -970,9 +970,12 @@ export interface CardBatchOptions {
  * Issue #2399 — what happened, or would happen, to one card of a batch, as the
  * daemon answered: `included` (with the exact `prompt` it gets) or `skipped`
  * for a preview; `delivered`, `closed` or `failed` for an execution. A skip or
- * a failure carries a stable `code` and a sentence to show. `unknown` (code
- * `no_answer`) is the desktop's, never a daemon's: the execution was sent and
- * the daemon did not answer in time, so the agent may or may not get it.
+ * a failure carries a stable `code` and a sentence to show. `unknown` is the
+ * desktop's, never a daemon's: an execution nobody confirmed, which may or may
+ * not have reached the agent. The bridge gives it code `no_answer` when its
+ * wait ran out (possibly before the request was written) and
+ * `connection_lost` when the connection broke after the request was written;
+ * the hook's fallback for a rejected call carries no code.
  */
 export interface CardBatchOutcome extends CardBatchEntry {
   outcome: "included" | "skipped" | "delivered" | "closed" | "failed" | "unknown" | string;

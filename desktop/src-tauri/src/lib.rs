@@ -2151,13 +2151,17 @@ async fn agent_card_invoke_batch(
     .await
 }
 
-/// Issue #2399 re-review: the outcome of an executed entry the daemon did not
-/// answer before [`card_batch_reply_timeout`] ran out. Only this bridge says
-/// it, never a daemon: the request was sent, so the entry may have been
-/// delivered, may still be, or may not be. It is neither `failed` ("not sent")
+/// Issue #2399 re-review: the outcome of an executed entry whose fate the
+/// bridge cannot confirm. Only this bridge says it, never a daemon. It carries
+/// [`CODE_CARD_BATCH_NO_ANSWER`] when [`card_batch_reply_timeout`] ran out, and
+/// [`CODE_CARD_BATCH_CONNECTION_LOST`] when the connection broke after the
+/// request was written. The entry may have been delivered, may still be, or
+/// may not be: a timeout can be spent before the request was written, so it is
+/// not proof the request was sent either. It is neither `failed` ("not sent")
 /// nor `delivered`.
 pub(crate) const CARD_BATCH_UNKNOWN: &str = "unknown";
-/// The code an unanswered entry carries beside [`CARD_BATCH_UNKNOWN`].
+/// The code an entry carries beside [`CARD_BATCH_UNKNOWN`] when the bound ran
+/// out with no answer, whether or not the request had been written by then.
 pub(crate) const CODE_CARD_BATCH_NO_ANSWER: &str = "no_answer";
 
 /// The extra time an executed batch is allowed for each entry it names.
@@ -2224,20 +2228,26 @@ pub(crate) fn card_batch_connection_lost_message(detail: &str) -> String {
 
 /// [`agent_card_invoke_batch`] minus the webview.
 ///
-/// The daemon's answer is waited for at most [`card_batch_reply_timeout`].
-/// A preview sends nothing, so any failure is an error. An execution answers
-/// every entry, and which outcome depends on whether the request left:
+/// The batch client exchange, which starts once the trusted link is acquired,
+/// is bounded by [`card_batch_reply_timeout`]; acquiring that link comes first
+/// and has its own bound. A preview sends nothing, so any failure is an error.
+/// An execution answers every entry, and which outcome depends on what the
+/// bridge can place:
 ///
-/// - before it was written (the deck could not be reached or trusted, its
-///   `Hello` failed, it is a successor of the daemon that listed the cards),
-///   and when the daemon refused the whole request, every entry is `failed`:
-///   no entry ran.
-/// - after it was written (the connection broke, the reply was cut off or
-///   unreadable, or the bound ran out) every entry is [`CARD_BATCH_UNKNOWN`]:
-///   the daemon may have delivered it, or be delivering it still, so "not
-///   sent" would be a claim nobody can make. The client says which by
-///   answering [`ClientError::Unanswered`] for every failure after the first
-///   byte of the request.
+/// - a failure known to come before the request was written (the deck could
+///   not be reached or trusted, its `Hello` failed, it is a successor of the
+///   daemon that listed the cards), and the daemon refusing the whole
+///   request, make every entry `failed`: no entry ran.
+/// - a failure after it was written (the connection broke, the reply was cut
+///   off or unreadable) makes every entry [`CARD_BATCH_UNKNOWN`] with
+///   [`CODE_CARD_BATCH_CONNECTION_LOST`]: the daemon may have delivered it, or
+///   be delivering it still, so "not sent" would be a claim nobody can make.
+///   The client says which by answering [`ClientError::Unanswered`] for every
+///   failure after the first byte of the request.
+/// - the bound running out makes every entry [`CARD_BATCH_UNKNOWN`] with
+///   [`CODE_CARD_BATCH_NO_ANSWER`]. The bound does not say whether the request
+///   was written before it ran out (a hung connect or `Hello` spends it too),
+///   so the outcome is unconfirmed rather than sent.
 ///
 /// Nothing is sent again: the user decides, from the cards, whether to.
 async fn agent_card_invoke_batch_on(

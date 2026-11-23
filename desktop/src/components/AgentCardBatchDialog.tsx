@@ -6,7 +6,7 @@ import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import type { CardBatchOutcome } from "../types";
 import { ExactText, ExactTextNote, SourceBadge } from "./AgentCard";
 
-/** What one agent's row says it got, after Send. `unknown` is a request that was sent and then not answered — the daemon did not answer in time, or the connection broke: it may have acted or still act, so it is neither a failure nor a delivery. */
+/** What one agent's row says it got, after Send. `unknown` is an execution nobody confirmed — the wait ran out (`no_answer`, possibly before the request was written), the connection broke after it was written (`connection_lost`), or the webview call rejected (no code): the daemon may or may not have acted, or may still act, so it is neither a failure nor a delivery. */
 const RESULT_WORD: Record<string, string> = { delivered: "Delivered", closed: "Closed", failed: "Failed", unknown: "No answer" };
 
 /** The headline of the results. Unanswered agents are not counted as sent or as failed: either may still be true. */
