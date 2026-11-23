@@ -113,9 +113,11 @@
 #                    `close_orchestration` stops every role of a run, and
 #                    "close the billing agent" must never stop it. Words of the
 #                    row's own `id` or `description`, which `table.rs` checks.
-#                    Two rows use it: that one, and
+#                    Three rows use it: that one,
 #                    `approve_project_commands` (PRD #1885), which needs the
-#                    word "approve" so that a bare start never approves
+#                    word "approve" so that a bare start never approves, and
+#                    `cancel_inbox_message` (issue #2148), which needs the
+#                    message named so that a bare "cancel" stays `close`'s
 #                    (`voice_table_conjunctive_rows_are_the_deliberate_set`).
 #   must_not_say     a REFUSE-ONLY guard: a pick is refused when the
 #                    transcript contains one of these, whatever the check
@@ -2618,6 +2620,76 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
   [[commands.params]]
   name = "orchestration"
   kind = "orchestration_ref"
+
+# Issue #2148 — the voice forms of Retry and Cancel on a deck message that
+# waits on the user (PRD #1666 §6.4): one the deck is not sure reached the
+# agent, one that ran out of attempts, one held for an hour, or one the agent
+# never started on. The Daemons screen lists them on the agent's tile, which
+# is the only place their buttons are drawn, so both rows run there alone.
+#
+# **Which message.** A deck message has no name a user would say — its subject
+# and sender are whatever another agent wrote — so a row names it by the agent
+# it was sent TO, an `agent_ref`, and acts on every message that agent's tile
+# lists for the verb: all of them for Cancel, all but those out of attempts for
+# Retry. Nothing about a message reaches the command model: the subjects and
+# senders are shown in the confirmation, on screen, and nowhere else.
+#
+# **Both only OPEN a confirmation**, as the stops and Generate config do: Retry
+# can deliver a message twice, Cancel stops a delivery for good, and either may
+# cover several messages, so the confirmation lists each one by sender and
+# subject and nothing happens until the user presses its button
+# (`voice_table_d5_rows_only_ask`). A click on a row's own button acts on that
+# one message at once, as it did before.
+#
+# **"Cancel" is a view word.** `close` owns "cancel" and "never mind", and the
+# confirmation is closed by them, so `cancel_inbox_message` needs the message
+# NAMED (`must_name`): a bare "cancel" closes what is on top and cancels no
+# message. That makes the Cancel button's bare label the one on this surface
+# that is not its own voice phrase; "Retry" is.
+[[commands]]
+id          = "retry_inbox_message"
+description = """Retry the deck messages waiting on the user for one agent on the Daemons screen —
+the voice form of the Retry button beside a deck message whose delivery is uncertain or that may
+not have reached the agent. Use for retry, retry the message, retry the message to the tester,
+retry the tester's message, send the coder's deck message again, resend the message to the
+reviewer. Set `agent` to the agent the message was sent TO, the way `open_agent` does. It never
+sends anything by itself: the app shows a confirmation listing every message it would retry and
+the user confirms by hand. Not for posting a new message, typing to an agent or opening one;
+cancelling a message is `cancel_inbox_message`."""
+invoke      = "confirmRetryInboxMessage"
+screens     = ["deck"]
+unavailable_hint = "retrying a deck message works from the Daemons screen, where each agent's tile lists the messages waiting on you"
+report      = "Confirm retrying the deck messages to {agent} — nothing has been sent yet."
+asks_to     = "retry a deck message"
+try_saying  = "retry the message to {agent}"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "cancel_inbox_message"
+description = """Cancel the deck messages waiting on the user for one agent on the Daemons screen,
+so the deck stops delivering them — the voice form of the Cancel button beside a deck message whose
+delivery is uncertain, that ran out of attempts or that may not have reached the agent. Use for
+cancel the message to the tester, cancel the tester's deck message, cancel the messages to the
+coder, drop the message to the reviewer, give up on the message to the tester. Set `agent` to the
+agent the message was sent TO, the way `open_agent` does. The user must say "message": a bare
+"cancel" or "never mind" is `close`, which closes what is on top and cancels no message. It never
+cancels anything by itself: the app shows a confirmation listing every message it would cancel and
+the user confirms by hand. Not for stopping an agent (`stop_agent`); retrying a message is
+`retry_inbox_message`."""
+invoke      = "confirmCancelInboxMessage"
+screens     = ["deck"]
+unavailable_hint = "cancelling a deck message works from the Daemons screen, where each agent's tile lists the messages waiting on you"
+report      = "Confirm cancelling the deck messages to {agent} — nothing has been cancelled yet."
+asks_to     = "cancel a deck message"
+try_saying  = "cancel the message to {agent}"
+must_name   = ["message", "messages"]
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
 
 # PRD #2374 — the agent dashboard's cards.
 #

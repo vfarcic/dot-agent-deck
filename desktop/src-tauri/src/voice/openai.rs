@@ -399,6 +399,8 @@ mod tests {
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",
+                "retry_inbox_message",
+                "cancel_inbox_message",
                 "set_overview_mode",
                 "show_agent_card",
                 "next_agent_card",
