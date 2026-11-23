@@ -2091,7 +2091,8 @@ async fn start(
         .and_then(|agent| journal.attempt_id(agent));
     // Round 6 (B1): the fence names the agent's leader and attempt as soon
     // as they are known, so it lifts once that leader is gone. One that
-    // cannot be rewritten stays as placed, found by its pane instead.
+    // cannot be rewritten stays as placed, and its agent is found by the
+    // launch nonce it carries (round 7, B1), never by its pane.
     marker.pid = leader.map(|leader| leader.pid);
     marker.pid_start = leader.map(|leader| leader.start);
     marker.to = new_attempt.clone();
