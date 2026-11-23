@@ -528,14 +528,17 @@ fn focus(deck: &common::TuiDeck, agent: Agent) {
         frame.contains("[Command Mode Ctrl+D]")
     });
     grid(deck, "interactive composer", |frame| match agent {
+        // Screen-reader Claude renders its composer as a pane line that is
+        // exactly `$`. The startup banner is not required: a resumed
+        // conversation replays its transcript and the banner is not on
+        // screen, while the bare `$` composer is.
         Agent::Claude => {
             frame.contains("? for shortcuts")
-                || (frame.contains("[Screen Reader Mode: on via flag]")
-                    && frame.lines().any(|line| {
-                        line.split('│')
-                            .nth(1)
-                            .is_some_and(|pane| pane.trim() == "$")
-                    }))
+                || frame.lines().any(|line| {
+                    line.split('│')
+                        .nth(1)
+                        .is_some_and(|pane| pane.trim() == "$")
+                })
         }
         Agent::Codex => frame.contains("Ask Codex to do anything"),
     });
@@ -623,9 +626,14 @@ fn nonce() -> String {
 
 fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     let mut fixture = LiveRestore::new(agent, name);
-    // Separate random draws: the filename cannot reveal the remembered word.
+    // Separate random draws: the filename cannot reveal the codename. The
+    // codename is written to no file the test or the prompts ask for: the
+    // acknowledgement holds the fixed text `OK`, so after restart the only
+    // copy is the conversation itself (the native transcript that resume
+    // reloads). The recall turn's tool calls are checked below for a look
+    // into that transcript, the one on-disk route around the conversation.
     let file_nonce = nonce();
-    let word = format!("MEMORY{}", nonce());
+    let word = format!("CODENAME{}", nonce());
     let ack_name = format!("ack-{file_nonce}.txt");
     let recall_name = format!("recall-{file_nonce}.txt");
     let ack_path = fixture.repo.join(&ack_name);
@@ -638,7 +646,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     });
     focus(&attached, agent);
     let first_prompt = format!(
-        "Remember the secret word {word} in this conversation. Use your shell tool now to run exactly: printf 'ack\\n' >> {ack_name} . Do not store the secret in any file or repeat this command later. Finish your turn and wait."
+        "For this session, the project codename is {word}. Please acknowledge by creating the file {ack_name} containing the single line OK, using your shell tool. That is all for now; finish your turn."
     );
     prompt(
         &fixture,
@@ -648,7 +656,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
         &first_prompt,
         &ack_name,
     );
-    common::wait_for_file_trimmed_eq(&ack_path, "ack", TURN).unwrap_or_else(|observed| {
+    common::wait_for_file_trimmed_eq(&ack_path, "OK", TURN).unwrap_or_else(|observed| {
         panic!(
             "initial acknowledgement missing: {observed}\npane:\n{}",
             attached.snapshot_grid()
@@ -656,7 +664,11 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     });
     fixture.wait_idle(&original_id, &attached);
     let original_ack = ack(&ack_path);
-    assert_eq!(original_ack.bytes, b"ack\n");
+    assert_eq!(
+        String::from_utf8_lossy(&original_ack.bytes).trim(),
+        "OK",
+        "the acknowledgement holds only the fixed text, never the codename"
+    );
     let original_attempt = fixture.attempt(&original_id, None);
     let original_session = fixture.session(&original_attempt);
     eprintln!("restore original attempt: {original_attempt}; native session: {original_session}");
@@ -767,8 +779,9 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     );
     focus(&attached, agent);
     let recall = format!(
-        "Write the word I asked you to remember into {recall_name} using your shell tool. Use only your conversation memory: do not read or search files, history or session storage. Do not modify any other file. Then finish your turn and wait."
+        "What is the project codename I told you earlier in this conversation? Please write just the codename into the file {recall_name} using your shell tool, answering from our conversation without looking anything up. Then finish your turn."
     );
+    let recall_events = fixture.live.subscribe_events();
     prompt(
         &fixture,
         &attached,
@@ -784,6 +797,28 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
         )
     });
     fixture.wait_idle(&restored_id, &attached);
+    // The codename reached the recall file from the conversation, not from
+    // a look at the stored transcript: no tool call in the recall turn names
+    // the agents' session storage. A tool event without a detail is not
+    // evidence either way, so this rules out the visible route only.
+    let lookups: Vec<String> = recall_events
+        .snapshot()
+        .into_iter()
+        .filter(|event| {
+            event.agent_id.as_deref() == Some(restored_id.as_str())
+                && event.event_type == dot_agent_deck::event::EventType::ToolStart
+        })
+        .filter_map(|event| event.tool_detail)
+        .filter(|detail| {
+            [".claude", ".codex", ".jsonl"]
+                .iter()
+                .any(|storage| detail.contains(storage))
+        })
+        .collect();
+    assert!(
+        lookups.is_empty(),
+        "the recall must come from the conversation, not from reading its stored transcript: {lookups:?}"
+    );
     assert_eq!(
         ack(&ack_path),
         original_ack,
@@ -805,7 +840,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     // success or panic. No process-name kill, host session or credential edit.
 }
 
-/// Scenario: In an attached TUI, a real interactive Haiku remembers a unique word and writes an acknowledgement, then the test stops its daemon by pid and starts a replacement sharing the same state directory and isolated HOME. The person presses I, s and c to restore and continue; the agent receives the restart note first, recalls the word into a new file without rewriting its acknowledgement, and its new journal attempt keeps the old session id while the named card shows a live status.
+/// Scenario: In an attached TUI, a real interactive Haiku is told a unique project codename and writes an acknowledgement, then the test stops its daemon by pid and starts a replacement sharing the same state directory and isolated HOME. The person presses I, s and c to restore and continue; the agent receives the restart note first, writes the codename into a new file from the conversation alone without rewriting its acknowledgement, and its new journal attempt keeps the old session id while the named card shows a live status.
 #[spec("journal/restore/016")]
 #[test]
 fn journal_restore_016_real_claude_recalls_its_conversation_after_tui_restore() {
@@ -814,7 +849,7 @@ fn journal_restore_016_real_claude_recalls_its_conversation_after_tui_restore() 
     exercise(Agent::Claude, "haiku-016", true);
 }
 
-/// Scenario: A real interactive Codex on the harness's cheap mini model remembers a unique word under an attached TUI before its daemon is stopped by pid. After restart, a human CLI restore with --continue --yes brings back the same native session, delivers the restart note before the recall request, and recalls the word into a new file while leaving the first acknowledgement unchanged and showing a live named card.
+/// Scenario: A real interactive Codex on the harness's cheap mini model is told a unique project codename under an attached TUI before its daemon is stopped by pid. After restart, a human CLI restore with --continue --yes brings back the same native session, delivers the restart note before the recall request, and writes the codename into a new file while leaving the first acknowledgement unchanged and showing a live named card.
 #[spec("journal/restore/017")]
 #[test]
 // Quarantined (CLAUDE.md rule 6): Codex sends its first hook only with its
