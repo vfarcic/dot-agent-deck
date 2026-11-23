@@ -3622,7 +3622,11 @@ pub enum AttachRequest {
     /// `request_id` names the batch; a repeat of an execution sends nothing
     /// again while the batch is remembered (up to
     /// [`crate::agent_cards::REQUEST_ID_MEMORY`], sooner when newer batches
-    /// need the room), and is answered with the first execution's outcomes.
+    /// need the room), and is answered with what the first execution
+    /// answered. That answer is the one the daemon kept: for an answer too
+    /// large to remember whole, a shortened one (each entry's message cut
+    /// short, or each entry [`crate::agent_cards::BATCH_UNKNOWN`]), which the
+    /// first execution's caller is given too.
     /// The reply rides back on [`AttachResponse::card_action_batch`]. A
     /// refusal of the whole request (`ok: false`) comes only before any entry
     /// ran; an execution that started answers per entry, an entry the daemon

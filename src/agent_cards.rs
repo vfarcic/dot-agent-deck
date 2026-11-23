@@ -2999,7 +2999,11 @@ impl CardStore {
     /// code with its message cut short ([`compact_outcome`]), or, if even
     /// that does not fit, each entry [`BATCH_UNKNOWN`] with
     /// [`CODE_BATCH_ANSWER_NOT_KEPT`] ([`minimal_outcome`]), which fits in
-    /// the room the claim reserved for it. Returns what was remembered.
+    /// the room the claim reserved for it. Returns what was remembered (the
+    /// whole answer, remembered nowhere, on the path marked unreachable), and
+    /// [`execute_batch_once`] answers the first caller and every repeat
+    /// waiting on this run with that return, so they get exactly what a later
+    /// repeat reads back.
     fn finish_batch(
         &self,
         request_id: &str,
@@ -4019,7 +4023,9 @@ fn in_repeat_order(mut result: CardBatchResult, distinct: &[&CardBatchEntry]) ->
 /// `Err` therefore always means that no entry of this request ran. Once an
 /// execution has started, every answer is per entry: an execution whose run
 /// is cut short answers [`interrupted_batch`], and one whose answer the deck
-/// did not keep whole answers what it kept ([`CardStore::finish_batch`]).
+/// did not keep whole answers what it kept ([`CardStore::finish_batch`]) —
+/// to its first caller and to every repeat alike, so a repeat gets the same
+/// answer whether it waited on the run or arrived after it.
 ///
 /// A batch is remembered for up to [`REQUEST_ID_MEMORY`], sooner when newer
 /// batches need the room ([`MAX_REMEMBERED_BATCHES`],
@@ -4087,8 +4093,10 @@ where
                 } else {
                     interrupted_batch(&rid, &targets, answered)
                 };
-                store_of(&holder).finish_batch(&rid, fingerprint, &answer, &entry_ids);
-                let _ = tx.send(Some(answer));
+                // Publish what was kept, so the first caller, a repeat
+                // waiting on this run and a later repeat get one answer.
+                let kept = store_of(&holder).finish_batch(&rid, fingerprint, &answer, &entry_ids);
+                let _ = tx.send(Some(kept));
             });
             answer
         }
@@ -8045,12 +8053,13 @@ mod batch_tests {
         assert_eq!(posted(&posts), 1, "and posts nothing");
     }
 
-    /// PR #2491 review (reviewer and auditor P2): a batch's answer too large
-    /// for the batches' memory is remembered smaller, never as a refusal:
-    /// a repeat gets each entry's outcome and message id without its long
+    /// PR #2491 review (reviewer and auditor P2, then P2/P3): a batch's
+    /// answer too large for the batches' memory is remembered smaller, never
+    /// as a refusal: each entry's outcome and message id without its long
     /// text, or — when even that does not fit — each entry `unknown` with
-    /// code `answer_not_kept`, never `failed`. The first caller got the
-    /// whole answer, and no repeat posts.
+    /// code `answer_not_kept`, never `failed`. The first caller, a repeat
+    /// that waited on the running batch and a later repeat all get that one
+    /// kept answer, and the entry is pressed once.
     #[tokio::test]
     async fn a_batch_answer_too_large_to_remember_is_kept_smaller_and_never_read_as_a_refusal() {
         let huge = "x".repeat(MAX_REMEMBERED_BATCH_BYTES + 1);
@@ -8060,41 +8069,83 @@ mod batch_tests {
         ] {
             let store = Arc::new(CardStore::default());
             let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let presses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let entries = [confirmed("p1", "a1")];
             seed_cards(&store, "go", &entries);
-            let huge = huge.clone();
-            let press = move |request: CardActionRequest| {
-                let huge = huge.clone();
-                async move {
-                    CardActionResult {
-                        request_id: request.request_id,
-                        outcome: "sent".into(),
-                        // The compact form drops a name and keeps a message id.
-                        message_id: Some(if long_name {
-                            "m-1".into()
-                        } else {
-                            huge.clone()
-                        }),
-                        kept_worktree: None,
-                        code: None,
-                        message: Some(if long_name { huge } else { "name".into() }),
-                        entry_revision: None,
+            let (release, released) = tokio::sync::watch::channel(false);
+            let started = Arc::new(tokio::sync::Notify::new());
+            let press = || {
+                let (huge, presses, released, started) = (
+                    huge.clone(),
+                    Arc::clone(&presses),
+                    released.clone(),
+                    Arc::clone(&started),
+                );
+                move |request: CardActionRequest| {
+                    let (huge, mut released, started) =
+                        (huge.clone(), released.clone(), Arc::clone(&started));
+                    presses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        started.notify_one();
+                        let _ = released.wait_for(|go| *go).await;
+                        CardActionResult {
+                            request_id: request.request_id,
+                            outcome: "sent".into(),
+                            // The compact form drops a name and keeps a message id.
+                            message_id: Some(if long_name {
+                                "m-1".into()
+                            } else {
+                                huge.clone()
+                            }),
+                            kept_worktree: None,
+                            code: None,
+                            message: Some(if long_name { huge } else { "name".into() }),
+                            entry_revision: None,
+                        }
                     }
                 }
             };
-            let first =
-                execute_batch_once(Arc::clone(&store), itself, batch_id, "go", &entries, press)
-                    .await
-                    .unwrap();
-            assert_eq!(
-                first.entries[0].outcome, BATCH_DELIVERED,
-                "{batch_id}: the first caller gets it whole"
-            );
-            let again = run_batch(&store, &posts, batch_id, "go", &entries)
+            let first = {
+                let (store, entries, press) = (Arc::clone(&store), entries.clone(), press());
+                tokio::spawn(async move {
+                    execute_batch_once(store, itself, batch_id, "go", &entries, press).await
+                })
+            };
+            started.notified().await;
+            let mut waiting = {
+                let (store, entries, press) = (Arc::clone(&store), entries.clone(), press());
+                Box::pin(async move {
+                    execute_batch_once(store, itself, batch_id, "go", &entries, press).await
+                })
+            };
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(pending, "{batch_id}: the repeat waits on the running batch");
+            release.send(true).unwrap();
+            let first = first.await.unwrap().unwrap();
+            let waited = waiting
                 .await
-                .expect("a repeat is answered per entry, not refused");
-            assert_eq!(posted(&posts), 0, "{batch_id}: the repeat posts nothing");
-            let entry = &again.entries[0];
+                .expect("a waiting repeat is answered per entry, not refused");
+            let later = run_batch(&store, &posts, batch_id, "go", &entries)
+                .await
+                .expect("a later repeat is answered per entry, not refused");
+            assert_eq!(
+                presses.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{batch_id}: the entry is pressed once"
+            );
+            assert_eq!(posted(&posts), 0, "{batch_id}: no repeat posts");
+            assert_eq!(
+                waited, first,
+                "{batch_id}: the waiting repeat gets the first answer"
+            );
+            assert_eq!(
+                later, first,
+                "{batch_id}: a later repeat gets the first answer"
+            );
+            let entry = &first.entries[0];
             assert_eq!(entry.outcome, want, "{batch_id}: {entry:?}");
             if long_name {
                 assert_eq!(entry.message_id.as_deref(), Some("m-1"));
@@ -8111,7 +8162,7 @@ mod batch_tests {
                 );
             }
             assert!(
-                batch_answer_bytes(&again) <= MAX_REMEMBERED_BATCH_BYTES,
+                batch_answer_bytes(&first) <= MAX_REMEMBERED_BATCH_BYTES,
                 "{batch_id}: what is kept fits the batches' memory"
             );
         }
