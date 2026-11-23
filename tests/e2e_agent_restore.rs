@@ -2500,6 +2500,100 @@ fn journal_restore_039_restoring_both_agents_of_one_item_restores_both() {
     decks.assert_gone_from_list(&id);
 }
 
+/// Scenario: A plain pane's work holds two interrupted attempts of a scripted Claude in folders and conversations of their own, the second leaving a child running in its old session. Restoring both brings the first back and refuses the second still-running; the item stays listed with the first reading as brought back and not offered again, and the second still offered. Once the child is gone, restoring the item brings the second back and the item leaves the list.
+#[cfg(target_os = "linux")]
+#[spec("journal/restore/042")]
+#[test]
+fn journal_restore_042_a_partly_refused_restore_keeps_the_refused_agent_listed() {
+    let mut decks = Decks::start();
+    let first = decks.start_pane("restore-part-a-042");
+    let folder = decks.folder("restore-part-b-042");
+    // The second's old launch leaves a child in its session, outside the
+    // process group the restart stops.
+    std::fs::write(decks.root.join("survive-stop"), "").unwrap();
+    let second = decks.start_pane_with("restore-part-b-042", &folder, &decks.command());
+    let survivor = survivor(&decks, "survivor.json");
+    std::fs::remove_file(decks.root.join("survive-stop")).unwrap();
+    assert_ne!(first["session"], second["session"], "premise: {second}");
+    let first = decks.attempt(&string(&first, "agent"));
+    let second = decks.attempt(&string(&second, "agent"));
+    decks.restart();
+    assert!(
+        running(survivor.pid, survivor.start),
+        "premise: the child outlives the restart"
+    );
+    move_attempt(
+        &decks.state,
+        &string(&second, "attempt"),
+        &string(&first, "work"),
+    );
+    let (first, second) = (string(&first, "attempt"), string(&second, "attempt"));
+    let id = string(&decks.item_for(&first), "id");
+    let reply = final_reply(
+        &decks,
+        json!({"op":"restore-interrupted", "id":id, "agents":[first, second],
+               "mode":"continue", "dry_run":false}),
+    );
+    let outcome = &reply["interrupted_restore"];
+    let restored = outcome["restored"].as_array().unwrap();
+    assert_eq!(restored.len(), 1, "the first comes back: {reply}");
+    assert_eq!(restored[0]["attempt"], first.as_str(), "{reply}");
+    assert_eq!(restored[0]["first_message_posted"], true, "{reply}");
+    assert_eq!(
+        restored[0]["recorded"], true,
+        "its successor link is what the list reads: {reply}"
+    );
+    let refused = outcome["refused"].as_array().unwrap();
+    assert_eq!(refused.len(), 1, "{reply}");
+    assert_eq!(refused[0]["attempt"], second.as_str(), "{reply}");
+    assert_eq!(refused[0]["reason"], "still-running", "{reply}");
+    assert_eq!(decks.starts().len(), 3, "only the first came back");
+    // The item stays listed: the refused agent is still offered, the one
+    // brought back is not.
+    let kept = decks.item_for(&second);
+    assert_eq!(kept["id"], id, "the item stays listed: {kept}");
+    let verdict = |attempt: &str| {
+        kept["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["attempt"] == attempt)
+            .unwrap_or_else(|| panic!("{attempt} is listed: {kept}"))["restore"]
+            .clone()
+    };
+    assert_eq!(
+        verdict(&first),
+        json!({"kind":"none", "reason":"restored"}),
+        "{kept}"
+    );
+    assert_eq!(verdict(&second), json!({"kind":"resume"}), "{kept}");
+    let reply = final_reply(&decks, restore_request(&id, &first));
+    assert_refused(&reply, &first, "not-restorable");
+    assert_eq!(decks.starts().len(), 3, "nothing more started");
+    let (pid, start) = (survivor.pid, survivor.start);
+    drop(survivor);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !running(pid, start)
+        }),
+        "the test's own child is gone"
+    );
+    // The whole item, no agent named: only the second is offered.
+    let reply = final_reply(
+        &decks,
+        json!({"op":"restore-interrupted", "id":id, "agents":[],
+               "mode":"continue", "dry_run":false}),
+    );
+    let outcome = &reply["interrupted_restore"];
+    assert_eq!(outcome["refused"], json!([]), "{reply}");
+    let restored = outcome["restored"].as_array().unwrap();
+    assert_eq!(restored.len(), 1, "{reply}");
+    assert_eq!(restored[0]["attempt"], second.as_str(), "{reply}");
+    assert_eq!(restored[0]["recorded"], true, "{reply}");
+    assert_eq!(decks.starts().len(), 4, "each came back once");
+    decks.assert_gone_from_list(&id);
+}
+
 /// A dispatched single-agent unit run by the scripted Claude with [`TASK`]
 /// as its saved task: its attempt.
 fn dispatched_unit(decks: &Decks, name: &str) -> String {
@@ -2579,7 +2673,7 @@ fn journal_restore_040_a_start_over_whose_task_cannot_be_posted_starts_nothing()
     );
 }
 
-/// Scenario: A scripted OpenCode-typed agent ran in a known conversation. After a restart, Start over starts it through the launch shim, and it reports that same conversation as its first, so it is stopped before anything is sent, the answer is not-fresh, and the item stays listed. Started over again when it comes up in a new conversation, it is started.
+/// Scenario: Two scripted OpenCode-typed agents ran in a known conversation. After a restart, Start over of the first starts it through the launch shim and it reports that same conversation first, so it is stopped before anything is sent, the answer is not-fresh, and the item stays listed; started over again in a new conversation, it is started. Start over of the second, which reports no conversation at all, is settled by the shim's acknowledgement and started.
 #[spec("journal/restore/041")]
 #[test]
 fn journal_restore_041_a_start_over_that_reports_the_old_conversation_is_not_fresh() {
@@ -2587,27 +2681,31 @@ fn journal_restore_041_a_start_over_that_reports_the_old_conversation_is_not_fre
     std::os::unix::fs::symlink(decks.bin.join("claude"), decks.bin.join("opencode")).unwrap();
     // Every fresh start reports SESSION, the start over's among them.
     std::fs::write(decks.root.join("fixed-session"), "").unwrap();
-    let name = "restore-oc-reuse-041";
-    let folder = decks.folder(name);
-    let reply = inbox::attach(
-        &decks.live,
-        json!({
-            "op":"start-agent",
-            "command":common::capability_export_command("exec opencode --model restore-synthetic"),
-            "cwd":folder, "display_name":name, "agent_type":"open_code", "rows":40, "cols":140,
-            "env":[["DOT_AGENT_DECK_PANE_ID", name]]
-        }),
-    );
-    assert_eq!(reply["ok"], true, "fixture launch: {reply}");
-    let original = decks.wait_start(name);
-    assert_eq!(original["session"], SESSION, "premise: {original}");
-    let attempt = string(&decks.attempt(&string(&reply, "id")), "attempt");
-    journal::wait_for(&decks.state, "the old conversation", |lines| {
-        journal::find(lines, "attempt_session", |line| {
-            line["attempt"] == attempt.as_str() && line["session"] == SESSION
-        })
-        .cloned()
-    });
+    let opencode = |decks: &Decks, name: &str| {
+        let folder = decks.folder(name);
+        let reply = inbox::attach(
+            &decks.live,
+            json!({
+                "op":"start-agent",
+                "command":common::capability_export_command("exec opencode --model restore-synthetic"),
+                "cwd":folder, "display_name":name, "agent_type":"open_code", "rows":40, "cols":140,
+                "env":[["DOT_AGENT_DECK_PANE_ID", name]]
+            }),
+        );
+        assert_eq!(reply["ok"], true, "fixture launch: {reply}");
+        let original = decks.wait_start(name);
+        assert_eq!(original["session"], SESSION, "premise: {original}");
+        let attempt = string(&decks.attempt(&string(&reply, "id")), "attempt");
+        journal::wait_for(&decks.state, "the old conversation", |lines| {
+            journal::find(lines, "attempt_session", |line| {
+                line["attempt"] == attempt.as_str() && line["session"] == SESSION
+            })
+            .cloned()
+        });
+        attempt
+    };
+    let attempt = opencode(&decks, "restore-oc-reuse-041");
+    let silent = opencode(&decks, "restore-oc-silent-041");
     decks.restart();
     let item = decks.item_for(&attempt);
     let id = string(&item, "id");
@@ -2617,7 +2715,7 @@ fn journal_restore_041_a_start_over_that_reports_the_old_conversation_is_not_fre
     );
     let reply = final_reply(&decks, start_over_request(&id, &attempt));
     assert_eq!(start_over_refusal(&reply), "not-fresh", "{reply}");
-    assert_eq!(decks.starts().len(), 2, "premise: it was started");
+    assert_eq!(decks.starts().len(), 3, "premise: it was started");
     assert!(
         common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
             common::agent_records_on(&decks.live.attach_socket).is_empty()
@@ -2633,5 +2731,21 @@ fn journal_restore_041_a_start_over_that_reports_the_old_conversation_is_not_fre
     let started = &reply["interrupted_start_over"]["started"];
     assert!(started.is_object(), "{reply}");
     assert_eq!(started["recorded"], true, "{reply}");
+    decks.assert_gone_from_list(&id);
+    // One that reports no conversation within the confirmation's bound is
+    // settled by the shim's acknowledgement, and started.
+    std::fs::write(decks.root.join("no-hook"), "").unwrap();
+    let id = string(&decks.item_for(&silent), "id");
+    let reply = final_reply(&decks, start_over_request(&id, &silent));
+    let started = &reply["interrupted_start_over"]["started"];
+    assert!(started.is_object(), "silence is not refused: {reply}");
+    assert_eq!(started["recorded"], true, "{reply}");
+    assert!(
+        common::agent_records_on(&decks.live.attach_socket)
+            .iter()
+            .any(|agent| started["agent_id"] == agent.id.as_str()),
+        "the agent keeps running: {reply}"
+    );
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
     decks.assert_gone_from_list(&id);
 }

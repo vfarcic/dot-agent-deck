@@ -119,9 +119,12 @@
 //! on) and answers `not-resumed`, or `not-stopped` when the stop could not be
 //! confirmed. A confirmed restore posts the restart note as the agent's first
 //! inbox message (reason `restart note`), then writes
-//! `attempt_restored{how: resumed}`, and `closed how=restored` on the
-//! item's works once every agent the request selected was handled
-//! ([`close_item`]). A note that
+//! `attempt_restored{how: resumed}`. Once every agent the request selected
+//! was handled, `closed how=restored` is written on the item's works when a
+//! fresh read finds every interrupted agent of the item brought back
+//! ([`settle_item`]); while one is still interrupted (refused, or not
+//! selected), the item stays listed and the agents brought back read as
+//! such (`restored`), not offered again. A note that
 //! cannot be posted after all stops the agent again and leaves the item
 //! listed as it was (`note-not-delivered`).
 //!
@@ -134,15 +137,17 @@
 //! `PATH` after the shim, which may be a script of the user's) and refuses
 //! ones that select an existing conversation, and starts Claude Code under a
 //! new conversation id the deck chose. A refusal answers
-//! `command-reopens`; a shim not reached, or a Claude Code whose first
-//! attested conversation is not the new one, answers `not-fresh`; either
-//! stops the agent before anything is posted to it ([`confirm_fresh`],
-//! audit B3). Antigravity and a plain shell carry no request and are not
+//! `command-reopens`; a shim not reached, a Claude Code whose first
+//! attested conversation is not the new one, or an OpenCode, Pi or Devin
+//! whose first attested conversation is the old one, answers `not-fresh`;
+//! either stops the agent before anything is posted to it
+//! ([`confirm_fresh`], audit B3). Antigravity and a plain shell carry no request and are not
 //! checked. A dispatched unit's saved task is posted as its first inbox
 //! message (reason `saved task`), and no restart note: the agent is new and
 //! has no conversation to be told about; one that cannot be posted stops the
 //! agent again and leaves the item listed (`task-not-delivered`). Then
-//! `attempt_restored{how: started_over}` and `closed how=started_over`.
+//! `attempt_restored{how: started_over}` and, on the same terms as a
+//! restore's close ([`settle_item`]), `closed how=started_over`.
 //!
 //! **Stopping an agent it started** ([`stop_proven`], audit F4, F4a,
 //! round-4 F5) kills every process in the POSIX session its leader leads (a
@@ -166,10 +171,11 @@
 //! Claude Code start over is confirmed by the first conversation the launch
 //! reports; for Codex, OpenCode, Pi and Devin the check is of the arguments
 //! the shim sees, and, for the last three when the old conversation is
-//! known, of the first conversation the launch reports ([`confirm_fresh`]),
-//! so a script of the user's named after Codex, or after one of the others
-//! when the old conversation is not known, that selects a conversation
-//! itself is not checked (round-4 F3/B1). For every
+//! known, of the first conversation the launch reports within
+//! [`CONFIRM_TIMEOUT`] ([`confirm_fresh`]), so a script of the user's named
+//! after Codex, or after one of the others when the old conversation is not
+//! known or no report comes in time, that selects a conversation itself is
+//! not checked (round-4 F3/B1). For every
 //! agent, a program the user's command or script starts after the first one
 //! (a second Claude Code in a conversation it chose, say) is not checked: the
 //! deck verifies the first conversation the launch reports (round 5, B3). An
@@ -1691,9 +1697,11 @@ pub async fn restore(
         }
     }
     // Review (Qodo #5): every selected agent was handled; the item closes
-    // once, for all of them, when any came back.
+    // once, for all of them, when every interrupted agent of it is back. One
+    // refused, or not selected, keeps it listed, the ones restored reading
+    // as brought back ([`RestoreReason::Restored`]).
     if let Some(closing) = closing {
-        let recorded = close_item(&journal, &closing.works, closing.how).await;
+        let recorded = settle_item(&journal, &item.id, closing).await;
         for agent in &mut outcome.restored {
             agent.recorded = recorded;
         }
@@ -1788,7 +1796,7 @@ pub async fn start_over(
             ..StartOverOutcome::default()
         },
         Started::Done(mut agent, closing) => {
-            agent.recorded = close_item(&journal, &closing.works, closing.how).await;
+            agent.recorded = settle_item(&journal, &item.id, closing).await;
             StartOverOutcome {
                 dry_run,
                 started: Some(agent),
@@ -2414,7 +2422,7 @@ async fn start(
         lift_marker(placed, state_dir, &target.attempt);
     }
     // Review (Qodo #5): the item's works are closed by the caller once every
-    // agent the request selected was handled ([`close_item`]): closing them
+    // agent the request selected was handled ([`settle_item`]): closing them
     // here would leave the next selected agent of the same item refused as
     // no longer listed. The successor link written above already holds this
     // agent's conversation, and the request's restore lock keeps any other
@@ -2440,9 +2448,39 @@ struct Closing {
     how: CloseHow,
 }
 
-/// Write `closed` with `how` on each of `works`, the item's, once every agent
-/// of a request was handled: answers whether it was recorded, so the item
-/// leaves the list. Blocking on the journal.
+/// Review (Qodo #5): once every agent a request selected was handled, close
+/// the item `item` ([`close_item`]) when a fresh read finds every
+/// interrupted attempt of it brought back, and leave it listed otherwise.
+/// Answers [`RestoredAgent::recorded`]: whether the close was written, or,
+/// with an agent of the item still interrupted, `true` (the successor links
+/// already written are what the list reads); `false` when the journal could
+/// not be read to tell.
+async fn settle_item(journal: &WorkJournal, item: &WorkId, closing: Closing) -> bool {
+    let reader = journal.clone();
+    let root = item.clone();
+    let back = tokio::task::spawn_blocking(move || {
+        let read = reader.read().ok()?;
+        if read.stats.truncated {
+            return None;
+        }
+        Some(crate::interrupted_work::every_interrupted_attempt_restored(
+            &read,
+            &root,
+            |run| reader.run_is_live(run),
+        ))
+    })
+    .await
+    .ok()
+    .flatten();
+    match back {
+        Some(true) => close_item(journal, &closing.works, closing.how).await,
+        Some(false) => true,
+        None => false,
+    }
+}
+
+/// Write `closed` with `how` on each of `works`, the item's: answers whether
+/// it was recorded, so the item leaves the list. Blocking on the journal.
 async fn close_item(journal: &WorkJournal, works: &[WorkId], how: CloseHow) -> bool {
     let events: Vec<Event> = works
         .iter()
@@ -3015,10 +3053,12 @@ struct Unfresh {
 /// Review (Qodo #4): for an agent started without a new id, `old_session`
 /// is the conversation the interrupted agent was last in, given when the
 /// deck knows it and the agent reports a conversation before its prompt
-/// ([`crate::agent_registry::FirstHook::BeforePrompt`]). The shim's
-/// acknowledgement is then not enough: the agent's first report is waited
-/// for, and one naming `old_session` (a launcher that chose it after the
-/// shim's check), or none in time, is `not-fresh`.
+/// ([`crate::agent_registry::FirstHook::BeforePrompt`]). The agent's first
+/// report is then waited for, up to `bound`: one naming `old_session` (a
+/// launcher that chose it after the shim's check) is `not-fresh`, and one
+/// naming another conversation is the one confirmed. When none comes in
+/// time, the shim's acknowledgement settles it, as it does without
+/// `old_session`.
 #[cfg(unix)]
 async fn confirm_fresh(
     registry: &AgentPtyRegistry,
@@ -3081,6 +3121,14 @@ async fn confirm_fresh(
             return Err(not_fresh(None));
         }
         if Instant::now() >= deadline {
+            // Review (Qodo #4): an acknowledged start of an agent with no new
+            // id that sent no report in time settles on the acknowledgement,
+            // as it does when the old conversation is not known: whether
+            // those agents report before their prompt is not verified, so
+            // silence is no evidence against a fresh start.
+            if state == AckState::Resumed && new_session.is_none() {
+                return Ok(None);
+            }
             return Err(not_fresh(None));
         }
         tokio::time::sleep(CONFIRM_POLL).await;

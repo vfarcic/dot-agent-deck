@@ -644,6 +644,7 @@ const RESTORE_REASON_SENTENCES: Record<string, string> = {
   "not-interrupted": "The restart did not stop this agent.",
   "not-resumed": "The deck tried to restore the agent's conversation and could not.",
   "old-process-unknown": "An older version of the deck started this agent, so the deck cannot tell whether its old process is gone.",
+  restored: "The deck already brought this agent back.",
 };
 const RESTORE_REASON_UNKNOWN = "The agent cannot be restored.";
 

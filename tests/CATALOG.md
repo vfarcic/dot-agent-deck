@@ -1173,7 +1173,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); the second pane's attempt is moved onto the first pane's work in the dead run's journal and in its launch record: the shape a plain pane whose agent was replaced in place leaves when the deck goes away before the replaced attempt's end is written, which no public request makes in one test.
 - **Agent:** synthetic `claude`, two attempts in folders and conversations of their own.
 - **Asserts:** the item lists both agents with `resume`; one restore request selecting both answers two restored agents, each `recorded` and with its first message posted, and no refusal; each came back once; the item leaves the list (PR #2497 review, Qodo: the item closes once, after every selected agent was handled).
-- **Does not assert:** two agents of one item in the same folder (the second is refused `directory-in-use` beside the first's successor); a partial success.
+- **Does not assert:** two agents of one item in the same folder (the second is refused `directory-in-use` beside the first's successor); a partial success (`journal/restore/042`).
 - **Platform coverage:** mac+linux.
 
 ##### journal/restore/040 — A start over whose saved task cannot be posted starts nothing.
@@ -1187,9 +1187,25 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/restore/041 — A start over that reports the old conversation is not fresh.
 
 - **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`), through the launch shim's `opencode`.
-- **Agent:** synthetic agent typed OpenCode (the `claude` stand-in under the name `opencode`), whose every fresh start reports the old conversation, then one in a new conversation.
-- **Asserts:** Start over is refused `not-fresh`, the agent it started is stopped, nothing is sent and the item stays listed; started over again in a new conversation, it is started and the item's close is recorded (PR #2497 review, Qodo: for an agent started without a new id that reports before its prompt, the first report is compared with the old conversation).
-- **Does not assert:** an agent that reports no conversation in time (`not-fresh`, by the same bound); Codex, whose first report comes with its first prompt and is not waited for.
+- **Agent:** two synthetic agents typed OpenCode (the `claude` stand-in under the name `opencode`), each in a known conversation of its own item: the first's every fresh start reports the old conversation, then one in a new conversation; the second's start over sends no hook (`no-hook`).
+- **Asserts:** Start over of the first is refused `not-fresh`, the agent it started is stopped, nothing is sent and the item stays listed; started over again in a new conversation, it is started and the item's close is recorded (PR #2497 review, Qodo: for an agent started without a new id that reports before its prompt, the first report is compared with the old conversation). Start over of the second, which reports nothing within the confirmation bound, is started on the shim's acknowledgement: recorded, still running, nothing sent, and the item leaves the list (whether those agents report before their prompt is not verified, so silence is not refused).
+- **Does not assert:** the real OpenCode, Pi or Devin (no lane-2 test covers their Start over); Codex, whose first report comes with its first prompt and is not waited for.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/042 — A partly refused restore keeps the refused agent listed.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan. The second pane's attempt is moved onto the first pane's work, as in `journal/restore/039`.
+- **Agent:** synthetic `claude`, two attempts in folders and conversations of their own; the second's old launch leaves a capped `survive-stop` child in its session, out of the process group the restart stops.
+- **Asserts:** one restore selecting both brings the first back (`recorded`, first message posted) and refuses the second `still-running`; the item stays listed with the first `none` / `restored` and the second `resume`; a restore naming the first is refused `not-restorable` and starts nothing; once the child is gone, a restore of the item naming no agent brings back the second alone, `recorded`, and the item leaves the list (PR #2497 review, Qodo: the item closes only once every interrupted agent of it is back).
+- **Does not assert:** a start over leaving another agent interrupted (it goes through the same `settle_item` check); an interrupted agent that can never come back (the item stays listed for the person to dismiss).
+- **Platform coverage:** linux.
+
+##### journal/restore/043 — A partly restored item offers only the agent still interrupted.
+
+- **Layer:** L1 `TestBackend` through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); details and question.
+- **Agent:** none; an injected item with one agent `none` / `restored` and one `resume`.
+- **Asserts:** the details list each agent with its own verdict sentence, the first `The deck already brought this agent back.`; `s` asks about the agent still interrupted only; `c` sends one RestoreInterrupted naming that attempt alone.
+- **Does not assert:** daemon execution (`journal/restore/042`); the desktop app's rendering, which reads the same verdict and sentence (`interruptedWork.test.ts`, `journal/restore/009`).
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

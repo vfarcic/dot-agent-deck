@@ -1801,3 +1801,66 @@ fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list
         assert!(list.items.is_empty(), "{how:?}: {list:?}");
     }
 }
+
+/// Review (Qodo #5): of a plain pane's two interrupted attempts, the one an
+/// `attempt_restored` names reads `none` / `restored` while the other keeps
+/// its verdict, and the item may be closed only once both are named.
+#[test]
+fn an_attempt_brought_back_reads_restored_and_the_item_closes_once_all_are_back() {
+    use crate::event::AgentType;
+    use crate::work_journal::RestoredHow;
+    let mut j = Journal::default();
+    let w = work(1);
+    j.opened(
+        &w,
+        Launch::Pane,
+        None,
+        pane_refs("pane-1"),
+        Some("/home/someone/code/p"),
+    );
+    let (first, second) = (attempt(OLD, 1), attempt(OLD, 2));
+    let mut records = Vec::new();
+    for (n, a) in [&first, &second].into_iter().enumerate() {
+        j.started(&w, a);
+        let id = format!("{:08x}-0000-4cde-8fab-0123456789ab", n + 1);
+        restore_session(&mut j, &w, a, AgentType::ClaudeCode, &id);
+        j.ended(&w, a, EndHow::Interrupted);
+        records.push(restore_record(&w, a, AgentType::ClaudeCode));
+    }
+    assert!(!every_interrupted_attempt_restored(
+        &j.read(),
+        &w,
+        live_only
+    ));
+    let brought_back = |j: &mut Journal, from: &AttemptId, n: u64| {
+        j.push(
+            LIVE,
+            Event::AttemptRestored {
+                work: w.clone(),
+                from: from.clone(),
+                to: attempt(LIVE, n),
+                how: RestoredHow::Resumed,
+                session: None,
+            },
+        );
+    };
+    brought_back(&mut j, &first, 1);
+    let list = derive_in(&j, records.clone(), &[]);
+    assert_eq!(list.items.len(), 1, "still listed: {list:?}");
+    let agents = &list.items[0].agents;
+    assert_eq!(
+        restore_verdict(&agents[0]),
+        serde_json::json!({"kind": "none", "reason": "restored"})
+    );
+    assert_eq!(agents[1].restore, RestoreVerdict::Resume);
+    assert!(
+        !every_interrupted_attempt_restored(&j.read(), &w, live_only),
+        "the second is still interrupted"
+    );
+    brought_back(&mut j, &second, 2);
+    assert!(every_interrupted_attempt_restored(&j.read(), &w, live_only));
+    assert!(
+        !every_interrupted_attempt_restored(&j.read(), &work(9), live_only),
+        "an item the read does not hold"
+    );
+}

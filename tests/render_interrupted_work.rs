@@ -2513,3 +2513,55 @@ fn journal_restore_008_confirmations_target_one_attempt_once_and_honour_capabili
         );
     }
 }
+
+/// Scenario: Open the interrupted list on an item whose first agent the deck already brought back and whose second is still interrupted, then open its details and press s, then c. The details show the first agent as brought back and the second as restorable; the question names the second agent only, and c sends a restore of that one attempt.
+#[spec("journal/restore/043")]
+#[test]
+fn journal_restore_043_a_partly_restored_item_offers_only_the_agent_still_interrupted() {
+    let _flag = RestoreFlag::set(true);
+    let mut listed = restore_fixture(AGENT_ID, RESTORE_ATTEMPT_A, "restore-back", true);
+    let mut waiting = listed.agents[0].clone();
+    listed.agents[0].restore = RestoreVerdict::NotRestorable {
+        reason: RestoreReason::Restored,
+    };
+    waiting.attempt = dot_agent_deck::work_journal::AttemptId::parse(RESTORE_ATTEMPT_B).unwrap();
+    waiting.name = Some("restore-waiting".into());
+    listed.agents.push(waiting);
+    let steps = |more: &[char]| {
+        let mut steps = vec![
+            InterruptedSeamStep::RestoreCapability(true),
+            ch('I'),
+            key(KeyCode::Enter),
+        ];
+        steps.extend(more.iter().copied().map(ch));
+        steps
+    };
+    let (shown, _) = run(&only(listed.clone()), &steps(&[]));
+    let details = shown.last().unwrap();
+    let back = at(details, "restore-back");
+    let waits = at(details, "restore-waiting");
+    let back_said = at(details, restore_reason_sentence(RestoreReason::Restored));
+    let waits_said = at(details, &restore_verdict_sentence(RestoreVerdict::Resume));
+    assert!(
+        back < back_said && back_said < waits && waits < waits_said,
+        "each agent with its own verdict:\n{details}"
+    );
+    let (shown, sent) = run(&only(listed.clone()), &steps(&['s']));
+    let question = shown.last().unwrap();
+    at(question, &restore_question("restore-waiting"));
+    assert!(
+        !question.contains(&restore_question("restore-back")),
+        "the agent brought back is not asked about again:\n{question}"
+    );
+    assert!(restore_actions(&sent).is_empty(), "s only asks: {sent:?}");
+    let (_, sent) = run(&only(listed), &steps(&['s', 'c']));
+    assert_eq!(
+        restore_actions(&sent),
+        vec![expected_restore(
+            AGENT_ID,
+            RESTORE_ATTEMPT_B,
+            RestoreMode::Continue
+        )],
+        "c restores the agent still interrupted, alone"
+    );
+}

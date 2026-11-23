@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import * as words from "./interruptedWork";
+import type { InterruptedItem, ItemAgent, RestoreVerdict } from "./interruptedWork";
 
 /**
  * PRD #1790 stage 2 (decision D2, CLAUDE.md rule 22) — the desktop's copy of
@@ -180,6 +181,7 @@ describe("the interrupted work wording", () => {
     ["NotInterrupted", "not-interrupted", "The restart did not stop this agent."],
     ["NotResumed", "not-resumed", "The deck tried to restore the agent's conversation and could not."],
     ["OldProcessUnknown", "old-process-unknown", "An older version of the deck started this agent, so the deck cannot tell whether its old process is gone."],
+    ["Restored", "restored", "The deck already brought this agent back."],
     ["Unknown", "unknown", "The agent cannot be restored."],
   ] as const;
 
@@ -198,6 +200,17 @@ describe("the interrupted work wording", () => {
     }
     expect(words.restoreReasonSentence("a-newer-reason")).toBe("The agent cannot be restored.");
     expect(words.restoreVerdictSentence({ kind: "a-newer-verdict" })).toBe("The agent cannot be restored.");
+  });
+
+  /** Scenario: an item whose first agent the deck already brought back and whose second is still interrupted asks about the second, as the TUI does, and says of the first that it is back. */
+  it("journal/restore/009 asks about the agent still interrupted, not the one brought back", () => {
+    const agent = (attempt: string, restore: RestoreVerdict) => ({ attempt, name: attempt, restore }) as ItemAgent;
+    const back = agent("restore-back/1", { kind: "none", reason: "restored" });
+    const waiting = agent("restore-waiting/2", { kind: "resume" });
+    const item = { id: "w-partial", agents: [back, waiting] } as unknown as InterruptedItem;
+    expect(words.restoreAgent(item)).toBe(waiting);
+    expect(words.offersChoice(back.restore)).toBe(false);
+    expect(words.restoreVerdictSentence(back.restore)).toBe("The deck already brought this agent back.");
   });
 
   /** Scenario: a refused restore or Start over shows the same explanation as Rust for the recorded refusal code, including old processes, unsafe tasks and an unsuccessful conversation resume. A newer refusal uses the shared unknown-refusal sentence. */

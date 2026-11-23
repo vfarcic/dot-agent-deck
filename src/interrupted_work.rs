@@ -247,6 +247,10 @@ pub enum RestoreReason {
     /// build before stage 3 wrote it), so the deck cannot tell the old agent
     /// is gone and will not resume its conversation; it can be started over.
     OldProcessUnknown,
+    /// Review (Qodo #5): the deck already brought this agent back (a
+    /// restore or a start over recorded its successor), while another agent
+    /// of the same item is still interrupted, so the item stays listed.
+    Restored,
     /// A reason of a newer daemon's.
     #[serde(other)]
     Unknown,
@@ -1218,6 +1222,36 @@ pub fn still_interrupted(
         && !works.iter().any(|w| index.has_live_attempt(w))
 }
 
+/// PRD #1790 stage 3, review (Qodo #5): whether every interrupted attempt
+/// of the item rooted at `root` was brought back (an `attempt_restored`
+/// names it as `from`), so a restore or start over may close the item. An
+/// item with no interrupted attempt, or one `read` does not hold, is not.
+pub fn every_interrupted_attempt_restored(
+    read: &JournalRead,
+    root: &WorkId,
+    is_live: impl Fn(&str) -> bool,
+) -> bool {
+    let no_records = LaunchRead::default();
+    let index = Index::build(read, &no_records, is_live);
+    let roots = index.roots();
+    let Some(works) = roots.under.get(root) else {
+        return false;
+    };
+    let mut interrupted = works
+        .iter()
+        .flat_map(|work| index.attempts(work))
+        .filter(|attempt| {
+            matches!(
+                index.attempt_state.get(attempt),
+                Some(
+                    AttemptState::Ended { interrupted: true } | AttemptState::Open { live: false }
+                )
+            )
+        })
+        .peekable();
+    interrupted.peek().is_some() && interrupted.all(|attempt| index.restored.contains(attempt))
+}
+
 /// PRD #1790 stage 3: the action that opens the restore question.
 pub const RESTORE_ACTION: &str = "Restore";
 /// The question's choice that restores the agent and lets it carry on.
@@ -1277,6 +1311,7 @@ pub fn restore_reason_sentence(reason: RestoreReason) -> &'static str {
         RestoreReason::OldProcessUnknown => {
             "An older version of the deck started this agent, so the deck cannot tell whether its old process is gone."
         }
+        RestoreReason::Restored => "The deck already brought this agent back.",
         RestoreReason::Unknown => "The agent cannot be restored.",
     }
 }
@@ -1597,7 +1632,11 @@ pub struct RestoredAgent {
     /// Its first message (the restart note, or the saved task) was posted.
     #[serde(default)]
     pub first_message_posted: bool,
-    /// The item's close was recorded, so it leaves the list.
+    /// What the start had to record was recorded: its successor link and,
+    /// once every interrupted agent of the item is back, the item's close,
+    /// so it leaves the list (review Qodo #5: an item with an agent still
+    /// interrupted stays listed, this one reading as brought back). `false`:
+    /// the item may be listed again.
     #[serde(default)]
     pub recorded: bool,
 }
@@ -2100,6 +2139,9 @@ struct Index<'a> {
     /// PRD #1790 stage 3: attempts a resume was tried for and did not take
     /// (`restore_failed`).
     restore_failed: HashSet<&'a AttemptId>,
+    /// Review (Qodo #5): attempts a restore or start over brought back
+    /// (`attempt_restored`'s `from`).
+    restored: HashSet<&'a AttemptId>,
     /// Each attempt's latest session, as
     /// [`crate::work_journal::latest_session_of`] answers it, indexed in the
     /// one pass (review R5).
@@ -2133,6 +2175,7 @@ impl<'a> Index<'a> {
             ambiguous: HashSet::new(),
             role_of: HashMap::new(),
             restore_failed: HashSet::new(),
+            restored: HashSet::new(),
             sessions: HashMap::new(),
         };
         let mut seen: HashSet<&WorkId> = HashSet::new();
@@ -2201,7 +2244,10 @@ impl<'a> Index<'a> {
                         crate::work_journal::keep_latest(&mut index.sessions, report);
                     }
                 }
-                Event::Linked { .. } | Event::AttemptRestored { .. } => {}
+                Event::AttemptRestored { from, .. } => {
+                    index.restored.insert(from);
+                }
+                Event::Linked { .. } => {}
             }
         }
         let mut live_runs: HashMap<&str, bool> = HashMap::new();
@@ -2610,6 +2656,10 @@ impl<'a> Index<'a> {
             none(RestoreReason::OrchestrationLater)
         } else if !interrupted {
             none(RestoreReason::NotInterrupted)
+        } else if self.restored.contains(attempt) {
+            // Review (Qodo #5): brought back by a request that left another
+            // agent of the item interrupted; not offered again.
+            none(RestoreReason::Restored)
         } else if self.ambiguous.contains(attempt) {
             none(RestoreReason::AmbiguousRecord)
         } else if let Some(record) = record {
