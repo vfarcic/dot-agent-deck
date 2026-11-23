@@ -5,7 +5,7 @@ import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTU
 import { deckName } from "../lib/displayText";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type DeckRuntimeState } from "../types";
-import { BATCH_NOT_KNOWN } from "../hooks/useAgentCardsView";
+import { BATCH_DAEMON_UNREACHABLE, BATCH_NOT_KNOWN } from "../hooks/useAgentCardsView";
 import { AgentOverview } from "./AgentOverview";
 
 const INSTANCE = "daemon-instance-batch";
@@ -325,5 +325,73 @@ describe("batch card actions (#2399)", () => {
     expect(within(results).queryByText(/[Nn]othing was sent/)).toBeNull();
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
+  /// Scenario: Send a reviewed batch that the daemon answers with each text queued in its agent's inbox, as a single press is when it answers. Each agent's row reads "Queued for the agent", the same words the card's delivery history uses, and the headline says it was queued for all of them, never "Delivered" or "Sent to all".
+  it("desktop/agent-cards/040: a queued batch reads as queued, as a single press does, never as delivered", async () => {
+    const calls = setup();
+    const dialog = await startSelectedBatch();
+    calls.invokeCardActionBatch.mockImplementationOnce(async (_deckId: string, _actionId: string, options: BatchOptions) => ({
+      request_id: options.requestId,
+      entries: INCLUDED.map((entry) => ({ ...entry, outcome: "delivered" as const, message_id: `m-${entry.agent_id}`, state: "queued" })),
+    }));
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    const results = screen.getByTestId("agent-cards-batch-results");
+    const rows = within(results).getAllByTestId("agent-cards-batch-entry");
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row).toHaveAttribute("data-outcome", "delivered");
+      expect(within(row).getByText("Queued for the agent", { exact: true })).toBeInTheDocument();
+      expect(within(row).queryByText("Delivered", { exact: true })).toBeNull();
+    }
+    expect(within(results).getByRole("status")).toHaveTextContent("Queued for all 2");
+    expect(within(results).queryByText(/Sent to all|Delivered/)).toBeNull();
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Select one card on each of two daemons and start a batch while one daemon cannot answer its preview. The confirmation still opens: the reachable daemon's agent is included with its exact text, the other daemon's agent is skipped with the reason and its daemon's error, and Send sends only to the daemon that previewed. When neither daemon can answer, the confirmation says nothing was sent, with the error, and offers no Send.
+  it("desktop/agent-cards/041: one daemon whose preview fails does not block the others' agents", async () => {
+    const calls = setupTwoDaemons();
+    const answer = calls.invokeCardActionBatch.getMockImplementation()!;
+    calls.invokeCardActionBatch.mockImplementation(async (deckId: string, actionId: string, options: BatchOptions) => {
+      if (deckId === FIXTURE_DAEMON_ID && options.mode === "preview") throw new Error("the deck is not reachable");
+      return answer(deckId, actionId, options);
+    });
+    fireEvent.click(screen.getByTestId("agent-cards-select"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    const dialog = screen.getByTestId("agent-cards-batch-confirm");
+    expect(dialog).toHaveAttribute("data-stage", "review");
+    expect(within(dialog).queryByText(/Nothing was sent/)).toBeNull();
+    const rowFor = (scope: HTMLElement, name: string) => within(scope).getAllByTestId("agent-cards-batch-entry").filter((row) => within(row).queryByText(name, { exact: true }));
+    const included = rowFor(dialog, "remote-coder");
+    expect(included).toHaveLength(1);
+    expect(included[0]).toHaveClass("is-included");
+    expect(within(included[0]).getByTestId("agent-cards-batch-prompt").textContent).toBe("remote-coder: go ahead.");
+    const skipped = rowFor(dialog, "local-coder");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toHaveClass("is-skipped");
+    expect(within(skipped[0]).getByTestId("agent-cards-batch-daemon")).toHaveTextContent(`on ${calls.localName}`);
+    expect(within(skipped[0]).getByText(`${BATCH_DAEMON_UNREACHABLE}: the deck is not reachable`)).toBeInTheDocument();
+    expect(within(dialog).getByText("Sends to 1 agent")).toBeInTheDocument();
+
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    const executed = calls.invokeCardActionBatch.mock.calls.filter(([, , options]) => options.mode === "execute");
+    expect(executed.map(([deckId]) => deckId)).toEqual([FIXTURE_REMOTE_DAEMON_ID]);
+    const results = screen.getByTestId("agent-cards-batch-results");
+    expect(within(results).getAllByTestId("agent-cards-batch-entry")).toHaveLength(1);
+    expect(rowFor(results, "remote-coder")[0]).toHaveAttribute("data-outcome", "delivered");
+    fireEvent.click(within(results).getByTestId("agent-cards-batch-close"));
+
+    calls.invokeCardActionBatch.mockImplementation(async (deckId: string) => {
+      throw new Error(deckId === FIXTURE_DAEMON_ID ? "the deck is not reachable" : "the far deck timed out");
+    });
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    const failed = screen.getByTestId("agent-cards-batch-confirm");
+    expect(within(failed).getByRole("alert")).toHaveTextContent("Nothing was sent: the deck is not reachable; the far deck timed out");
+    expect(within(failed).queryAllByTestId("agent-cards-batch-entry")).toHaveLength(0);
+    expect(within(failed).getByRole("button", { name: /^Send$/ })).toBeDisabled();
+    expect(calls.invokeCardActionBatch.mock.calls.filter(([, , options]) => options.mode === "execute")).toHaveLength(1);
   });
 });

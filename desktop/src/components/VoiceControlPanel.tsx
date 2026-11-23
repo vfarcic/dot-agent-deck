@@ -5500,6 +5500,15 @@ const VOICE_CHOICE_NOUNS: Record<string, string> = {
 };
 
 /**
+ * One offered entry's identity in the list. `value` alone is not one: an
+ * agent's id is its daemon's own, so two daemons under All daemons can both
+ * offer agent `planner` (#2399 re-review). The deck and the daemon process
+ * that listed it tell them apart; the kind does for a choice across sections.
+ */
+const voiceChoiceKey = (candidate: VoiceResolvedParamDto) =>
+  `${candidate.kind}\u0000${candidate.deckId ?? ""}\u0000${candidate.incarnation ?? ""}\u0000${candidate.value}`;
+
+/**
  * PRD #1261 — the numbered choice, as a modal dialog in `ConfirmDialog`'s
  * look (PR #1451 round 3, the maintainer's call).
  *
@@ -5520,15 +5529,6 @@ const VOICE_CHOICE_NOUNS: Record<string, string> = {
  * window's shortcuts while the dialog has focus. Clicking the scrim cancels,
  * as `ConfirmDialog`'s does.
  */
-/**
- * One offered entry's identity in the list. `value` alone is not one: an
- * agent's id is its daemon's own, so two daemons under All daemons can both
- * offer agent `planner` (#2399 re-review). The deck and the daemon process
- * that listed it tell them apart; the kind does for a choice across sections.
- */
-const voiceChoiceKey = (candidate: VoiceResolvedParamDto) =>
-  `${candidate.kind}\u0000${candidate.deckId ?? ""}\u0000${candidate.incarnation ?? ""}\u0000${candidate.value}`;
-
 function VoiceChoiceDialog({ offer, secondsLeft, onPick, onCancel }: {
   offer: VoiceChoiceOffer;
   secondsLeft: number | undefined;

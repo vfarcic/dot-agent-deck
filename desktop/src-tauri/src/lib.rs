@@ -2175,12 +2175,30 @@ pub(crate) const CODE_CARD_BATCH_NO_ANSWER: &str = "no_answer";
 /// dialog forever, not to hurry a daemon that is working.
 pub(crate) const CARD_BATCH_ENTRY_ALLOWANCE: Duration = Duration::from_secs(10);
 
+/// The longest the desktop waits for a daemon's answer to one executed batch,
+/// however many entries it names (PR #2491 review).
+///
+/// While it waits, the batch dialog holds the app (`useInertBackground`) and
+/// refuses Cancel, `Escape` and voice's `close`, so the wait is a freeze of
+/// the whole window; at [`CARD_BATCH_ENTRY_ALLOWANCE`] an entry alone, a
+/// 256-entry batch would hold it for over 40 minutes. Three minutes is the
+/// most of that freeze we accept, and it still covers what a working daemon
+/// needs: its prompt entries are in-memory posts that take milliseconds each,
+/// so a batch of any allowed size answers in seconds, and a close entry waits
+/// for its agent to stop within the deck's termination grace (3 s,
+/// `AGENT_TERMINATE_GRACE`), so the ceiling still covers some 60 closes that
+/// each spend the whole grace. Past it, every entry reads No answer, as any
+/// unanswered batch does: the daemon keeps going, and each card's own
+/// delivery history shows what it did.
+pub(crate) const CARD_BATCH_EXECUTE_CEILING: Duration = Duration::from_secs(180);
+
 /// How long the desktop waits for a daemon's answer to one batch request.
 ///
 /// A preview reads the cards and sends nothing, so it is any round trip
 /// ([`crate::daemon_bridge::DECK_REPLY_TIMEOUT`]). An execution is that plus
 /// [`CARD_BATCH_ENTRY_ALLOWANCE`] for each entry it names (a repeated entry
-/// counts, which only lengthens the wait).
+/// counts, which only lengthens the wait), capped at
+/// [`CARD_BATCH_EXECUTE_CEILING`].
 pub(crate) fn card_batch_reply_timeout(
     mode: dot_agent_deck::agent_cards::CardBatchMode,
     entries: usize,
@@ -2193,6 +2211,7 @@ pub(crate) fn card_batch_reply_timeout(
             let entries = u32::try_from(entries).unwrap_or(u32::MAX);
             crate::daemon_bridge::DECK_REPLY_TIMEOUT
                 .saturating_add(CARD_BATCH_ENTRY_ALLOWANCE.saturating_mul(entries))
+                .min(CARD_BATCH_EXECUTE_CEILING)
         }
     }
 }

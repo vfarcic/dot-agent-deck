@@ -16922,6 +16922,20 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** each agent's row reads "No answer" with the error and the sentence that it is not known whether the agent got it, never "Failed" or "Nothing was sent"; the execution is not sent again (#2399 re-review).
 - **Does not assert:** the bridge's own classification of a failure before or after the request was written, which the Rust transport tests `a_card_batch_whose_connection_breaks_after_sending_ends_unknown_and_is_not_resent` and `a_card_batch_refused_before_sending_fails_and_sends_nothing` in `desktop/src-tauri/src/restart_binding_tests.rs` pin.
 
+##### desktop/agent-cards/040 — A queued batch reads as queued, as a single press does, never as delivered.
+
+- **Test:** vitest `desktop/agent-cards/040: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed batch bridge whose execution answers each entry `delivered` with `state: "queued"`, as the daemon does.
+- **Asserts:** each agent's row reads "Queued for the agent" (the card delivery history's words for the same state), never "Delivered", and the headline reads "Queued for all 2", never "Sent to all" (PR #2491 review).
+- **Does not assert:** that the daemon sends `state`, which `a_sent_batch_entry_says_its_text_is_queued_as_its_card_records_it` in `src/agent_cards.rs` (`batch_tests`) pins; nor a later change of the delivery state, which the card's own history shows.
+
+##### desktop/agent-cards/041 — One daemon whose preview fails does not block the others' agents.
+
+- **Test:** vitest `desktop/agent-cards/041: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), two fixture daemons, stubbed batch bridge whose preview rejects on one of them, then on both.
+- **Asserts:** with one daemon failing, the confirmation opens in review with no error: the other daemon's agent is included with its exact text, the failing daemon's agent is skipped with `BATCH_DAEMON_UNREACHABLE` and that daemon's error and names its daemon, and Send executes on the daemon that previewed only; with both failing, the confirmation says "Nothing was sent" with both errors, lists no agent and offers no Send (PR #2491 review).
+- **Does not assert:** a real unreachable deck, or the bridge's own preview timeout.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

@@ -3388,7 +3388,8 @@ class FixtureDeckBridge implements DeckBridge {
    * Issue #2399 — the preview answers a batch as a daemon would, from the
    * cards it shows: a preview includes each card offering the action enabled,
    * with that card's own exact text, and skips the rest with a reason; an
-   * execution delivers to every confirmed entry. Nothing changes in the
+   * execution queues the text for every confirmed entry, as a daemon answers
+   * it (`state: "queued"`). Nothing changes in the
    * fixture's state.
    */
   async invokeCardActionBatch(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult> {
@@ -3398,7 +3399,7 @@ class FixtureDeckBridge implements DeckBridge {
       const card = cards.find((candidate) => candidate.pane_id === target.pane_id && candidate.agent_id === target.agent_id);
       const base = { pane_id: target.pane_id, agent_id: target.agent_id, ...(card ? { name: card.name } : {}) };
       if (options.mode === "execute") {
-        return card ? { ...base, outcome: "delivered", message_id: `m-fixture-batch-${target.agent_id}` } : { ...base, outcome: "failed", code: "unknown_entry", message: "there is no such card" };
+        return card ? { ...base, outcome: "delivered", message_id: `m-fixture-batch-${target.agent_id}`, state: "queued" } : { ...base, outcome: "failed", code: "unknown_entry", message: "there is no such card" };
       }
       const action = card?.actions.find((candidate) => candidate.id === actionId);
       if (!card) return { ...base, outcome: "skipped", code: "unknown_entry", message: "there is no such card" };

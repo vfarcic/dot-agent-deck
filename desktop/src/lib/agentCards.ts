@@ -172,6 +172,11 @@ const DELIVERY_DETAIL: Record<string, string> = {
   cancelled: "cancelled",
 };
 
+/** A delivery state in words, as a card's delivery history says it (`queued` reads "Queued for the agent"). */
+export function deliveryStateWord(state: string): string {
+  return DELIVERY_STATE[state] ?? state.replace(/_/g, " ");
+}
+
 export function deliverySentence(delivery: Pick<NonNullable<AgentCardAction["last_delivery"]>, "state" | "detail">): string {
   const state = DELIVERY_STATE[delivery.state] ?? delivery.state;
   if (!delivery.detail) return state;

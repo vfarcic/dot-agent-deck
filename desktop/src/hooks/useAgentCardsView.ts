@@ -40,6 +40,14 @@ const NOTHING_SELECTED = "No card is selected.";
 export const BATCH_STILL_SENDING = "The batch is still being sent, so it stays open: the result for each agent shows here when every daemon has answered.";
 /** What follows the error on each agent's row when a batch's execution failed in a way the desktop could not place before or after the request left. */
 export const BATCH_NOT_KNOWN = "it is not known whether this agent got it. Check the agent before sending again";
+/**
+ * Why an agent is skipped when its daemon's preview failed (PR #2491 review):
+ * the other daemons' agents still proceed, and nothing is sent to this one.
+ * The daemon's own error follows.
+ */
+export const BATCH_DAEMON_UNREACHABLE = "its daemon did not answer the preview, so nothing is sent to it";
+/** The code such a skipped agent carries. */
+export const CODE_BATCH_DAEMON_UNREACHABLE = "daemon_unreachable";
 /** …when another batch is asked for while one is being sent. */
 export const ANOTHER_BATCH_SENDING = "A batch is still being sent; wait for its results before starting another.";
 
@@ -329,7 +337,15 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     setOpen(undefined);
     setNotice(undefined);
     setBatch({ actionId, label, scope, stage: "previewing", groups: [], results: [] });
-    void Promise.all([...groups.values()].map(async (group): Promise<CardBatchGroup> => {
+    /* Each daemon's preview settles on its own (PR #2491 review): one that
+       cannot be reached, times out or refuses the request leaves its agents
+       skipped with its error, and the other daemons' agents proceed. Send
+       sends only to agents a preview included, so none of them is sent to.
+       When no daemon answered, there is nothing to review, and the error is
+       the batch's. */
+    const parts = [...groups.values()];
+    const reason = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
+    void Promise.allSettled(parts.map(async (group): Promise<CardBatchGroup> => {
       const answer = await invokeBatch(group.deckId, actionId, {
         mode: "preview",
         entries: group.cards.map((card) => ({ pane_id: card.entry.pane_id, agent_id: card.entry.agent_id })),
@@ -337,10 +353,26 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
         instanceId: group.instanceId,
       });
       return { deckId: group.deckId, instanceId: group.instanceId, entries: answer.entries };
-    })).then(
-      (answered) => { if (batchRun.current === run) setBatch((current) => current && { ...current, stage: "review", groups: answered }); },
-      (cause: unknown) => { if (batchRun.current === run) setBatch((current) => current && { ...current, stage: "review", error: cause instanceof Error ? cause.message : String(cause) }); },
-    );
+    })).then((settled) => {
+      if (batchRun.current !== run) return;
+      const failures = settled.flatMap((part) => (part.status === "rejected" ? [reason(part.reason)] : []));
+      if (failures.length === settled.length) {
+        const error = [...new Set(failures)].join("; ");
+        setBatch((current) => current && { ...current, stage: "review", error });
+        return;
+      }
+      const answered = settled.map((part, at): CardBatchGroup => {
+        if (part.status === "fulfilled") return part.value;
+        const group = parts[at];
+        const message = `${BATCH_DAEMON_UNREACHABLE}: ${reason(part.reason)}`;
+        return {
+          deckId: group.deckId,
+          instanceId: group.instanceId,
+          entries: group.cards.map((card) => ({ pane_id: card.entry.pane_id, agent_id: card.entry.agent_id, name: card.entry.name, outcome: "skipped", code: CODE_BATCH_DAEMON_UNREACHABLE, message })),
+        };
+      });
+      setBatch((current) => current && { ...current, stage: "review", groups: answered });
+    });
     return undefined;
   }, [invokeBatch]);
   /* `token` is the version of the action the user was shown — the pressed

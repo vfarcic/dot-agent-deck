@@ -985,6 +985,13 @@ export interface CardBatchOutcome extends CardBatchEntry {
   prompt?: string;
   prompt_source?: string;
   message_id?: string;
+  /**
+   * A `delivered` entry's delivery state when the daemon answered, as its own
+   * card records the same press (`recent_deliveries`): `queued` — the text is
+   * in the agent's inbox and the agent has not confirmed it yet. `delivered`
+   * is the outcome the press reached, not the agent's receipt.
+   */
+  state?: string;
   kept_worktree?: string;
   code?: string;
   message?: string;

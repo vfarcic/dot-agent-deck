@@ -3,19 +3,56 @@ import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import type { CardBatchGroup, CardBatchView } from "../hooks/useAgentCardsView";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
+import { deliveryStateWord } from "../lib/agentCards";
 import type { CardBatchOutcome } from "../types";
 import { ExactText, ExactTextNote, SourceBadge } from "./AgentCard";
 
-/** What one agent's row says it got, after Send. `unknown` is an execution nobody confirmed — the wait ran out (`no_answer`, possibly before the request was written), the connection broke after it was written (`connection_lost`), or the webview call rejected (no code): the daemon may or may not have acted, or may still act, so it is neither a failure nor a delivery. */
+/** What one agent's row says it got, after Send. `unknown` is an execution nobody confirmed — the wait ran out (`no_answer`, possibly before the request was written), the connection broke after it was written (`connection_lost`), or the webview call rejected (no code): the daemon may or may not have acted, or may still act, so it is neither a failure nor a delivery. A `delivered` entry is worded by its delivery `state` instead ({@link resultWord}). */
 const RESULT_WORD: Record<string, string> = { delivered: "Delivered", closed: "Closed", failed: "Failed", unknown: "No answer" };
 
-/** The headline of the results. Unanswered agents are not counted as sent or as failed: either may still be true. */
-function resultsHeadline(total: number, failed: number, unknown: number): string {
-  if (unknown === 0) return failed === 0 ? `Sent to all ${total}` : `${total - failed} of ${total} sent; ${failed} failed`;
-  const parts = [`${total - failed - unknown} of ${total} confirmed sent`];
-  if (failed > 0) parts.push(`${failed} failed`);
-  parts.push(`${unknown} not answered, may still be delivered`);
-  return parts.join("; ");
+/**
+ * A `delivered` entry the daemon answered with a delivery state that is not
+ * the agent's confirmed receipt — `queued`: its text is in the agent's inbox
+ * and the agent has not confirmed it (PR #2491 review).
+ */
+const isQueued = (entry: CardBatchOutcome) => entry.outcome === "delivered" && entry.state !== undefined && entry.state !== "delivered";
+
+/**
+ * One row's word, after Send. A batch claims no more than a single press: a
+ * queued entry reads as the card's own delivery history says the same press
+ * ("Queued for the agent"), never "Delivered" (PR #2491 review).
+ */
+function resultWord(entry: CardBatchOutcome): string {
+  if (entry.outcome === "delivered" && entry.state !== undefined) return deliveryStateWord(entry.state);
+  return RESULT_WORD[entry.outcome] ?? displayText(entry.outcome, DISPLAY_LIMITS.name);
+}
+
+/**
+ * The headline of the results. Unanswered agents are not counted as sent or as
+ * failed: either may still be true. Queued agents are counted as queued, never
+ * as delivered: their agent has not confirmed the text yet (PR #2491 review).
+ */
+function resultsHeadline(rows: readonly BatchRow[]): string {
+  const total = rows.length;
+  const tally = (test: (entry: CardBatchOutcome) => boolean) => rows.filter((row) => test(row.entry)).length;
+  const failed = tally((entry) => entry.outcome === "failed");
+  const unknown = tally((entry) => entry.outcome === "unknown");
+  if (unknown > 0) {
+    const parts = [`${total - failed - unknown} of ${total} confirmed sent`];
+    if (failed > 0) parts.push(`${failed} failed`);
+    parts.push(`${unknown} not answered, may still be delivered`);
+    return parts.join("; ");
+  }
+  const queued = tally(isQueued);
+  const closed = tally((entry) => entry.outcome === "closed");
+  const sent = total - failed - queued - closed;
+  const kinds = ([[queued, "queued for the agent"], [closed, "closed"], [sent, "sent"]] as const).filter(([count]) => count > 0);
+  if (failed === 0 && kinds.length === 1) {
+    const [, word] = kinds[0];
+    return word === "closed" ? `Closed all ${total}` : word === "sent" ? `Sent to all ${total}` : `Queued for all ${total}`;
+  }
+  const done = kinds.map(([count, word]) => `${count} ${word}`).join(", ");
+  return done ? `${done} of ${total}; ${failed} failed` : `${failed} of ${total} failed`;
 }
 
 /**
@@ -48,8 +85,10 @@ function rowName(row: BatchRow, names: ReadonlyMap<string, string>): string {
  * exact text it gets (quoted, never an input), and each skipped agent with
  * the reason. Every batch stops here, whatever the action's own `confirm`
  * says, and only Send sends; voice opens this and never presses it (PRD #802
- * D5). After Send it says, for each agent, whether its text was delivered or
- * why it failed — a partial failure reads as one, never as a success. A daemon
+ * D5). After Send it says, for each agent, whether its text was queued for it
+ * (the most a press can say when it answers: the card's delivery history
+ * shows when the agent confirms it) or why it failed — a partial failure
+ * reads as one, never as a success. A daemon
  * that did not answer before the desktop stopped waiting leaves its agents
  * "No answer": the daemon may still deliver, so they read as neither.
  *
@@ -73,8 +112,6 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
   const names = new Map(previewed.flatMap((row) => (row.entry.name ? [[rowKey(row), row.entry.name] as const] : [])));
   const done = view.stage === "done";
   const results = rowsOf(view.results);
-  const failed = results.filter((row) => row.entry.outcome === "failed").length;
-  const unknown = results.filter((row) => row.entry.outcome === "unknown").length;
   /* Which daemon each agent is on, said only when the batch reaches more than one. */
   const severalDaemons = new Set([...view.groups, ...view.results].map((group) => group.deckId)).size > 1;
   const who = (row: BatchRow, extra?: ReactNode) => (
@@ -146,11 +183,11 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
           )}
           {done && (
             <>
-              <h3 role="status">{resultsHeadline(results.length, failed, unknown)}</h3>
+              <h3 role="status">{resultsHeadline(results)}</h3>
               <ul className="agent-cards-batch-list">
                 {results.map((row) => { const { entry } = row; return (
                   <li key={rowKey(row)} className={`agent-cards-batch-entry is-${entry.outcome === "failed" ? "failed" : entry.outcome === "unknown" ? "unknown" : "done"}`} data-testid="agent-cards-batch-entry" data-outcome={entry.outcome}>
-                    {who(row, <span className="agent-cards-batch-outcome">{RESULT_WORD[entry.outcome] ?? displayText(entry.outcome, DISPLAY_LIMITS.name)}</span>)}
+                    {who(row, <span className="agent-cards-batch-outcome">{resultWord(entry)}</span>)}
                     {entry.outcome === "failed" && <p className="agent-cards-batch-reason">{displayText(entry.message ?? "the deck did not act on this agent", DISPLAY_LIMITS.message)}</p>}
                     {entry.outcome === "unknown" && <p className="agent-cards-batch-reason">{displayText(entry.message ?? "the deck did not answer, so it is not known whether this agent got it", DISPLAY_LIMITS.message)}</p>}
                   </li>

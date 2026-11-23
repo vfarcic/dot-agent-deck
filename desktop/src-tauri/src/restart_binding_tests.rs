@@ -1424,6 +1424,22 @@ async fn a_card_batch_the_deck_never_answers_ends_unknown_at_its_bound_and_is_no
         crate::daemon_bridge::DECK_REPLY_TIMEOUT + crate::CARD_BATCH_ENTRY_ALLOWANCE * 2,
         "an execution's bound grows with its entries"
     );
+    // PR #2491 review: and stops growing at the ceiling, so a large batch
+    // cannot hold the app for long.
+    let largest = crate::card_batch_reply_timeout(
+        CardBatchMode::Execute,
+        dot_agent_deck::agent_cards::MAX_BATCH_ENTRIES,
+    );
+    assert_eq!(largest, crate::CARD_BATCH_EXECUTE_CEILING);
+    assert!(
+        largest <= std::time::Duration::from_secs(180),
+        "the ceiling is at most three minutes: {largest:?}"
+    );
+    assert_eq!(
+        crate::card_batch_reply_timeout(CardBatchMode::Execute, usize::MAX),
+        crate::CARD_BATCH_EXECUTE_CEILING,
+        "however many entries a request names"
+    );
 
     // Paused, so the bound elapses as soon as nothing but the silent batch is
     // left to wait on.
@@ -1503,6 +1519,52 @@ async fn a_card_batch_the_deck_never_answers_ends_unknown_at_its_bound_and_is_no
         "the preview's bound is the round trip's: {waited:?}"
     );
     assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 2);
+
+    // PR #2491 review: an execution large enough that its per-entry bound
+    // passes the ceiling is answered at the ceiling.
+    let many: Vec<_> = (0..40)
+        .map(|id| CardBatchEntry {
+            pane_id: format!("pane-{id}"),
+            agent_id: id.to_string(),
+            action_token: "token".into(),
+            instance_id: "a".into(),
+        })
+        .collect();
+    assert!(
+        crate::daemon_bridge::DECK_REPLY_TIMEOUT
+            + crate::CARD_BATCH_ENTRY_ALLOWANCE * many.len() as u32
+            > crate::CARD_BATCH_EXECUTE_CEILING,
+        "precondition: uncapped, this batch would wait past the ceiling"
+    );
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let large = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-silent-3",
+        many,
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    let large = large.expect("an unanswered execution still answers each entry");
+    assert_eq!(large.entries.len(), 40);
+    let ceiling = crate::CARD_BATCH_EXECUTE_CEILING;
+    for entry in &large.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_eq!(
+            entry.message.as_deref(),
+            Some(crate::card_batch_no_answer_message(ceiling).as_str())
+        );
+    }
+    assert!(
+        waited >= ceiling && waited < ceiling + crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+        "a large batch waits no longer than the ceiling: {waited:?}"
+    );
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 3);
 }
 
 /// Two batch entries for agents `1` and `2`, as their preview on process `a`
