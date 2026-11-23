@@ -24915,8 +24915,19 @@ mod spawn_tests {
             reviewer.last_output
         );
 
-        // Every attached client was told, once, with the same record.
+        // Every attached client was told, once, with the same record. The
+        // ending is recorded before it is announced, so the loop above can
+        // see it first: wait (bounded) for the announcement, then take what
+        // else was sent.
         let mut announced = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while announced.is_empty() {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(crate::event::BroadcastMsg::RoleEnded(role))) => announced.push(role),
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
         while let Ok(msg) = rx.try_recv() {
             if let crate::event::BroadcastMsg::RoleEnded(role) = msg {
                 announced.push(role);
