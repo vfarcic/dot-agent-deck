@@ -1,6 +1,6 @@
 # Interrupted Work
 
-When the deck daemon restarts, the agents it was running stop. The units a dispatcher started, the orchestrations, the scheduled issue dispatches and the agents you opened yourself leave their branches, worktrees and reports behind, and the restarted deck no longer runs any of them. **Interrupted work** is the list of what a restart left behind, so you can pick up where it stopped, clean up the worktrees you no longer need, and read the reports nobody received. The TUI, the desktop app and the `dot-agent-deck interrupted` command show the same list with the same words.
+When the deck daemon restarts, the agents it was running stop. The units a dispatcher started, the orchestrations, the scheduled issue dispatches and the agents you opened yourself leave their branches, worktrees and reports behind, and the restarted deck no longer runs any of them. **Interrupted work** is the list of what a restart left behind, so you can pick up where it stopped, clean up the worktrees you no longer need, and read the reports nobody received. With experimental features on, you can also bring a stopped agent back with its conversation ([Restore an agent](#restore-an-agent)). The TUI, the desktop app and the `dot-agent-deck interrupted` command show the same list with the same words.
 
 ## What is listed
 
@@ -88,7 +88,7 @@ dot-agent-deck interrupted dismiss --all        # stop listing every item (asks 
 |---|---|
 | 0 | Done |
 | 1 | Refused, kept the worktree, named no listed item, or failed |
-| 2 | The running daemon does not support interrupted work |
+| 2 | The running daemon does not support interrupted work, or, for `restore` and `start-over`, restoring |
 | 3 | No deck daemon is running |
 
 ## Reclaim a worktree
@@ -122,9 +122,111 @@ The branch is never deleted. A kept branch stops you dispatching a unit of the s
 
 A **Dismiss all** of many items, or a `dismiss` naming many, is sent in parts, all to the same daemon. If that daemon is restarted, stops answering or refuses partway through, the rest are not sent, and the answer says how many items were not, or may not have been, dismissed, such as `1 more item may not have been dismissed: the deck daemon was replaced. List the interrupted work again.`; from a shell the command then exits 1. Open the list again to see what is left.
 
+## Restore an agent
+
+> **Experimental, off unless you turn it on.** Restoring is behind the `experimental` flag. Set `experimental = true` under `[features]` in `.dot-agent-deck.toml`; for the desktop app, turn it on before you start the app ([Configuration → Turn on experimental features](configuration.md#turn-on-experimental-features) has both). With the flag off, the `s` key and the **Restore** button are not there, `interrupted restore` and `interrupted start-over` refuse and say the flag is off, and a restarted agent's conversation can still be picked up by hand, as [The deck restarted and its agents disappeared](troubleshooting.md#the-deck-restarted-and-its-agents-disappeared) describes.
+
+**Restore** brings a stopped agent back with its conversation: the deck starts the agent again with the command it was started with, in the folder it was working in, and the agent continues the same conversation instead of starting a blank one. It is offered for an item that is one agent: an agent you started yourself, or a unit or issue dispatch run by a single agent. An orchestration's agents are listed in its details with what they were (name, role, folder), and say that orchestrations come back in a later version; reclaim or dismiss the orchestration instead.
+
+The TUI and the desktop app ask before restoring, and from a shell you choose with an option. You choose between:
+
+- **Restore and continue**: the agent comes back and picks up where it stopped. If its last turn was cut off, it first checks what already happened, then carries on without doing it again.
+- **Restore only**: the agent comes back and waits until you tell it to continue.
+- **Start over in this worktree**: offered instead when the agent cannot be restored with its conversation (below). The deck starts the agent's command again in the same folder as a new agent with no memory of the earlier conversation. A dispatched unit or issue dispatch is given its saved task again as its first message; an agent you started yourself is started with no task. The work already committed in the worktree is still there, so read the branch before you let it repeat anything.
+
+The restored agent appears as a new agent on the dashboard, a card in the TUI and a row on the desktop app's dashboard, under the same name, and the item leaves the list. A started-over agent appears the same way.
+
+### What the restored agent is told
+
+As soon as the agent is back in its conversation, the deck sends it one message saying that the deck restarted and resumed its session:
+
+- After **Restore and continue**, the message tells the agent that its previous turn may have been cut off. It asks the agent to check the current state first (`git status`, `git log`, and whether anything was already pushed, opened or sent), then continue from where it stopped without repeating what already happened, and to do nothing and wait for the next message if its previous turn had finished.
+- After **Restore only**, the message tells the agent the same, but asks it to do nothing until you tell it to continue, and to check the current state when you do.
+
+A started-over agent gets no such message: it has no earlier conversation to be told about.
+
+### TUI and desktop app
+
+The TUI and the desktop app use the same words and the same keys. Open the **Interrupted work** list (`I`), select the item, and:
+
+| Key | Action |
+|---|---|
+| `s` | **Restore** the selected item, in the list or in its details: opens the question |
+| `c` | In the question, **Restore and continue** |
+| `o` | In the question, **Restore only** |
+| `w` | In the question, **Start over in this worktree**, when it is offered |
+| `Esc`, `q` or `n` | Leave the question without restoring anything |
+
+In the desktop app the dialog also has a **Restore** button, and the question shows **Restore and continue**, **Restore only**, **Start over in this worktree** (when it is offered) and **Back** as buttons. With several daemons, the agent comes back on the daemon whose dialog you used.
+
+By voice ([Voice Control](desktop/voice.md#interrupted-work)), say **"restore the agent"**, **"bring back fix-login"** or **"resume fix-login's conversation"** to open the question for that item. Choosing **Restore and continue**, **Restore only** or **Start over in this worktree** is done on screen, since each starts an agent that spends credits and may push or send.
+
+### From a shell
+
+```bash
+dot-agent-deck interrupted show <id>                              # the item's agents, and whether each can be restored
+dot-agent-deck interrupted restore <id> --continue                # restore, and let it carry on
+dot-agent-deck interrupted restore <id> --only                    # restore, and let it wait for you
+dot-agent-deck interrupted start-over <id> --agent <attempt>      # start the agent's command again, without its conversation
+```
+
+`interrupted show` lists each of the item's agents with the id to pass to `--agent`, and says whether it can be restored, can only be started over, or neither, and why.
+
+| Option | Command | What it does |
+|---|---|---|
+| `--continue` | `restore` | Restore and continue. `restore` needs exactly one of `--continue` and `--only` |
+| `--only` | `restore` | Restore only |
+| `--agent <attempt>` | `restore`, `start-over` | The agent to act on. `restore` acts on every agent of the item that can be restored when you leave it out; `start-over` needs it |
+| `--dry-run` | `restore`, `start-over` | Say what would happen, and start nothing |
+| `--yes` | `restore`, `start-over` | Act without asking. Without a terminal to ask on, it is needed |
+
+### Which agents can be restored
+
+| Agent | Restored with its conversation | What is missing |
+|---|---|---|
+| Claude Code | Yes | — |
+| Codex | Yes, when the deck's Codex hooks are installed and trusted ([Installation → Agent hooks](installation.md#agent-hooks)) and its command has no subcommand and no prompt, such as plain `codex` or `codex -m <model>` | Without its hooks the deck never learns which conversation Codex was in. A command with a subcommand or a prompt is offered Start over |
+| OpenCode | Not yet | The deck does not yet learn reliably which conversation the agent was in, so it could bring back an older conversation or a blank one. Start over is offered |
+| Pi | Not yet | The deck does not yet learn which conversation the agent was in. Start over is offered |
+| Devin | Not yet | It is not yet confirmed that the conversation the deck hears about is the one Devin can resume. Start over is offered |
+| Antigravity | Not yet | The deck knows no way to resume an Antigravity conversation by its id. Start over is offered |
+| A pane started without an agent, such as a plain shell | No | There is no conversation to restore. Start over is offered |
+
+Some ways of starting an agent cannot be restored, even for Claude Code and Codex. The deck then stops the agent it started before sending it anything, and the item stays listed with Start over offered:
+
+- a command that calls the agent by its full path, such as `/usr/local/bin/claude`, rather than by its name;
+- a script that sets its own `PATH` before it starts the agent, or a wrapper that drops the arguments it is given;
+- a wrapper that starts the agent with a different home or configuration folder than it had, so the agent cannot find its conversation;
+- native Windows, which the deck does not run on.
+
+### Things to know
+
+- **A restored unit no longer reports to its dispatcher.** A dispatched unit or issue dispatch comes back as an agent of its own: the dispatcher that started it is not told when it finishes. Read what it did in its pane, and tell the dispatcher yourself if it needs to know.
+- **Claude Code may ask for permissions it did not ask for before.** An agent started to skip permission prompts can ask for them again after it is restored. Answer them in its pane.
+- **A prompt in the agent's command is sent again.** If the agent was started with a prompt on its command line, such as `claude "fix the login tests"`, Claude Code receives that prompt again as a new message when it is restored. Agents the deck starts normally take their task as a message instead, so this applies only to a command you wrote that way. Codex with a prompt on its command line is not restored; Start over is offered.
+- **The old agent must be gone.** The deck restores an agent only when it can confirm the agent it stopped is no longer running, so that two copies of it do not write to one conversation.
+
+### When an agent is not restored
+
+The deck checks again when you confirm. When a check fails it starts nothing, and when the agent it started did not come back in its conversation it stops that agent before sending it anything. The answer says why, in words such as these:
+
+| What it says | What it means | What to do |
+|---|---|---|
+| The agent cannot be restored with its conversation yet | The agent is one the table above marks "Not yet", or a plain shell. | Use **Start over in this worktree**. |
+| The deck does not know which conversation the agent was in | The agent stopped before it reported its conversation, or a Codex agent ran without the deck's hooks. | Use Start over. For Codex, install and trust the hooks so later agents can be restored. |
+| The deck has no record of how the agent was started | The agent was started by an earlier version of the deck. | Use Start over, or dismiss the item. |
+| The deck cannot confirm the old agent has stopped | The agent was started by an earlier version of the deck, which did not record what the deck needs to check. | Use Start over, or dismiss the item. |
+| The old agent is still running | A process of the stopped agent is still running, and a second copy would write to the same conversation. | Stop that process, then restore again. |
+| The agent's folder was moved, is gone, or others can write to it | The deck starts an agent only in the folder it was working in, and only when no other user can change that folder. | Put the folder back, or remove the write access others have, then restore again. Otherwise dismiss the item. |
+| The agent came back without its conversation | The agent started, but not in its earlier conversation: its command calls it by full path, a script replaced `PATH` or dropped the arguments, the agent could not find the conversation, or it exited. The deck stopped it before sending it anything. | See the list of ways of starting an agent that cannot be restored, above. Use Start over. |
+| The worktree is no longer there | Start over runs in the item's worktree, which is gone. | Dismiss the item. |
+| The saved task cannot be read safely | A dispatched unit's saved task file was replaced by a link, or others can read or change it. | Check the file in the worktree's `.dot-agent-deck` folder, or start the agent yourself. |
+| Orchestrations come back in a later version | The item is an orchestration, or a unit run by more than one agent. | Reclaim or dismiss it. |
+| The deck could not read its whole work journal | Part of the record restoring is checked against could not be read. | Try again later. |
+
 ## Agents can list, not change
 
-An agent running in one of the deck's panes can run `interrupted list` and `interrupted show`, so a dispatcher can tell you what a restart left behind. Reclaiming and dismissing are left to you: from an agent's pane they are refused with `Refused: this request came from an agent in a deck pane, …`. Do them from the TUI, the desktop app or a terminal that is not one of the deck's panes.
+An agent running in one of the deck's panes can run `interrupted list` and `interrupted show`, so a dispatcher can tell you what a restart left behind. Reclaiming, dismissing, restoring and starting over are left to you: from an agent's pane they are refused with `Refused: this request came from an agent in a deck pane, …`. Do them from the TUI, the desktop app or a terminal that is not one of the deck's panes.
 
 ## Differences between the clients
 
