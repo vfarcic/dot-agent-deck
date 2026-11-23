@@ -1733,8 +1733,15 @@ fn dispatch_return_030_real_single_unit_sends_an_update_to_its_report() {
          When its report arrives, relay the filename to me, and if it later sends an update to \
          that report, relay what the update says too."
     );
-    deck.send_keys(directive.as_bytes());
-    deck.send_keys(b"\r");
+    // Issue #701's helper, not text and `\r` in one burst: typed that way the
+    // Enter can be read as part of a paste, and the directive then sits
+    // unsubmitted in the dispatcher's input with no `UserPromptSubmit` (seen
+    // on this test while working issue #2485, failing "must start its unit").
+    let events = deck.subscribe_events();
+    let dispatcher_agent = dispatcher_ids
+        .first()
+        .expect("the acknowledged seed names the dispatcher's agent");
+    deck.submit_claude_prompt(&events, dispatcher_agent, &directive, unit);
     assert!(
         common::wait_until(Duration::from_secs(90), || {
             common::agent_records_on(deck.attach_socket_path())
@@ -1845,8 +1852,8 @@ fn dispatch_return_030_real_single_unit_sends_an_update_to_its_report() {
          then send an update to your report giving the number in that file. \
          Do not ask questions."
     );
-    deck.send_keys(nudge.as_bytes());
-    deck.send_keys(b"\r");
+    let unit_agent = unit_ids.first().expect("the dispatched unit is registered");
+    deck.submit_claude_prompt(&events, unit_agent, &nudge, STAMP_FILE);
     assert!(
         common::wait_until(Duration::from_secs(60), || stamp().is_some()),
         "the unit never wrote {STAMP_FILE} after being told its report was out of date.\n\
