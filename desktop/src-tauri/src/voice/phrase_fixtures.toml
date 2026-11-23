@@ -5,6 +5,61 @@
 # representative phrase is repeated on a screen where that action is not
 # callable so a typo in `commands.toml`'s `screens` column is observable.
 
+# Issue #2399: opening an agent, selecting its card and acting on a selection
+# are separate requests. Use the generated run's single coder so these cases
+# measure command selection rather than the default fleet's two-coder tie.
+[[fixtures]]
+name = "card-selection-bare-select-opens-agent"
+utterance = "select the coder"
+screen = "overview"
+generated_run = true
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-selection-select-coders-card"
+utterance = "select the coder's card"
+screen = "overview"
+generated_run = true
+action = "select_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-selection-unselect-testers-card"
+utterance = "unselect the tester's card"
+screen = "overview"
+action = "unselect_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "card-selection-go-ahead-on-selected-agents"
+utterance = "go ahead on the selected agents"
+screen = "overview"
+action = "run_card_action_on_selection"
+outcome = "dispatch"
+resolved_card_action = "go ahead"
+
+[[fixtures]]
+name = "card-selection-close-selected-ones"
+utterance = "close the selected ones"
+screen = "overview"
+action = "run_card_action_on_selection"
+outcome = "dispatch"
+resolved_card_action = "close"
+
+[[fixtures]]
+name = "card-selection-single-tree-batch-control"
+utterance = "go ahead on everything under the coder"
+screen = "overview"
+generated_run = true
+action = "run_card_action_batch"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+resolved_card_action = "go ahead"
+
 [[fixtures]]
 name = "open-agent-zoom"
 utterance = "zoom the tester"

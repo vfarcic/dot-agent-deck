@@ -221,6 +221,10 @@ struct PhraseFixture {
     /// It is the transcript's own slice, so it is compared exactly.
     #[serde(default)]
     resolved_command: Option<String>,
+    /// The card button's label grounded in the transcript, before the webview
+    /// matches it against the selected cards' available actions.
+    #[serde(default)]
+    resolved_card_action: Option<String>,
     #[serde(default)]
     pending_action: bool,
     /// PRD #1541 — run the utterance with typing mode on for the planted
@@ -443,7 +447,8 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 
 /// Scenario: Validate every checked-in phrase and the planted fleet before any
 /// live-model gate. With local opt-in, verify outcomes through the shipping
-/// keyed API backend with the deck shown or hidden as each fixture specifies.
+/// keyed API backend with the deck shown or hidden as each fixture specifies,
+/// including card selection versus opening and the selected cards' action label.
 #[tokio::test]
 // Quarantined (CLAUDE.md rule 6), owner vfarcic; local-only, never in CI. It
 // was red on every one of five full runs on 2026-11-19 and on all four on
@@ -489,7 +494,7 @@ fn paraphrase_manifest() -> FixtureManifest {
 
 /// Scenario: Parse the checked-in phrase and paraphrase manifests and check
 /// every fixture against the command table, the screens and the planted fleet,
-/// decks, directories and New agent form, with no model and no credential. This
+/// decks, directories, New agent form and card-action expectations, with no model and no credential. This
 /// keeps the fixtures checked in every run while 001 and 002 are quarantined.
 #[test]
 fn voice_desktop_phrases_010_phrase_and_paraphrase_fixtures_validate_without_a_model() {
@@ -1725,6 +1730,25 @@ fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
                 fixture.name
             );
         }
+        if let Some(expected) = fixture.resolved_card_action.as_deref() {
+            let row = table()
+                .row(&fixture.action)
+                .expect("card action row exists");
+            assert!(
+                fixture.outcome == OutcomeKind::Dispatch
+                    && row
+                        .params
+                        .iter()
+                        .any(|param| param.kind == ParamKind::CardAction),
+                "{}: `resolved_card_action` needs a dispatch with a card_action parameter",
+                fixture.name
+            );
+            assert!(
+                !expected.is_empty() && fixture.utterance.to_lowercase().contains(expected),
+                "{}: `resolved_card_action` must be the lowercased card label in the utterance",
+                fixture.name
+            );
+        }
         if let Some(expected) = fixture.resolved_dir.as_deref() {
             assert!(
                 fixture.listing || fixture.hostile_listing,
@@ -1919,6 +1943,12 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                     }
                     None => true,
                 };
+                let card_action_matches = match fixture.resolved_card_action.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::CardAction) == Some(expected)
+                    }
+                    None => true,
+                };
                 let prefix_matches = match fixture.dictate_prefix.as_deref() {
                     Some(expected) => marked_prefix(&answer.outcome)
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
@@ -2016,6 +2046,7 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                     && prefix_matches
                     && filter_matches
                     && command_matches
+                    && card_action_matches
                     && deck_named
                     && deck_eligible
                     && unavailable_named
@@ -2028,11 +2059,11 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
                          resolved_orchestration={:?} dictate_prefix={:?} resolved_filter={:?} \
                          resolved_command={:?} candidates={:?} resolved_kind={:?} \
-                         resolved_status={:?}, got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
+                         resolved_status={:?} resolved_card_action={:?}, got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
                          resolved_filter={:?} resolved_command={:?} candidates={:?} resolved_kind={:?} \
-                         resolved_status={:?} model_value={:?} sentence={:?}",
+                         resolved_status={:?} resolved_card_action={:?} model_value={:?} sentence={:?}",
                         if !candidates_match {
                             "the tie does not offer the expected candidates; "
                         } else if !deck_named {
@@ -2060,6 +2091,7 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                         fixture.candidates,
                         fixture.resolved_kind,
                         fixture.resolved_status,
+                        fixture.resolved_card_action,
                         actual_action,
                         resolved_deck(&answer.outcome),
                         resolved_dir(&answer.outcome),
@@ -2072,6 +2104,7 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                         offered_values(&answer.outcome),
                         resolved_of(&answer.outcome, ParamKind::AgentKind),
                         resolved_of(&answer.outcome, ParamKind::AgentStatus),
+                        resolved_of(&answer.outcome, ParamKind::CardAction),
                         model_value(&answer.outcome),
                         // The app's own sentence, which says WHY a refusal
                         // refused — the kinds alone cannot tell a model's
