@@ -22,6 +22,8 @@ use dot_agent_deck::report_recovery::{MAX_REPORT_UPDATES, USUAL_REPORT_UPDATES};
 use spec::spec;
 
 const WAIT: Duration = Duration::from_secs(60);
+/// The opening of the seed a dispatcher-mode pane is given.
+const DISPATCHER_SEED_OPENING: &str = "You are an ordinary assistant";
 
 struct UpdateDeck {
     deck: TuiDeck,
@@ -120,29 +122,45 @@ os.execvp("cat", ["cat"])
                 .is_some_and(|live| live.agent_type == Some(AgentType::ClaudeCode))
     }
 
-    /// The dispatcher, opened the way a user opens a pane: from the TUI's
-    /// New Agent dialog.
-    fn open_caller(&self, name: &str) -> AgentRecord {
+    /// The dispatcher, opened the way a user opens one: the TUI's New Agent
+    /// dialog with dispatcher mode chosen. It is the deck's only pane, and the
+    /// dispatcher seed is in its inbox before it is returned.
+    fn open_dispatcher(&self) -> AgentRecord {
         self.deck.send_keys(b"\x0e");
         self.deck.send_keys(b" ");
-        self.deck.wait_for_string("┌ New Agent");
-        self.deck.send_keys(b"\t");
-        self.deck.send_keys(&[0x7f; 96]);
-        self.deck.send_keys(name.as_bytes());
+        self.deck.wait_for_string("No mode");
+        self.deck
+            .send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C");
+        self.deck.wait_for_string("dispatcher mode");
         let (col, row) = self.deck.wait_for_in_grid("[Submit]");
         self.deck.click(col, row);
         self.deck.wait_for_absence("[Submit]");
+        let ready = || {
+            let records = self.records();
+            match records.as_slice() {
+                [only] if self.probe_ready(only) => Some(only.clone()),
+                _ => None,
+            }
+        };
         assert!(
-            common::wait_until(WAIT, || self.records().iter().any(|r| {
-                r.display_name.as_deref() == Some(name) && self.probe_ready(r)
-            })),
-            "caller {name} did not publish its own identity\n{}",
+            common::wait_until(WAIT, || ready().is_some()),
+            "the dispatcher did not publish its own identity\n{}",
             self.deck.snapshot_grid()
         );
-        self.records()
-            .into_iter()
-            .find(|r| r.display_name.as_deref() == Some(name))
-            .expect("ready caller")
+        let dispatcher = ready().expect("ready dispatcher");
+        let pane = dispatcher
+            .pane_id_env
+            .as_deref()
+            .expect("dispatcher pane id");
+        assert!(
+            common::wait_until(WAIT, || self
+                .inbox(pane)
+                .iter()
+                .any(|text| text.contains(DISPATCHER_SEED_OPENING))),
+            "the dispatcher pane never received the dispatcher seed\n{}",
+            self.deck.snapshot_grid()
+        );
+        dispatcher
     }
 
     fn cli(&self, as_pane: &AgentRecord, cwd: &Path, args: &[&str]) -> Output {
@@ -278,12 +296,12 @@ fn assert_exit(label: &str, output: &Output, code: i32) {
     );
 }
 
-/// Scenario: Start the deck, open a dispatcher pane from the New Agent dialog and dispatch a single stand-in unit from it. The unit reports, then sends four different updates with `work-done --done`; the dispatcher's inbox receives each update once as its own numbered update, the first three without a note and the fourth saying the unit has sent more updates than usual and may be looping. Sending the fourth update again delivers nothing new.
+/// Scenario: Start the deck, open a dispatcher-mode pane from the New Agent dialog and dispatch a single stand-in unit from it. The unit reports, then sends four different updates with `work-done --done`; the dispatcher's inbox receives each update once as its own numbered update, the first three without a note and the fourth saying the unit has sent more updates than usual and may be looping. Sending the fourth update again delivers nothing new.
 #[spec("dispatch/return/034")]
 #[test]
 fn return_034_an_update_past_the_usual_count_reaches_the_dispatcher_flagged() {
     let mut test = UpdateDeck::new();
-    let caller = test.open_caller("dispatcher");
+    let caller = test.open_dispatcher();
     let unit = test.dispatch_single(&caller, "updating-unit");
 
     let first = test.report(&unit, "R034-FIRST-REPORT");
@@ -327,11 +345,13 @@ fn return_034_an_update_past_the_usual_count_reaches_the_dispatcher_flagged() {
     }
 
     // An identical repeat of the flagged update is answered and delivers
-    // nothing new.
+    // nothing new. The daemon answers a repeat `already_accepted` before it
+    // would post anything, so once the CLI has its answer the inbox is final.
     let body = format!("R034-UPDATE-{flagged}-OF-THE-REPORT");
     let again = test.report(&unit, &body);
     assert_exit("a repeat of the flagged update", &again, 0);
-    std::thread::sleep(Duration::from_secs(2));
     assert_eq!(test.delivered(&caller, &body, 1).len(), 1);
-    assert_eq!(test.delivered(&caller, UPDATE_OPENING, 0).len(), flagged);
+    // Counted by the updates' own text: the dispatcher seed quotes the update
+    // opening too.
+    assert_eq!(test.delivered(&caller, "R034-UPDATE-", 0).len(), flagged);
 }

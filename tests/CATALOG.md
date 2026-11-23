@@ -6851,7 +6851,7 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/return/034 — A unit's fourth update reaches the dispatcher flagged as a possible loop.
-- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_dispatch_report_updates.rs`); the dispatcher is opened from the TUI's New Agent dialog and runs a real `dispatch --single`.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_dispatch_report_updates.rs`); the dispatcher is opened from the TUI's New Agent dialog with dispatcher mode chosen, its dispatcher seed is in its inbox, and it runs a real `dispatch --single`.
 - **Agent:** none — identity-recording probes that emit a synthetic `SessionStart` and exec `cat`, using their own minted pane capabilities.
 - **Asserts:** after the unit's first report, its next `USUAL_REPORT_UPDATES + 1` (4) different `work-done --done` reports each exit 0 saying which update they sent, and each reaches the dispatcher's inbox once, opening with the update wording and naming its number of at most `MAX_REPORT_UPDATES`; updates 1 to 3 carry no loop note and update 4 carries `LOOPING_NOTE`; an identical repeat of update 4 exits 0 and delivers nothing new.
 - **Why it exists:** issue #2485: the dispatcher-visible note on an update past the usual count, through the spawned binary.
