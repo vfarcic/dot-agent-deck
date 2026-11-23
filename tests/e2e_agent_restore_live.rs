@@ -117,6 +117,9 @@ struct LiveRestore {
     repo: PathBuf,
     path: String,
     name: String,
+    /// Each daemon lifetime keeps its own log here (`deck-<n>.log`), so a
+    /// failed restore can say why the daemon refused it.
+    logs: Vec<PathBuf>,
     _scratch: tempfile::TempDir,
 }
 
@@ -167,7 +170,8 @@ impl LiveRestore {
             installed.parent().unwrap().display(),
             common::path_with_binary_dir()
         );
-        let live = spawn(&home, &state, &path);
+        let first_log = scratch.path().join("deck-1.log");
+        let live = spawn(&home, &state, &path, &first_log);
         let fixture = Self {
             live,
             gone: Vec::new(),
@@ -176,6 +180,7 @@ impl LiveRestore {
             repo,
             path,
             name: name.to_string(),
+            logs: vec![first_log],
             _scratch: scratch,
         };
         // This starts a standalone agent; there is no project orchestration
@@ -294,7 +299,9 @@ impl LiveRestore {
         // Close the old client before replacement so its reconnect machinery
         // cannot start another daemon on the now-dead fixture endpoints.
         drop(attached);
-        let next = spawn(&self.home, &self.state, &self.path);
+        let log = self.logs[0].with_file_name(format!("deck-{}.log", self.logs.len() + 1));
+        let next = spawn(&self.home, &self.state, &self.path, &log);
+        self.logs.push(log);
         self.gone.push(std::mem::replace(&mut self.live, next));
     }
 
@@ -373,7 +380,8 @@ impl LiveRestore {
                     .find(|record| record["display_name"] == self.name);
                 found.borrow().is_some()
             }),
-            "restored named agent never appeared"
+            "restored named agent never appeared\n{}",
+            self.restore_diagnostics()
         );
         found.into_inner().unwrap()
     }
@@ -438,13 +446,41 @@ impl LiveRestore {
     }
 }
 
+impl LiveRestore {
+    /// Why a restore was refused, redacted for test output: every daemon
+    /// lifetime's `restore:` log lines and the journal's `restore_failed`
+    /// lines, whose `failure` and `shim` name the cause.
+    fn restore_diagnostics(&self) -> String {
+        let mut out = String::new();
+        for log in &self.logs {
+            let text = std::fs::read_to_string(log)
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+            out.push_str(&format!("daemon log {}:\n", log.display()));
+            for line in text.lines().filter(|line| line.contains("restore:")) {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+        out.push_str("journal restore_failed lines:\n");
+        for line in journal::lines(&self.state)
+            .iter()
+            .filter(|line| line["kind"] == "restore_failed")
+        {
+            out.push_str(&format!(
+                "  failure={} shim={} line={line}\n",
+                line["failure"], line["shim"]
+            ));
+        }
+        common::redact_credentials_for_output(&out)
+    }
+}
+
 fn project_trust() -> toml::Value {
     let mut table = toml::map::Map::new();
     table.insert("trust_level".into(), toml::Value::String("trusted".into()));
     toml::Value::Table(table)
 }
 
-fn spawn(home: &Path, state: &Path, path: &str) -> common::DaemonProc {
+fn spawn(home: &Path, state: &Path, path: &str, log: &Path) -> common::DaemonProc {
     let codex = home.join(".codex");
     let config = home.join(".config");
     let mut env = vec![
@@ -456,6 +492,7 @@ fn spawn(home: &Path, state: &Path, path: &str) -> common::DaemonProc {
         ("DOT_AGENT_DECK_STATE_DIR", state.to_str().unwrap()),
         ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
         ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900"),
+        ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
         ("PATH", path),
     ];
     let key = std::env::var("ANTHROPIC_API_KEY")
@@ -571,6 +608,13 @@ fn ack(path: &Path) -> Ack {
     }
 }
 
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 fn nonce() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS randomness for independent test sentinels");
@@ -638,6 +682,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
         "no blank agent before the person's choice"
     );
     let attached = fixture.tui("after.toml");
+    let mut cli_answered_ms = None;
     grid(&attached, "restart footer", |frame| {
         frame.contains("interrupted item")
     });
@@ -669,13 +714,15 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
         let outcome = bounded(restore, CONTROL);
         if !outcome.status.success() {
             eprintln!(
-                "restore failure journal: {}\nlive records: {:?}\npane:\n{}",
+                "restore failure journal: {}\nlive records: {:?}\npane:\n{}\nrestore diagnostics:\n{}",
                 journal::dump(&fixture.state),
                 fixture.records(),
-                common::redact_credentials_for_output(&attached.snapshot_grid())
+                common::redact_credentials_for_output(&attached.snapshot_grid()),
+                fixture.restore_diagnostics()
             );
         }
         let outcome = succeeded(outcome);
+        cli_answered_ms = Some(epoch_ms());
         eprintln!(
             "restore human CLI outcome: {}",
             String::from_utf8_lossy(&outcome.stdout)
@@ -688,6 +735,19 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     let resumed_session = fixture.session(&new_attempt);
     eprintln!(
         "restore new attempt: {new_attempt}; native session: {resumed_session}; live record: {restored}"
+    );
+    // The CLI answers only once the restored agent's first attested
+    // SessionStart confirmed the conversation, so spawn (the new attempt's
+    // journal stamp) to that answer bounds spawn to first SessionStart.
+    if let (Some(answered), Some(spawned)) = (cli_answered_ms, new_attempt["ts_ms"].as_u64()) {
+        eprintln!(
+            "restore timing: spawn to confirmed first SessionStart <= {} ms (attempt_started ts_ms {spawned}, CLI answered {answered})",
+            answered.saturating_sub(spawned)
+        );
+    }
+    eprintln!(
+        "restore diagnostics after success:\n{}",
+        fixture.restore_diagnostics()
     );
     assert_eq!(
         resumed_session, original_session,
