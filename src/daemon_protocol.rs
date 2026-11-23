@@ -8578,23 +8578,31 @@ async fn handle_connection(
             entries,
         } => {
             // Each close entry is the same stop a single press's close sends.
-            let close = || {
+            // The batch runs on a task of its own, so the maker owns its
+            // handles.
+            let close = {
                 let registry = Arc::clone(&registry);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let worktree_registry = worktree_registry.clone();
-                move |id: String, keep: bool| async move {
-                    let (outcome, hold) = stop_agent_request(
-                        &id,
-                        keep,
-                        &registry,
-                        &state,
-                        &event_tx,
-                        &worktree_registry,
-                    )
-                    .await;
-                    drop(hold);
-                    outcome
+                move || {
+                    let registry = Arc::clone(&registry);
+                    let state = state.clone();
+                    let event_tx = event_tx.clone();
+                    let worktree_registry = worktree_registry.clone();
+                    move |id: String, keep: bool| async move {
+                        let (outcome, hold) = stop_agent_request(
+                            &id,
+                            keep,
+                            &registry,
+                            &state,
+                            &event_tx,
+                            &worktree_registry,
+                        )
+                        .await;
+                        drop(hold);
+                        outcome
+                    }
                 }
             };
             let resp = match crate::agent_cards::invoke_batch(

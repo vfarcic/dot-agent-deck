@@ -16936,6 +16936,27 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** with one daemon failing, the confirmation opens in review with no error: the other daemon's agent is included with its exact text, the failing daemon's agent is skipped with `BATCH_DAEMON_UNREACHABLE` and that daemon's error and names its daemon, and Send executes on the daemon that previewed only; with both failing, the confirmation says "Nothing was sent" with both errors, lists no agent and offers no Send (PR #2491 review).
 - **Does not assert:** a real unreachable deck, or the bridge's own preview timeout.
 
+##### desktop/agent-cards/042 — A delivered entry without a delivery state reads as queued, never as delivered.
+
+- **Test:** vitest `desktop/agent-cards/042: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed batch bridge whose execution answers each entry `delivered` with no `state`, as an earlier development build of the batch verb did.
+- **Asserts:** each agent's row reads "Queued for the agent" and the headline "Queued for all 2", never "Delivered" or "Sent to all" (PR #2491 review).
+- **Does not assert:** a real daemon of that build; this release's daemon always sends `state` (`a_sent_batch_entry_says_its_text_is_queued_as_its_card_records_it`).
+
+##### desktop/agent-cards/043 — A daemon that refuses the preview shows its reason, not that it did not answer.
+
+- **Test:** vitest `desktop/agent-cards/043: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), two fixture daemons, stubbed batch bridge whose preview on one daemon answers each entry `skipped` / `deck_refused` with the daemon's reason, as the desktop bridge answers a refused preview.
+- **Asserts:** that daemon's agent is skipped under its own name with the daemon's reason, never `BATCH_DAEMON_UNREACHABLE` or "did not answer"; the other daemon's agent is included; Send executes on that other daemon only (PR #2491 review).
+- **Does not assert:** the bridge's mapping of a refusal to skipped entries, which the Rust transport test `a_card_batch_preview_the_deck_refuses_skips_each_agent_with_the_deck_s_reason` in `desktop/src-tauri/src/restart_binding_tests.rs` pins against a fake deck.
+
+##### desktop/agent-cards/044 — The results headline counts queued, closed, failed and unanswered agents apart.
+
+- **Test:** vitest `desktop/agent-cards/044: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed batch bridge answering a prompt batch with one entry queued and one unanswered, then a close batch with one closed, one failed and one unanswered.
+- **Asserts:** the headlines read "1 queued for the agent of 2; 1 not answered, may still be delivered" and "1 closed of 3; 1 failed; 1 not answered, may still be closed", and the close batch's headline says neither "sent" nor "delivered" (PR #2491 review).
+- **Does not assert:** the wording of a batch whose rows mix prompt and close actions.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

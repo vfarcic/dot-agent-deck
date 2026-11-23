@@ -2175,20 +2175,22 @@ pub(crate) const CODE_CARD_BATCH_NO_ANSWER: &str = "no_answer";
 /// dialog forever, not to hurry a daemon that is working.
 pub(crate) const CARD_BATCH_ENTRY_ALLOWANCE: Duration = Duration::from_secs(10);
 
-/// The longest the desktop waits for a daemon's answer to one executed batch,
-/// however many entries it names (PR #2491 review).
+/// The longest one executed batch command takes, however many entries it
+/// names (PR #2491 review): reaching and trusting the deck, then sending the
+/// request and waiting for its answer, all within one deadline taken when the
+/// command starts.
 ///
 /// While it waits, the batch dialog holds the app (`useInertBackground`) and
 /// refuses Cancel, `Escape` and voice's `close`, so the wait is a freeze of
 /// the whole window; at [`CARD_BATCH_ENTRY_ALLOWANCE`] an entry alone, a
 /// 256-entry batch would hold it for over 40 minutes. Three minutes is the
-/// most of that freeze we accept, and it still covers what a working daemon
-/// needs: its prompt entries are in-memory posts that take milliseconds each,
-/// so a batch of any allowed size answers in seconds, and a close entry waits
-/// for its agent to stop within the deck's termination grace (3 s,
-/// `AGENT_TERMINATE_GRACE`), so the ceiling still covers some 60 closes that
-/// each spend the whole grace. Past it, every entry reads No answer, as any
-/// unanswered batch does: the daemon keeps going, and each card's own
+/// most of that freeze we accept. A working daemon's prompt entries are
+/// in-memory posts that take milliseconds each. A close entry's own wait for
+/// its agent to stop is bounded by the deck's termination grace (3 s,
+/// `AGENT_TERMINATE_GRACE`), but the rest of a close (releasing the pane, a
+/// kept worktree) is not bounded by it, so a batch of many closes on a loaded
+/// host can run past the ceiling. Past it, every entry reads No answer, as
+/// any unanswered batch does: the daemon keeps going, and each card's own
 /// delivery history shows what it did.
 pub(crate) const CARD_BATCH_EXECUTE_CEILING: Duration = Duration::from_secs(180);
 
@@ -2247,16 +2249,23 @@ pub(crate) fn card_batch_connection_lost_message(detail: &str) -> String {
 
 /// [`agent_card_invoke_batch`] minus the webview.
 ///
-/// The batch client exchange, which starts once the trusted link is acquired,
-/// is bounded by [`card_batch_reply_timeout`]; acquiring that link comes first
-/// and has its own bound. A preview sends nothing, so any failure is an error.
-/// An execution answers every entry, and which outcome depends on what the
+/// The whole command — acquiring the trusted link (waiting for the deck's
+/// establishment gate, and a handshake when the held link is stale), then the
+/// batch exchange — runs against one deadline, [`card_batch_reply_timeout`]
+/// from when it starts (PR #2491 review). A preview sends nothing, so a deck
+/// that cannot be reached or does not answer is an error, and a deck that
+/// refuses the preview (the `Hello`, a replaced daemon, an older daemon, or
+/// the request as a whole) answers every entry `skipped` with the deck's
+/// reason, so the user reads why rather than that nobody answered. An
+/// execution answers every entry, and which outcome depends on what the
 /// bridge can place:
 ///
 /// - a failure known to come before the request was written (the deck could
 ///   not be reached or trusted, its `Hello` failed, it is a successor of the
 ///   daemon that listed the cards), and the daemon refusing the whole
-///   request, make every entry `failed`: no entry ran.
+///   request, make every entry `failed`: no entry ran. The deadline running
+///   out while the link is still being acquired is one of these: the request
+///   is written only after the link is held.
 /// - a failure after it was written (the connection broke, the reply was cut
 ///   off or unreadable) makes every entry [`CARD_BATCH_UNKNOWN`] with
 ///   [`CODE_CARD_BATCH_CONNECTION_LOST`]: the daemon may have delivered it, or
@@ -2264,9 +2273,10 @@ pub(crate) fn card_batch_connection_lost_message(detail: &str) -> String {
 ///   The client says which by answering [`ClientError::Unanswered`] for every
 ///   failure after the first byte of the request.
 /// - the bound running out makes every entry [`CARD_BATCH_UNKNOWN`] with
-///   [`CODE_CARD_BATCH_NO_ANSWER`]. The bound does not say whether the request
-///   was written before it ran out (a hung connect or `Hello` spends it too),
-///   so the outcome is unconfirmed rather than sent.
+///   [`CODE_CARD_BATCH_NO_ANSWER`] once the link is held. The bound does not
+///   say whether the request was written before it ran out (a hung connect or
+///   `Hello` of the exchange spends it too), so the outcome is unconfirmed
+///   rather than sent.
 ///
 /// Nothing is sent again: the user decides, from the cards, whether to.
 async fn agent_card_invoke_batch_on(
@@ -2294,6 +2304,9 @@ async fn agent_card_invoke_batch_on(
                 })
                 .collect(),
         };
+    // One deadline for the whole command, the link's acquisition included.
+    let deadline = card_batch_reply_timeout(mode, entries.len());
+    let until = tokio::time::Instant::now() + deadline;
     let failed = dot_agent_deck::agent_cards::BATCH_FAILED;
     // The request was not written: a preview fails, an execution's entries
     // are each `failed` with `code`.
@@ -2301,17 +2314,38 @@ async fn agent_card_invoke_batch_on(
         CardBatchMode::Preview => Err(safe_message(error)),
         CardBatchMode::Execute => Ok(every(failed, code, &format!("{error}; nothing was sent"))),
     };
+    // The deck refused, and ran no entry: an execution's entries are each
+    // `failed` (`unsent` says what was not done), a preview's each `skipped`,
+    // with the deck's reason.
+    let refused = |code: &str, reason: &str, unsent: &str| match mode {
+        CardBatchMode::Preview => Ok(every(
+            dot_agent_deck::agent_cards::BATCH_SKIPPED,
+            code,
+            &format!("{reason}; nothing is sent to this agent"),
+        )),
+        CardBatchMode::Execute => Ok(every(failed, code, &format!("{reason}; {unsent}"))),
+    };
     let daemon = match crate::dto::DeckScope::resolve(Some(deck_id)) {
-        Ok(scope) => match state.daemon.trusted(scope.endpoint()).await {
-            Ok(daemon) => daemon,
-            Err(error) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
-        },
+        Ok(scope) => {
+            match tokio::time::timeout_at(until, state.daemon.trusted(scope.endpoint())).await {
+                Ok(Ok(daemon)) => daemon,
+                Ok(Err(error)) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
+                Err(_) => {
+                    return not_sent(
+                        CODE_CARD_BATCH_NOT_SENT,
+                        &format!(
+                            "the deck could not be reached within {}s",
+                            deadline.as_secs()
+                        ),
+                    );
+                }
+            }
+        }
         Err(error) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
     };
     if let Err(error) = daemon.require_compatible() {
         return not_sent(CODE_CARD_BATCH_NOT_SENT, &error);
     }
-    let deadline = card_batch_reply_timeout(mode, entries.len());
     let reply = daemon.client.invoke_card_action_batch(
         instance_id,
         mode,
@@ -2319,14 +2353,14 @@ async fn agent_card_invoke_batch_on(
         request_id,
         entries.clone(),
     );
-    let answer = match tokio::time::timeout(deadline, reply).await {
+    let answer = match tokio::time::timeout_at(until, reply).await {
         Ok(Ok(answer)) => answer,
         Ok(Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed)) => {
-            return Ok(every(
-                failed,
+            return refused(
                 dot_agent_deck::agent_cards::CODE_DAEMON_REPLACED,
-                "the deck's daemon was restarted after these cards were read; nothing was sent",
-            ));
+                "the deck's daemon was restarted after these cards were read",
+                "nothing was sent",
+            );
         }
         Ok(Err(ClientError::Unanswered(detail))) => {
             return match mode {
@@ -2343,14 +2377,11 @@ async fn agent_card_invoke_batch_on(
         // The daemon refused the `Hello` or the request: either way it ran no
         // entry, though the request itself may have reached it.
         Ok(Err(error @ ClientError::Server(_))) => {
-            return match mode {
-                CardBatchMode::Preview => Err(safe_message(error.to_string())),
-                CardBatchMode::Execute => Ok(every(
-                    failed,
-                    CODE_CARD_BATCH_DECK_REFUSED,
-                    &format!("{error}; nothing was delivered"),
-                )),
-            };
+            return refused(
+                CODE_CARD_BATCH_DECK_REFUSED,
+                &format!("the deck refused the request: {error}"),
+                "nothing was delivered",
+            );
         }
         // Every failure after the request's first byte is `Unanswered`, so
         // what is left failed before it: connecting, or the `Hello`.
@@ -2369,14 +2400,14 @@ async fn agent_card_invoke_batch_on(
             };
         }
     };
-    Ok(match answer {
-        GatedQuery::Answered(result) => result,
-        GatedQuery::Unsupported => every(
-            failed,
+    match answer {
+        GatedQuery::Answered(result) => Ok(result),
+        GatedQuery::Unsupported => refused(
             "unsupported",
             "this deck's daemon does not support batch card actions; upgrade it to act on several cards at once",
+            "nothing was sent",
         ),
-    })
+    }
 }
 
 /// Has the selection moved since this receiver last observed it?

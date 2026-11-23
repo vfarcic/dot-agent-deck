@@ -11,11 +11,16 @@ import { ExactText, ExactTextNote, SourceBadge } from "./AgentCard";
 const RESULT_WORD: Record<string, string> = { delivered: "Delivered", closed: "Closed", failed: "Failed", unknown: "No answer" };
 
 /**
- * A `delivered` entry the daemon answered with a delivery state that is not
- * the agent's confirmed receipt — `queued`: its text is in the agent's inbox
- * and the agent has not confirmed it (PR #2491 review).
+ * The delivery state a `delivered` entry is worded by. A daemon of this
+ * release always says `queued`: the text is in the agent's inbox and the agent
+ * has not confirmed it. An entry without a state (an earlier development build
+ * of the batch verb) is read the same way, the most that a delivered press can
+ * say when it answers, never as the agent's receipt (PR #2491 review).
  */
-const isQueued = (entry: CardBatchOutcome) => entry.outcome === "delivered" && entry.state !== undefined && entry.state !== "delivered";
+const deliveredState = (entry: CardBatchOutcome) => entry.state ?? "queued";
+
+/** A `delivered` entry whose state is not the agent's confirmed receipt. */
+const isQueued = (entry: CardBatchOutcome) => entry.outcome === "delivered" && deliveredState(entry) !== "delivered";
 
 /**
  * One row's word, after Send. A batch claims no more than a single press: a
@@ -23,35 +28,43 @@ const isQueued = (entry: CardBatchOutcome) => entry.outcome === "delivered" && e
  * ("Queued for the agent"), never "Delivered" (PR #2491 review).
  */
 function resultWord(entry: CardBatchOutcome): string {
-  if (entry.outcome === "delivered" && entry.state !== undefined) return deliveryStateWord(entry.state);
+  if (entry.outcome === "delivered") return deliveryStateWord(deliveredState(entry));
   return RESULT_WORD[entry.outcome] ?? displayText(entry.outcome, DISPLAY_LIMITS.name);
 }
 
+/** Whether a preview's action kind closes its agent. */
+const isClose = (kind: string | undefined) => kind === "close" || kind === "close_keep_worktree";
+
 /**
- * The headline of the results. Unanswered agents are not counted as sent or as
- * failed: either may still be true. Queued agents are counted as queued, never
- * as delivered: their agent has not confirmed the text yet (PR #2491 review).
+ * The headline of the results. Each outcome is counted on its own, in the
+ * words of its row: queued for the agent (never delivered: the agent has not
+ * confirmed the text yet), delivered to the agent, closed, failed, and not
+ * answered. An unanswered agent is counted as neither done nor failed: either
+ * may still be true, and what it may still be is the action's (a close may
+ * still close it, anything else may still be delivered). `kinds` is each row's
+ * action kind, as the preview answered it (PR #2491 review).
  */
-function resultsHeadline(rows: readonly BatchRow[]): string {
+function resultsHeadline(rows: readonly BatchRow[], kinds: ReadonlyMap<string, string>): string {
   const total = rows.length;
   const tally = (test: (entry: CardBatchOutcome) => boolean) => rows.filter((row) => test(row.entry)).length;
   const failed = tally((entry) => entry.outcome === "failed");
-  const unknown = tally((entry) => entry.outcome === "unknown");
-  if (unknown > 0) {
-    const parts = [`${total - failed - unknown} of ${total} confirmed sent`];
+  const unanswered = rows.filter((row) => row.entry.outcome === "unknown");
+  const queued = tally(isQueued);
+  const delivered = tally((entry) => entry.outcome === "delivered" && !isQueued(entry));
+  const closed = tally((entry) => entry.outcome === "closed");
+  const counts = ([[queued, "queued for the agent"], [delivered, "delivered to the agent"], [closed, "closed"]] as const).filter(([count]) => count > 0);
+  const done = counts.map(([count, word]) => `${count} ${word}`).join(", ");
+  if (unanswered.length > 0) {
+    const closing = unanswered.every((row) => isClose(kinds.get(rowKey(row))));
+    const parts = [done ? `${done} of ${total}` : `0 of ${total} confirmed ${closing ? "closed" : "sent"}`];
     if (failed > 0) parts.push(`${failed} failed`);
-    parts.push(`${unknown} not answered, may still be delivered`);
+    parts.push(`${unanswered.length} not answered, may still be ${closing ? "closed" : "delivered"}`);
     return parts.join("; ");
   }
-  const queued = tally(isQueued);
-  const closed = tally((entry) => entry.outcome === "closed");
-  const sent = total - failed - queued - closed;
-  const kinds = ([[queued, "queued for the agent"], [closed, "closed"], [sent, "sent"]] as const).filter(([count]) => count > 0);
-  if (failed === 0 && kinds.length === 1) {
-    const [, word] = kinds[0];
-    return word === "closed" ? `Closed all ${total}` : word === "sent" ? `Sent to all ${total}` : `Queued for all ${total}`;
+  if (failed === 0 && counts.length === 1) {
+    const [, word] = counts[0];
+    return word === "closed" ? `Closed all ${total}` : word === "delivered to the agent" ? `Delivered to all ${total}` : `Queued for all ${total}`;
   }
-  const done = kinds.map(([count, word]) => `${count} ${word}`).join(", ");
   return done ? `${done} of ${total}; ${failed} failed` : `${failed} of ${total} failed`;
 }
 
@@ -110,6 +123,7 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
   const included = previewed.filter((row) => row.entry.outcome === "included");
   const skipped = previewed.filter((row) => row.entry.outcome !== "included");
   const names = new Map(previewed.flatMap((row) => (row.entry.name ? [[rowKey(row), row.entry.name] as const] : [])));
+  const kinds = new Map(previewed.flatMap((row) => (row.entry.kind ? [[rowKey(row), row.entry.kind] as const] : [])));
   const done = view.stage === "done";
   const results = rowsOf(view.results);
   /* Which daemon each agent is on, said only when the batch reaches more than one. */
@@ -183,7 +197,7 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
           )}
           {done && (
             <>
-              <h3 role="status">{resultsHeadline(results)}</h3>
+              <h3 role="status">{resultsHeadline(results, kinds)}</h3>
               <ul className="agent-cards-batch-list">
                 {results.map((row) => { const { entry } = row; return (
                   <li key={rowKey(row)} className={`agent-cards-batch-entry is-${entry.outcome === "failed" ? "failed" : entry.outcome === "unknown" ? "unknown" : "done"}`} data-testid="agent-cards-batch-entry" data-outcome={entry.outcome}>

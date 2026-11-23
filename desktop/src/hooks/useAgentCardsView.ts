@@ -41,11 +41,13 @@ export const BATCH_STILL_SENDING = "The batch is still being sent, so it stays o
 /** What follows the error on each agent's row when a batch's execution failed in a way the desktop could not place before or after the request left. */
 export const BATCH_NOT_KNOWN = "it is not known whether this agent got it. Check the agent before sending again";
 /**
- * Why an agent is skipped when its daemon's preview failed (PR #2491 review):
- * the other daemons' agents still proceed, and nothing is sent to this one.
- * The daemon's own error follows.
+ * Why an agent is skipped when its daemon could not be reached or did not
+ * answer the preview (PR #2491 review): the other daemons' agents still
+ * proceed, and nothing is sent to this one. The error follows. A daemon that
+ * answered by refusing the preview is not this: the desktop bridge answers
+ * each of its agents skipped with the daemon's own reason.
  */
-export const BATCH_DAEMON_UNREACHABLE = "its daemon did not answer the preview, so nothing is sent to it";
+export const BATCH_DAEMON_UNREACHABLE = "its daemon could not be reached or did not answer the preview, so nothing is sent to it";
 /** The code such a skipped agent carries. */
 export const CODE_BATCH_DAEMON_UNREACHABLE = "daemon_unreachable";
 /** …when another batch is asked for while one is being sent. */
@@ -338,11 +340,12 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     setNotice(undefined);
     setBatch({ actionId, label, scope, stage: "previewing", groups: [], results: [] });
     /* Each daemon's preview settles on its own (PR #2491 review): one that
-       cannot be reached, times out or refuses the request leaves its agents
-       skipped with its error, and the other daemons' agents proceed. Send
-       sends only to agents a preview included, so none of them is sent to.
-       When no daemon answered, there is nothing to review, and the error is
-       the batch's. */
+       cannot be reached or does not answer leaves its agents skipped with
+       its error, and the other daemons' agents proceed. One that refuses the
+       preview answers it, each agent skipped with the daemon's reason, so it
+       is not read as unanswered. Send sends only to agents a preview
+       included, so none of them is sent to. When no daemon answered, there
+       is nothing to review, and the error is the batch's. */
     const parts = [...groups.values()];
     const reason = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
     void Promise.allSettled(parts.map(async (group): Promise<CardBatchGroup> => {
@@ -352,7 +355,12 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
         requestId: newCardRequestId(),
         instanceId: group.instanceId,
       });
-      return { deckId: group.deckId, instanceId: group.instanceId, entries: answer.entries };
+      /* An entry the daemon answered without a name (a preview it refused
+         whole, which the bridge answers for each agent) keeps the name its
+         card shows. */
+      const named = new Map(group.cards.map((card) => [`${card.entry.pane_id}\u0000${card.entry.agent_id}`, card.entry.name]));
+      const entries = answer.entries.map((entry) => entry.name !== undefined ? entry : { ...entry, name: named.get(`${entry.pane_id}\u0000${entry.agent_id}`) });
+      return { deckId: group.deckId, instanceId: group.instanceId, entries };
     })).then((settled) => {
       if (batchRun.current !== run) return;
       const failures = settled.flatMap((part) => (part.status === "rejected" ? [reason(part.reason)] : []));

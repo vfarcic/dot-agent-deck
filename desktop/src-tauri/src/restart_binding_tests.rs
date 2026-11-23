@@ -1717,3 +1717,142 @@ async fn a_card_batch_refused_before_sending_fails_and_sends_nothing() {
     }
     assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
 }
+
+/// Scenario (PR #2491 review): the user sends "Go ahead" to two agents while
+/// acquiring the link to their deck takes 20 s, and the deck then never
+/// answers the batch. The whole send still ends at the batch's one bound, so
+/// the dialog is held no longer than it: each agent reads "unknown". When the
+/// link is not acquired within the bound at all, each agent reads "failed",
+/// nothing sent, and no batch request reaches the deck.
+#[tokio::test]
+async fn a_card_batch_s_bound_covers_acquiring_the_link_to_its_deck() {
+    use dot_agent_deck::agent_cards::{BATCH_FAILED, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-slow-link", "a");
+    deck.script.lock().unwrap().silent_batch = true;
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let deadline = crate::card_batch_reply_timeout(CardBatchMode::Execute, 2);
+    let slow_link = std::time::Duration::from_secs(20);
+    assert!(
+        slow_link < deadline,
+        "precondition: the link arrives in time"
+    );
+    let gate = state.daemon.establishment_gate_for_test(&deck.endpoint());
+
+    tokio::time::pause();
+    let held = Arc::clone(&gate).lock_owned().await;
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(slow_link).await;
+        drop(held);
+    });
+    let started = tokio::time::Instant::now();
+    let sent = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-slow-link-1",
+        batch_entries(),
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    release.await.unwrap();
+    let result = sent.expect("an unanswered execution still answers each entry");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_NO_ANSWER)
+        );
+    }
+    assert!(
+        waited >= deadline && waited < deadline + std::time::Duration::from_secs(1),
+        "the time spent acquiring the link counts against the one bound: {waited:?}"
+    );
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
+
+    tokio::time::pause();
+    let held = Arc::clone(&gate).lock_owned().await;
+    let started = tokio::time::Instant::now();
+    let sent = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-slow-link-2",
+        batch_entries(),
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    drop(held);
+    let result = sent.expect("an execution that was not sent still answers each entry");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_FAILED, "{entry:?}");
+        assert_eq!(entry.code.as_deref(), Some(crate::CODE_CARD_BATCH_NOT_SENT));
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(message.ends_with("; nothing was sent"), "{message}");
+    }
+    assert!(
+        waited >= deadline && waited < deadline + std::time::Duration::from_secs(1),
+        "a link never acquired ends at the same bound: {waited:?}"
+    );
+    assert_eq!(
+        deck.script.lock().unwrap().batch_requests.len(),
+        1,
+        "no batch request was written"
+    );
+}
+
+/// Scenario (PR #2491 review): the user previews "Go ahead" on two agents of
+/// a deck that refuses the request whole, as it refuses a batch naming more
+/// cards than it allows. Each agent is skipped with the deck's own reason,
+/// rather than read as a deck that did not answer, and nothing is sent.
+#[tokio::test]
+async fn a_card_batch_preview_the_deck_refuses_skips_each_agent_with_the_deck_s_reason() {
+    use dot_agent_deck::agent_cards::{BATCH_SKIPPED, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-preview-refused", "a");
+    deck.script.lock().unwrap().refuse_batch =
+        Some("invoke-card-action-batch: a batch may name at most 256 cards; this one names more");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Preview,
+        "batch-preview-refused-1",
+        batch_entries(),
+    )
+    .await
+    .expect("a refused preview answers each entry");
+    assert_eq!(result.entries.len(), 2);
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_SKIPPED, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_DECK_REFUSED)
+        );
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("at most 256 cards")
+                && message.ends_with("; nothing is sent to this agent"),
+            "{message}"
+        );
+        assert!(!message.contains("did not answer"), "{message}");
+    }
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
+}

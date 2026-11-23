@@ -396,4 +396,89 @@ describe("batch card actions (#2399)", () => {
     expect(within(failed).getByRole("button", { name: /^Send$/ })).toBeDisabled();
     expect(calls.invokeCardActionBatch.mock.calls.filter(([, , options]) => options.mode === "execute")).toHaveLength(1);
   });
+
+  /// Scenario: Send a reviewed batch that a daemon answers with each text delivered but no delivery state, as an earlier development build of the batch verb did. Each agent's row reads "Queued for the agent", the most a press can say when it answers, and the headline says it was queued for all of them, never "Delivered" or "Sent to all".
+  it("desktop/agent-cards/042: a delivered entry without a delivery state reads as queued, never as delivered", async () => {
+    const calls = setup();
+    const dialog = await startSelectedBatch();
+    calls.invokeCardActionBatch.mockImplementationOnce(async (_deckId: string, _actionId: string, options: BatchOptions) => ({
+      request_id: options.requestId,
+      entries: INCLUDED.map(({ pane_id, agent_id, name }) => ({ pane_id, agent_id, name, outcome: "delivered" as const, message_id: `m-${agent_id}` })),
+    }));
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    const results = screen.getByTestId("agent-cards-batch-results");
+    const rows = within(results).getAllByTestId("agent-cards-batch-entry");
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row).toHaveAttribute("data-outcome", "delivered");
+      expect(within(row).getByText("Queued for the agent", { exact: true })).toBeInTheDocument();
+    }
+    expect(within(results).getByRole("status")).toHaveTextContent("Queued for all 2");
+    expect(within(results).queryByText(/Sent to all|Delivered/)).toBeNull();
+  });
+
+  /// Scenario: Select one card on each of two daemons and start a batch while one daemon refuses the preview whole, as it refuses a batch naming more cards than it allows. That daemon's agent is skipped with the daemon's own reason, not with the sentence for a daemon that did not answer, the other daemon's agent is included, and Send sends only to the daemon that previewed.
+  it("desktop/agent-cards/043: a daemon that refuses the preview shows its reason, not that it did not answer", async () => {
+    const calls = setupTwoDaemons();
+    const answer = calls.invokeCardActionBatch.getMockImplementation()!;
+    // What the desktop bridge answers for a preview the daemon refused whole.
+    const REFUSED = "the deck refused the request: invoke-card-action-batch: a batch may name at most 256 cards; this one names more; nothing is sent to this agent";
+    calls.invokeCardActionBatch.mockImplementation(async (deckId: string, actionId: string, options: BatchOptions) => {
+      if (deckId === FIXTURE_DAEMON_ID && options.mode === "preview") {
+        return { request_id: options.requestId, entries: options.entries.map(({ pane_id, agent_id }) => ({ pane_id, agent_id, outcome: "skipped" as const, code: "deck_refused", message: REFUSED })) };
+      }
+      return answer(deckId, actionId, options);
+    });
+    fireEvent.click(screen.getByTestId("agent-cards-select"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    const dialog = screen.getByTestId("agent-cards-batch-confirm");
+    expect(dialog).toHaveAttribute("data-stage", "review");
+    const rowFor = (scope: HTMLElement, name: string) => within(scope).getAllByTestId("agent-cards-batch-entry").filter((row) => within(row).queryByText(name, { exact: true }));
+    const skipped = rowFor(dialog, "local-coder");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toHaveClass("is-skipped");
+    expect(within(skipped[0]).getByText(REFUSED)).toBeInTheDocument();
+    expect(within(dialog).queryByText(new RegExp(BATCH_DAEMON_UNREACHABLE))).toBeNull();
+    expect(within(dialog).queryByText(/did not answer/)).toBeNull();
+    expect(rowFor(dialog, "remote-coder")[0]).toHaveClass("is-included");
+
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    const executed = calls.invokeCardActionBatch.mock.calls.filter(([, , options]) => options.mode === "execute");
+    expect(executed.map(([deckId]) => deckId)).toEqual([FIXTURE_REMOTE_DAEMON_ID]);
+  });
+
+  /// Scenario: Send two reviewed batches whose daemon answers one agent and leaves the other unanswered: first a prompt the daemon queued for one agent, then a close it confirmed for one agent. The headline counts each outcome in its own words, "1 queued for the agent of 2" and "1 closed of 2", says the unanswered agent may still be delivered or may still be closed as its action is, and never calls a closed agent sent.
+  it("desktop/agent-cards/044: the results headline counts queued, closed, failed and unanswered agents apart", async () => {
+    const calls = setup();
+    const unanswered = (entry: BatchEntry) => ({ pane_id: entry.pane_id, agent_id: entry.agent_id, outcome: "unknown", code: "no_answer", message: "the deck did not answer within 35s" });
+    let dialog = await startSelectedBatch();
+    calls.invokeCardActionBatch.mockImplementationOnce(async (_deckId: string, _actionId: string, options: BatchOptions) => ({
+      request_id: options.requestId,
+      entries: [{ ...INCLUDED[0], outcome: "delivered", message_id: "m-root", state: "queued" }, unanswered(INCLUDED[1])],
+    }) as never);
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    let results = screen.getByTestId("agent-cards-batch-results");
+    expect(within(results).getByRole("status")).toHaveTextContent("1 queued for the agent of 2; 1 not answered, may still be delivered");
+    expect(within(results).queryByText(/confirmed sent/)).toBeNull();
+    fireEvent.click(within(results).getByTestId("agent-cards-batch-close"));
+
+    const third = { pane_id: OUTSIDE.pane_id, agent_id: OUTSIDE.agent_id, name: OUTSIDE.name };
+    const closing = [...INCLUDED.map(({ prompt: _prompt, ...entry }) => entry), { ...third, outcome: "included" as const, action_token: "tok-preview-outside", instance_id: INSTANCE }]
+      .map((entry) => ({ ...entry, kind: "close", label: "Close" }));
+    calls.invokeCardActionBatch.mockImplementation(async (_deckId: string, _actionId: string, options: BatchOptions) => ({
+      request_id: options.requestId,
+      entries: options.mode === "preview"
+        ? [...closing, SKIPPED]
+        : [{ ...INCLUDED[0], outcome: "closed" }, { ...INCLUDED[1], outcome: "failed", code: "close_failed", message: "the agent did not stop" }, { ...third, outcome: "unknown", code: "no_answer", message: "the deck did not answer within 45s" }],
+    }) as never);
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    dialog = screen.getByTestId("agent-cards-batch-confirm");
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    results = screen.getByTestId("agent-cards-batch-results");
+    const headline = within(results).getByRole("status");
+    expect(headline).toHaveTextContent("1 closed of 3; 1 failed; 1 not answered, may still be closed");
+    expect(headline).not.toHaveTextContent(/sent|delivered/i);
+  });
 });
