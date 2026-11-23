@@ -2253,7 +2253,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               </OverviewInstrument>
             </DashboardCounters>
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
-            {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
+            {/* Icon-only since the deck left the experimental flag (issue #1308): with its label the shipped top bar ran past 1440px on CI's font. The rail's Daemons entry is the labelled door. */}
+            <button className="button secondary compact" data-testid="overview-open-deck" aria-label="Open daemons" title="Open daemons" onClick={openDeck}><SquareTerminal size={14} /></button>
             {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} consumeCards={runtime.consumeAgentCards} />}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
             {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}
@@ -2339,6 +2340,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               filtering={filtering}
               fleetSize={decks.length}
               onOpenDeck={openDeck}
+              orchestrationsShown={desktopFeaturesOf(runtime).showOrchestrations}
               onAddDaemon={addDaemon}
               onReconnect={() => {
                 setOverrideError(undefined);
@@ -2483,7 +2485,7 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner }: {
+function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, orchestrationsShown = false, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner }: {
   /** PRD #1790 stage 2 — this deck's interrupted work banner, while its daemon lists any. */
   interruptedBanner?: ReactNode;
   deck: FleetDeck;
@@ -2500,8 +2502,9 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
   startError?: StartErrorView;
   /** Issue #1490 — Start daemon on this deck. Absent unless its reason offers it. */
   onStartDaemon?: () => void;
-  /** Absent while the deck is hidden (issue #1198), which removes this group's Open deck buttons. */
   onOpenDeck?: () => void;
+  /** Whether the Orchestrations panel is shown (it is behind the experimental flag, issue #1198), so a sentence may send the user to it. */
+  orchestrationsShown?: boolean;
   onReconnect: () => void;
   onConnectAnyway?: () => void;
   /** PRD #1487 — Upgrade this deck's daemon, and on the local deck this machine's CLI (issue #1753). Absent unless something is behind. */
@@ -2667,6 +2670,7 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
           overrideError={overrideError}
           startError={startError}
           onOpenDeck={onOpenDeck}
+          orchestrationsShown={orchestrationsShown}
           onReconnect={onReconnect}
           onStartDaemon={onStartDaemon}
           onConnectAnyway={onConnectAnyway}
@@ -2695,7 +2699,7 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent, onAddDaemon }: {
+function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, orchestrationsShown = false, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent, onAddDaemon }: {
   agents: OverviewAgent[];
   sections: OverviewSection[];
   filtering: boolean;
@@ -2715,8 +2719,9 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
   overrideError?: string;
   /** Issue #1490 — why the last Start daemon on this deck failed, in the crate's words, and its technical detail. */
   startError?: StartErrorView;
-  /** Absent while the deck is hidden (issue #1198): no Open deck button, and no sentence sending the user to it. */
   onOpenDeck?: () => void;
+  /** Whether the Orchestrations panel is shown (issue #1198): a sentence sends the user to it only then. */
+  orchestrationsShown?: boolean;
   onReconnect: () => void;
   /** Issue #1490 — offered in place of Reconnect when the deck's reason says no daemon runs. */
   onStartDaemon?: () => void;
@@ -2884,13 +2889,14 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
       No "Open daemons" here: it opened the Daemons screen for the SELECTED
       daemon, not this group's, so under All daemons it landed on a "choose a
       daemon" note; with experimental features on, the top bar and the rail
-      keep that door. The Orchestrations panel is named only where the screen
-      it lives on is shown (issue #1198); a sentence pointing at a hidden
-      screen is a door that is not there.
+      keep that door. The Orchestrations panel is named only while it is shown
+      (issue #1198; the Daemons screen it opens on left the flag in #1308, the
+      panel did not); a sentence pointing at a hidden panel is a door that is
+      not there.
     */
     const next = onNewAgent
-      ? onOpenDeck ? "Create an agent on this daemon, or activate an orchestration from the Daemons screen's Orchestrations panel." : "Create an agent on this daemon."
-      : onOpenDeck ? "Activate an orchestration from the Daemons screen's Orchestrations panel, or start an agent from the CLI in a project directory." : "Start an agent from the CLI in a project directory.";
+      ? orchestrationsShown ? "Create an agent on this daemon, or activate an orchestration from the Daemons screen's Orchestrations panel." : "Create an agent on this daemon."
+      : orchestrationsShown ? "Activate an orchestration from the Daemons screen's Orchestrations panel, or start an agent from the CLI in a project directory." : "Start an agent from the CLI in a project directory.";
     return (
       <div className="overview-note overview-note-row" data-testid="overview-first-run">
         <Blocks size={22} aria-hidden="true" />

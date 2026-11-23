@@ -18985,7 +18985,7 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "<span>Open daemons</span>",
+            source: "aria-label=\"Open daemons\"",
             file: AGENT_OVERVIEW_TSX,
             said: "Open daemons",
             row: "open_deck",
