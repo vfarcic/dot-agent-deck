@@ -695,12 +695,6 @@ export interface DesktopFeatures {
    * tabs, which a live daemon supplies nothing for today. Off leaves Terminal as the only tab.
    */
   showAgentDetails: boolean;
-  /**
-   * PRD #1790 stage 3 — the interrupted work dialog's Restore: its button and
-   * `s` key, the restore question, and the spoken restore. Off leaves the
-   * dialog listing interrupted work as before.
-   */
-  showAgentRestore: boolean;
 }
 
 /** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
@@ -711,7 +705,6 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showOrchestrations: false,
   showAgentProfiles: false,
   showAgentDetails: false,
-  showAgentRestore: false,
 };
 
 /*

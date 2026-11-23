@@ -964,9 +964,9 @@ enum InterruptedCmd {
         #[arg(long, requires = "all")]
         yes: bool,
     },
-    /// Restore an item's agent with its conversation (experimental). It
-    /// comes back as a pane of its own, in the folder it ran in, and is told
-    /// the deck restarted.
+    /// Restore an item's agent with its conversation. It comes back as a
+    /// pane of its own, in the folder it ran in, and is told the deck
+    /// restarted.
     Restore {
         /// The item's id, or its unique name, branch or id suffix.
         id: String,
@@ -993,8 +993,7 @@ enum InterruptedCmd {
         yes: bool,
     },
     /// Start an item's agent over in the folder it ran in, without its
-    /// conversation (experimental). A dispatched unit gets its saved task
-    /// again.
+    /// conversation. A dispatched unit gets its saved task again.
     StartOver {
         /// The item's id, or its unique name, branch or id suffix.
         id: String,
@@ -4446,9 +4445,6 @@ async fn run_interrupted_cli(cmd: InterruptedCmd) -> ExitCode {
     use std::io::{BufRead, IsTerminal, Write};
     let client = DaemonClient::new(client_attach_socket_path());
     let identity = || dot_agent_deck::close_cli::ambient_identity();
-    // PRD #1790 stage 3: the restore surfaces read the experimental flag, as
-    // the TUI and the daemon do, from the launch project's config (env wins).
-    dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let mut ask = |question: &str| {
         eprint!("{question}");
         let _ = std::io::stderr().flush();

@@ -452,7 +452,6 @@ export const RESTART_NOTE_NOT_SENT = "The deck could not give the restored agent
 export const SAVED_TASK_NOT_SENT = "The deck could not give the new agent its saved task. Give it the task yourself.";
 export const RESTORE_NOT_RECORDED = "The deck could not record this, so the item may be listed again. Dismiss it if it is.";
 export const NOTHING_RESTORED = "Nothing was restored.";
-export const RESTORE_NEEDS_EXPERIMENTAL = "Restoring agents is experimental and turned off. Turn it on with `[features] experimental = true` in .dot-agent-deck.toml, or set DOT_AGENT_DECK_EXPERIMENTAL=1.";
 export const RESTORE_UNSUPPORTED = "The running deck daemon does not support restoring agents. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
 export const MAX_SHOWN_CHARS = 300;
 /** `MAX_SHOWN_REPORTS`: the most reports one page shows; Previous reports falls back on it with no page to go back to. */

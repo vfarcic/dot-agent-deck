@@ -147,7 +147,6 @@ fn daemon_with(state: &Path, path: &str, extra: &[(&str, &str)]) -> common::Daem
     let mut env = vec![
         ("DOT_AGENT_DECK_STATE_DIR", state.to_str().unwrap()),
         ("PATH", path),
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
     ];
     env.extend_from_slice(extra);
     inbox::daemon_unbound(&env)
@@ -307,11 +306,9 @@ impl Decks {
         dir
     }
 
+    /// The CLI as a person runs it, with the experimental flag pinned off:
+    /// restore is not behind it (issue #2494).
     fn person(&self, args: &[&str]) -> Output {
-        self.person_with_flag(args, "1")
-    }
-
-    fn person_with_flag(&self, args: &[&str], flag: &str) -> Output {
         Command::new(common::contained_deck_binary())
             .args(args)
             .env_clear()
@@ -320,7 +317,7 @@ impl Decks {
             .env("DOT_AGENT_DECK_SOCKET", &self.live.hook_socket)
             .env("DOT_AGENT_DECK_ATTACH_SOCKET", &self.live.attach_socket)
             .env("DOT_AGENT_DECK_STATE_DIR", &self.state)
-            .env("DOT_AGENT_DECK_EXPERIMENTAL", flag)
+            .env("DOT_AGENT_DECK_EXPERIMENTAL", "0")
             .stdin(Stdio::null())
             .current_dir(&self.repo)
             .output()
@@ -488,7 +485,7 @@ fn assert_refused(reply: &Value, attempt: &str, reason: &str) {
     );
 }
 
-/// Scenario: Restart a daemon that ran a scripted Claude with a known conversation, inspect the CLI's per-agent verdict, and refuse an unconfirmed or disabled restore without starting anything. Restore and continue then starts the original command with literal resume arguments, removes the interrupted item, and delivers exactly the continue note as its first inbox message.
+/// Scenario: Restart a daemon that ran a scripted Claude with a known conversation, inspect the CLI's per-agent verdict, and refuse an unconfirmed restore without starting anything, with the experimental flag off. Restore and continue then starts the original command with literal resume arguments, removes the interrupted item, and delivers exactly the continue note as its first inbox message.
 #[spec("journal/restore/011")]
 #[test]
 fn journal_restore_011_continue_resumes_the_session_before_its_first_message() {
@@ -520,25 +517,13 @@ fn journal_restore_011_continue_resumes_the_session_before_its_first_message() {
         "no TTY needs --yes: {}",
         text(&unconfirmed)
     );
-    for args in [
-        vec!["interrupted", "restore", &id, "--continue", "--yes"],
-        vec![
-            "interrupted",
-            "start-over",
-            &id,
-            "--agent",
-            &attempt,
-            "--yes",
-        ],
-    ] {
-        let disabled = decks.person_with_flag(&args, "0");
-        exit(&disabled, 1);
-        assert!(
-            text(&disabled).contains("experimental"),
-            "name the disabled flag: {}",
-            text(&disabled)
-        );
-    }
+    let unconfirmed = decks.person(&["interrupted", "start-over", &id, "--agent", &attempt]);
+    exit(&unconfirmed, 1);
+    assert!(
+        text(&unconfirmed).contains("--yes"),
+        "no TTY needs --yes: {}",
+        text(&unconfirmed)
+    );
     assert_eq!(decks.starts().len(), 1, "refusals start nothing");
     assert!(decks.inbox(None).is_empty(), "refusals send nothing");
     let dry = decks.person(&["interrupted", "restore", &id, "--continue", "--dry-run"]);
@@ -596,7 +581,6 @@ fn restore_tui(decks: &Decks, snapshot: &str) -> common::TuiDeck {
             "DOT_AGENT_DECK_SOCKET",
             decks.live.hook_socket.to_string_lossy().to_string(),
         )
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             decks.root.join(snapshot).to_string_lossy().to_string(),

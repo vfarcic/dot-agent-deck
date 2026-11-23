@@ -887,8 +887,7 @@ fn refused_attempt(reason: words::RestoreRefusal) -> words::RestoreRefused {
 }
 
 #[test]
-fn show_prints_each_agent_its_attempt_and_its_verdict_with_the_flag_on() {
-    crate::features::set_for_test(crate::features::Features::test_with(true));
+fn show_prints_each_agent_its_attempt_and_its_verdict() {
     let mut unit = item(UNIT_ID, ItemKind::Unit, "fix-login");
     unit.agents.push(words::ItemAgent {
         attempt: crate::work_journal::AttemptId::parse(ATTEMPT).unwrap(),
@@ -912,16 +911,10 @@ fn show_prints_each_agent_its_attempt_and_its_verdict_with_the_flag_on() {
     assert!(text.contains(ATTEMPT), "{text}");
     assert!(text.contains(words::RESTORE_VERDICT_RESUME), "{text}");
     assert!(text.contains(words::START_OVER), "{text}");
-    crate::features::set_for_test(crate::features::Features::test_with(false));
-    let text = render_item(&unit);
-    assert!(
-        !text.contains(ATTEMPT) && !text.contains(words::RESTORE_VERDICT_RESUME),
-        "no verdicts with the flag off: {text}"
-    );
 }
 
 #[test]
-fn restore_and_start_over_are_refused_before_anything_is_sent_when_off_or_unconfirmed() {
+fn restore_and_start_over_are_refused_before_anything_is_sent_when_unconfirmed() {
     let (_dir, client) = no_daemon();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let restore = |dry_run: bool, yes: bool| RestoreArgs {
@@ -931,34 +924,9 @@ fn restore_and_start_over_are_refused_before_anything_is_sent_when_off_or_unconf
         dry_run,
         yes,
     };
-    // The flag off: refused, naming it, whatever was confirmed.
-    crate::features::set_for_test(crate::features::Features::test_with(false));
-    let out = rt.block_on(run_restore(
-        &client,
-        &restore(false, true),
-        &AmbientIdentity::Person,
-        Confirm::NoTerminal,
-    ));
-    assert_eq!(out.code, EXIT_REFUSED);
-    assert!(out.stderr.contains("experimental"), "{}", out.stderr);
-    let out = rt.block_on(run_start_over(
-        &client,
-        &StartOverArgs {
-            id: UNIT_ID.into(),
-            agent: ATTEMPT.into(),
-            dry_run: false,
-            yes: true,
-        },
-        &AmbientIdentity::Person,
-        Confirm::NoTerminal,
-    ));
-    assert_eq!(out.code, EXIT_REFUSED);
-    assert!(out.stderr.contains("experimental"), "{}", out.stderr);
-
-    // On: no terminal and no --yes refuses and names --yes; a person who
-    // says no restores nothing. Neither reaches the (absent) daemon, which
-    // would be exit 3.
-    crate::features::set_for_test(crate::features::Features::test_with(true));
+    // No terminal and no --yes refuses and names --yes; a person who says
+    // no restores nothing. Neither reaches the (absent) daemon, which would
+    // be exit 3.
     let out = rt.block_on(run_restore(
         &client,
         &restore(false, false),
@@ -967,6 +935,24 @@ fn restore_and_start_over_are_refused_before_anything_is_sent_when_off_or_unconf
     ));
     assert_eq!(out.code, EXIT_REFUSED);
     assert!(out.stderr.contains("--yes"), "{}", out.stderr);
+    let out = rt.block_on(run_start_over(
+        &client,
+        &StartOverArgs {
+            id: UNIT_ID.into(),
+            agent: ATTEMPT.into(),
+            dry_run: false,
+            yes: false,
+        },
+        &AmbientIdentity::Person,
+        Confirm::NoTerminal,
+    ));
+    assert_eq!(out.code, EXIT_REFUSED);
+    assert_eq!(
+        out.stderr.trim_end(),
+        words::START_OVER_NEEDS_YES,
+        "{}",
+        out.stderr
+    );
     let mut asked = Vec::new();
     let mut no = |question: &str| {
         asked.push(question.to_string());
@@ -994,7 +980,6 @@ fn restore_and_start_over_are_refused_before_anything_is_sent_when_off_or_unconf
         Confirm::NoTerminal,
     ));
     assert_eq!(out.code, EXIT_UNREACHABLE, "{}", out.stderr);
-    crate::features::set_for_test(crate::features::Features::test_with(false));
 }
 
 #[test]

@@ -927,11 +927,11 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** orphaned descendants in an old process session or the spawn write site.
 - **Platform coverage:** mac+linux.
 
-##### journal/restore/007 — The TUI asks with the offered restore choices and hides the surface when disabled.
+##### journal/restore/007 — The TUI asks with the offered restore choices.
 
 - **Layer:** L1 `TestBackend` and insta through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); list and details entry points.
 - **Agent:** none; injected Claude resume, Pi Start-over and older-deck Claude (`start_over`, `old-process-unknown`) verdicts.
-- **Asserts:** `s` opens the question for the selected name without acting; a resumable agent shows exactly `Restore and continue` and `Restore only`; a gap agent offers `Start over in this worktree` instead; a Claude an older deck started shows the `old-process-unknown` sentence and Start over only, `c`/`o` send nothing and `w` sends one StartOverInterrupted for its attempt (review R#2); wording equals the shared Rust constants. With experimental features off, the same key leaves the rendered list/details unchanged, no restore hint or choice is drawn in the dashboard/footer/details, and no action request is recorded.
+- **Asserts:** `s` opens the question for the selected name without acting; a resumable agent shows exactly `Restore and continue` and `Restore only`; a gap agent offers `Start over in this worktree` instead; a Claude an older deck started shows the `old-process-unknown` sentence and Start over only, `c`/`o` send nothing and `w` sends one StartOverInterrupted for its attempt (review R#2); wording equals the shared Rust constants. All of it runs with the experimental flag off: restore is not behind it (issue #2494).
 - **Does not assert:** daemon execution or genuine conversation recall; the resulting snapshots need review at promotion.
 - **Platform coverage:** mac+linux.
 
@@ -947,7 +947,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI outside a pane, no terminal on stdin; restart by SIGTERM to the owned daemon pid and a new daemon on the same state directory.
 - **Agent:** synthetic executable named `claude` on PATH, recording argv and reporting a real hook-protocol `SessionStart` through the deck's hook CLI. No agent credential.
-- **Asserts:** show names the agent and attempt and says `Can be restored with its conversation.`; without `--yes` a nonterminal restore refuses and names `--yes`; with `DOT_AGENT_DECK_EXPERIMENTAL=0`, restore and start-over refuse and name the flag; dry-run starts nothing and keeps the item. Restore and continue launches the original command once in its folder with separate `--resume`, UUID arguments, removes all three one-shot resume variables from the child, shows the same name on an independent dashboard pane, sends exactly the continue note as its first inbox message with deck reason `restart note`, and removes the interrupted item.
+- **Asserts:** show names the agent and attempt and says `Can be restored with its conversation.`; without `--yes` a nonterminal restore and a nonterminal start-over each refuse and name `--yes`; every CLI call runs with `DOT_AGENT_DECK_EXPERIMENTAL=0`, since restore is not behind the flag (issue #2494); dry-run starts nothing and keeps the item. Restore and continue launches the original command once in its folder with separate `--resume`, UUID arguments, removes all three one-shot resume variables from the child, shows the same name on an independent dashboard pane, sends exactly the continue note as its first inbox message with deck reason `restart note`, and removes the interrupted item.
 - **Does not assert:** genuine agent conversation recall (lane 2, 016/017); TUI or desktop confirmation controls (007–010/015); Restore-only delivery (015); unsupported launch shapes.
 - **Platform coverage:** mac+linux.
 
@@ -1004,7 +1004,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L1 unit of the TUI's saved-pane startup predicate, extending `tests/session_restore_precedence.rs` around the real SavedSession::load call in `src/ui.rs`.
 - **Agent:** none; in-memory saved pane, interrupted list and launch records.
-- **Asserts:** on a daemon-empty startup with experimental features on, a saved pane is deferred exactly when its directory and verbatim command match a launch record joined by both item work id and resumable attempt id; name changes do not defeat the match. Flag off, Start-over verdict, different directory or command, missing item/record, or wrong-work/wrong-attempt record preserves ordinary saved-pane startup. The existing daemon-hydration-wins gate remains structural.
+- **Asserts:** on a daemon-empty startup with the experimental flag pinned off, a saved pane is deferred exactly when its directory and verbatim command match a launch record joined by both item work id and resumable attempt id; name changes do not defeat the match. Start-over verdict, different directory or command, missing item/record, or wrong-work/wrong-attempt record preserves ordinary saved-pane startup. The existing daemon-hydration-wins gate remains structural.
 - **Does not assert:** an actual PTY launch on this predicate (the production call site must use it); remote transport of the daemon's matching launch data; process liveness or the agent's actual resume (006/011/015).
 - **Platform coverage:** mac+linux.
 

@@ -78,8 +78,7 @@ pub enum Press {
     DismissAll,
     /// `y` in a confirmation.
     Yes,
-    /// PRD #1790 stage 3, `s` in the list or details (experimental): ask
-    /// whether to restore the selected item's agent.
+    /// PRD #1790 stage 3, `s` in the list or details: ask whether to restore the selected item's agent.
     Restore,
     /// `c` in the restore question: Restore and continue.
     RestoreContinue,
@@ -1067,13 +1066,12 @@ pub(super) fn handle_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig)
             _ if shifted('d') => Some(Press::DismissAll),
             KeyCode::Char('r') => Some(Press::Reclaim),
             KeyCode::Char('d') => Some(Press::Dismiss),
-            // PRD #1790 stage 3: experimental, gated here and in the hints.
-            KeyCode::Char('s') if crate::features::show_agent_restore() => Some(Press::Restore),
+            KeyCode::Char('s') => Some(Press::Restore),
             _ => None,
         },
         View::Details { .. } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(Press::Back),
-            KeyCode::Char('s') if crate::features::show_agent_restore() => Some(Press::Restore),
+            KeyCode::Char('s') => Some(Press::Restore),
             KeyCode::Enter => Some(Press::Open),
             KeyCode::Char('n') => Some(Press::NextReports),
             KeyCode::Char('p') => Some(Press::PreviousReports),
@@ -1786,38 +1784,36 @@ fn details_body(
         None => {}
     }
     // PRD #1790 stage 3: each agent and whether it can come back, as the
-    // CLI's `interrupted show` lists them — behind the experimental flag.
-    if crate::features::show_agent_restore() {
-        for agent in &item.agents {
-            let mut name = agent.name.as_deref().map(clean).unwrap_or_default();
-            if let Some(role) = &agent.role {
-                name.push_str(&format!(" ({})", clean(role)));
-            }
-            let mut said = format!(
-                "{}: {name} · {}: {}",
-                words::LABEL_AGENT,
-                words::LABEL_ATTEMPT,
-                clean(agent.attempt.as_str())
-            );
-            if let Some(folder) = &agent.folder {
-                said.push_str(&format!(" · {}: {}", words::LABEL_FOLDER, clean(folder)));
-            }
-            lines.extend(wrapped(&said, width, "    ", text_primary()));
-            lines.extend(wrapped(
-                &words::restore_verdict_sentence(agent.restore),
-                width,
-                "      ",
-                text_dim(),
-            ));
+    // CLI's `interrupted show` lists them.
+    for agent in &item.agents {
+        let mut name = agent.name.as_deref().map(clean).unwrap_or_default();
+        if let Some(role) = &agent.role {
+            name.push_str(&format!(" ({})", clean(role)));
         }
-        if item.agents_omitted > 0 {
-            lines.extend(wrapped(
-                &words::omitted_sentence(item.agents_omitted),
-                width,
-                "    ",
-                text_dim(),
-            ));
+        let mut said = format!(
+            "{}: {name} · {}: {}",
+            words::LABEL_AGENT,
+            words::LABEL_ATTEMPT,
+            clean(agent.attempt.as_str())
+        );
+        if let Some(folder) = &agent.folder {
+            said.push_str(&format!(" · {}: {}", words::LABEL_FOLDER, clean(folder)));
         }
+        lines.extend(wrapped(&said, width, "    ", text_primary()));
+        lines.extend(wrapped(
+            &words::restore_verdict_sentence(agent.restore),
+            width,
+            "      ",
+            text_dim(),
+        ));
+    }
+    if item.agents_omitted > 0 {
+        lines.extend(wrapped(
+            &words::omitted_sentence(item.agents_omitted),
+            width,
+            "    ",
+            text_dim(),
+        ));
     }
     if item.cut {
         lines.extend(wrapped(words::ITEM_CUT, width, "    ", text_dim()));
@@ -2093,7 +2089,7 @@ fn hints(iw: &InterruptedWork, overflow: bool) -> String {
                 if item.kind != ItemKind::Agent {
                     parts.push(format!("r {}", lower(words::RECLAIM_ACTION)));
                 }
-                if crate::features::show_agent_restore() && !item.agents.is_empty() {
+                if !item.agents.is_empty() {
                     parts.push(format!("s {}", lower(words::RESTORE_ACTION)));
                 }
                 parts.push(format!("d {}", lower(words::DISMISS_ACTION)));
@@ -2109,9 +2105,7 @@ fn hints(iw: &InterruptedWork, overflow: bool) -> String {
             if !asked && iw.item(id).is_some_and(|item| !item.reports.is_empty()) {
                 parts.push("Enter show reports".to_string());
             }
-            if crate::features::show_agent_restore()
-                && iw.item(id).is_some_and(|item| !item.agents.is_empty())
-            {
+            if iw.item(id).is_some_and(|item| !item.agents.is_empty()) {
                 parts.push(format!("s {}", lower(words::RESTORE_ACTION)));
             }
             if let Some(show) = show.as_deref().filter(|_| *asked) {

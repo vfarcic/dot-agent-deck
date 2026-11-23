@@ -240,24 +240,22 @@ fn render_item_paged(item: &InterruptedItem, page: Option<(usize, Option<usize>)
         }
     }
     // PRD #1790 stage 3: each agent, the attempt a restore or start-over
-    // names, and whether it can come back — behind the experimental flag.
-    if crate::features::show_agent_restore() {
-        for agent in &item.agents {
-            let name = agent.name.as_deref().map(shown).unwrap_or_default();
-            out.push_str(&format!(
-                "    {}: {name}  {}: {}\n        {}\n",
-                words::LABEL_AGENT,
-                words::LABEL_ATTEMPT,
-                agent.attempt,
-                words::restore_verdict_sentence(agent.restore)
-            ));
-        }
-        if item.agents_omitted > 0 {
-            out.push_str(&format!(
-                "    {}\n",
-                words::omitted_sentence(item.agents_omitted)
-            ));
-        }
+    // names, and whether it can come back.
+    for agent in &item.agents {
+        let name = agent.name.as_deref().map(shown).unwrap_or_default();
+        out.push_str(&format!(
+            "    {}: {name}  {}: {}\n        {}\n",
+            words::LABEL_AGENT,
+            words::LABEL_ATTEMPT,
+            agent.attempt,
+            words::restore_verdict_sentence(agent.restore)
+        ));
+    }
+    if item.agents_omitted > 0 {
+        out.push_str(&format!(
+            "    {}\n",
+            words::omitted_sentence(item.agents_omitted)
+        ));
     }
     if item.cut {
         out.push_str(&format!("    {}\n", words::ITEM_CUT));
@@ -667,9 +665,9 @@ fn restore_refusal_text(refused: &words::RestoreRefused) -> String {
     }
 }
 
-/// Whether the acting command may go on: the experimental flag is on, and
-/// it was confirmed (`--yes`, a dry run, or the person answered yes on a
-/// terminal). `None` to go on; otherwise the output that refuses.
+/// Whether the acting command may go on: it was confirmed (`--yes`, a dry
+/// run, or the person answered yes on a terminal). `None` to go on; otherwise
+/// the output that refuses.
 fn restore_gate(
     dry_run: bool,
     yes: bool,
@@ -677,9 +675,6 @@ fn restore_gate(
     question: &str,
     confirm: Confirm<'_>,
 ) -> Option<CliOutput> {
-    if !crate::features::show_agent_restore() {
-        return Some(failed(words::RESTORE_NEEDS_EXPERIMENTAL, EXIT_REFUSED));
-    }
     if dry_run || yes {
         return None;
     }
@@ -695,10 +690,10 @@ fn restore_gate(
     }
 }
 
-/// Whether the acting command will ask on a terminal: the flag is on, it is
-/// not a dry run, `--yes` was not given, and there is a terminal.
+/// Whether the acting command will ask on a terminal: it is not a dry run,
+/// `--yes` was not given, and there is a terminal.
 fn asks(dry_run: bool, yes: bool, confirm: &Confirm<'_>) -> bool {
-    crate::features::show_agent_restore() && !dry_run && !yes && matches!(confirm, Confirm::Ask(_))
+    !dry_run && !yes && matches!(confirm, Confirm::Ask(_))
 }
 
 /// `question` with a dry run's Git note ([`words::restore_git_note`]) in

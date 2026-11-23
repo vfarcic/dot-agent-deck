@@ -2130,39 +2130,14 @@ fn interrupted_037_a_failed_refresh_says_the_list_may_be_out_of_date() {
     );
 }
 
-use dot_agent_deck::features::{self, Features};
 use dot_agent_deck::interrupted_work::{
     ItemAgent, RESTORE_ACTION, RESTORE_AND_CONTINUE, RESTORE_AND_CONTINUE_EXPLANATION,
     RESTORE_ONLY, RESTORE_ONLY_EXPLANATION, RestoreMode, RestoreReason, RestoreVerdict, START_OVER,
     restore_question, restore_reason_sentence, restore_verdict_sentence, start_over_question,
 };
-use std::sync::{Mutex, MutexGuard};
 
 const RESTORE_ATTEMPT_A: &str = "restore-seam/7";
 const RESTORE_ATTEMPT_B: &str = "restore-seam/8";
-static RESTORE_FLAG_LOCK: Mutex<()> = Mutex::new(());
-
-// Restore the global even when an assertion panics. All flag-mutating tests in
-// this target take this lock; nextest also isolates each test in its own process.
-struct RestoreFlag {
-    old: Features,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl RestoreFlag {
-    fn set(enabled: bool) -> Self {
-        let lock = RESTORE_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = features::current();
-        features::set_for_test(Features::test_with(enabled));
-        Self { old, _lock: lock }
-    }
-}
-
-impl Drop for RestoreFlag {
-    fn drop(&mut self) {
-        features::set_for_test(self.old);
-    }
-}
 
 fn restore_fixture(id: &str, attempt: &str, name: &str, resume: bool) -> InterruptedItem {
     let mut listed = item(id, ItemKind::Agent, name);
@@ -2219,27 +2194,10 @@ fn expected_start_over(id: &str, attempt: &str) -> InterruptedSeamRequest {
     }
 }
 
-fn no_restore_hint(frame: &str) {
-    // Existing chrome spells key hints with the key first and a lowercase verb.
-    let lower = frame.to_lowercase();
-    for forbidden in [
-        "s restore",
-        "restore s",
-        "restore and continue",
-        "restore only",
-    ] {
-        assert!(
-            !lower.contains(forbidden),
-            "flag off hides {forbidden:?}:\n{frame}"
-        );
-    }
-}
-
-/// Scenario: Open the interrupted list and press s on a resumable Claude, on an agent that can only start over, and on a Claude an older deck started without recording its process, inspecting both the list and details entry points. The older-deck Claude is offered Start over only, and w sends exactly that; a non-restorable or newer verdict offers no confirmation; with experimental features off, s opens no question and neither view draws a restore hint.
+/// Scenario: Open the interrupted list and press s on a resumable Claude, on an agent that can only start over, and on a Claude an older deck started without recording its process, inspecting both the list and details entry points. The older-deck Claude is offered Start over only, and w sends exactly that; a non-restorable or newer verdict offers no confirmation, all with the experimental flag left off.
 #[spec("journal/restore/007")]
 #[test]
 fn journal_restore_007_the_question_offers_only_the_selected_agents_choices() {
-    let _flag = RestoreFlag::set(true);
     assert_eq!(RESTORE_ACTION, "Restore");
     assert_eq!(RESTORE_AND_CONTINUE, "Restore and continue");
     assert_eq!(RESTORE_ONLY, "Restore only");
@@ -2357,36 +2315,12 @@ fn journal_restore_007_the_question_offers_only_the_selected_agents_choices() {
             "non-restorable: {sent:?}"
         );
     }
-
-    features::set_for_test(Features::test_with(false));
-    let listed = only(restore_fixture(
-        AGENT_ID,
-        RESTORE_ATTEMPT_A,
-        "restore-scratch",
-        true,
-    ));
-    for details in [false, true] {
-        let mut steps = vec![InterruptedSeamStep::RestoreCapability(true), ch('I')];
-        if details {
-            steps.push(key(KeyCode::Enter));
-        }
-        steps.push(ch('s'));
-        let (shown, sent) = run(&listed, &steps);
-        no_restore_hint(&shown[0]);
-        let before = &shown[shown.len() - 2];
-        let after = shown.last().unwrap();
-        no_restore_hint(before);
-        no_restore_hint(after);
-        assert_eq!(before, after, "s is inert when the flag is off");
-        assert!(restore_actions(&sent).is_empty(), "{sent:?}");
-    }
 }
 
 /// Scenario: Select the second interrupted agent and confirm with c or o, or choose w for an agent that must start over; only that item's shown attempt is sent once, even after more action keys while it is pending. Escape, q and n return without acting, and a daemon missing restore-agents receives no restore or start-over request and leaves an explanation on screen.
 #[spec("journal/restore/008")]
 #[test]
 fn journal_restore_008_confirmations_target_one_attempt_once_and_honour_capabilities() {
-    let _flag = RestoreFlag::set(true);
     let list_for = |resume| InterruptedList {
         items: vec![
             restore_fixture(AGENT_ID, RESTORE_ATTEMPT_A, "restore-first", true),
@@ -2518,7 +2452,6 @@ fn journal_restore_008_confirmations_target_one_attempt_once_and_honour_capabili
 #[spec("journal/restore/043")]
 #[test]
 fn journal_restore_043_a_partly_restored_item_offers_only_the_agent_still_interrupted() {
-    let _flag = RestoreFlag::set(true);
     let mut listed = restore_fixture(AGENT_ID, RESTORE_ATTEMPT_A, "restore-back", true);
     let mut waiting = listed.agents[0].clone();
     listed.agents[0].restore = RestoreVerdict::NotRestorable {

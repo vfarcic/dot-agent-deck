@@ -13850,23 +13850,17 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// PRD #1790 stage 3 (brief §11-Q1, option b; catalog `journal/restore/018`):
 /// whether the daemon-empty saved-workspace restore leaves `saved` for the
 /// restore question instead of starting its command again as a blank agent.
-/// True only with [`crate::features::show_agent_restore`] on, for a saved
-/// pane whose folder and exact command are those of a launch record that
-/// `interrupted` lists as an agent offered a resume, joined by both the
-/// item's work id and the agent's attempt. A Start-over or any other
+/// True only for a saved pane whose folder and exact command are those of a
+/// launch record that `interrupted` lists as an agent offered a resume,
+/// joined by both the item's work id and the agent's attempt. A Start-over or any other
 /// verdict, a different folder or command, or a record of another attempt
 /// or work starts the pane as before. It starts nothing and checks no
 /// process: the daemon's own checks run when the restore is asked for.
-///
-/// A presentation decision of the TUI's: no daemon logic reads the flag.
 pub fn should_defer_saved_agent_restore(
     saved: &config::SavedPane,
     interrupted: &crate::interrupted_work::InterruptedList,
     launches: &[crate::launch_records::LaunchRecord],
 ) -> bool {
-    if !crate::features::show_agent_restore() {
-        return false;
-    }
     interrupted.items.iter().any(|item| {
         item.agents.iter().any(|agent| {
             agent.restore == crate::interrupted_work::RestoreVerdict::Resume
@@ -13887,9 +13881,9 @@ const SAVED_RESTORE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// PRD #1790 stage 3: what [`should_defer_saved_agent_restore`] decides
 /// from — the attached daemon's interrupted work list and the launch records
 /// in this user's state directory — or `None` when no saved pane could be
-/// left for the restore question: the flag is off, no plain saved pane has a
-/// command, the daemon did not answer within its bound or cannot list
-/// interrupted work, or it offers no resume.
+/// left for the restore question: no plain saved pane has a command, the
+/// daemon did not answer within its bound or cannot list interrupted work,
+/// or it offers no resume.
 ///
 /// The launch records are read locally, but only a record whose work id and
 /// attempt are those of an item and agent this daemon listed can match: a
@@ -13902,11 +13896,10 @@ fn saved_restore_deferral(
     crate::interrupted_work::InterruptedList,
     Vec<crate::launch_records::LaunchRecord>,
 )> {
-    if !crate::features::show_agent_restore()
-        || !saved
-            .panes
-            .iter()
-            .any(|pane| pane.orchestration.is_none() && !pane.command.is_empty())
+    if !saved
+        .panes
+        .iter()
+        .any(|pane| pane.orchestration.is_none() && !pane.command.is_empty())
     {
         return None;
     }

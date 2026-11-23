@@ -1878,7 +1878,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const interruptedDeck = interruptedOpen ? interrupted?.decks[interruptedOpen.deckId] : undefined;
   const interruptedDeckName = interruptedOpen ? decks.find((deck) => deck.snapshot.connection.deckId === interruptedOpen.deckId) : undefined;
   const interruptedDialogView = interrupted && interruptedOpen && interruptedDeck && interruptedDeck.instance === interruptedOpen.instance
-    ? <InterruptedWorkDialog key={`${interruptedOpen.deckId}:${interruptedOpen.instance}`} deckLabel={interruptedDeckName ? deckName(interruptedDeckName.snapshot.connection) : ""} deck={interruptedDeck} target={interruptedOpen} runtime={interrupted} controlsRef={interruptedControls} restoreShown={desktopFeaturesOf(runtime).showAgentRestore} />
+    ? <InterruptedWorkDialog key={`${interruptedOpen.deckId}:${interruptedOpen.instance}`} deckLabel={interruptedDeckName ? deckName(interruptedDeckName.snapshot.connection) : ""} deck={interruptedDeck} target={interruptedOpen} runtime={interrupted} controlsRef={interruptedControls} />
     : undefined;
   const cardsBodyFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
     const shown = cardsOnScreen(deck);

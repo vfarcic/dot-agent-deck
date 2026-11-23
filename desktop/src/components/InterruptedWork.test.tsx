@@ -1349,10 +1349,11 @@ function desktopRestoreBridge(kind: DesktopRestoreKind = "resume") {
   };
 }
 
-function RestoreOverview({ bridge, enabled = true, voiceChannel }: { bridge: DeckBridge; enabled?: boolean; voiceChannel?: VoiceOverviewChannel }) {
+/** Every experimental surface off: restore is not behind the flag (issue #2494). */
+function RestoreOverview({ bridge, voiceChannel }: { bridge: DeckBridge; voiceChannel?: VoiceOverviewChannel }) {
   const deck = deckOf("restore-process");
   const interruptedWork = useInterruptedWork(bridge, [deck]);
-  return <AgentOverview runtime={{ ...baseRuntime(deck), desktopFeatures: fixtureDesktopFeatures(enabled ? "?experimental=1" : ""), ...(interruptedWork ? { interruptedWork } : {}) }} onNavigate={vi.fn()} voiceChannel={voiceChannel} />;
+  return <AgentOverview runtime={{ ...baseRuntime(deck), desktopFeatures: fixtureDesktopFeatures(""), ...(interruptedWork ? { interruptedWork } : {}) }} onNavigate={vi.fn()} voiceChannel={voiceChannel} />;
 }
 
 async function restoreKey(dialog: HTMLElement, key: string) {
@@ -1455,22 +1456,6 @@ describe("journal/restore/009 — the desktop restore question", () => {
     expect(recorded.actions()).toEqual([]);
   });
 
-  /** Scenario: with experimental features off, both list and details hide Restore, and s leaves the visible view unchanged and starts nothing. The daemon still lists the agent's recorded restore verdict. */
-  it("journal/restore/009 keeps the restore seam inert with the flag off", async () => {
-    const recorded = desktopRestoreBridge();
-    render(<RestoreOverview bridge={recorded.bridge} enabled={false} />);
-    const dialog = await openDialog();
-    for (const details of [false, true]) {
-      if (details) await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
-      expect(within(dialog).queryByTestId("interrupted-restore")).toBeNull();
-      const before = dialog.textContent;
-      await restoreKey(dialog, "s");
-      expect(dialog.textContent).toBe(before);
-      expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
-    }
-    expect(recorded.actions()).toEqual([]);
-  });
-
   /** Scenario: select a Claude that an older deck started without recording its process, and press s. The question explains that and offers Start over only: c and o send nothing, and w sends one start over of that attempt. */
   it("journal/restore/009 offers only Start over for an agent an older deck started", async () => {
     const recorded = desktopRestoreBridge("legacy");
@@ -1534,21 +1519,6 @@ describe("journal/restore/010 — spoken restore asks and stops", () => {
     const dialog = await openDialog();
     await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), { filterText: "missing item" }); });
     expect(voice.reportRefused).toHaveBeenCalledWith(expect.any(String));
-    expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
-    expect(recorded.actions()).toEqual([]);
-  });
-
-  /** Scenario: a spoken restore made with experimental features off opens no question and starts nothing, even though the daemon lists resumable agents. */
-  it("journal/restore/010 keeps the spoken restore seam hidden with the flag off", async () => {
-    const recorded = desktopRestoreBridge();
-    const channel: VoiceOverviewChannel = { current: undefined };
-    render(<RestoreOverview bridge={recorded.bridge} enabled={false} voiceChannel={channel} />);
-    const dialog = await openDialog();
-    const reportRefused = vi.fn();
-    await act(async () => {
-      VOICE_ACTIONS.askRestoreInterrupted.run({ ...(channel.current as VoiceOverviewContext), reportRefused }, {});
-    });
-    expect(reportRefused).toHaveBeenCalledWith(expect.stringMatching(/experimental|enabled|available/i));
     expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
     expect(recorded.actions()).toEqual([]);
   });

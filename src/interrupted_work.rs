@@ -1387,8 +1387,6 @@ pub const RESTORE_NEEDS_YES: &str =
 /// A start-over asked for with no terminal to confirm on and no `--yes`.
 pub const START_OVER_NEEDS_YES: &str =
     "Refused: there is no terminal to confirm on, so nothing was started. Add --yes to start over.";
-/// The restore surfaces are experimental and the flag is off.
-pub const RESTORE_NEEDS_EXPERIMENTAL: &str = "Restoring agents is experimental and turned off. Turn it on with `[features] experimental = true` in .dot-agent-deck.toml, or set DOT_AGENT_DECK_EXPERIMENTAL=1.";
 /// Audit suggestion (CLI confirmation binding): the daemon that answered the
 /// question was replaced before the confirmed action reached it.
 pub const RESTORE_DAEMON_REPLACED: &str = "Refused: the deck daemon was restarted or replaced while you were answering, so nothing was started. Ask again.";

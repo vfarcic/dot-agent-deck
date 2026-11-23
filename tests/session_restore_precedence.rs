@@ -65,7 +65,7 @@ impl Drop for SavedAgentFlag {
     }
 }
 
-/// Scenario: On a fresh TUI startup with no hydrated panes, a saved pane matching a resumable agent's recorded directory and exact command is left for the restore question instead of starting blank. Turning the flag off, changing either match field, or having only a Start-over verdict keeps the ordinary saved-pane start, and an unrelated launch record cannot suppress it.
+/// Scenario: On a fresh TUI startup with no hydrated panes, a saved pane matching a resumable agent's recorded directory and exact command is left for the restore question instead of starting blank, with the experimental flag pinned off. Changing either match field, or having only a Start-over verdict keeps the ordinary saved-pane start, and an unrelated launch record cannot suppress it.
 #[spec("journal/restore/018")]
 #[test]
 fn journal_restore_018_saved_panes_defer_only_an_exact_restorable_launch() {
@@ -122,17 +122,12 @@ fn journal_restore_018_saved_panes_defer_only_an_exact_restorable_launch() {
 
     // Exercise the same startup branch as SavedSession::load on a fresh daemon.
     assert!(should_apply_snapshot(&AppState::default()));
-    features::set_for_test(Features::test_with(true));
-    assert!(
-        should_defer_saved_agent_restore(&saved, &interrupted, std::slice::from_ref(&launch)),
-        "the matching command must not start blank before the user answers Restore"
-    );
     features::set_for_test(Features::test_with(false));
     assert!(
-        !should_defer_saved_agent_restore(&saved, &interrupted, std::slice::from_ref(&launch)),
-        "flag off preserves automatic saved-workspace startup"
+        should_defer_saved_agent_restore(&saved, &interrupted, std::slice::from_ref(&launch)),
+        "the matching command must not start blank before the user answers Restore, \
+         with the experimental flag off"
     );
-    features::set_for_test(Features::test_with(true));
     for verdict in [
         RestoreVerdict::StartOver {
             reason: RestoreReason::AgentCannotResume,

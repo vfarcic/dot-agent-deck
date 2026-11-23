@@ -288,7 +288,6 @@ impl LiveRestore {
             .env("DOT_AGENT_DECK_STATE_DIR", &self.state)
             .env("DOT_AGENT_DECK_SOCKET", &self.live.hook_socket)
             .env("DOT_AGENT_DECK_ATTACH_SOCKET", &self.live.attach_socket)
-            .env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
             .current_dir(&self.repo);
         command
     }
@@ -307,7 +306,6 @@ impl LiveRestore {
                 "DOT_AGENT_DECK_SOCKET",
                 self.live.hook_socket.to_string_lossy(),
             )
-            .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
             .with_env(
                 "DOT_AGENT_DECK_SESSION",
                 self.state.join(lifetime).to_string_lossy(),
@@ -534,7 +532,6 @@ fn spawn(home: &Path, state: &Path, path: &str, log: &Path) -> common::DaemonPro
         // .claude.json onboarding/trust and .claude credential locations.
         ("CODEX_HOME", codex.to_str().unwrap()),
         ("DOT_AGENT_DECK_STATE_DIR", state.to_str().unwrap()),
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
         ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900"),
         ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
         ("PATH", path),

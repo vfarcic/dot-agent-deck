@@ -755,12 +755,12 @@ describe("TauriDeckBridge", () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
 
-    invoke.mockResolvedValueOnce({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true, showAgentRestore: true });
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true, showAgentRestore: true });
+    invoke.mockResolvedValueOnce({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true });
     expect(invoke).toHaveBeenLastCalledWith("desktop_features");
 
     invoke.mockResolvedValueOnce({ showDeck: "yes", showProjects: 1 });
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false, showAgentRestore: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
     await bridge.dispose();
   });
 
@@ -1814,18 +1814,6 @@ describe("TauriDeckBridge", () => {
       expect(await bridge.interruptedWorkStartOver(target, "w", "restore-desktop/8", false)).toEqual({ outcome: "unsupported" });
     }
   });
-
-  /** Scenario: the app hides Restore when desktop_features is old, malformed or false. Only the literal true field enables it, and the fixture's experimental switch mirrors that decision. */
-  it("journal/restore/009 defaults the desktop restore feature off", async () => {
-    const { normalizeDesktopFeatures, fixtureDesktopFeatures } = await import("./bridge");
-    for (const raw of [null, {}, { showAgentRestore: false }, { showAgentRestore: "true" }]) {
-      expect(normalizeDesktopFeatures(raw).showAgentRestore).toBe(false);
-    }
-    expect(normalizeDesktopFeatures({ showAgentRestore: true }).showAgentRestore).toBe(true);
-    expect(fixtureDesktopFeatures("").showAgentRestore).toBe(false);
-    expect(fixtureDesktopFeatures("?experimental=0").showAgentRestore).toBe(false);
-    expect(fixtureDesktopFeatures("?experimental=1").showAgentRestore).toBe(true);
-  });
 });
 
 describe("FixtureDeckBridge scenarios", () => {
@@ -1861,13 +1849,13 @@ describe("FixtureDeckBridge scenarios", () => {
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
 
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false, showAgentRestore: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
 
     window.history.replaceState({}, "", "/?fixture=1&experimental=1");
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true, showAgentRestore: true });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true });
 
     window.history.replaceState({}, "", "/?fixture=1&experimental=0");
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false, showAgentRestore: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
   });
 
   /**

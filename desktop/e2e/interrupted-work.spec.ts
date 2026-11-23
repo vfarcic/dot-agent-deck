@@ -298,8 +298,9 @@ test.describe("Interrupted work", () => {
   });
 });
 
-async function openRestorePreview(page: Page, enabled = true, fixture = "restore") {
-  await page.goto(`/?fixture=1&interrupted=${fixture}${enabled ? "&experimental=1" : ""}`);
+/** Opened with every experimental surface off: restore is not behind the flag (issue #2494). */
+async function openRestorePreview(page: Page, fixture = "restore") {
+  await page.goto(`/?fixture=1&interrupted=${fixture}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await expect(page.getByTestId("interrupted-banner")).toContainText("2 interrupted items from before the restart");
@@ -413,7 +414,7 @@ test.describe("journal/restore/009 — desktop restore in the browser", () => {
   /** Scenario: in a short, narrow window, open the restore question for an agent whose long name wraps taller than the dialog, with the page's clock held so nothing counts before the test scrolls. Showing only the middle of the name, then only its end, then the choices below it leaves c ignored however long each is shown; scrolling through every line from the top makes c restore the agent. */
   test("journal/restore/009 a part taller than the window counts only once all of it was shown", async ({ page }) => {
     test.setTimeout(90_000);
-    const dialog = await openRestorePreview(page, true, "restore-long");
+    const dialog = await openRestorePreview(page, "restore-long");
     await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
     await page.setViewportSize({ width: 360, height: 120 });
     await page.clock.install();
@@ -449,20 +450,5 @@ test.describe("journal/restore/009 — desktop restore in the browser", () => {
     await page.keyboard.press("c");
     await expect(dialog).toHaveCount(0);
     await expect(page.getByTestId("interrupted-banner")).toContainText("1 interrupted item from before the restart");
-  });
-
-  /** Scenario: without experimental features, the stopped agents remain listed but list and details have no Restore button. Pressing s opens no question and leaves the list unchanged. */
-  test("journal/restore/009 hides Restore and ignores s without experimental features", async ({ page }) => {
-    const dialog = await openRestorePreview(page, false);
-    await expect(dialog.getByTestId("interrupted-restore")).toHaveCount(0);
-    await page.keyboard.press("s");
-    await expect(dialog.getByTestId("interrupted-restore-question")).toHaveCount(0);
-    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(2);
-    await dialog.getByTestId("interrupted-details").click();
-    await expect(dialog.getByTestId("interrupted-details-view")).toBeVisible();
-    await expect(dialog.getByTestId("interrupted-restore")).toHaveCount(0);
-    await page.keyboard.press("s");
-    await expect(dialog.getByTestId("interrupted-restore-question")).toHaveCount(0);
-    await expect(dialog.getByTestId("interrupted-details-view")).toBeVisible();
   });
 });
