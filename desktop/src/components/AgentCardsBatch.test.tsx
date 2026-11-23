@@ -16,7 +16,7 @@ const CHILD_TEXT = "CHILD-EXACT-2399: proceed with the child.";
 type BatchEntry = {
   pane_id: string; agent_id: string; outcome: "included" | "skipped" | "delivered" | "failed";
   name?: string; prompt?: string; action_token?: string; instance_id?: string;
-  code?: string; message?: string; message_id?: string;
+  code?: string; message?: string; message_id?: string; state?: string;
 };
 type BatchOptions = { mode: "preview" | "execute"; entries: { pane_id: string; agent_id: string; action_token?: string; instance_id?: string }[]; requestId: string };
 
@@ -55,10 +55,10 @@ function setup({ partial = false }: { partial?: boolean } = {}) {
   const invokeCardActionBatch = vi.fn(async (_deckId: string, _actionId: string, options: BatchOptions) => ({
     request_id: options.requestId,
     entries: options.mode === "preview" ? [...INCLUDED, SKIPPED] : [
-      { ...INCLUDED[0], outcome: "delivered", message_id: "m-batch-root" },
+      { ...INCLUDED[0], outcome: "delivered", message_id: "m-batch-root", state: "queued" },
       partial
         ? { ...INCLUDED[1], outcome: "failed", code: "stale_action", message: "The action changed after you reviewed it." }
-        : { ...INCLUDED[1], outcome: "delivered", message_id: "m-batch-child" },
+        : { ...INCLUDED[1], outcome: "delivered", message_id: "m-batch-child", state: "queued" },
     ],
   }));
   const live = {
@@ -116,7 +116,7 @@ function setupTwoDaemons() {
         ? [{ ...SHARED, name, outcome: "included", prompt: `${name}: go ahead.`, action_token: `tok-${name}`, instance_id: onLocal ? INSTANCE : REMOTE_INSTANCE }]
         : [onLocal
           ? { ...SHARED, outcome: "failed", code: "stale_action", message: "The action changed after you reviewed it." }
-          : { ...SHARED, name, outcome: "delivered", message_id: "m-remote" }],
+          : { ...SHARED, name, outcome: "delivered", message_id: "m-remote", state: "queued" }],
     };
   });
   const live = {
@@ -202,7 +202,7 @@ describe("batch card actions (#2399)", () => {
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });
 
-  /// Scenario: Send a reviewed batch in which the root succeeds and the child's action has changed. The result names each agent, marks the root delivered and the child failed with the daemon's reason, without claiming that the batch wholly succeeded.
+  /// Scenario: Send a reviewed batch in which the root's text is queued and the child's action has changed. The result names each agent, marks the root queued for the agent and the child failed with the daemon's reason, and counts one queued and one failed without claiming delivery.
   it("desktop/agent-cards/031: a partial failure shows the result for each agent", async () => {
     const calls = setup({ partial: true });
     const dialog = await startSelectedBatch();
@@ -213,9 +213,11 @@ describe("batch card actions (#2399)", () => {
     const child = rows.find((row) => within(row).queryByText("child", { exact: true }));
     expect(root).toBeDefined();
     expect(child).toBeDefined();
-    expect(within(root!).getByText("Delivered", { exact: true })).toBeInTheDocument();
+    expect(within(root!).getByText("Queued for the agent", { exact: true })).toBeInTheDocument();
+    expect(within(root!).queryByText("Delivered", { exact: true })).toBeNull();
     expect(within(child!).getByText("Failed", { exact: true })).toBeInTheDocument();
     expect(within(child!).getByText("The action changed after you reviewed it.")).toBeInTheDocument();
+    expect(within(results).getByRole("status")).toHaveTextContent("1 queued for the agent of 2; 1 failed");
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });

@@ -16859,11 +16859,11 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** even `confirm=false` opens a confirmation showing each included agent's exact daemon-previewed text as a quote, without a text input, and the skipped agent's reason; no execution occurs before Send or after Cancel; a later Send submits only the included preview entries with their definition tokens and daemon instances.
 - **Does not assert:** transport to a real daemon (agent-report/batch/002).
 
-##### desktop/agent-cards/031 — Partial results name each delivered and failed agent.
+##### desktop/agent-cards/031 — Partial results name each queued and failed agent.
 
 - **Test:** vitest `desktop/agent-cards/031: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** after Send, the root's row says Delivered and the child's row says Failed with the daemon's changed-action reason; the batch uses its own request rather than single-card invocations.
+- **Asserts:** after Send, the daemon's `state: "queued"` response makes the root's row say Queued for the agent, never Delivered, and the child's row says Failed with the daemon's changed-action reason; the headline counts one queued and one failed, and the batch uses its own request rather than single-card invocations.
 - **Does not assert:** a real stale definition (agent-report/batch/003).
 
 ##### desktop/agent-cards/032 — Voice starts a batch by opening its confirmation.
