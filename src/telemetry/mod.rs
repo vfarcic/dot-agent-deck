@@ -185,8 +185,12 @@ fn start_from(
     #[cfg(unix)]
     if let Some(deck) = deck {
         match shim::install(&config_dir, deck) {
-            Ok(dir) if telemetry.is_enabled() => telemetry.set_shim_dir(dir),
-            Ok(_) => {}
+            Ok(dir) => {
+                shim::record_installed(dir.clone());
+                if telemetry.is_enabled() {
+                    telemetry.set_shim_dir(dir);
+                }
+            }
             Err(e) => tracing::warn!(
                 "telemetry: the PATH shim could not be written ({e}); Codex and Devin will not \
                  switch on their own telemetry, and no agent can be restored with its \

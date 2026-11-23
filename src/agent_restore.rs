@@ -29,27 +29,41 @@
 //!    ([`crate::orchestrator_context::resolve_trusted_dir_path`],
 //!    [`crate::orchestrator_context::project_root_refusal`]); the agent starts
 //!    through that held descriptor ([`AgentPtyRegistry::spawn_agent_in`]);
-//! 6. the old process is gone: no process with the record's pid and start
-//!    time ([`crate::launch_records::process_gone`]), and on Linux no process
-//!    left in the old agent's session ([`old_session_has_members`]). A record
-//!    without the pid fields (written by a build before stage 3) refuses a
-//!    restore (`old-process-unknown`) but not a start over;
-//! 7. for a start over of a dispatched unit, the saved task is read without
-//!    following a symlink, a regular owner-only file of bounded size
-//!    ([`crate::dispatch_task::read_saved`]);
-//! 8. the request came from the person: one carrying a pane claim
+//! 6. the old process is gone, on evidence: the kernel says no process holds
+//!    the record's pid, or the one holding it started at another time
+//!    ([`crate::launch_records::process_gone`]); and no process is left in
+//!    the old agent's session ([`old_session_left`], Linux and macOS). A
+//!    record without the pid fields (written by a build before stage 3), a
+//!    process the OS would not let the deck look at, or a session it could
+//!    not list, refuses a restore (`old-process-unknown`) but not a start
+//!    over;
+//! 7. no other agent the deck runs is in the same conversation, nor being
+//!    restored into it (`session-in-use`, [`Sessions::in_use`],
+//!    [`InFlight`]);
+//! 8. for a start over of a dispatched unit, the saved task is read through
+//!    the held folder without following a symlink, a regular owner-only file
+//!    of bounded size ([`crate::dispatch_task::read_saved_in`]);
+//! 9. the request came from the person: one carrying a pane claim
 //!    ([`CallerClaim`]) is refused, as reclaim's is (the same cooperative
 //!    guard, not an authentication boundary).
 //!
-//! Restores and start-overs of one attempt are serialized ([`InFlight`]): a
-//! second request while one runs is refused, so two clients cannot start two
-//! writers into one conversation.
+//! Restores and start-overs of one attempt, and restores into one
+//! conversation, are serialized ([`InFlight`]): a second request while one
+//! runs is refused, so two clients cannot start two writers into one
+//! conversation. At most [`MAX_PENDING_RESTORES`] run at once.
+//!
+//! A dry run also reads the item's Git facts with the list's bounded probes
+//! ([`crate::interrupted_work_daemon::item_git_facts`]), so a client can name
+//! an open pull request on the item's branch in its question. It refuses
+//! nothing: a resume continues the work that pull request is about.
 //!
 //! **Restore.** The agent is started as a dashboard pane of its own (a fresh
 //! pane work, `launch: pane`), with the recorded command, `SHELL` override,
 //! agent type and name, a one-shot resume request in its environment
-//! ([`crate::telemetry::shim::RESUME_ENV_KEYS`]) and the shim directory first
-//! on that one spawn's `PATH`. It is confirmed only when its first attested
+//! ([`crate::telemetry::shim::RESUME_ENV_KEYS`]: a fresh token bound to the
+//! confirmation's lifetime, [`crate::telemetry::shim::mint_token`]) and the
+//! installed shim directory first on that one spawn's `PATH`
+//! ([`restore_path`]). It is confirmed only when its first attested
 //! hook session ([`AgentPtyRegistry::watch_restore_session`]) is the requested
 //! one, within [`CONFIRM_TIMEOUT`]. A different session, a refused
 //! acknowledgement from the shim, the agent exiting, or no confirmation in
@@ -68,7 +82,8 @@
 //!
 //! **What this does not guard against.** The checks run once each, before the
 //! spawn; another process can change the folder or start an agent there in
-//! between, as for reclaim. The descendant scan is Linux-only. A launch the
+//! between, as for reclaim. The session scan sees processes still in the old
+//! agent's session; one that left it (`setsid`) is not found. A launch the
 //! shim cannot reach (the agent called by an absolute path, `PATH`
 //! replaced, a wrapper that drops arguments) is never resumed: it is caught
 //! by the confirmation and answered `not-resumed`.
@@ -99,6 +114,10 @@ pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the confirmation looks.
 const CONFIRM_POLL: Duration = Duration::from_millis(50);
 
+/// How long past the confirmation's bound a restore's resume token stays
+/// usable: room for the agent's launch script to reach the shim.
+const TOKEN_SLACK_SECS: u64 = 60;
+
 /// The inbox reason the restart note is posted under.
 pub const RESTART_NOTE_REASON: &str = "restart note";
 
@@ -118,27 +137,59 @@ fn confirm_timeout() -> Duration {
     CONFIRM_TIMEOUT
 }
 
-/// The attempts a restore or start-over is running for.
-static IN_FLIGHT: LazyLock<Mutex<HashSet<AttemptId>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+/// The most restores and start-overs running at once (audit S3).
+pub const MAX_PENDING_RESTORES: usize = 16;
 
-/// One attempt held against a second restore or start-over until dropped.
-struct InFlight(AttemptId);
+/// What the running restores and start-overs hold: each one's attempt, and
+/// for a restore the conversation it resumes into.
+#[derive(Default)]
+struct Held {
+    attempts: HashSet<AttemptId>,
+    sessions: HashSet<String>,
+}
+
+static IN_FLIGHT: LazyLock<Mutex<Held>> = LazyLock::new(|| Mutex::new(Held::default()));
+
+/// One attempt, and the conversation a restore of it resumes into, held
+/// against a second restore or start-over until dropped: of the same attempt
+/// (`already-restoring`), or of any attempt into the same conversation
+/// (`session-in-use`, audit "later slices" 3); and at most
+/// [`MAX_PENDING_RESTORES`] at once (`too-many-pending`).
+struct InFlight {
+    attempt: AttemptId,
+    session: Option<String>,
+}
 
 impl InFlight {
-    fn take(attempt: &AttemptId) -> Option<Self> {
+    fn take(attempt: &AttemptId, session: Option<&str>) -> Result<Self, RestoreRefusal> {
         let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        held.insert(attempt.clone())
-            .then(|| InFlight(attempt.clone()))
+        if held.attempts.contains(attempt) {
+            return Err(RestoreRefusal::AlreadyRestoring);
+        }
+        if session.is_some_and(|session| held.sessions.contains(session)) {
+            return Err(RestoreRefusal::SessionInUse);
+        }
+        if held.attempts.len() >= MAX_PENDING_RESTORES {
+            return Err(RestoreRefusal::TooManyPending);
+        }
+        held.attempts.insert(attempt.clone());
+        if let Some(session) = session {
+            held.sessions.insert(session.to_string());
+        }
+        Ok(InFlight {
+            attempt: attempt.clone(),
+            session: session.map(str::to_string),
+        })
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        IN_FLIGHT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
+        let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        held.attempts.remove(&self.attempt);
+        if let Some(session) = &self.session {
+            held.sessions.remove(session);
+        }
     }
 }
 
@@ -157,19 +208,58 @@ struct Target {
     session: Option<String>,
     /// The program the shim resumes (a restore).
     program: Option<&'static str>,
-    /// The saved task to post first (a dispatched unit's start over).
-    task: Option<String>,
+    /// A dispatched unit's start over: its saved task is read from the held
+    /// folder and posted first ([`start`]).
+    wants_task: bool,
 }
 
 /// What the journal checks found for a request.
 struct Prepared {
     journal: WorkJournal,
+    /// The item, as this request's own read found it.
+    item: InterruptedItem,
     /// The item's works, root first, which a success closes.
     works: Vec<WorkId>,
     targets: Vec<Result<Target, RestoreRefused>>,
 }
 
-/// The journal checks of a request: 1–4, 6 and 7 of the module docs.
+/// What a request's read says of every attempt's conversation: each
+/// attempt's latest session, and which attempts ended.
+struct Sessions<'a> {
+    latest: std::collections::HashMap<&'a AttemptId, crate::work_journal::SessionReport<'a>>,
+    ended: HashSet<&'a AttemptId>,
+}
+
+impl<'a> Sessions<'a> {
+    fn of(read: &'a crate::work_journal::JournalRead) -> Self {
+        let ended = read
+            .lines
+            .iter()
+            .filter_map(|line| match &line.event {
+                Event::AttemptEnded { attempt, .. } => Some(attempt),
+                _ => None,
+            })
+            .collect();
+        Sessions {
+            latest: crate::work_journal::latest_sessions(&read.lines),
+            ended,
+        }
+    }
+
+    /// Whether an attempt other than `attempt`, not ended and of a run that
+    /// is live, is in `session` now: an agent the deck runs (a copy restored
+    /// before, say) that a resume would write beside.
+    fn in_use(&self, attempt: &AttemptId, session: &str, live: &dyn Fn(&str) -> bool) -> bool {
+        self.latest.iter().any(|(other, report)| {
+            *other != attempt
+                && report.session == session
+                && !self.ended.contains(other)
+                && live(other.run())
+        })
+    }
+}
+
+/// The journal checks of a request: 1–4, 6 and 7 of the module docs (8 and 5 in [`start`]).
 /// Blocking.
 fn prepare(
     journal: WorkJournal,
@@ -198,6 +288,8 @@ fn prepare(
     let launches = crate::launch_records::read_all(state_dir)
         .map_err(|_| refuse(RestoreRefusal::IncompleteRead))?;
     let works = CloseSets::build(&snap.read).works_under(&item.id);
+    let sessions = Sessions::of(&snap.read);
+    let live = |run: &str| journal.run_is_live(run);
     let chosen: Vec<Result<&crate::interrupted_work::ItemAgent, RestoreRefused>> = if attempts
         .is_empty()
     {
@@ -228,12 +320,14 @@ fn prepare(
         .into_iter()
         .map(|agent| {
             let agent = agent?;
-            check_agent(&snap.read, &launches, &works, &item, agent, want)
+            check_agent(&sessions, &live, &launches, &works, &item, agent, want)
                 .map_err(|reason| RestoreRefused::new(Some(agent.attempt.clone()), reason))
         })
         .collect();
+    drop(sessions);
     Ok(Prepared {
         journal,
+        item,
         works,
         targets,
     })
@@ -254,7 +348,8 @@ fn offers(verdict: RestoreVerdict, want: Want) -> bool {
 
 /// The checks of one agent of the item.
 fn check_agent(
-    read: &crate::work_journal::JournalRead,
+    sessions: &Sessions<'_>,
+    live: &dyn Fn(&str) -> bool,
     launches: &[LaunchRecord],
     works: &[WorkId],
     item: &InterruptedItem,
@@ -281,25 +376,31 @@ fn check_agent(
     let (session, program) = match want {
         Want::StartOver => (None, None),
         Want::Resume => {
-            let Some((session, reported)) =
-                crate::work_journal::latest_session_of(&read.lines, &agent.attempt)
-            else {
+            let Some(report) = sessions.latest.get(&agent.attempt) else {
                 return Err(RestoreRefusal::NoSessionId);
             };
+            let session = report.session;
             let agent_type = record
                 .agent_type
                 .clone()
-                .unwrap_or_else(|| reported.clone());
+                .unwrap_or_else(|| report.agent.clone());
             let Some(resume) = crate::agent_registry::spec(&agent_type).resume else {
                 return Err(RestoreRefusal::NotRestorable);
             };
             if !resume.valid_session_id(session) {
                 return Err(RestoreRefusal::SessionIdInvalid);
             }
+            if sessions.in_use(&agent.attempt, session, live) {
+                return Err(RestoreRefusal::SessionInUse);
+            }
             (Some(session.to_string()), Some(resume.program))
         }
     };
-    match crate::launch_records::process_gone(&record) {
+    let gone = crate::launch_records::process_gone(&record).and_then(|()| match record.pid {
+        Some(pid) => old_session_left(pid),
+        None => Err(ProcessNotGone::OldProcessUnknown),
+    });
+    match gone {
         Ok(()) => {}
         Err(ProcessNotGone::StillRunning) => return Err(RestoreRefusal::StillRunning),
         // A start over writes to no old conversation; a resume would.
@@ -308,77 +409,58 @@ fn check_agent(
         }
         Err(ProcessNotGone::OldProcessUnknown) => {}
     }
-    if let Some(pid) = record.pid
-        && old_session_has_members(pid)
-    {
-        return Err(RestoreRefusal::StillRunning);
-    }
-    let task = match want {
-        Want::StartOver if matches!(item.kind, ItemKind::Unit | ItemKind::IssueDispatch) => {
-            let folder = Path::new(record.cwd.as_deref().unwrap_or_default());
-            match crate::dispatch_task::read_saved(folder, &record.work) {
-                Ok(task) => Some(task),
-                Err(crate::dispatch_task::SavedTaskError::NotSaved) => {
-                    return Err(RestoreRefusal::NoSavedTask);
-                }
-                Err(crate::dispatch_task::SavedTaskError::Unsafe) => {
-                    return Err(RestoreRefusal::TaskUnsafe);
-                }
-            }
-        }
-        _ => None,
-    };
     Ok(Target {
         attempt: agent.attempt.clone(),
         record,
         session,
         program,
-        task,
+        wants_task: want == Want::StartOver
+            && matches!(item.kind, ItemKind::Unit | ItemKind::IssueDispatch),
     })
 }
 
-/// Whether a process other than the old agent itself is still in the session
-/// the old agent `pid` led (Linux): a child it left behind that could still
-/// write to its conversation or worktree. Asked only while `pid` names no
-/// process: Linux does not hand out a pid that is still some process's
-/// session id, so a live `pid` (another process, its start time differs,
-/// [`crate::launch_records::process_gone`]) means that session emptied
-/// before. A `/proc` that cannot be listed answers `true`, the safe side.
-/// Elsewhere `false`: not looked for.
-#[cfg(target_os = "linux")]
-fn old_session_has_members(pid: u32) -> bool {
-    if crate::platform::proc::process_start_of(pid).is_some() {
-        return false;
+/// Whether the session the old agent `pid` led is empty: a child it left
+/// behind there could still write to its conversation or worktree (audit
+/// "later slices" 2). Asked once [`crate::launch_records::process_gone`]
+/// found `pid` itself gone. `Ok` when no process is in that session;
+/// `still-running` when one is; `old-process-unknown` when the OS would not
+/// say ([`crate::platform::proc::session_has_members`]: Linux and macOS
+/// list their processes; elsewhere nothing can be said).
+///
+/// A `pid` now held by another process (it started at another time): on
+/// Linux the kernel hands out no pid that is still a session's id, so the
+/// old session emptied before; elsewhere the scan still runs, and a new
+/// process that leads a session of that id refuses (the safe side).
+fn old_session_left(pid: u32) -> Result<(), ProcessNotGone> {
+    use crate::platform::proc::{ProcessProbe, probe_process, session_has_members};
+    match probe_process(pid) {
+        ProcessProbe::Started(_) if cfg!(target_os = "linux") => return Ok(()),
+        ProcessProbe::Started(_) | ProcessProbe::Absent => {}
+        ProcessProbe::Unknown => return Err(ProcessNotGone::OldProcessUnknown),
     }
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return true;
-    };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return false;
-        };
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-            return false;
-        }
-        std::fs::read_to_string(entry.path().join("stat"))
-            .ok()
-            .and_then(|stat| session_of_stat(&stat))
-            == Some(pid)
-    })
+    match session_has_members(pid) {
+        Some(false) => Ok(()),
+        Some(true) => Err(ProcessNotGone::StillRunning),
+        None => Err(ProcessNotGone::OldProcessUnknown),
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn old_session_has_members(_pid: u32) -> bool {
-    false
-}
-
-/// The session id in a `/proc/<pid>/stat` line: the fourth field after the
-/// command name's closing parenthesis (state, ppid, pgrp, session).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn session_of_stat(stat: &str) -> Option<u32> {
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(3)?.parse().ok()
+/// The `PATH` a restore spawn gets: the shim directory `shim` first, then
+/// `current` (the daemon's own) without any entry that is `shim` already.
+/// An absent or empty `current` gives `shim` alone, never `<shim>:`, whose
+/// trailing empty entry would make the current directory searched (audit
+/// "later slices" 5).
+fn restore_path(shim: &str, current: Option<&std::ffi::OsStr>) -> Option<String> {
+    let current = current.unwrap_or_default();
+    if current.is_empty() {
+        return Some(shim.to_string());
+    }
+    let current = current.to_str()?;
+    let rest: Vec<&str> = current.split(':').filter(|entry| *entry != shim).collect();
+    if rest.is_empty() {
+        return Some(shim.to_string());
+    }
+    Some(format!("{shim}:{}", rest.join(":")))
 }
 
 /// The folder check of the module docs' item 5, answering the held directory
@@ -452,14 +534,6 @@ fn restored_pane_id(name: Option<&str>) -> String {
     )
 }
 
-/// A fresh one-shot resume token: 32 lowercase hex characters from OS
-/// randomness ([`crate::telemetry::shim::is_resume_token`] accepts it).
-fn resume_token() -> Option<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).ok()?;
-    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
 /// The handles a restore needs beyond the registry, to stop an agent the way
 /// `StopAgent` would.
 pub struct Daemon<'a> {
@@ -498,7 +572,7 @@ pub async fn restore(
         dry_run,
         ..RestoreOutcome::default()
     };
-    // Any claim, well formed or not: see the module docs' item 8.
+    // Any claim, well formed or not: see the module docs' item 9.
     if caller.is_some() {
         outcome
             .refused
@@ -520,9 +594,16 @@ pub async fn restore(
     };
     let Prepared {
         journal,
+        item,
         works,
         targets,
     } = prepared;
+    // §4 item 10: a dry run says what Git and GitHub say of the item, an
+    // open pull request above all, so the question can show it. It refuses
+    // nothing: a resume continues the work that pull request is about.
+    if dry_run {
+        outcome.git = Some(crate::interrupted_work_daemon::item_git_facts(&item).await);
+    }
     for target in targets {
         let target = match target {
             Ok(target) => target,
@@ -566,11 +647,17 @@ pub async fn start_over(
     }
     let Prepared {
         journal,
+        item,
         works,
         mut targets,
     } = match prepared(daemon.registry, id, vec![attempt], Want::StartOver).await {
         Ok(prepared) => prepared,
         Err(refusal) => return refused(refusal),
+    };
+    let git = if dry_run {
+        Some(crate::interrupted_work_daemon::item_git_facts(&item).await)
+    } else {
+        None
     };
     let target = match targets.pop() {
         Some(Ok(target)) => target,
@@ -581,6 +668,7 @@ pub async fn start_over(
         Started::Would(_) => StartOverOutcome {
             dry_run,
             would_start: true,
+            git,
             ..StartOverOutcome::default()
         },
         Started::Done(agent) => StartOverOutcome {
@@ -600,7 +688,27 @@ enum Started {
 }
 
 /// Start `target`: resumed when `mode` is set, started over otherwise. The
-/// folder is checked here, last before the spawn.
+/// folder is checked here, last before the spawn, and a dispatched unit's
+/// saved task is read through the held folder.
+#[cfg(not(unix))]
+async fn start(
+    _daemon: &Daemon<'_>,
+    _journal: &WorkJournal,
+    _works: &[WorkId],
+    target: Target,
+    _mode: Option<RestoreMode>,
+    _dry_run: bool,
+) -> Started {
+    Started::Refused(RestoreRefused::new(
+        Some(target.attempt),
+        RestoreRefusal::Unsupported,
+    ))
+}
+
+/// Start `target`: resumed when `mode` is set, started over otherwise. The
+/// folder is checked here, last before the spawn, and a dispatched unit's
+/// saved task is read through the held folder.
+#[cfg(unix)]
 async fn start(
     daemon: &Daemon<'_>,
     journal: &WorkJournal,
@@ -609,34 +717,67 @@ async fn start(
     mode: Option<RestoreMode>,
     dry_run: bool,
 ) -> Started {
+    use std::os::fd::AsFd as _;
     let attempt = target.attempt.clone();
     let refuse = |reason| Started::Refused(RestoreRefused::new(Some(attempt.clone()), reason));
-    let Some(_held) = InFlight::take(&target.attempt) else {
-        return refuse(RestoreRefusal::AlreadyRestoring);
+    let _held = match InFlight::take(&target.attempt, target.session.as_deref()) {
+        Ok(held) => held,
+        Err(reason) => return refuse(reason),
     };
-    #[cfg(unix)]
-    let dir = {
-        let cwd = target.record.cwd.clone().unwrap_or_default();
-        match tokio::task::spawn_blocking(move || verified_folder(&cwd)).await {
-            Ok(Ok(dir)) => dir,
-            Ok(Err(reason)) => return refuse(reason),
-            Err(_) => return refuse(RestoreRefusal::FolderUnsafe),
-        }
+    let cwd = target.record.cwd.clone().unwrap_or_default();
+    let work = target.record.work.clone();
+    let wants_task = target.wants_task;
+    let folder = tokio::task::spawn_blocking(move || {
+        let dir = verified_folder(&cwd)?;
+        let task = if wants_task {
+            match crate::dispatch_task::read_saved_in(dir.as_fd(), &work) {
+                Ok(task) => Some(task),
+                Err(crate::dispatch_task::SavedTaskError::NotSaved) => {
+                    return Err(RestoreRefusal::NoSavedTask);
+                }
+                Err(crate::dispatch_task::SavedTaskError::Unsafe) => {
+                    return Err(RestoreRefusal::TaskUnsafe);
+                }
+            }
+        } else {
+            None
+        };
+        Ok((dir, task))
+    })
+    .await;
+    let (dir, task) = match folder {
+        Ok(Ok(found)) => found,
+        Ok(Err(reason)) => return refuse(reason),
+        Err(_) => return refuse(RestoreRefusal::FolderUnsafe),
     };
-    if let Some(task) = target.task.as_deref()
+    if let Some(task) = task.as_deref()
         && crate::spawn::admit_seed(daemon.registry, SAVED_TASK_REASON, task).is_err()
     {
         return refuse(RestoreRefusal::TaskUnsafe);
     }
-    // The shim this restore resumes through, and where it acknowledges.
-    let shim_dir =
-        crate::telemetry::exporter::default_config_dir().join(crate::telemetry::shim::DIR_NAME);
-    let acks = crate::telemetry::shim::resume_acks_dir(&shim_dir);
-    if let Some(program) = target.program
-        && (!shim_dir.join(program).is_file() || acks.is_none())
-    {
-        return refuse(RestoreRefusal::Unsupported);
-    }
+    // The shim this restore resumes through, as this daemon installed it,
+    // and the directory it acknowledges in, held.
+    let shim = match target.program {
+        Some(program) => {
+            let Some(shim_dir) = crate::telemetry::shim::installed_dir() else {
+                return refuse(RestoreRefusal::Unsupported);
+            };
+            if !shim_dir.join(program).is_file() || shim_dir.to_str().is_none() {
+                return refuse(RestoreRefusal::Unsupported);
+            }
+            let Ok(acks) = crate::telemetry::shim::open_acks(&shim_dir, true) else {
+                return refuse(RestoreRefusal::Unsupported);
+            };
+            // Audit S3: retire what expired, then refuse rather than add to
+            // a directory at its bound.
+            let left = crate::telemetry::shim::retire_expired(&acks, now_secs());
+            if left >= crate::telemetry::shim::MAX_ACK_ENTRIES {
+                return refuse(RestoreRefusal::TooManyPending);
+            }
+            Some((shim_dir, acks))
+        }
+        None => None,
+    };
     if dry_run {
         return Started::Would(target.attempt);
     }
@@ -651,15 +792,22 @@ async fn start(
         env.push(("SHELL".to_string(), shell.clone()));
     }
     let mut token = None;
-    if let (Some(session), Some(program)) = (&target.session, target.program) {
-        let Some(minted) = resume_token() else {
+    if let (Some(session), Some(program), Some((shim_dir, _))) =
+        (&target.session, target.program, &shim)
+    {
+        // Bound to this attempt's confirmation: a shim reached after it ends
+        // claims nothing (audit "later slices" 6, S3).
+        let lifetime = confirm_timeout().as_secs().saturating_add(TOKEN_SLACK_SECS);
+        let Some(minted) = crate::telemetry::shim::mint_token(now_secs(), lifetime) else {
             return refuse(RestoreRefusal::SpawnFailed);
         };
-        let Some(shim) = shim_dir.to_str() else {
+        let Some(path) = shim_dir
+            .to_str()
+            .and_then(|shim| restore_path(shim, std::env::var_os("PATH").as_deref()))
+        else {
             return refuse(RestoreRefusal::Unsupported);
         };
-        let path = std::env::var("PATH").unwrap_or_default();
-        env.push(("PATH".to_string(), format!("{shim}:{path}")));
+        env.push(("PATH".to_string(), path));
         env.push((
             crate::telemetry::shim::RESUME_AGENT_ENV.to_string(),
             program.to_string(),
@@ -689,11 +837,7 @@ async fn start(
         // own, which every client shows through the ordinary events.
         work_id: None,
     };
-    #[cfg(unix)]
     let spawned = daemon.registry.spawn_agent_in(opts, &dir);
-    #[cfg(not(unix))]
-    let spawned = daemon.registry.spawn_agent(opts);
-    #[cfg(unix)]
     drop(dir);
     let agent_id = match spawned {
         Ok(id) => id,
@@ -716,7 +860,7 @@ async fn start(
                 &pane_id,
                 &agent_id,
                 session,
-                acks.as_deref().zip(token.as_deref()),
+                shim.as_ref().map(|(_, acks)| acks).zip(token.as_deref()),
                 confirm_timeout(),
             )
             .await;
@@ -754,7 +898,7 @@ async fn start(
         _ => (
             RestoredHow::StartedOver,
             CloseHow::StartedOver,
-            target.task.clone().map(|task| (SAVED_TASK_REASON, task)),
+            task.map(|task| (SAVED_TASK_REASON, task)),
         ),
     };
     let first_message_posted = match &first {
@@ -813,16 +957,21 @@ async fn record_blocking(journal: &WorkJournal, events: Vec<Event>) -> bool {
 
 /// Wait at most `bound` for the agent `agent_id` in `pane` to report its
 /// first attested session, and answer whether it is `session`. Gives up
-/// early on a refused acknowledgement from the shim (`ack`: its directory
-/// and the request's token) and on the agent exiting.
+/// early on a refused acknowledgement from the shim (`ack`: the held
+/// directory and the request's token, read with
+/// [`crate::telemetry::shim::ack_state`]) and on the agent exiting. An
+/// acknowledgement only says the shim gave the arguments; the session the
+/// agent attests is what confirms.
+#[cfg(unix)]
 async fn confirm(
     registry: &AgentPtyRegistry,
     pane: &str,
     agent_id: &str,
     session: &str,
-    ack: Option<(&Path, &str)>,
+    ack: Option<(&crate::platform::trusted_dir::TrustedDir, &str)>,
     bound: Duration,
 ) -> Result<(), RestoreFailure> {
+    use crate::telemetry::shim::{AckState, ack_state};
     let deadline = Instant::now() + bound;
     loop {
         if let Some((generation, seen)) = registry.restore_session_seen(pane)
@@ -834,10 +983,8 @@ async fn confirm(
                 Err(RestoreFailure::SessionMismatch)
             };
         }
-        if let Some((dir, token)) = ack
-            && dir
-                .join(format!("{token}{}", crate::telemetry::shim::REFUSED_SUFFIX))
-                .exists()
+        if let Some((acks, token)) = ack
+            && ack_state(acks, token) == AckState::Refused
         {
             return Err(RestoreFailure::Refused);
         }
@@ -846,7 +993,8 @@ async fn confirm(
             return Err(RestoreFailure::Exited);
         }
         if Instant::now() >= deadline {
-            let applied = ack.is_some_and(|(dir, token)| dir.join(token).exists());
+            let applied =
+                ack.is_some_and(|(acks, token)| ack_state(acks, token) == AckState::Resumed);
             return Err(if applied {
                 RestoreFailure::TimedOut
             } else {
@@ -855,6 +1003,13 @@ async fn confirm(
         }
         tokio::time::sleep(CONFIRM_POLL).await;
     }
+}
+
+/// Seconds since the Unix epoch, now.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The agent type the shim resumes as, for a test.
@@ -867,14 +1022,36 @@ fn program_of(agent: &crate::event::AgentType) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// PRD #1790 stage 3 (audit "later slices" 5): the shim leads the
+    /// restore's `PATH` once, and an absent or empty `PATH` never becomes
+    /// `<shim>:`, which would search the current directory.
     #[test]
-    fn the_session_is_read_after_the_command_names_closing_parenthesis() {
+    fn the_restore_path_leads_with_the_shim_once_and_adds_no_empty_entry() {
+        use std::ffi::OsStr;
+        let shim = "/state/telemetry/bin";
+        assert_eq!(restore_path(shim, None).as_deref(), Some(shim));
         assert_eq!(
-            session_of_stat("4242 (a (weird) name) S 1 4242 4100 0 -1"),
-            Some(4100)
+            restore_path(shim, Some(OsStr::new(""))).as_deref(),
+            Some(shim)
         );
-        assert_eq!(session_of_stat("4242 (claude) S 1 4242"), None);
-        assert_eq!(session_of_stat("no parenthesis"), None);
+        assert_eq!(
+            restore_path(shim, Some(OsStr::new("/usr/bin:/bin"))).as_deref(),
+            Some("/state/telemetry/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            restore_path(shim, Some(OsStr::new("/state/telemetry/bin:/usr/bin"))).as_deref(),
+            Some("/state/telemetry/bin:/usr/bin"),
+            "deduplicated"
+        );
+        assert_eq!(
+            restore_path(shim, Some(OsStr::new("/state/telemetry/bin"))).as_deref(),
+            Some(shim)
+        );
+        assert_eq!(
+            restore_path(shim, Some(OsStr::new("/usr/bin::/bin"))).as_deref(),
+            Some("/state/telemetry/bin:/usr/bin::/bin"),
+            "an empty entry the daemon's own PATH had is kept as it was"
+        );
     }
 
     #[test]
@@ -887,13 +1064,6 @@ mod tests {
             assert!(id.contains("restored-unit-014-"), "{id}");
             assert!(!crate::spawn::is_orchestration_role_pane_id(id), "{id}");
         }
-    }
-
-    #[test]
-    fn a_resume_token_is_one_the_shim_accepts() {
-        let token = resume_token().expect("OS randomness");
-        assert!(crate::telemetry::shim::is_resume_token(&token), "{token}");
-        assert_ne!(resume_token(), Some(token));
     }
 
     #[test]
@@ -918,18 +1088,86 @@ mod tests {
     #[test]
     fn one_attempt_is_held_against_a_second_restore_until_released() {
         let attempt = AttemptId::parse("r-held-test/7").expect("an attempt id");
-        let first = InFlight::take(&attempt).expect("free");
-        assert!(InFlight::take(&attempt).is_none());
+        let first = InFlight::take(&attempt, None).expect("free");
+        assert_eq!(
+            InFlight::take(&attempt, None).err(),
+            Some(RestoreRefusal::AlreadyRestoring)
+        );
         drop(first);
-        assert!(InFlight::take(&attempt).is_some());
+        assert!(InFlight::take(&attempt, None).is_ok());
     }
 
-    #[cfg(target_os = "linux")]
+    /// PRD #1790 stage 3 (audit "later slices" 3): two different attempts
+    /// resuming into one conversation are not restored at once.
     #[test]
-    fn a_live_pid_or_an_empty_session_has_no_members_left() {
-        // This process is alive, so its pid is not scanned.
-        assert!(!old_session_has_members(std::process::id()));
-        // A pid no process holds and no session is named after.
-        assert!(!old_session_has_members(i32::MAX as u32));
+    fn two_attempts_into_one_conversation_are_not_restored_at_once() {
+        const SESSION: &str = "fedcba98-7654-4321-8fab-0123456789ab";
+        let one = AttemptId::parse("r-session-test/1").expect("an attempt id");
+        let two = AttemptId::parse("r-session-test/2").expect("an attempt id");
+        let first = InFlight::take(&one, Some(SESSION)).expect("free");
+        assert_eq!(
+            InFlight::take(&two, Some(SESSION)).err(),
+            Some(RestoreRefusal::SessionInUse)
+        );
+        drop(first);
+        assert!(InFlight::take(&two, Some(SESSION)).is_ok());
+    }
+
+    /// PRD #1790 stage 3 (audit "later slices" 3): an attempt the deck runs
+    /// now in the same conversation makes it in use; one that ended, or whose
+    /// run is gone, does not.
+    #[test]
+    fn a_live_attempt_in_the_same_conversation_makes_it_in_use() {
+        use crate::work_journal::{EndHow, JournalRead, Line};
+        const SESSION: &str = "fedcba98-7654-4321-8fab-0123456789ab";
+        let work = WorkId::parse("w-abcdefgh-0000000000000001").expect("a work id");
+        let target = AttemptId::parse("r-old/1").expect("an attempt id");
+        let live_copy = AttemptId::parse("r-live/3").expect("an attempt id");
+        let ended = AttemptId::parse("r-live/4").expect("an attempt id");
+        let line = |run: &str, seq: u64, event: Event| Line {
+            v: 1,
+            ts_ms: seq,
+            run: run.to_string(),
+            seq,
+            event,
+        };
+        let session = |attempt: &AttemptId| Event::AttemptSession {
+            work: work.clone(),
+            attempt: attempt.clone(),
+            session: SESSION.to_string(),
+            agent: crate::event::AgentType::ClaudeCode,
+        };
+        let mut read = JournalRead {
+            lines: vec![
+                line("r-old", 1, session(&target)),
+                line("r-live", 2, session(&ended)),
+                line(
+                    "r-live",
+                    3,
+                    Event::AttemptEnded {
+                        work: work.clone(),
+                        attempt: ended.clone(),
+                        how: EndHow::Exited,
+                        code: None,
+                        cause: None,
+                    },
+                ),
+            ],
+            ..JournalRead::default()
+        };
+        let live = |run: &str| run == "r-live";
+        assert!(!Sessions::of(&read).in_use(&target, SESSION, &live));
+        read.lines.push(line("r-live", 4, session(&live_copy)));
+        assert!(Sessions::of(&read).in_use(&target, SESSION, &live));
+        assert!(!Sessions::of(&read).in_use(&target, SESSION, &|_: &str| false));
+    }
+
+    /// PRD #1790 stage 3 (audit "later slices" 2): a pid no process holds and
+    /// no session is named after leaves nothing behind; this process's own
+    /// session, led by nobody gone, is not asked about.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_empty_session_has_nothing_left() {
+        assert_eq!(old_session_left(i32::MAX as u32), Ok(()));
     }
 }

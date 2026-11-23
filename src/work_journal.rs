@@ -749,18 +749,70 @@ pub fn latest_session_of<'a>(
 ) -> Option<(&'a str, &'a crate::event::AgentType)> {
     lines
         .iter()
-        .filter(|line| line.run == attempt.run())
-        .filter_map(|line| match &line.event {
-            Event::AttemptSession {
-                attempt: a,
-                session,
-                agent,
-                ..
-            } if a == attempt => Some((line.seq, session.as_str(), agent)),
-            _ => None,
-        })
-        .max_by_key(|(seq, _, _)| *seq)
-        .map(|(_, session, agent)| (session, agent))
+        .filter_map(own_session_report)
+        .filter(|report| report.attempt == attempt)
+        .max_by_key(|report| report.seq)
+        .map(|report| (report.session, report.agent))
+}
+
+/// One `attempt_session` line, read the way [`latest_session_of`] reads
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionReport<'a> {
+    pub attempt: &'a AttemptId,
+    pub seq: u64,
+    pub session: &'a str,
+    pub agent: &'a crate::event::AgentType,
+}
+
+/// `line` as a session report of an attempt of its own run, the only lines
+/// [`latest_session_of`] counts; `None` for any other line. An index built in
+/// one pass keeps, per attempt, the report with the highest `seq`
+/// ([`latest_sessions`]).
+pub fn own_session_report(line: &Line) -> Option<SessionReport<'_>> {
+    match &line.event {
+        Event::AttemptSession {
+            attempt,
+            session,
+            agent,
+            ..
+        } if line.run == attempt.run() => Some(SessionReport {
+            attempt,
+            seq: line.seq,
+            session: session.as_str(),
+            agent,
+        }),
+        _ => None,
+    }
+}
+
+/// Every attempt's latest session in `lines`, as [`latest_session_of`]
+/// answers it for each, in one pass.
+pub fn latest_sessions(lines: &[Line]) -> HashMap<&AttemptId, SessionReport<'_>> {
+    let mut latest: HashMap<&AttemptId, SessionReport<'_>> = HashMap::new();
+    for report in lines.iter().filter_map(own_session_report) {
+        keep_latest(&mut latest, report);
+    }
+    latest
+}
+
+/// Keep `report` in `latest` when it is the highest `seq` of its attempt so
+/// far.
+pub fn keep_latest<'a>(
+    latest: &mut HashMap<&'a AttemptId, SessionReport<'a>>,
+    report: SessionReport<'a>,
+) {
+    match latest.entry(report.attempt) {
+        std::collections::hash_map::Entry::Occupied(mut held) => {
+            // `>=`: the later of equal ones, as `max_by_key` keeps.
+            if report.seq >= held.get().seq {
+                held.insert(report);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(free) => {
+            free.insert(report);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

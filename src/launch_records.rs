@@ -178,15 +178,26 @@ impl std::fmt::Display for ProcessNotGone {
 }
 
 /// PRD #1790 stage 3: whether the agent `record` launched is gone, so a
-/// resumed copy would not write to one conversation beside it. `Ok` when no
-/// process with the record's pid and start time exists; a pid now held by a
-/// process that started at another time is another process. A record without
-/// both fields proves nothing and is refused as unknown, as is every record on
-/// a platform that cannot read a start time.
+/// resumed copy would not write to one conversation beside it. `Ok` only on
+/// evidence: the kernel says no process holds the pid, or the process holding
+/// it started at another time (another process). A record without both
+/// fields proves nothing and is refused as unknown, as is a lookup that could
+/// not read the process (review R1 / audit B1:
+/// [`crate::platform::proc::ProcessProbe::Unknown`]) and every record on a
+/// platform that cannot read a start time.
 ///
 /// It checks the agent's own process only: a child of it still running in
 /// its session is the restore verb's to look for.
 pub fn process_gone(record: &LaunchRecord) -> Result<(), ProcessNotGone> {
+    process_gone_with(record, crate::platform::proc::probe_process)
+}
+
+/// [`process_gone`] with the process probe injected, for a test.
+pub fn process_gone_with(
+    record: &LaunchRecord,
+    probe: impl Fn(u32) -> crate::platform::proc::ProcessProbe,
+) -> Result<(), ProcessNotGone> {
+    use crate::platform::proc::ProcessProbe;
     let (Some(pid), Some(started)) = (record.pid, record.pid_start) else {
         return Err(ProcessNotGone::OldProcessUnknown);
     };
@@ -197,9 +208,10 @@ pub fn process_gone(record: &LaunchRecord) -> Result<(), ProcessNotGone> {
     if i32::try_from(pid).is_err() {
         return Ok(());
     }
-    match crate::platform::proc::process_start_of(pid) {
-        Some(now) if now == started => Err(ProcessNotGone::StillRunning),
-        _ => Ok(()),
+    match probe(pid) {
+        ProcessProbe::Started(now) if now == started => Err(ProcessNotGone::StillRunning),
+        ProcessProbe::Started(_) | ProcessProbe::Absent => Ok(()),
+        ProcessProbe::Unknown => Err(ProcessNotGone::OldProcessUnknown),
     }
 }
 
@@ -616,6 +628,37 @@ mod tests {
         r.pid = Some(u32::MAX);
         r.pid_start = Some(1);
         assert!(process_gone(&r).is_ok());
+    }
+
+    /// PRD #1790 stage 3 (review R1 / audit B1): only evidence makes the old
+    /// process gone. A lookup that failed for a pid some process may still
+    /// hold is unknown; the kernel's "no such process" and a different start
+    /// time (a reused pid) are gone; the recorded start time is running.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_failed_process_lookup_is_never_taken_as_the_process_being_gone() {
+        use crate::platform::proc::ProcessProbe;
+        let mut r = record(&work(), 7, 42);
+        r.pid = Some(4242);
+        r.pid_start = Some(1000);
+        let gone = |probe: ProcessProbe| {
+            process_gone_with(&r, |pid| {
+                assert_eq!(pid, 4242);
+                probe
+            })
+            .map_err(|reason| reason.to_string())
+        };
+        assert_eq!(
+            gone(ProcessProbe::Unknown),
+            Err("old-process-unknown".into()),
+            "a live process whose identity could not be read"
+        );
+        assert_eq!(gone(ProcessProbe::Absent), Ok(()));
+        assert_eq!(gone(ProcessProbe::Started(2000)), Ok(()), "a reused pid");
+        assert_eq!(
+            gone(ProcessProbe::Started(1000)),
+            Err("still-running".into())
+        );
     }
 
     fn work() -> WorkId {

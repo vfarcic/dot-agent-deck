@@ -695,6 +695,21 @@ fn restore_gate(
     }
 }
 
+/// Whether the acting command will ask on a terminal: the flag is on, it is
+/// not a dry run, `--yes` was not given, and there is a terminal.
+fn asks(dry_run: bool, yes: bool, confirm: &Confirm<'_>) -> bool {
+    crate::features::show_agent_restore() && !dry_run && !yes && matches!(confirm, Confirm::Ask(_))
+}
+
+/// `question` with a dry run's Git note ([`words::restore_git_note`]) in
+/// front, when there is one.
+fn with_git_note(question: String, git: Option<&words::GitFacts>) -> String {
+    match words::restore_git_note(git) {
+        Some(note) => format!("{note} {question}"),
+        None => question,
+    }
+}
+
 /// `interrupted restore <id> (--continue | --only) [--agent <attempt>]…
 /// [--dry-run] [--yes]`: bring the item's agents back with their
 /// conversations. Asks first on a terminal, unless `--yes` or `--dry-run`;
@@ -705,11 +720,29 @@ pub async fn run_restore(
     identity: &AmbientIdentity,
     confirm: Confirm<'_>,
 ) -> CliOutput {
+    let mut question = words::restore_question(&shown(&args.id));
+    // §4 item 10: ask with what a dry run says of an open pull request. Best
+    // effort: a dry run that cannot answer leaves the question as it is, and
+    // the request itself reports why.
+    if asks(args.dry_run, args.yes, &confirm)
+        && let Ok(GatedQuery::Answered(outcome)) = client
+            .restore_interrupted(
+                &args.id,
+                args.agents.clone(),
+                args.mode,
+                true,
+                identity.claim(),
+                None,
+            )
+            .await
+    {
+        question = with_git_note(question, outcome.git.as_ref());
+    }
     if let Some(refused) = restore_gate(
         args.dry_run,
         args.yes,
         words::RESTORE_NEEDS_YES,
-        &words::restore_question(&shown(&args.id)),
+        &question,
         confirm,
     ) {
         return refused;
@@ -738,6 +771,9 @@ pub fn render_restore(outcome: &words::RestoreOutcome) -> CliOutput {
     let mut stderr = String::new();
     for attempt in &outcome.would_restore {
         stdout.push_str(&format!("{} {attempt}\n", words::RESTORE_WOULD));
+    }
+    if let Some(note) = words::restore_git_note(outcome.git.as_ref()) {
+        stdout.push_str(&format!("{note}\n"));
     }
     for agent in &outcome.restored {
         let name = agent.name.as_deref().map(shown).unwrap_or_default();
@@ -786,11 +822,19 @@ pub async fn run_start_over(
     identity: &AmbientIdentity,
     confirm: Confirm<'_>,
 ) -> CliOutput {
+    let mut question = words::start_over_question(&shown(&args.agent));
+    if asks(args.dry_run, args.yes, &confirm)
+        && let Ok(GatedQuery::Answered(outcome)) = client
+            .start_over_interrupted(&args.id, &args.agent, true, identity.claim(), None)
+            .await
+    {
+        question = with_git_note(question, outcome.git.as_ref());
+    }
     if let Some(refused) = restore_gate(
         args.dry_run,
         args.yes,
         words::START_OVER_NEEDS_YES,
-        &words::start_over_question(&shown(&args.agent)),
+        &question,
         confirm,
     ) {
         return refused;
@@ -811,7 +855,10 @@ pub fn render_start_over(outcome: &words::StartOverOutcome) -> CliOutput {
         return failed(restore_refusal_text(refused), EXIT_REFUSED);
     }
     if outcome.would_start {
-        return ok(format!("{}\n", words::START_OVER_WOULD));
+        let note = words::restore_git_note(outcome.git.as_ref())
+            .map(|note| format!("{note}\n"))
+            .unwrap_or_default();
+        return ok(format!("{}\n{note}", words::START_OVER_WOULD));
     }
     let Some(agent) = &outcome.started else {
         return failed(words::NOTHING_RESTORED, EXIT_REFUSED);

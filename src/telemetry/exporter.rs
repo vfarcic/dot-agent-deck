@@ -1123,6 +1123,7 @@ impl Telemetry {
         // PRD #1790 stage 3: a restore spawn already put the shim first.
         if let Some(shim) = self.shim_dir.as_deref().and_then(Path::to_str)
             && let Some(path) = base.get("PATH")
+            && path != shim
             && !path.starts_with(&format!("{shim}:"))
         {
             // An empty `PATH` is the current directory, and stays so after

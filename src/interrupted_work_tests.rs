@@ -242,6 +242,8 @@ fn journal_restore_003_bad_evidence_never_offers_resume() {
         ("journal-incomplete", "none", "incomplete-read"),
         ("launch-incomplete", "none", "incomplete-read"),
         ("launch-skipped", "none", "incomplete-read"),
+        ("journal-newer", "none", "incomplete-read"),
+        ("journal-unknown-kind", "none", "incomplete-read"),
     ] {
         let mut j = Journal::default();
         let (w, a) = pane(&mut j, 1);
@@ -281,7 +283,10 @@ fn journal_restore_003_bad_evidence_never_offers_resume() {
         j.truncated = case == "journal-incomplete";
         records.truncated = case == "launch-incomplete";
         records.skipped = usize::from(case == "launch-skipped");
-        let list = derive_with_home(&j.read(), &records, live_only, &[], &home());
+        let mut read = j.read();
+        read.stats.newer_version = usize::from(case == "journal-newer");
+        read.stats.unknown_kind = usize::from(case == "journal-unknown-kind");
+        let list = derive_with_home(&read, &records, live_only, &[], &home());
         let item = list.items.iter().find(|item| item.id == w).unwrap();
         assert_eq!(
             item.agents.len(),
@@ -293,9 +298,51 @@ fn journal_restore_003_bad_evidence_never_offers_resume() {
             serde_json::json!({"kind": kind, "reason": reason}),
             "{case}"
         );
-        if case.ends_with("incomplete") || case == "launch-skipped" {
+        if case.ends_with("incomplete") || case == "launch-skipped" || case.starts_with("journal-")
+        {
             assert!(list.incomplete, "{case}");
         }
+    }
+}
+
+/// PRD #1790 stage 3 (review R5): with many interrupted agents, each still
+/// gets the latest session of its own attempt, now read from the index built
+/// in one pass rather than from a scan of the whole journal per agent.
+#[test]
+fn many_interrupted_agents_each_resume_their_own_latest_session() {
+    use crate::event::AgentType;
+    const AGENTS: u64 = 600;
+    let session =
+        |n: u64, generation: u64| format!("{n:08x}-{generation:04x}-4cde-8fab-0123456789ab");
+    let mut j = Journal::default();
+    let mut records = Vec::new();
+    for n in 1..=AGENTS {
+        let (w, a) = pane(&mut j, n);
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, &session(n, 1));
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, &session(n, 2));
+        j.ended(&w, &a, EndHow::Interrupted);
+        records.push(restore_record(&w, &a, AgentType::ClaudeCode));
+    }
+    let read = j.read();
+    let list = derive_with_home(&read, &launches(records), live_only, &[], &home());
+    assert_eq!(list.items.len(), AGENTS as usize);
+    for n in 1..=AGENTS {
+        let item = list.items.iter().find(|item| item.id == work(n)).unwrap();
+        assert_eq!(item.agents.len(), 1);
+        assert_eq!(item.agents[0].restore, RestoreVerdict::Resume, "agent {n}");
+        assert_eq!(
+            crate::work_journal::latest_session_of(&read.lines, &item.agents[0].attempt)
+                .map(|(id, _)| id.to_string()),
+            Some(session(n, 2)),
+        );
+    }
+    let indexed = crate::work_journal::latest_sessions(&read.lines);
+    assert_eq!(indexed.len(), AGENTS as usize);
+    for (attempt, report) in indexed {
+        assert_eq!(
+            crate::work_journal::latest_session_of(&read.lines, attempt).map(|(id, _)| id),
+            Some(report.session)
+        );
     }
 }
 

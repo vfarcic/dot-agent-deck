@@ -177,8 +177,8 @@ dot-agent-deck interrupted start-over <id> --agent <attempt>      # start the ag
 | `--continue` | `restore` | Restore and continue. `restore` needs exactly one of `--continue` and `--only` |
 | `--only` | `restore` | Restore only |
 | `--agent <attempt>` | `restore`, `start-over` | The agent to act on. `restore` acts on every agent of the item that can be restored when you leave it out; `start-over` needs it |
-| `--dry-run` | `restore`, `start-over` | Say what would happen, and start nothing |
-| `--yes` | `restore`, `start-over` | Act without asking. Without a terminal to ask on, it is needed |
+| `--dry-run` | `restore`, `start-over` | Say what would happen, and start nothing. When the item's branch has an open pull request, it also says `Its branch has an open pull request, which the agent may change.` |
+| `--yes` | `restore`, `start-over` | Act without asking. Without a terminal to ask on, it is needed. On a terminal, the question names an open pull request on the item's branch, as `--dry-run` does |
 
 ### Which agents can be restored
 
@@ -215,19 +215,21 @@ The deck checks again when you confirm. When a check fails it starts nothing, an
 | The agent cannot be restored with its conversation yet | The agent is one the table above marks "Not yet", or a plain shell. | Use **Start over in this worktree**. |
 | The deck does not know which conversation the agent was in | The agent stopped before it reported its conversation, or a Codex agent ran without the deck's hooks. | Use Start over. For Codex, install and trust the hooks so later agents can be restored. |
 | The deck has no record of how the agent was started | The agent was started by an earlier version of the deck. | Use Start over, or dismiss the item. |
-| The deck cannot confirm the old agent has stopped | The agent was started by an earlier version of the deck, which did not record what the deck needs to check. | Use Start over, or dismiss the item. |
+| The deck cannot confirm the old agent has stopped | The agent was started by an earlier version of the deck, which did not record what the deck needs to check, or your system did not let the deck look at the old agent's processes. | Use Start over, or dismiss the item. |
 | The old agent is still running | A process of the stopped agent is still running, and a second copy would write to the same conversation. | Stop that process, then restore again. |
 | The agent's folder was moved, is gone, or others can write to it | The deck starts an agent only in the folder it was working in, and only when no other user can change that folder. | Put the folder back, or remove the write access others have, then restore again. Otherwise dismiss the item. |
 | The deck does not know which folder the agent ran in | The record of how the agent was started names no folder, so the deck has nowhere safe to start it. | Dismiss the item, and start the agent yourself in the right folder. |
 | The restart did not stop this agent | The item is listed for a report nobody received, but its agent finished on its own or is still running, so there is nothing to bring back. | Read the report, then dismiss the item. |
 | The deck tried to restore the agent's conversation and could not | An earlier restore of this agent did not bring its conversation back, so only Start over is offered now. | Use Start over, or dismiss the item. |
 | This agent is already being restored or started over | Another restore or start-over of the same agent, from this or another client, has not finished yet. | Wait for it, then list the interrupted work again. |
+| Another agent is in this conversation now | An agent the deck runs, such as a copy of this one you restored from another item, is in the same conversation, or is being restored into it. | Stop that agent first, or use Start over. |
+| Too many restores are waiting | Many restores are running at once, or are waiting for their agents to start. | Try again in a minute. |
 | The unit's saved task is not there | Start over gives a dispatched unit its saved task again, and the file in the worktree's `.dot-agent-deck` folder is gone. | Start the agent yourself and give it the task, or dismiss the item. |
 | The agent came back without its conversation | The agent started, but not in its earlier conversation: its command calls it by full path, a script replaced `PATH` or dropped the arguments, the agent could not find the conversation, or it exited. The deck stopped it before sending it anything. | See the list of ways of starting an agent that cannot be restored, above. Use Start over. |
 | The worktree is no longer there | Start over runs in the item's worktree, which is gone. | Dismiss the item. |
 | The saved task cannot be read safely | A dispatched unit's saved task file was replaced by a link, or others can read or change it. | Check the file in the worktree's `.dot-agent-deck` folder, or start the agent yourself. |
 | Orchestrations come back in a later version | The item is an orchestration, or a unit run by more than one agent. | Reclaim or dismiss it. |
-| The deck could not read its whole work journal | Part of the record restoring is checked against could not be read. | Try again later. |
+| The deck could not read its whole work journal or all its records of how agents were started | Part of the record restoring is checked against could not be read, or was written by a newer version of the deck. | Try again later. After going back to an older version of the deck, upgrade again to restore. |
 
 ## Agents can list, not change
 

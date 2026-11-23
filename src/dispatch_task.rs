@@ -171,19 +171,50 @@ pub enum SavedTaskError {
 /// [`SavedTaskError::Unsafe`].
 #[cfg(unix)]
 pub fn read_saved(worktree: &Path, work: &WorkId) -> Result<String, SavedTaskError> {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let folder = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(worktree)
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => SavedTaskError::NotSaved,
+            _ => SavedTaskError::Unsafe,
+        })?;
+    read_saved_in(folder.as_fd(), work)
+}
+
+/// [`read_saved`] relative to `worktree`, a directory descriptor the caller
+/// holds (a restore's verified folder, audit "later slices" 4), so nothing
+/// on the folder's path is resolved again.
+#[cfg(unix)]
+pub fn read_saved_in(
+    worktree: std::os::fd::BorrowedFd<'_>,
+    work: &WorkId,
+) -> Result<String, SavedTaskError> {
     use std::io::Read as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
 
     let open_error = |e: io::Error| match e.kind() {
         io::ErrorKind::NotFound => SavedTaskError::NotSaved,
         _ => SavedTaskError::Unsafe,
     };
-    let dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(worktree.join(CONTEXT_DIR_NAME))
-        .map_err(open_error)?;
+    let context = std::ffi::CString::new(CONTEXT_DIR_NAME).map_err(|_| SavedTaskError::Unsafe)?;
+    // SAFETY: a directory descriptor the caller holds and a NUL-terminated
+    // name; the result is a fresh descriptor we take sole ownership of, or -1.
+    let fd = unsafe {
+        libc::openat(
+            worktree.as_raw_fd(),
+            context.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(open_error(io::Error::last_os_error()));
+    }
+    // SAFETY: `fd` was just returned by `openat` and is owned by nothing else.
+    let dir = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
     let meta = dir.metadata().map_err(|_| SavedTaskError::Unsafe)?;
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };

@@ -398,6 +398,7 @@ pub struct ResumeSpec {
     pub placement: ResumePlacement,
     valid_id: fn(&str) -> bool,
     conflicting: fn(&[std::ffi::OsString]) -> bool,
+    inspecting: fn(&[std::ffi::OsString]) -> bool,
 }
 
 impl ResumeSpec {
@@ -410,6 +411,15 @@ impl ResumeSpec {
     /// mode or command a resume cannot be combined with.
     pub fn conflicts(&self, args: &[std::ffi::OsString]) -> bool {
         (self.conflicting)(args)
+    }
+
+    /// Review R3: whether the agent's own `args` start no conversation at
+    /// all: a version or help query, or a subcommand that manages the agent
+    /// rather than running a session (`claude mcp list`, `codex login`). A
+    /// launch script may make such a call before the one that starts the
+    /// agent; the shim leaves its resume request for that later call.
+    pub fn inspects(&self, args: &[std::ffi::OsString]) -> bool {
+        (self.inspecting)(args)
     }
 
     /// The arguments that resume `id`, as separate argv entries.
@@ -434,26 +444,211 @@ pub fn is_canonical_uuid(id: &str) -> bool {
         })
 }
 
-/// Claude Code's options that choose a conversation, or a non-interactive
-/// run a resume cannot be combined with.
-const CLAUDE_CONFLICTS: [&str; 8] = [
-    "-c",
+/// Claude Code's long options that choose a conversation, start one
+/// somewhere other than this pane, or a non-interactive run a resume cannot
+/// be combined with (`claude --help`, Claude Code 2.1).
+const CLAUDE_CONFLICTS: [&str; 13] = [
     "--continue",
-    "-r",
     "--resume",
     "--session-id",
     "--fork-session",
-    "-p",
     "--print",
+    "--from-pr",
+    "--teleport",
+    "--cloud",
+    "--environment",
+    "--bg",
+    "--background",
+    "--desktop",
+    "--no-session-persistence",
 ];
 
+/// Claude Code's short options of the same kind: `-c`, `-p`, `-r`.
+const CLAUDE_SHORT_CONFLICTS: [char; 3] = ['c', 'p', 'r'];
+
+/// Claude Code's long options that take one value, the next argument
+/// whatever it looks like, unless given as `--opt=value`. Only options known
+/// to take a value belong here: listing a flag would skip the argument after
+/// it, which may be a conflicting option. An option not listed anywhere is
+/// read as a flag, so a value after it is read as an argument of its own (a
+/// false conflict at worst, which refuses).
+const CLAUDE_VALUE_OPTIONS: [&str; 28] = [
+    "--agent",
+    "--agents",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--autocompact",
+    "--debug-file",
+    "--effort",
+    "--environment",
+    "--fallback-model",
+    "--input-format",
+    "--json-schema",
+    "--max-budget-usd",
+    "--max-turns",
+    "--model",
+    "--name",
+    "--output-format",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--permission-prompts",
+    "--plugin-dir",
+    "--plugin-url",
+    "--remote-control-session-name-prefix",
+    "--session-id",
+    "--setting-sources",
+    "--settings",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--system-prompt-snapshot",
+];
+
+/// Claude Code's options taking one or more values: every following
+/// argument up to the next one that starts with `-`.
+const CLAUDE_VARIADIC_OPTIONS: [&str; 9] = [
+    "--add-dir",
+    "--allowedTools",
+    "--allowed-tools",
+    "--betas",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--file",
+    "--mcp-config",
+    "--tools",
+];
+
+/// Claude Code's options with an optional value: the next argument when it
+/// does not start with `-`.
+const CLAUDE_OPTIONAL_VALUE_OPTIONS: [&str; 8] = [
+    "--cloud",
+    "--debug",
+    "--from-pr",
+    "--prompt-suggestions",
+    "--remote-control",
+    "--resume",
+    "--teleport",
+    "--worktree",
+];
+
+/// Claude Code's subcommands that manage it rather than start a session.
+const CLAUDE_MANAGING_SUBCOMMANDS: [&str; 24] = [
+    "agents",
+    "attach",
+    "auth",
+    "auto-mode",
+    "config",
+    "doctor",
+    "gateway",
+    "import",
+    "install",
+    "kill",
+    "logs",
+    "mcp",
+    "migrate-installer",
+    "plugin",
+    "plugins",
+    "purge",
+    "respawn",
+    "rm",
+    "setup-token",
+    "stop",
+    "ultrareview",
+    "update",
+    "upgrade",
+    "help",
+];
+
+/// What Claude Code's own arguments ask for, read the way its option parser
+/// (Commander) reads them, so an option's value is never taken for an option
+/// (`--append-system-prompt --continue` chooses no conversation) and the
+/// short forms count: attached values (`-r<id>`) and clusters (`-cp`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ClaudeArgs {
+    /// They choose a conversation, or a mode a resume cannot be combined
+    /// with (review R4).
+    conflict: bool,
+    /// They start no conversation: a version or help query, or a managing
+    /// subcommand (review R3).
+    inspect: bool,
+}
+
+fn classify_claude(args: &[std::ffi::OsString]) -> ClaudeArgs {
+    let args: Vec<std::borrow::Cow<'_, str>> =
+        args.iter().map(|arg| arg.to_string_lossy()).collect();
+    let mut out = ClaudeArgs::default();
+    let mut variadic = false;
+    let mut positionals = 0usize;
+    let mut at = 0;
+    // Whether the argument after `at` is an option's optional value.
+    let optional_value = |at: usize| args.get(at + 1).is_some_and(|next| !next.starts_with('-'));
+    while at < args.len() {
+        let arg = args[at].as_ref();
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            variadic = false;
+            let (name, inline) = match long.split_once('=') {
+                Some((name, _)) => (format!("--{name}"), true),
+                None => (arg.to_string(), false),
+            };
+            let name = name.as_str();
+            out.conflict |= CLAUDE_CONFLICTS.contains(&name);
+            out.inspect |= name == "--help" || name == "--version";
+            if !inline {
+                if CLAUDE_VALUE_OPTIONS.contains(&name) {
+                    at += 1;
+                } else if CLAUDE_VARIADIC_OPTIONS.contains(&name) {
+                    at += 1;
+                    variadic = true;
+                } else if CLAUDE_OPTIONAL_VALUE_OPTIONS.contains(&name) && optional_value(at) {
+                    at += 1;
+                }
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
+            variadic = false;
+            for (offset, flag) in cluster.char_indices() {
+                out.conflict |= CLAUDE_SHORT_CONFLICTS.contains(&flag);
+                out.inspect |= flag == 'h' || flag == 'v';
+                let rest_empty = offset + flag.len_utf8() == cluster.len();
+                match flag {
+                    // A value: the rest of the cluster, else the next argument.
+                    'n' => {
+                        if rest_empty {
+                            at += 1;
+                        }
+                        break;
+                    }
+                    // An optional value: the rest of the cluster, else the next
+                    // argument when it is not an option.
+                    'r' | 'd' | 'w' => {
+                        if rest_empty && optional_value(at) {
+                            at += 1;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        } else if !variadic {
+            if positionals == 0 && CLAUDE_MANAGING_SUBCOMMANDS.contains(&arg) {
+                // Everything after a subcommand is its own.
+                out.inspect = true;
+                return out;
+            }
+            positionals += 1;
+        }
+        at += 1;
+    }
+    out
+}
+
 fn claude_resume_conflicts(args: &[std::ffi::OsString]) -> bool {
-    args.iter().any(|arg| {
-        let arg = arg.to_string_lossy();
-        CLAUDE_CONFLICTS.iter().any(|flag| {
-            arg == *flag || (flag.starts_with("--") && arg.starts_with(&format!("{flag}=")))
-        })
-    })
+    classify_claude(args).conflict
+}
+
+fn claude_inspects(args: &[std::ffi::OsString]) -> bool {
+    classify_claude(args).inspect
 }
 
 /// Codex's options that take a value as the next argument (`codex --help`,
@@ -505,12 +700,61 @@ fn codex_resume_conflicts(args: &[std::ffi::OsString]) -> bool {
     false
 }
 
+/// Codex's subcommands that manage it rather than start or continue a
+/// session (`codex --help`, codex-cli 0.169).
+const CODEX_MANAGING_SUBCOMMANDS: [&str; 20] = [
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "completion",
+    "update",
+    "doctor",
+    "debug",
+    "features",
+    "help",
+    "archive",
+    "unarchive",
+    "delete",
+    "migrate-rollouts",
+    "migrate-nfs-db",
+    "apply",
+    "a",
+    "sandbox",
+    "cloud",
+    "queue",
+];
+
+/// Whether Codex's own `args` start no session: `--help`/`-h` or
+/// `--version`/`-V` before its first positional argument, or a first
+/// positional argument that is a managing subcommand. Option values are
+/// skipped as [`codex_resume_conflicts`] skips them.
+fn codex_inspects(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return false;
+        }
+        if matches!(arg.as_ref(), "--help" | "-h" | "--version" | "-V") {
+            return true;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            return CODEX_MANAGING_SUBCOMMANDS.contains(&arg.as_ref());
+        }
+        if !arg.contains('=') && CODEX_VALUE_OPTIONS.contains(&arg.as_ref()) {
+            let _ = args.next();
+        }
+    }
+    false
+}
+
 /// Claude Code: `claude --resume <id> <its own arguments>`.
 pub static CLAUDE_RESUME: ResumeSpec = ResumeSpec {
     program: "claude",
     placement: ResumePlacement::Flag(&["--resume"]),
     valid_id: is_canonical_uuid,
     conflicting: claude_resume_conflicts,
+    inspecting: claude_inspects,
 };
 
 /// Codex: `codex resume <id> <its own options>`.
@@ -519,6 +763,7 @@ pub static CODEX_RESUME: ResumeSpec = ResumeSpec {
     placement: ResumePlacement::Subcommand("resume"),
     valid_id: is_canonical_uuid,
     conflicting: codex_resume_conflicts,
+    inspecting: codex_inspects,
 };
 
 /// PRD #211 ([`AgentSpec::status_osc7501`]): how one agent reports its status
@@ -1892,6 +2137,106 @@ mod tests {
                 spec(&agent).resume.is_none(),
                 "{agent:?} is a documented gap"
             );
+        }
+    }
+
+    /// PRD #1790 stage 3 (review R4): Claude Code's conflicting options are
+    /// recognised in the forms its parser accepts — attached short values and
+    /// short clusters — and an option's value is never read as an option.
+    #[test]
+    fn claude_conflicts_cover_short_forms_and_skip_option_values() {
+        use std::ffi::OsString;
+        const ID: &str = "01234567-89ab-4cde-8fab-0123456789ab";
+        let claude = spec(&AgentType::ClaudeCode).resume.unwrap();
+        let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        let attached = format!("-r{ID}");
+        for args in [
+            vec![attached.as_str()],
+            vec!["-cp"],
+            vec!["-pc"],
+            vec!["--dangerously-skip-permissions", "-cd"],
+            vec!["-rsome-name"],
+            vec!["-r"],
+            vec!["--print=true"],
+            vec!["--continue=yes"],
+            vec!["--from-pr", "12"],
+            vec!["--teleport"],
+            vec!["--bg"],
+            vec!["--model", "haiku", "-p", "hello"],
+            vec!["hello", "--print"],
+            vec!["--add-dir", "/a", "/b", "-c"],
+        ] {
+            assert!(claude.conflicts(&os(&args)), "Claude accepted {args:?}");
+        }
+        for args in [
+            vec!["--append-system-prompt", "--continue"],
+            vec!["--model", "-p"],
+            vec!["-n", "-c"],
+            vec!["-n-c"],
+            vec!["--system-prompt=--resume"],
+            vec!["--add-dir", "/a", "/b"],
+            vec!["--debug", "hooks"],
+            vec!["-d", "--model", "haiku"],
+            vec!["-dc"],
+            vec!["--", "-c"],
+            vec!["fix the -p flag"],
+            vec!["--dangerously-skip-permissions", "--model", "haiku"],
+        ] {
+            assert!(!claude.conflicts(&os(&args)), "Claude refused {args:?}");
+        }
+    }
+
+    /// PRD #1790 stage 3 (review R3): a version or help query, or a managing
+    /// subcommand, starts no conversation, so the shim leaves the resume
+    /// request for the agent's real start; a session start is not one.
+    #[test]
+    fn version_help_and_managing_subcommands_start_no_conversation() {
+        use std::ffi::OsString;
+        let claude = spec(&AgentType::ClaudeCode).resume.unwrap();
+        let codex = spec(&AgentType::Codex).resume.unwrap();
+        let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        for args in [
+            vec!["--version"],
+            vec!["-v"],
+            vec!["--help"],
+            vec!["-h"],
+            vec!["--model", "haiku", "--version"],
+            vec!["mcp", "list"],
+            vec!["doctor"],
+            vec!["mcp", "add", "-p", "x"],
+        ] {
+            assert!(claude.inspects(&os(&args)), "Claude: {args:?}");
+        }
+        for args in [
+            vec![],
+            vec!["--model", "haiku"],
+            vec!["fix the tests"],
+            vec!["--model", "--version"],
+            vec!["--", "--version"],
+            vec!["fix", "doctor"],
+        ] {
+            assert!(!claude.inspects(&os(&args)), "Claude: {args:?}");
+        }
+        for args in [
+            vec!["--version"],
+            vec!["-V"],
+            vec!["--help"],
+            vec!["-h"],
+            vec!["login", "status"],
+            vec!["-c", "model=\"x\"", "mcp", "list"],
+        ] {
+            assert!(codex.inspects(&os(&args)), "Codex: {args:?}");
+        }
+        for args in [
+            vec![],
+            vec!["--model", "mini"],
+            vec!["exec", "hello"],
+            vec!["resume", "--last"],
+            vec!["hello"],
+            vec!["-m", "--version"],
+            vec!["--", "--version"],
+        ] {
+            assert!(!codex.inspects(&os(&args)), "Codex: {args:?}");
         }
     }
 

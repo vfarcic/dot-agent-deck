@@ -2091,6 +2091,16 @@ fn spawn_with_dir(
     for knob in crate::inbox_watcher::TEST_KNOBS {
         cmd.env_remove(knob);
     }
+    // PRD #1790 stage 3 (audit S4): a one-shot resume request, on the same
+    // rule. A daemon started from a launcher that still carried one (a
+    // restore's wrapper, say) would otherwise hand it to every agent it
+    // spawns, and with the shim on their `PATH` the first of them to start
+    // the named agent would be resumed into a conversation meant for another
+    // pane. The restore spawn is the one caller that supplies a request, in
+    // `opts.env` below.
+    for key in crate::telemetry::shim::RESUME_ENV_KEYS {
+        cmd.env_remove(key);
+    }
 
     for (k, v) in &opts.env {
         // PRD #127 C2: `SHELL` in `opts.env` is a wrapper-choice override only
@@ -27373,6 +27383,60 @@ mod spawn_tests {
             0,
             "child saw DOT_AGENT_DECK_VIA_DAEMON — agent_pty::spawn must scrub it"
         );
+    }
+
+    /// PRD #1790 stage 3 (audit S4): a resume request in the daemon's own
+    /// environment reaches no spawned agent, whether or not the spawn's
+    /// `PATH` leads with a shim directory (telemetry on or off); a request the
+    /// spawn itself supplies, as a restore does, does.
+    #[test]
+    fn spawn_scrubs_an_inherited_resume_request_and_keeps_an_explicit_one() {
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let keys = crate::telemetry::shim::RESUME_ENV_KEYS;
+        let prior: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior values are restored before the lock is released.
+        unsafe {
+            std::env::set_var(keys[0], "claude");
+            std::env::set_var(keys[1], "01234567-89ab-4cde-8fab-0123456789ab");
+            std::env::set_var(keys[2], "inherited-token");
+        }
+        // Exit 1 when any of the three is set, else 0.
+        let probe = "sh -c 'exit ${DOT_AGENT_DECK_RESUME_AGENT:+1}${DOT_AGENT_DECK_RESUME_SESSION:+1}${DOT_AGENT_DECK_RESUME_TOKEN:+1}0'";
+        let status_of = |env: Vec<(String, String)>| {
+            let pty = spawn(SpawnOptions {
+                command: Some(probe),
+                env,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+            let mut child = pty.child;
+            child.wait().expect("wait should succeed").exit_code()
+        };
+        let path = std::env::var("PATH").unwrap_or_default();
+        let shim_path = vec![("PATH".to_string(), format!("/state/telemetry/bin:{path}"))];
+        let without_shim = status_of(Vec::new());
+        let with_shim = status_of(shim_path.clone());
+        let mut explicit = shim_path;
+        explicit.push((keys[2].to_string(), "restore-token".to_string()));
+        let restore = status_of(explicit);
+        unsafe {
+            for (key, value) in keys.iter().zip(prior) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        assert_eq!(
+            without_shim, 0,
+            "telemetry off: an inherited request reached the child"
+        );
+        assert_eq!(
+            with_shim, 0,
+            "telemetry on: an inherited request reached the child"
+        );
+        assert_ne!(restore, 0, "the restore's own request must reach its agent");
     }
 
     #[test]

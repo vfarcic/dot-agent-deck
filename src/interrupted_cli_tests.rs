@@ -1094,3 +1094,71 @@ fn a_start_over_says_what_it_started_or_why_it_did_not() {
     assert_eq!(out.code, EXIT_OK);
     assert!(out.stdout.contains(words::START_OVER_WOULD));
 }
+
+/// PRD #1790 stage 3 (§4 item 10): a dry run whose Git facts show an open
+/// pull request says so, for a restore and for a start over; one without
+/// says nothing about it.
+#[test]
+fn a_dry_run_names_an_open_pull_request_on_the_items_branch() {
+    let open = Some(words::GitFacts {
+        worktree_exists: Some(true),
+        pr: words::PrFact::Open,
+        ..Default::default()
+    });
+    let restore = words::RestoreOutcome {
+        dry_run: true,
+        would_restore: vec![crate::work_journal::AttemptId::parse(ATTEMPT).unwrap()],
+        git: open.clone(),
+        ..Default::default()
+    };
+    let out = render_restore(&restore);
+    assert_eq!(out.code, EXIT_OK);
+    assert!(
+        out.stdout.contains(words::RESTORE_PR_OPEN),
+        "{}",
+        out.stdout
+    );
+    let start_over = words::StartOverOutcome {
+        dry_run: true,
+        would_start: true,
+        git: open,
+        ..Default::default()
+    };
+    let out = render_start_over(&start_over);
+    assert!(
+        out.stdout.contains(words::START_OVER_WOULD),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains(words::RESTORE_PR_OPEN),
+        "{}",
+        out.stdout
+    );
+    let merged = words::RestoreOutcome {
+        git: Some(words::GitFacts {
+            pr: words::PrFact::Merged,
+            ..Default::default()
+        }),
+        ..restore
+    };
+    assert!(
+        !render_restore(&merged)
+            .stdout
+            .contains(words::RESTORE_PR_OPEN)
+    );
+    assert_eq!(
+        with_git_note("Restore?".into(), merged.git.as_ref()),
+        "Restore?"
+    );
+    assert_eq!(
+        with_git_note(
+            "Restore?".into(),
+            Some(&words::GitFacts {
+                pr: words::PrFact::Open,
+                ..Default::default()
+            })
+        ),
+        format!("{} Restore?", words::RESTORE_PR_OPEN)
+    );
+}

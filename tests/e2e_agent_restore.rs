@@ -60,7 +60,8 @@ def write_json(path, value):
     with open(tmp, 'w') as f:
         json.dump(value, f)
     os.replace(tmp, path)
-write_json(os.path.join(root, 'restore-argv-' + agent + '.json'), record)
+# Registry agent ids restart in each daemon; pane ids distinguish both launches.
+write_json(os.path.join(root, 'restore-argv-' + pane + '.json'), record)
 if os.path.exists(os.path.join(root, 'survive-stop')):
     child = os.fork()
     if child == 0:
@@ -83,7 +84,7 @@ hook = subprocess.run([deck, 'hook', '--agent', 'claude-code'],
 if hook.returncode:
     sys.stderr.buffer.write(hook.stderr)
     sys.exit(97)
-open(os.path.join(root, 'ready-' + agent), 'w').close()
+open(os.path.join(root, 'ready-' + pane), 'w').close()
 tty.setraw(0)
 os.write(1, '────────────────────\r\n❯\r\n────────────────────\r\n'.encode())
 while True:
@@ -170,19 +171,19 @@ impl Decks {
         );
         assert_eq!(reply["ok"], true, "fixture launch: {reply}");
         let agent = string(&reply, "id");
-        let started = self.wait_start(&agent);
+        let started = self.wait_start(name);
         journal::wait_for(&self.state, "the fixture attempt", |lines| {
             journal::attempt_of(lines, &agent).cloned()
         });
         started
     }
 
-    fn wait_start(&self, agent: &str) -> Value {
-        let file = self.root.join(format!("restore-argv-{agent}.json"));
+    fn wait_start(&self, pane: &str) -> Value {
+        let file = self.root.join(format!("restore-argv-{pane}.json"));
         assert!(
             common::wait_until(common::child_boot_budget(), || file.is_file()
-                && self.root.join(format!("ready-{agent}")).is_file()),
-            "stand-in {agent} never reported SessionStart"
+                && self.root.join(format!("ready-{pane}")).is_file()),
+            "stand-in in pane {pane} never reported SessionStart"
         );
         serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap()
     }
@@ -198,7 +199,7 @@ impl Decks {
             })
             .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
             .collect();
-        starts.sort_by_key(|s| string(s, "agent"));
+        starts.sort_by_key(|s| string(s, "pane"));
         starts
     }
 
@@ -463,9 +464,9 @@ fn journal_restore_011_continue_resumes_the_session_before_its_first_message() {
     );
     let resumed = starts
         .iter()
-        .find(|s| s["agent"] != original["agent"])
+        .find(|s| s["pane"] != original["pane"])
         .unwrap();
-    let resumed = decks.wait_start(&string(resumed, "agent"));
+    let resumed = decks.wait_start(&string(resumed, "pane"));
     assert_eq!(
         resumed["argv"],
         json!(["--resume", SESSION, "--model", "restore-synthetic"])
@@ -579,9 +580,9 @@ fn journal_restore_015_restore_only_from_the_tui_shows_the_named_pane_and_first_
     assert_eq!(starts.len(), 2, "one resumed launch: {starts:?}");
     let resumed = starts
         .iter()
-        .find(|s| s["agent"] != original["agent"])
+        .find(|s| s["pane"] != original["pane"])
         .unwrap();
-    let resumed = decks.wait_start(&string(resumed, "agent"));
+    let resumed = decks.wait_start(&string(resumed, "pane"));
     assert_eq!(
         resumed["argv"],
         json!(["--resume", SESSION, "--model", "restore-synthetic"])
@@ -616,7 +617,7 @@ fn journal_restore_012_a_different_session_is_stopped_without_a_first_message() 
     assert_eq!(starts.len(), 2, "one attempted resume: {starts:?}");
     let blank = starts
         .iter()
-        .find(|s| s["agent"] != original["agent"])
+        .find(|s| s["pane"] != original["pane"])
         .unwrap();
     assert_eq!(blank["session"], WRONG_SESSION);
     assert_eq!(blank["argv"][0], "--resume");
@@ -752,7 +753,7 @@ fn journal_restore_014_start_over_replays_only_a_safely_saved_dispatch_task() {
     );
     let starts = decks.starts();
     assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
-    let unit = decks.wait_start(&string(&starts[0], "agent"));
+    let unit = decks.wait_start(&string(&starts[0], "pane"));
     let old_attempt = decks.attempt(&string(&unit, "agent"));
     let attempt = string(&old_attempt, "attempt");
     let work = string(&old_attempt, "work");
@@ -801,10 +802,12 @@ fn journal_restore_014_start_over_replays_only_a_safely_saved_dispatch_task() {
         "--yes",
     ]);
     exit(&started, 0);
+    // Start over returns after spawn; the stand-in writes its sentinel next.
+    common::wait_until(common::child_boot_budget(), || decks.starts().len() >= 2);
     let starts = decks.starts();
     assert_eq!(starts.len(), 2, "Start over launches once: {starts:?}");
-    let fresh = starts.iter().find(|s| s["agent"] != unit["agent"]).unwrap();
-    let fresh = decks.wait_start(&string(fresh, "agent"));
+    let fresh = starts.iter().find(|s| s["pane"] != unit["pane"]).unwrap();
+    let fresh = decks.wait_start(&string(fresh, "pane"));
     assert_eq!(
         fresh["argv"],
         json!(["--model", "restore-synthetic"]),

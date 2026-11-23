@@ -33,14 +33,19 @@
 //! one-shot request in its environment ([`RESUME_AGENT_ENV`],
 //! [`RESUME_SESSION_ENV`], [`RESUME_TOKEN_ENV`]). When this program is the
 //! one it names, the shim removes the request from the program's environment,
-//! so nothing the agent starts is resumed into the same conversation, and
-//! either puts the agent's resume arguments in front of its own as separate
-//! argv entries ([`crate::agent_registry::ResumeSpec`]) and creates the
-//! token's acknowledgement in [`RESUME_ACKS_DIR`], or, for an id that is not
-//! of the agent's syntax or arguments that choose another conversation or
-//! command, writes `<token>.refused` with the reason and runs the program
-//! unchanged. A token whose acknowledgement exists already was used, and is
-//! not resumed again. A request for another program is left for it.
+//! so nothing the agent starts is resumed into the same conversation. A call
+//! that starts no conversation (a version or help query, a managing
+//! subcommand) leaves the token for the launch script's later call that does.
+//! Otherwise the shim claims the token exclusively (`<token>.claim` in
+//! [`RESUME_ACKS_DIR`], held by descriptor) and publishes one outcome: the
+//! agent's resume arguments in front of its own as separate argv entries
+//! ([`crate::agent_registry::ResumeSpec`]) with `<token>` acknowledging them,
+//! or, for an id that is not of the agent's syntax or arguments that choose
+//! another conversation or command, `<token>.refused` with the reason and the
+//! program unchanged. A claimed token is never claimed again, whatever its
+//! outcome. A minted token names its expiry, after which no shim claims it
+//! and its files may be retired; the directory's entries are bounded. A
+//! request for another program is left for it.
 //!
 //! Anything that goes wrong in step 2 runs the program unchanged: the shim
 //! never stops an agent from starting. The one refusal is a process tree that
@@ -87,8 +92,27 @@ pub const REFUSED_SESSION_ID_INVALID: &str = "session-id-invalid";
 /// A refusal's reason: the program has no resume by id.
 pub const REFUSED_AGENT_CANNOT_RESUME: &str = "agent-cannot-resume";
 
+/// The suffix of a token's claim: the one exclusive reservation a resume
+/// and a refusal share (audit S2).
+pub const CLAIM_SUFFIX: &str = ".claim";
+
 /// The longest resume token the shim accepts.
 const MAX_TOKEN_LEN: usize = 64;
+
+/// Audit S3: the most entries the acknowledgements directory holds before
+/// the shim claims no new token and the daemon starts no new restore.
+pub const MAX_ACK_ENTRIES: usize = 512;
+
+/// The longest a minted token stays usable: an expiry further from now is
+/// not claimed.
+pub const MAX_TOKEN_LIFETIME_SECS: u64 = 60 * 60;
+
+/// How long after a token's expiry its files are kept before
+/// [`retire_expired`] removes them: room for a clock stepped backwards.
+pub const ACK_RETIRE_GRACE_SECS: u64 = 60 * 60;
+
+/// The most names one [`retire_expired`] call looks at.
+const MAX_RETIRE_LISTED: usize = 4 * MAX_ACK_ENTRIES;
 
 /// The resume acknowledgements' directory for the shim directory `shim_dir`
 /// ([`install`]'s answer).
@@ -168,6 +192,21 @@ pub fn install(config_dir: &Path, deck: &str) -> std::io::Result<PathBuf> {
         std::fs::rename(&staged, dir.join(name))?;
     }
     Ok(dir)
+}
+
+/// The shim directory this daemon installed last ([`record_installed`]).
+static INSTALLED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// PRD #1790 stage 3 (audit "later slices" 5): remember `dir`, the answer of
+/// a successful [`install`], as the directory a restore resumes through.
+pub fn record_installed(dir: PathBuf) {
+    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+}
+
+/// The shim directory this daemon installed ([`record_installed`]), `None`
+/// when no installation succeeded: a restore then resumes nothing.
+pub fn installed_dir() -> Option<PathBuf> {
+    INSTALLED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The shim script for `name`: run the deck at `deck` as the shim in `dir`,
@@ -391,11 +430,16 @@ fn plan_with(
 }
 
 /// The arguments that resume `name` as `request` asks, or none. Resumes only
-/// for a token that can name an acknowledgement, and only once per token: the
-/// acknowledgement is created exclusively before the arguments are given. An
-/// id that is not of the agent's syntax, or the agent's own `args` choosing
-/// another conversation or command, writes the refused acknowledgement and
-/// gives none.
+/// for a usable token ([`token_usable`]), only once per token, and only for a
+/// call that starts a conversation: a version or help query, or a managing
+/// subcommand ([`crate::agent_registry::ResumeSpec::inspects`], review R3),
+/// claims nothing and leaves the request for the launch script's later call
+/// that does. Otherwise the token is claimed exclusively ([`settle`]) before
+/// anything else happens to it, whatever the outcome: an id that is not of
+/// the agent's syntax, or the agent's own `args` choosing another
+/// conversation or command, publishes the refused acknowledgement and gives
+/// none.
+#[cfg(unix)]
 fn resume_args(
     name: &str,
     dir: &Path,
@@ -405,14 +449,61 @@ fn resume_args(
     let Some(token) = request.token.as_deref().filter(|t| is_resume_token(t)) else {
         return Vec::new();
     };
-    let Some(acks) = resume_acks_dir(dir) else {
-        return Vec::new();
-    };
     let spec = crate::agent_registry::ALL
         .iter()
         .filter_map(|spec| spec.resume)
         .find(|resume| resume.program == name);
-    let session = request.session.as_deref().unwrap_or_default();
+    if spec.is_some_and(|spec| spec.inspects(args)) {
+        return Vec::new();
+    }
+    if !token_usable(token, now_secs()) {
+        return Vec::new();
+    }
+    let Ok(acks) = open_acks(dir, true) else {
+        return Vec::new();
+    };
+    settle(&acks, token, name, spec, request.session.as_deref(), args)
+}
+
+#[cfg(not(unix))]
+fn resume_args(
+    _name: &str,
+    _dir: &Path,
+    _args: &[OsString],
+    _request: &ResumeRequest,
+) -> Vec<OsString> {
+    Vec::new()
+}
+
+/// Audit S2: claim `token` in the held acknowledgements directory `acks`,
+/// then publish its one outcome. The claim is `<token>.claim`, created
+/// exclusively ([`CLAIM_SUFFIX`]): the one reservation a refusal and a resume
+/// share, so a token refused once is consumed as a resumed one is, and of two
+/// calls racing on one token only one decides. The outcome is written beside
+/// it and linked into place complete ([`publish`]): `<token>` for a resume,
+/// `<token>.refused` for a refusal. A claim with no outcome is a call that
+/// failed after claiming ([`AckState::Pending`]), which gives no arguments.
+/// The admission bound ([`MAX_ACK_ENTRIES`], audit S3) is checked first: a
+/// full directory claims nothing.
+#[cfg(unix)]
+fn settle(
+    acks: &crate::platform::trusted_dir::TrustedDir,
+    token: &str,
+    name: &str,
+    spec: Option<&crate::agent_registry::ResumeSpec>,
+    session: Option<&str>,
+    args: &[OsString],
+) -> Vec<OsString> {
+    if count_entries(acks, MAX_ACK_ENTRIES) >= MAX_ACK_ENTRIES {
+        return Vec::new();
+    }
+    if acks
+        .create_new_owner_only(&format!("{token}{CLAIM_SUFFIX}"))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let session = session.unwrap_or_default();
     let refusal = match spec {
         None => Some(REFUSED_AGENT_CANNOT_RESUME),
         Some(spec) if !spec.valid_session_id(session) => Some(REFUSED_SESSION_ID_INVALID),
@@ -420,39 +511,203 @@ fn resume_args(
         Some(_) => None,
     };
     if let Some(reason) = refusal {
-        let _ = write_ack(&acks, &format!("{token}{REFUSED_SUFFIX}"), reason);
+        let _ = publish(acks, token, &format!("{token}{REFUSED_SUFFIX}"), reason);
         return Vec::new();
     }
-    match (spec, write_ack(&acks, token, name)) {
+    match (spec, publish(acks, token, token, name)) {
         (Some(spec), Ok(())) => spec.args(session),
         _ => Vec::new(),
     }
 }
 
-/// Create `<acks>/<file>` exclusively, owner-only, holding `body` and a
-/// newline, in an owner-only `acks`. An existing file is an error and is
-/// left as it is.
+/// Write `body` and a newline to a staging file beside `name` in `acks`,
+/// owner-only and synced, then link it to `name`, which fails when `name`
+/// exists: a reader sees no file or the whole one, never part of one.
 #[cfg(unix)]
-fn write_ack(acks: &Path, file: &str, body: &str) -> std::io::Result<()> {
+fn publish(
+    acks: &crate::platform::trusted_dir::TrustedDir,
+    token: &str,
+    name: &str,
+    body: &str,
+) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    crate::platform::fsperm::ensure_owner_only_dir(acks)?;
-    let mut ack = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(acks.join(file))?;
-    ack.write_all(format!("{body}\n").as_bytes())?;
-    ack.sync_all()
+    let staged = format!(".{token}.tmp");
+    #[cfg(test)]
+    if test_seams::fail_publish() {
+        return Err(std::io::Error::other("publish failure (test seam)"));
+    }
+    let mut file = acks.create_new_owner_only(&staged)?;
+    let linked = file
+        .write_all(format!("{body}\n").as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| acks.link(&staged, name));
+    drop(file);
+    let _ = acks.remove_file(&staged);
+    linked?;
+    let _ = acks.sync();
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn write_ack(_acks: &Path, _file: &str, _body: &str) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "the launch shim runs on Unix only",
-    ))
+/// How many entries `acks` holds, counting at most `limit` (and `limit` when
+/// it cannot be listed, so a directory that cannot be read admits nothing).
+#[cfg(unix)]
+fn count_entries(acks: &crate::platform::trusted_dir::TrustedDir, limit: usize) -> usize {
+    let Ok(mut stream) = acks.stream() else {
+        return limit;
+    };
+    let mut count = 0;
+    while count < limit {
+        match stream.next_name() {
+            Some(Ok(_)) => count += 1,
+            Some(Err(_)) => return limit,
+            None => break,
+        }
+    }
+    count
+}
+
+/// The resume acknowledgements' directory of the shim directory `shim_dir`,
+/// held (audit S1): the telemetry directory opened as the anchor (owned by
+/// this account), then [`RESUME_ACKS_DIR`] below it, created owner-only when
+/// `create`, opened without following a link and verified owner-only. Every
+/// later operation is relative to the held descriptor, so a directory renamed
+/// or replaced by a link after this cannot redirect one.
+#[cfg(unix)]
+pub(crate) fn open_acks(
+    shim_dir: &Path,
+    create: bool,
+) -> std::io::Result<crate::platform::trusted_dir::TrustedDir> {
+    let parent = shim_dir.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the shim directory has no parent",
+        )
+    })?;
+    crate::platform::trusted_dir::TrustedDir::anchor(parent)?.child(RESUME_ACKS_DIR, create)
+}
+
+/// Where a restore's token stands, as the daemon reads it ([`ack_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckState {
+    /// Nothing claimed it yet.
+    Unclaimed,
+    /// Claimed, with no outcome published: a call is deciding, or failed
+    /// after claiming. Never a resume.
+    Pending,
+    /// The shim gave the agent its resume arguments.
+    Resumed,
+    /// The shim refused the request and ran the agent unchanged.
+    Refused,
+}
+
+/// Where `token` stands in the held acknowledgements directory `acks`: each
+/// name looked at without following a link, and only a regular file counts.
+#[cfg(unix)]
+pub(crate) fn ack_state(acks: &crate::platform::trusted_dir::TrustedDir, token: &str) -> AckState {
+    use crate::platform::trusted_dir::EntryKind;
+    let is_file = |name: &str| {
+        acks.entry(name)
+            .is_ok_and(|entry| entry.kind == EntryKind::File)
+    };
+    if is_file(&format!("{token}{REFUSED_SUFFIX}")) {
+        AckState::Refused
+    } else if is_file(token) {
+        AckState::Resumed
+    } else if is_file(&format!("{token}{CLAIM_SUFFIX}")) {
+        AckState::Pending
+    } else {
+        AckState::Unclaimed
+    }
+}
+
+/// Audit S3: a fresh token, unpredictable (16 bytes of OS randomness) and
+/// bound to a lifetime: `<expiry>-<32 hex>`, the expiry in seconds since the
+/// Unix epoch, `lifetime` from `now` and at most
+/// [`MAX_TOKEN_LIFETIME_SECS`]. `None` without OS randomness.
+pub fn mint_token(now: u64, lifetime: u64) -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let expiry = now.saturating_add(lifetime.min(MAX_TOKEN_LIFETIME_SECS));
+    Some(format!("{expiry}-{hex}"))
+}
+
+/// The expiry a token names ([`mint_token`]), or `None` for a token of
+/// another form.
+pub fn token_expiry(token: &str) -> Option<u64> {
+    let (expiry, rest) = token.split_once('-')?;
+    (!rest.is_empty() && !expiry.is_empty() && expiry.len() <= 20)
+        .then(|| expiry.parse().ok())
+        .flatten()
+}
+
+/// Whether the shim may claim `token` at `now`: a token that names an expiry
+/// only until it, and only when that expiry is within
+/// [`MAX_TOKEN_LIFETIME_SECS`] of `now`. A token of another form has no time
+/// bound; the admission bound ([`MAX_ACK_ENTRIES`]) is what limits those.
+fn token_usable(token: &str, now: u64) -> bool {
+    token_expiry(token)
+        .is_none_or(|expiry| expiry >= now && expiry <= now.saturating_add(MAX_TOKEN_LIFETIME_SECS))
+}
+
+/// Seconds since the Unix epoch, now.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Audit S3: remove from `acks` every file of a token whose expiry passed
+/// more than [`ACK_RETIRE_GRACE_SECS`] before `now`: its claim, its outcome
+/// and a staging file left behind. Safe across daemons and without weakening
+/// replay protection: a token past its expiry is claimed by no shim
+/// ([`token_usable`]), so its files are no longer what stops a replay.
+/// Files of a token of another form are never removed. Looks at most
+/// [`MAX_RETIRE_LISTED`] names per call. Answers how many entries remain.
+#[cfg(unix)]
+pub(crate) fn retire_expired(acks: &crate::platform::trusted_dir::TrustedDir, now: u64) -> usize {
+    let Ok(mut stream) = acks.stream() else {
+        return MAX_ACK_ENTRIES;
+    };
+    let mut names = Vec::new();
+    while names.len() < MAX_RETIRE_LISTED {
+        match stream.next_name() {
+            Some(Ok(name)) => names.push(name),
+            Some(Err(_)) | None => break,
+        }
+    }
+    drop(stream);
+    let mut remaining = 0;
+    for name in names {
+        let expired = name.to_str().is_some_and(|name| {
+            let token = name.trim_start_matches('.');
+            let token = token.split_once('.').map_or(token, |(token, _)| token);
+            token_expiry(token)
+                .is_some_and(|expiry| expiry.saturating_add(ACK_RETIRE_GRACE_SECS) < now)
+        });
+        if !(expired && acks.remove_file(&name).is_ok()) {
+            remaining += 1;
+        }
+    }
+    remaining
+}
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_PUBLISH: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make this thread's next [`super::publish`] calls fail, until reset.
+    pub(crate) fn set_fail_publish(fail: bool) {
+        FAIL_PUBLISH.with(|f| f.set(fail));
+    }
+
+    pub(super) fn fail_publish() -> bool {
+        FAIL_PUBLISH.with(Cell::get)
+    }
 }
 
 /// The arguments the deck puts in front of `name`'s own `args`, or none —
@@ -869,6 +1124,189 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// PRD #1790 stage 3 (audit S2): a refusal consumes the token as a resume
+    /// does, so the same token with arguments that would resume gets nothing,
+    /// and the daemon reads it refused.
+    #[test]
+    fn a_refused_token_is_consumed_and_a_valid_replay_gets_nothing() {
+        let f = fixture();
+        executable(&f.real.join("claude"));
+        let request = resume_env("claude", RESUME_ID, "replayed-token");
+        let refused = f.plan("claude", &["--continue"], &request).unwrap();
+        assert_eq!(refused.args, os(&["--continue"]));
+        let replay = f.plan("claude", &["--model", "haiku"], &request).unwrap();
+        assert_eq!(replay.args, os(&["--model", "haiku"]), "replayed");
+        let acks = f.telemetry.join(RESUME_ACKS_DIR);
+        assert!(!acks.join("replayed-token").exists());
+        let held = open_acks(&f.shim, false).unwrap();
+        assert_eq!(ack_state(&held, "replayed-token"), AckState::Refused);
+        assert_eq!(ack_state(&held, "never-used"), AckState::Unclaimed);
+    }
+
+    /// PRD #1790 stage 3 (audit S2): of calls racing on one token with
+    /// conflicting and resuming arguments, exactly one claims it and exactly
+    /// one outcome is published.
+    #[test]
+    fn concurrent_calls_on_one_token_publish_one_outcome() {
+        for round in 0..8 {
+            let f = std::sync::Arc::new(fixture());
+            executable(&f.real.join("claude"));
+            let token = format!("race-{round}");
+            let handles: Vec<_> = (0..6)
+                .map(|n| {
+                    let f = std::sync::Arc::clone(&f);
+                    let token = token.clone();
+                    std::thread::spawn(move || {
+                        let args: &[&str] = if n % 2 == 0 {
+                            &["--continue"]
+                        } else {
+                            &["--model", "haiku"]
+                        };
+                        let planned = f
+                            .plan("claude", args, &resume_env("claude", RESUME_ID, &token))
+                            .unwrap();
+                        planned.args.first() == Some(&OsString::from("--resume"))
+                    })
+                })
+                .collect();
+            let resumed = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|r| *r)
+                .count();
+            let acks = f.telemetry.join(RESUME_ACKS_DIR);
+            let success = acks.join(&token).exists();
+            let refusal = acks.join(format!("{token}{REFUSED_SUFFIX}")).exists();
+            assert!(success ^ refusal, "round {round}: one outcome");
+            assert_eq!(resumed, usize::from(success), "round {round}");
+        }
+    }
+
+    /// PRD #1790 stage 3 (audit S2): a call that fails after claiming the
+    /// token publishes nothing, gives no arguments, reads pending (never a
+    /// resume), and leaves the token consumed.
+    #[test]
+    fn a_failure_after_the_claim_is_pending_and_consumes_the_token() {
+        let f = fixture();
+        executable(&f.real.join("claude"));
+        let request = resume_env("claude", RESUME_ID, "failed-token");
+        test_seams::set_fail_publish(true);
+        let failed = f.plan("claude", &["--model", "haiku"], &request);
+        test_seams::set_fail_publish(false);
+        assert_eq!(failed.unwrap().args, os(&["--model", "haiku"]));
+        let held = open_acks(&f.shim, false).unwrap();
+        assert_eq!(ack_state(&held, "failed-token"), AckState::Pending);
+        let again = f.plan("claude", &["--model", "haiku"], &request).unwrap();
+        assert_eq!(again.args, os(&["--model", "haiku"]));
+        assert_eq!(ack_state(&held, "failed-token"), AckState::Pending);
+    }
+
+    /// PRD #1790 stage 3 (audit S1): the acknowledgements directory is held
+    /// by descriptor, so replacing it with a link after it was opened does not
+    /// redirect the claim or the outcome; and a link in its place is refused.
+    #[test]
+    fn a_replaced_acks_directory_does_not_redirect_the_outcome() {
+        let f = fixture();
+        let held = open_acks(&f.shim, true).unwrap();
+        let acks = f.telemetry.join(RESUME_ACKS_DIR);
+        let moved = f.telemetry.join("moved-acks");
+        let elsewhere = f.telemetry.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::rename(&acks, &moved).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &acks).unwrap();
+        let spec = crate::agent_registry::spec(&crate::event::AgentType::ClaudeCode).resume;
+        let args = settle(&held, "held-token", "claude", spec, Some(RESUME_ID), &[]);
+        assert_eq!(args, os(&["--resume", RESUME_ID]));
+        assert!(moved.join("held-token").is_file());
+        assert!(moved.join("held-token.claim").is_file());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert!(
+            open_acks(&f.shim, true).is_err(),
+            "a link where the directory was is refused"
+        );
+    }
+
+    /// PRD #1790 stage 3 (audit S3): a minted token names its expiry; one past
+    /// it, or one claiming an expiry too far away, claims and writes nothing;
+    /// retirement removes the files of expired tokens only; and a full
+    /// directory admits no new claim.
+    #[test]
+    fn token_lifetimes_bound_the_acknowledgements_directory() {
+        let now = now_secs();
+        let token = mint_token(now, 90).unwrap();
+        assert!(is_resume_token(&token), "{token}");
+        assert_eq!(token_expiry(&token), Some(now + 90));
+        assert_eq!(token_expiry("restore-token"), None);
+        assert!(token_usable(&token, now));
+        assert!(!token_usable(&token, now + 91));
+        assert!(!token_usable(
+            &format!("{}-ab", now + 2 * MAX_TOKEN_LIFETIME_SECS),
+            now
+        ));
+        assert!(token_usable("restore-token", now));
+        assert_eq!(
+            token_expiry(&mint_token(now, u64::MAX).unwrap()),
+            Some(now + MAX_TOKEN_LIFETIME_SECS)
+        );
+
+        let f = fixture();
+        executable(&f.real.join("claude"));
+        let expired = format!("{}-0123", now - 5);
+        let planned = f
+            .plan(
+                "claude",
+                &["--model", "haiku"],
+                &resume_env("claude", RESUME_ID, &expired),
+            )
+            .unwrap();
+        assert_eq!(planned.args, os(&["--model", "haiku"]));
+        assert_resume_env_removed(&planned);
+        assert!(!f.telemetry.join(RESUME_ACKS_DIR).exists());
+
+        let held = open_acks(&f.shim, true).unwrap();
+        let old = format!("{}-aa", now - ACK_RETIRE_GRACE_SECS - 10);
+        let recent = format!("{}-bb", now - 10);
+        for name in [
+            old.clone(),
+            format!("{old}{CLAIM_SUFFIX}"),
+            format!("{old}{REFUSED_SUFFIX}"),
+            format!(".{old}.tmp"),
+            recent.clone(),
+            format!("{recent}{CLAIM_SUFFIX}"),
+            "restore-token".to_string(),
+        ] {
+            held.create_new_owner_only(&name).unwrap();
+        }
+        assert_eq!(retire_expired(&held, now), 3);
+        let left: std::collections::BTreeSet<String> =
+            std::fs::read_dir(f.telemetry.join(RESUME_ACKS_DIR))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+        assert_eq!(
+            left,
+            [
+                recent.clone(),
+                format!("{recent}{CLAIM_SUFFIX}"),
+                "restore-token".into()
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        for n in 0..MAX_ACK_ENTRIES {
+            held.create_new_owner_only(&format!("filler-{n}")).unwrap();
+        }
+        let full = f
+            .plan(
+                "claude",
+                &[],
+                &resume_env("claude", RESUME_ID, &mint_token(now, 60).unwrap()),
+            )
+            .unwrap();
+        assert!(full.args.is_empty(), "a full directory admits no claim");
     }
 
     /// A telemetry directory holding the launch shim scripts, and

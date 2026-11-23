@@ -1117,6 +1117,26 @@ async fn git_facts(
     facts
 }
 
+/// PRD #1790 stage 3 (§4 item 10): `item`'s Git facts, its pull request
+/// above all, read with the list's own bounded probes and deadlines, for a
+/// restore's or start-over's dry run.
+pub(crate) async fn item_git_facts(item: &InterruptedItem) -> GitFacts {
+    item_git_facts_with(item, OsStr::new(GH)).await
+}
+
+/// [`item_git_facts`], running `gh` for pull request state.
+async fn item_git_facts_with(item: &InterruptedItem, gh: &OsStr) -> GitFacts {
+    git_facts(
+        item.kind,
+        item.worktree.clone(),
+        item.branch.clone(),
+        gh,
+        Deadline::after(GIT_FACT_TIMEOUT),
+        Deadline::after(PR_STATE_TIMEOUT),
+    )
+    .await
+}
+
 /// Fill each item's Git facts, [`GIT_FACT_CONCURRENCY`] items at a time, all
 /// by `total`: an item that has not started by then keeps the empty facts.
 async fn add_git_facts(items: &mut [InterruptedItem], gh: &OsStr, total: Deadline) {
