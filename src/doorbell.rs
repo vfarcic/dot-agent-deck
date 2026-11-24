@@ -401,8 +401,10 @@ pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: 
 /// and, for a ring, still no native component armed or inside the arm grace
 /// of an announcement. Part 2 (`inbox/doorbell/031`): and the message the
 /// ring names (`selected`) still queued for this generation, from a fresh
-/// query each time. Issue #2385: a ring the tick decided as a re-wake
-/// (`rewake`) is re-asked by the same rule ([`ring_admitted`]).
+/// query each time. Issue #2385: a ring the tick decided past a registered
+/// native component (`rewake`) is re-asked by the re-wake's rule
+/// ([`ring_admitted`]); any other ring keeps the check that nothing is armed,
+/// so a component that arms while it waits for the writer still stops it.
 ///
 /// Part 3, round 5-wake (plan §2.3): the check never waits on the hub's lock.
 /// The ring holds the writer, and the hub's holders can themselves wait on
@@ -676,6 +678,11 @@ pub struct HoldFacts {
     /// waited past the busy bound with the agent sending nothing
     /// ([`QuietClock`]).
     pub silent: bool,
+    /// Issue #2385: the doorbell passes over a registered native component,
+    /// its mail queued past the re-wake bound ([`RewakeClock`]). The wake
+    /// shows as stalled at once, so the reason in front of the doorbell does
+    /// too, rather than after a further stall window.
+    pub passed_over: bool,
 }
 
 /// What a hold does to its episode's clock ([`HoldEpisode`]).
@@ -772,7 +779,7 @@ impl HoldEpisode {
             + self
                 .running_since
                 .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
-        let shown = if facts.silent || elapsed >= after {
+        let shown = if facts.silent || facts.passed_over || elapsed >= after {
             reason
         } else {
             None
@@ -1252,6 +1259,7 @@ async fn run_tick(
                 not_taken: slot.not_taken.is_some(),
                 turns: input.turns,
                 silent,
+                passed_over,
             };
             if let Some(shown) = slot.hold.observe(&hold, now, config.wake_stall_after) {
                 info!(pane_id = %pane, agent_id = %agent, hold = ?shown, ?hold, "doorbell hold");
@@ -1292,15 +1300,6 @@ async fn run_tick(
                 slot.nudged = Some(input.turns);
             }
             let action = decide(&slot.bell, &facts, config, now);
-            if rewake && action != Action::Nothing {
-                info!(
-                    pane_id = %pane,
-                    agent_id = %agent,
-                    armed = facts.inbox.armed,
-                    rings = slot.bell.rings,
-                    "doorbell re-wake: the oldest message waited past the re-wake bound"
-                );
-            }
             if action == Action::Nothing {
                 if slot.bell.is_idle() && facts.inbox.queued.is_empty() {
                     slots.remove(&(pane.clone(), agent.clone()));
@@ -1362,7 +1361,7 @@ async fn run_tick(
                 &config,
                 &id,
                 admission,
-                rewake,
+                passed_over,
             );
             let Some(message) = crate::inbox::MessageId::parse(&id) else {
                 warn!(pane_id = %pane, agent_id = %agent, message_id = %id, "doorbell: a queued id that does not parse");
@@ -1391,6 +1390,16 @@ async fn run_tick(
             if effect.rang {
                 slot.bell.rang(Instant::now(), covered);
                 registry.inbox().note_ring(&pane, &agent);
+                if passed_over {
+                    // Issue #2385: once per ring that wrote, past a component.
+                    info!(
+                        pane_id = %pane,
+                        agent_id = %agent,
+                        message_id = %id,
+                        rings = slot.bell.rings,
+                        "doorbell re-wake: rang past a registered component the oldest message waited on past the re-wake bound"
+                    );
+                }
             }
             if effect.not_taken {
                 // Q9: the agent did not take the deck's Enter. No more rings
@@ -1713,6 +1722,51 @@ mod tests {
         );
     }
 
+    /// Issue #2385: a hold in front of a doorbell that passes over a
+    /// registered component is shown on the first tick, as the stalled wake
+    /// beside it is, not after a further stall window; with nothing holding
+    /// the ring it shows no reason.
+    #[test]
+    fn a_reason_shows_at_once_when_the_doorbell_passes_over_a_waiter() {
+        use crate::inbox_display::WakeHold;
+        let after = Duration::from_secs(120);
+        let t0 = Instant::now();
+        let draft = HoldFacts {
+            draft: true,
+            ..held(true)
+        };
+        let mut episode = HoldEpisode::default();
+        assert_eq!(
+            episode.observe(&draft, t0, after),
+            None,
+            "inside the window"
+        );
+        assert_eq!(
+            episode.observe(
+                &HoldFacts {
+                    passed_over: true,
+                    ..draft
+                },
+                t0 + Duration::from_secs(1),
+                after
+            ),
+            Some(Some(WakeHold::PossibleDraft))
+        );
+        let mut clear = HoldEpisode::default();
+        assert_eq!(
+            clear.observe(
+                &HoldFacts {
+                    passed_over: true,
+                    ..held(true)
+                },
+                t0,
+                after
+            ),
+            None,
+            "nothing holds the ring: no reason to show"
+        );
+    }
+
     fn held(queued: bool) -> HoldFacts {
         HoldFacts {
             queued,
@@ -1833,6 +1887,7 @@ mod tests {
             turns: 0,
             // Issue #2389's row comes first of all; its own test covers it.
             silent: false,
+            passed_over: false,
         };
         assert_eq!(
             obstacle(&HoldFacts {
