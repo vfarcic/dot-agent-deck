@@ -305,6 +305,7 @@ With the dialog open:
 - **"dismiss the first one"** or **"forget that one"** asks, in the dialog, whether to dismiss that item, naming it; it is dismissed when you confirm on screen.
 - **"dismiss all"** or **"clear the list"** asks whether to dismiss every listed item; they are dismissed when you confirm on screen.
 - **"show the details of the first one"**, **"show its reports"**, **"next reports"** and **"previous reports"** show an item and its kept reports on screen. The app does not read them aloud.
+- **"restore the agent"**, **"bring back fix-login"** or **"resume fix-login's conversation"** opens the question that restores that item's agent ([Interrupted Work → Restore an agent](../interrupted-work.md#restore-an-agent)). **Restore and continue**, **Restore only** and **Start over in this worktree** are chosen on screen, since each starts an agent that spends credits and may push or send.
 
 Name an item by its place in the list ("the second one", "the last one") or by its name or branch. With no item named, these act on the selected row.
 

@@ -5721,6 +5721,13 @@ mod tests {
             app_state.set_last_command_store(Arc::new(LastCommandStore::load(
                 dir.join("state").join(LAST_COMMAND_FILE),
             )));
+            // Issue #824: and its prompt library, beside it.
+            app_state.set_prompt_library(Arc::new(
+                dot_agent_deck::prompt_library::PromptLibraryStore::load(
+                    dir.join("state")
+                        .join(dot_agent_deck::prompt_library::PROMPTS_FILE),
+                ),
+            ));
             let server = {
                 let registry = Arc::clone(&registry);
                 let events = events.clone();
@@ -7472,6 +7479,82 @@ mod tests {
             }
             other => panic!("the local deck supports the query, got {other:?}"),
         }
+    }
+
+    /// Scenario: issue #824 under **All Decks** — the local deck is a current
+    /// real daemon and the remote row is a deck from before the prompt library.
+    /// The local deck lists an empty library, takes a save, a seed carrying a
+    /// stale copy of that prompt plus a new one, and a delete, answering the
+    /// library each time; the older deck answers every verb "unsupported" and
+    /// is sent none of them.
+    ///
+    /// **What it fails against.** A verb that reached the selected deck rather
+    /// than the one it names, a seed that overwrote a held prompt, or a request
+    /// sent to a deck that never advertised `prompt-library`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_prompt_library_reaches_only_the_deck_it_names() {
+        use crate::prompt_library::{
+            DesktopPrompt, DesktopPromptLibrary, PromptLibraryVerb, prompt_library_on,
+        };
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("824-local");
+        let older = OlderDeck::withholding(
+            "824-older",
+            &[dot_agent_deck::daemon_protocol::CAP_PROMPT_LIBRARY],
+        );
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("older-824.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+        let prompt = |id: &str, name: &str| DesktopPrompt {
+            id: id.into(),
+            name: name.into(),
+            body: format!("{name} body"),
+            note: None,
+        };
+
+        let mut local_answers = Vec::new();
+        for verb in [
+            PromptLibraryVerb::List,
+            PromptLibraryVerb::Save(prompt("a", "Edited")),
+            PromptLibraryVerb::Seed(vec![prompt("a", "Stale"), prompt("b", "New")]),
+            PromptLibraryVerb::Delete("a".into()),
+        ] {
+            local_answers.push(prompt_library_on(&state, &local_wire, verb).await);
+        }
+        let mut older_answers = Vec::new();
+        for verb in [
+            PromptLibraryVerb::List,
+            PromptLibraryVerb::Save(prompt("a", "A")),
+            PromptLibraryVerb::Seed(vec![prompt("b", "B")]),
+            PromptLibraryVerb::Delete("a".into()),
+        ] {
+            older_answers.push(prompt_library_on(&state, &older_wire, verb).await);
+        }
+        let refused = older.refused.load(Ordering::SeqCst);
+        local.shutdown();
+        older.shutdown();
+
+        let deck = |prompts: Vec<DesktopPrompt>| Ok(DesktopPromptLibrary::Deck { prompts });
+        assert_eq!(
+            local_answers,
+            vec![
+                deck(vec![]),
+                deck(vec![prompt("a", "Edited")]),
+                deck(vec![prompt("a", "Edited"), prompt("b", "New")]),
+                deck(vec![prompt("b", "New")]),
+            ]
+        );
+        for answer in older_answers {
+            assert_eq!(answer, Ok(DesktopPromptLibrary::Unsupported));
+        }
+        assert_eq!(refused, 0, "no prompt verb was sent to the older deck");
     }
 
     /// Scenario: issue #1240's listing options, aimed under **All Decks** at a

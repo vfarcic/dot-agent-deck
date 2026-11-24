@@ -583,7 +583,8 @@ report      = "Closed."
 # hidden is picked as `open_deck` and reaches this row only by this row's own
 # `yes` (audit A1). Asked together with `open_deck`, the meaning check answered
 # "go back" `no` for "close what is on top" 3 times in 3 manifest runs
-# (`deck-hidden-go-back`, 2026-10-20). Saying what the close does, as the
+# (`deck-hidden-go-back`, 2026-10-20; the fixture went with the Daemons
+# screen's flag in issue #1308). Saying what the close does, as the
 # description's first sentence does, names the going back.
 asks_to     = "close what is on top and go back to what is under it"
 try_saying  = "close this"
@@ -925,6 +926,39 @@ unavailable_hint = "report pages turn in an item's details in the Interrupted wo
 report      = "Showing the previous reports."
 asks_to     = "show the previous page of an interrupted item's reports"
 try_saying  = "previous reports"
+
+# PRD #1790 stage 3 — Restore in the Interrupted work dialog: brings an
+# agent a restart stopped back with its conversation, or starts it over in
+# its folder without it. **Voice asks the question only**: the dialog shows
+# the restore question for the item the words name, with its choices, and
+# starting the agent waits for the person's click or key on that question
+# (PRD #802 D5) — Restore and
+# continue, Restore only and Start over in this worktree are registry
+# entries of their own (`restoreAndContinueInterrupted`,
+# `restoreOnlyInterrupted`, `startOverInterrupted`), with no row. `item` as
+# `reclaim_interrupted`'s.
+[[commands]]
+id          = "restore_interrupted"
+description = """In the open Interrupted work dialog, ask to Restore an interrupted agent: the dialog asks whether to
+bring that agent back with its conversation, or to start it over in its folder when its conversation
+cannot come back, and the user chooses on screen. Use for restore the agent, restore it, restore the
+second one, bring back fix-login, resume fix-login's conversation, bring that agent back. Set `item` to
+the words the user used for which item, and only those: an ordinal ("second", "the last one") or the
+item's name or branch as they said it; leave `item` out when they named none. Never add a name the
+user did not say. It is not `reclaim_interrupted`, which removes a worktree, and not
+`dismiss_interrupted`."""
+invoke      = "askRestoreInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "restoring works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Asking whether to restore it."
+asks_to     = "restore an interrupted agent"
+try_saying  = "restore the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
 
 # PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
 # voice. The drop-down dispatches through the same registry entry

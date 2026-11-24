@@ -299,10 +299,8 @@ screen = "agent"
 action = "open_overview"
 outcome = "unavailable"
 
-# These first four `open_deck` fixtures run with the experimental deck shown.
-# The deck-hidden fixtures following them exercise the shipped overview: a
-# bare "go back" routes to `close`, while explicit deck requests resolve to
-# `open_deck` and are refused with the hidden-deck hint.
+# The Daemons screen left the experimental flag in issue #1308, so these
+# `open_deck` fixtures run it shown, as the shipped app does.
 [[fixtures]]
 name = "open-deck-back"
 utterance = "go back"
@@ -329,30 +327,6 @@ name = "open-deck-unavailable"
 utterance = "take me back to the terminals"
 # The agent screen, for `open-overview-unavailable`'s reason (#1197).
 screen = "agent"
-action = "open_deck"
-outcome = "unavailable"
-
-[[fixtures]]
-name = "deck-hidden-go-back"
-utterance = "go back"
-screen = "overview"
-deck_hidden = true
-action = "close"
-outcome = "dispatch"
-
-[[fixtures]]
-name = "deck-hidden-back-to-deck"
-utterance = "back to the deck"
-screen = "overview"
-deck_hidden = true
-action = "open_deck"
-outcome = "unavailable"
-
-[[fixtures]]
-name = "deck-hidden-open-deck"
-utterance = "open the deck"
-screen = "overview"
-deck_hidden = true
 action = "open_deck"
 outcome = "unavailable"
 
@@ -3126,3 +3100,31 @@ screen = "agent"
 action = "dictate_to_agent"
 outcome = "dispatch"
 dictate_prefix = "type"
+
+[[fixtures]]
+name = "restore-interrupted-selected"
+utterance = "restore the agent"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-bring-back"
+utterance = "bring back fix-login"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-conversation"
+utterance = "resume fix-login's conversation"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-unavailable-in-pane"
+utterance = "restore the agent"
+screen = "agent"
+action = "restore_interrupted"
+outcome = "unavailable"

@@ -29,6 +29,7 @@ mod local_deck;
 mod model_service;
 /// PRD #1401: the in-app pull request browser.
 mod pr_browser;
+mod prompt_library;
 // PRD #802 M4 — the credential seam PRD #803 M5 named, over the OS keychain.
 // Not voice-specific, so it is a module of its own rather than one under
 // `voice`: the rule it serves is #803's and any later feature needing a
@@ -2050,6 +2051,55 @@ async fn interrupted_work_dismiss(
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     crate::interrupted_work::dismiss(&daemon.client, &instance_id, ids).await
+}
+
+/// PRD #1790 stage 3: restore the attempts `agents` of interrupted item `id`
+/// on deck `deck_id` with their conversations, or with `dry_run` ask what
+/// that would do. The daemon starts the agent. Sent with no pane claim, and
+/// not behind the experimental flag (issue #2494).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn interrupted_work_restore(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    agents: Vec<String>,
+    mode: dot_agent_deck::interrupted_work::RestoreMode,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::RestoreOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::restore(&daemon.client, &instance_id, &id, agents, mode, dry_run).await
+}
+
+/// PRD #1790 stage 3: start attempt `agent` of interrupted item `id` on deck
+/// `deck_id` over in its folder, without its conversation, or with `dry_run`
+/// ask what that would do. Sent with no pane claim.
+#[tauri::command]
+async fn interrupted_work_start_over(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    agent: String,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::StartOverOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::start_over(&daemon.client, &instance_id, &id, &agent, dry_run).await
 }
 
 /// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
@@ -4077,9 +4127,6 @@ async fn desktop_voice_resolve(
         },
         voice::Transcript::new(utterance),
         settings.labels,
-        // Issue #1198: the deck is an experimental surface, so voice neither
-        // offers nor dispatches the way there while it is hidden.
-        dot_agent_deck::features::show_desktop_deck(),
     )
     .await
 }
@@ -4115,7 +4162,6 @@ async fn resolve_declared_utterance(
     declared: VoiceDeclaration<'_>,
     transcript: voice::Transcript,
     labels: crate::settings::LabelSharing,
-    show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
     let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     with_other_agents(&mut decks, declared.other_agents);
@@ -4136,7 +4182,6 @@ async fn resolve_declared_utterance(
         declared.reading,
         transcript,
         labels,
-        show_deck,
     )
     .await;
     voice::address_deck_switch(&mut result.outcome, |deck_id| {
@@ -5511,9 +5556,6 @@ async fn desktop_voice_commands(
             .voice
             .unwrap_or_default()
             .labels,
-        // Issue #1198: the list marks the deck's row unavailable while the deck
-        // is hidden, for the same reason the resolver refuses it.
-        dot_agent_deck::features::show_desktop_deck(),
     ))
 }
 
@@ -7703,6 +7745,10 @@ pub fn run() {
             antigravity_notice::desktop_antigravity_notice_start,
             antigravity_notice::desktop_antigravity_notice_choose,
             desktop_list_directories,
+            prompt_library::desktop_list_prompts,
+            prompt_library::desktop_save_prompt,
+            prompt_library::desktop_delete_prompt,
+            prompt_library::desktop_seed_prompts,
             desktop_inbox_action,
             desktop_generate_config,
             desktop_agent_opened,
@@ -7713,6 +7759,8 @@ pub fn run() {
             interrupted_work_show,
             interrupted_work_reclaim,
             interrupted_work_dismiss,
+            interrupted_work_restore,
+            interrupted_work_start_over,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_reconnect_deck,
@@ -8498,7 +8546,6 @@ mod tests {
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
-            true,
         )
         .await
     }

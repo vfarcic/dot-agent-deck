@@ -22,7 +22,7 @@ import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { STAR_THANKS, type StarChoice } from "./starPrompt";
 import { fixtureInterruptedWork } from "../data/fixtureInterrupted";
-import { isDismissOutcome, isInterruptedList, isInterruptedShow, isReclaimOutcome, normalizeInterruptedReply, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "./interruptedWork";
+import { isDismissOutcome, isInterruptedList, isInterruptedShow, isReclaimOutcome, isRestoreOutcome, isStartOverOutcome, normalizeInterruptedReply, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreOutcome, type StartOverOutcome } from "./interruptedWork";
 import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } from "./antigravityNotice";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
@@ -46,6 +46,8 @@ import type { HandoffEdge,
   DeckDirectoryListing,
   DeckFleet,
   DeckListingOptions,
+  DeckPrompt,
+  DeckPromptLibrary,
   DeckSnapshot,
   DesktopFeatures,
   AgentCardEntry,
@@ -2368,6 +2370,23 @@ export interface DeckBridge {
    */
   newAgentOptions(deckId: string): Promise<NewAgentOptions>;
   /**
+   * Issue #824 — the prompt library of the deck `deckId` names, which that
+   * deck's daemon keeps. Resolves `unsupported`, having sent nothing, for a
+   * deck from before the library; rejects exactly as {@link listDirectories}
+   * does.
+   */
+  listPrompts(deckId: string): Promise<DeckPromptLibrary>;
+  /** Issue #824 — add `prompt` to that deck's library, or replace the prompt with its id. Rejects with the deck's refusal when a limit is exceeded. */
+  savePrompt(deckId: string, prompt: DeckPrompt): Promise<DeckPromptLibrary>;
+  /** Issue #824 — remove the prompt with `id` from that deck's library; an unknown id is not an error. */
+  deletePrompt(deckId: string, id: string): Promise<DeckPromptLibrary>;
+  /**
+   * Issue #824 — hand the library this app kept on this device to that deck:
+   * it adds the prompts it does not hold and replaces none, all or nothing, so
+   * a rejection added nothing.
+   */
+  seedPrompts(deckId: string, prompts: DeckPrompt[]): Promise<DeckPromptLibrary>;
+  /**
    * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
    * on the deck `deckId` names: the project's, `not_project` for an ordinary
    * directory, or `unsupported` with the reason for a deck that cannot launch
@@ -2511,6 +2530,16 @@ export interface DeckBridge {
   interruptedWorkReclaim?(target: InterruptedTarget, id: string, dryRun: boolean): Promise<InterruptedReply<ReclaimOutcome>>;
   /** PRD #1790 stage 2 — dismiss exactly the items `ids` name (`interrupted_work_dismiss`); Dismiss all passes the ids it listed. */
   interruptedWorkDismiss?(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>>;
+  /**
+   * PRD #1790 stage 3 — restore the attempts `agents` of item `id` with their
+   * conversations (`interrupted_work_restore`), or with `dryRun` ask what that
+   * would do. The daemon starts the agent, so both clients restore the same
+   * way; `unsupported` when that daemon does not advertise `restore-agents`.
+   * The person's client: no pane claim.
+   */
+  interruptedWorkRestore?(target: InterruptedTarget, id: string, agents: string[], mode: RestoreMode, dryRun: boolean): Promise<InterruptedReply<RestoreOutcome>>;
+  /** PRD #1790 stage 3 — start attempt `agent` of item `id` over in its folder, without its conversation (`interrupted_work_start_over`). */
+  interruptedWorkStartOver?(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>>;
   dispose(): Promise<void>;
 }
 
@@ -2554,6 +2583,24 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 }
 
 /**
+ * Issue #824 — read a prompt-library reply field by field: a `deck` reply's
+ * prompts keep only entries with the four fields' types, and anything that is
+ * not a recognisable reply is an error rather than an empty library, so a
+ * malformed answer can never be mistaken for "this deck holds no prompts".
+ */
+export function normalizePromptLibrary(value: unknown): DeckPromptLibrary {
+  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+  if (record.kind === "unsupported") return { kind: "unsupported" };
+  if (record.kind !== "deck" || !Array.isArray(record.prompts)) throw new Error("The daemon's prompt library reply could not be read.");
+  const prompts = record.prompts.flatMap((entry): DeckPrompt[] => {
+    const prompt = typeof entry === "object" && entry !== null ? entry as Record<string, unknown> : {};
+    if (typeof prompt.id !== "string" || typeof prompt.name !== "string" || typeof prompt.body !== "string") return [];
+    return [{ id: prompt.id, name: prompt.name, body: prompt.body, ...(typeof prompt.note === "string" ? { note: prompt.note } : {}) }];
+  });
+  return { kind: "deck", prompts };
+}
+
+/**
  * Fixture mode's answer to {@link DeckBridge.desktopFeatures}: all OFF, the
  * shipped default, unless the preview URL carries `?experimental=1` (or
  * `true`) — the seam the vitest and Playwright suites use to see the gated
@@ -2563,7 +2610,7 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
-  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
+  return { showProjects: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
 }
 
 
@@ -3352,12 +3399,17 @@ class FixtureDeckBridge implements DeckBridge {
    * `interrupted=1` in the URL, `interrupted=many` for 27 more units than
    * the three (a list longer than the dialog), or `interrupted=unread` for an
    * empty list that says the journal could not be read whole (verification
-   * finding N4): a daemon that does not support it otherwise. Dismiss and a
-   * real reclaim remove the item for the rest of the session.
+   * finding N4), or `interrupted=restore` (PRD #1790 stage 3) for a unit
+   * that can be restored and a Pi that can only start over, or
+   * `interrupted=restore-long` for the same with an agent name far longer
+   * than the dialog is tall: a daemon that does not support it otherwise.
+   * Dismiss, a real reclaim, restore and start-over remove the item for the
+   * rest of the session.
    */
   private readonly interrupted = (() => {
     const asked = new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("interrupted");
-    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread", asked === "many" ? 27 : 0, asked === "unread");
+    const restorable = asked === "restore" || asked === "restore-long";
+    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread" || restorable, asked === "many" ? 27 : 0, asked === "unread", restorable, asked === "restore-long");
   })();
   async interruptedWorkList(target: InterruptedTarget): Promise<InterruptedReply<InterruptedList>> {
     return this.interrupted.list(target);
@@ -3370,6 +3422,12 @@ class FixtureDeckBridge implements DeckBridge {
   }
   async interruptedWorkDismiss(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>> {
     return this.interrupted.dismiss(target, ids);
+  }
+  async interruptedWorkRestore(target: InterruptedTarget, id: string, agents: string[], mode: RestoreMode, dryRun: boolean): Promise<InterruptedReply<RestoreOutcome>> {
+    return this.interrupted.restore(target, id, agents, mode, dryRun);
+  }
+  async interruptedWorkStartOver(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>> {
+    return this.interrupted.startOver(target, id, agent, dryRun);
   }
   /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
   async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
@@ -3414,6 +3472,8 @@ class FixtureDeckBridge implements DeckBridge {
   private starAnswered = false;
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
+  /** Issue #824 — each fixture deck's prompt library, kept in memory as its daemon would keep it. */
+  private promptLibraries = new Map<string, DeckPrompt[]>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
   private upgradesInFlight = new Set<string>();
   private upgradeQuestions = new Map<string, { questionId: number; answer: (choice: UpgradeChoice) => void }>();
@@ -4215,6 +4275,39 @@ class FixtureDeckBridge implements DeckBridge {
 
   async previewWorktreeClose(): Promise<WorktreeCloseReport> {
     return NO_WORKTREE_CLOSE_REPORT;
+  }
+
+  /** Issue #824 — the named fixture deck's prompt library, or `unsupported` for one this preview plays as older. */
+  async listPrompts(deckId: string): Promise<DeckPromptLibrary> {
+    return this.changePromptLibrary(deckId, (prompts) => prompts);
+  }
+
+  async savePrompt(deckId: string, prompt: DeckPrompt): Promise<DeckPromptLibrary> {
+    return this.changePromptLibrary(deckId, (prompts) => (
+      prompts.some((held) => held.id === prompt.id) ? prompts.map((held) => (held.id === prompt.id ? { ...prompt } : held)) : [...prompts, { ...prompt }]
+    ));
+  }
+
+  async deletePrompt(deckId: string, id: string): Promise<DeckPromptLibrary> {
+    return this.changePromptLibrary(deckId, (prompts) => prompts.filter((held) => held.id !== id));
+  }
+
+  /** The daemon's seed rule: add the ids it does not hold, in order, and replace none. */
+  async seedPrompts(deckId: string, seed: DeckPrompt[]): Promise<DeckPromptLibrary> {
+    return this.changePromptLibrary(deckId, (prompts) => {
+      const next = [...prompts];
+      for (const prompt of seed) if (!next.some((held) => held.id === prompt.id)) next.push({ ...prompt });
+      return next;
+    });
+  }
+
+  private async changePromptLibrary(deckId: string, change: (prompts: DeckPrompt[]) => DeckPrompt[]): Promise<DeckPromptLibrary> {
+    await Promise.resolve();
+    this.connectedDeck(deckId);
+    if (this.isOlderDeck(deckId)) return { kind: "unsupported" };
+    const next = change(this.promptLibraries.get(deckId) ?? []);
+    this.promptLibraries.set(deckId, next);
+    return { kind: "deck", prompts: next.map((prompt) => ({ ...prompt })) };
   }
 
   /** PRD #1223 M4 — the named fixture deck's options, or `unsupported` for one this preview plays as older. */
@@ -6168,6 +6261,16 @@ export class TauriDeckBridge implements DeckBridge {
     return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_dismiss", { deckId: target.deckId, instanceId: target.instance, ids }), isDismissOutcome);
   }
 
+  async interruptedWorkRestore(target: InterruptedTarget, id: string, agents: string[], mode: RestoreMode, dryRun: boolean): Promise<InterruptedReply<RestoreOutcome>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_restore", { deckId: target.deckId, instanceId: target.instance, id, agents, mode, dryRun }), isRestoreOutcome);
+  }
+
+  async interruptedWorkStartOver(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_start_over", { deckId: target.deckId, instanceId: target.instance, id, agent, dryRun }), isStartOverOutcome);
+  }
+
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
     const invoke = await this.getInvoke();
     return normalizeAgentCards(await invoke<unknown>("agent_cards_list", { deckId }));
@@ -6306,6 +6409,27 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOptions>("desktop_new_agent_options", { deckId });
+  }
+
+  /** Issue #824 — every prompt-library answer goes through {@link normalizePromptLibrary}. */
+  async listPrompts(deckId: string): Promise<DeckPromptLibrary> {
+    const invoke = await this.getInvoke();
+    return normalizePromptLibrary(await invoke<unknown>("desktop_list_prompts", { deckId }));
+  }
+
+  async savePrompt(deckId: string, prompt: DeckPrompt): Promise<DeckPromptLibrary> {
+    const invoke = await this.getInvoke();
+    return normalizePromptLibrary(await invoke<unknown>("desktop_save_prompt", { deckId, prompt }));
+  }
+
+  async deletePrompt(deckId: string, id: string): Promise<DeckPromptLibrary> {
+    const invoke = await this.getInvoke();
+    return normalizePromptLibrary(await invoke<unknown>("desktop_delete_prompt", { deckId, id }));
+  }
+
+  async seedPrompts(deckId: string, prompts: DeckPrompt[]): Promise<DeckPromptLibrary> {
+    const invoke = await this.getInvoke();
+    return normalizePromptLibrary(await invoke<unknown>("desktop_seed_prompts", { deckId, prompts }));
   }
 
   async previewWorktreeClose(deckId: string, paneIds: string[], incarnation?: string): Promise<WorktreeCloseReport> {

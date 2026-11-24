@@ -855,6 +855,28 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         );
         state.write().await.set_last_command_store(Arc::new(store));
     }
+    // Issue #824: the deck's prompt library, from the same state directory and
+    // under the same loader rules — a missing, bad or untrusted file loads as
+    // an empty library and never stops the daemon; see `crate::prompt_library`.
+    // Read on a blocking worker: the file may be several megabytes, unlike
+    // the one-line last-command file above.
+    {
+        let path = crate::prompt_library::PromptLibraryStore::default_path();
+        let store = match tokio::task::spawn_blocking(move || {
+            crate::prompt_library::PromptLibraryStore::load(path)
+        })
+        .await
+        {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(%error, "could not load the prompt library; starting with none");
+                crate::prompt_library::PromptLibraryStore::load_empty(
+                    crate::prompt_library::PromptLibraryStore::default_path(),
+                )
+            }
+        };
+        state.write().await.set_prompt_library(Arc::new(store));
+    }
     let event_tx = daemon.event_tx;
     // PRD #1741: OTLP export of agent runs, read from this process's
     // environment. Off unless it names an endpoint: no task, no client, and no

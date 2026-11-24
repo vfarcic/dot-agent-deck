@@ -1537,6 +1537,8 @@ fn show_reads_any_one_of_the_items_reports_by_its_id() {
         cut: false,
         progress: crate::interrupted_work::Progress::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     };
     for n in 1..=20 {
         item.reports.push(ItemReport {
@@ -1717,6 +1719,9 @@ fn a_dismissal_of_items_with_oversized_names_fits_its_reply() {
                     orchestration: None,
                     orchestration_id: None,
                     ts_ms: 1,
+                    pid: None,
+                    pid_start: None,
+                    launch_nonce: None,
                 },
             )
             .expect("write a launch record");
@@ -1914,6 +1919,8 @@ fn show_pages_reach_every_kept_report_beyond_the_metadata_cap() {
         cut: false,
         progress: crate::interrupted_work::Progress::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     };
     for n in 1..=total {
         item.reports.push(ItemReport {
@@ -2138,6 +2145,8 @@ fn a_report_page_past_the_end_up_to_usize_max_is_clamped() {
         cut: false,
         progress: Progress::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     };
     let body = |report_id: &str| ShownReport {
         report_id: report_id.to_string(),
@@ -2515,5 +2524,74 @@ fn git_facts_answer_unknown_when_the_worktree_lookup_stalls() {
         .expect("the facts answer by their deadline, not after the stalled lookup");
         assert_eq!(facts, GitFacts::default(), "unknown: {facts:?}");
         assert_eq!(facts.worktree_exists, None);
+    });
+}
+
+/// PRD #1790 stage 3 (§4 item 10): a restore's or start-over's dry run reads
+/// the item's Git facts with the list's bounded probes, so an open pull
+/// request on the item's branch reaches the client's question.
+#[cfg(unix)]
+#[test]
+fn a_dry_runs_git_facts_show_an_open_pull_request() {
+    use std::os::unix::fs::PermissionsExt as _;
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, &root)
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q", "-b", "agent/dispatch-x", "."]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "a"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/someone/something.git",
+        ]);
+        let gh = root.join("gh");
+        let answer =
+            r#"[{"state":"OPEN","headRefName":"agent/dispatch-x","isCrossRepository":false}]"#;
+        crate::test_isolation::write_script(&gh, format!("#!/bin/sh\nprintf '%s\\n' '{answer}'\n"))
+            .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let item = InterruptedItem {
+            id: WorkId::parse("w-abcdefgh-0000000000000001").unwrap(),
+            kind: ItemKind::Unit,
+            name: None,
+            issue: None,
+            repo: None,
+            branch: Some("agent/dispatch-x".into()),
+            worktree: Some(repo.to_string_lossy().into_owned()),
+            launcher: None,
+            last_entry: crate::interrupted_work::LastEntry {
+                kind: "ended".into(),
+                ts_ms: 1,
+            },
+            reports: Vec::new(),
+            reports_omitted: 0,
+            cut: false,
+            progress: crate::interrupted_work::Progress::default(),
+            git: None,
+            agents: Vec::new(),
+            agents_omitted: 0,
+        };
+        let facts = item_git_facts_with(&item, gh.as_os_str()).await;
+        assert_eq!(facts.worktree_exists, Some(true));
+        assert_eq!(facts.pr, crate::interrupted_work::PrFact::Open, "{facts:?}");
+        let gone = InterruptedItem {
+            worktree: Some(root.join("gone").to_string_lossy().into_owned()),
+            ..item
+        };
+        let facts = item_git_facts_with(&gone, gh.as_os_str()).await;
+        assert_eq!(facts.worktree_exists, Some(false));
+        assert_eq!(facts.pr, crate::interrupted_work::PrFact::Unknown);
     });
 }
