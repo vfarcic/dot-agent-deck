@@ -309,6 +309,27 @@ The hook socket's skew is closed on that socket, because a one-shot CLI runs no 
 
 The `cross-version` CI job compares `PROTOCOL_VERSION` at the previous release with the head first. `v0.48.0` and `v0.48.1` speak protocol 12, as this branch does, so against them the job runs the harness: tells 3 and 4 fail there in the ways part 3's `KNOWN_EFFECTS` entries explain, each naming a part-3 break the previous release does not declare ([cross-version-harness.md](cross-version-harness.md#which-release-is-previous)). Against a `v0.47.x` release (protocol 11) it runs no harness and records the protocol refusal as the rule-12 outcome ([cross-version-harness.md](cross-version-harness.md#in-ci)). The harness's stand-in panes run no Claude Code hook, so it exercises none of the hook pairings above; those are pinned by lane-1 stand-ins (`inbox/claude/028`, `inbox/claude/029`) and the floor tests. Part 1's and part 2's breaks (issue [#1755](https://github.com/vfarcic/dot-agent-deck/issues/1755), closed) need no `KNOWN_EFFECTS` entry: `v0.48.x` declares all three, so no same-protocol pairing disagrees on them.
 
+### The load test
+
+The merge gate for the message → wake → deliver → acknowledge round trip is `tests/e2e_inbox_load.rs` (`inbox/load/001` to `004` in `tests/CATALOG.md`). Each case runs one real interactive agent (Claude Code, OpenCode, Pi or Codex) in a PTY-attached `TuiDeck`, with three busy-loop processes per CPU running for the whole case. It posts messages at the agent's spawn seed, while it is idle and while it is inside a 30-second shell-tool turn (and, for Claude Code, after a `/clear`). A case passes only when every message is acknowledged in the inbox and the agent has acted on it, by creating that message's sentinel file, within one absolute window per agent: 240 s for the native agents, 300 s for Codex. Codex has no native wake, so its case is the doorbell-only one: it also checks each message is listed as acknowledged by the real `inbox list` CLI, and a message left queued fails it.
+
+The load test is lane 2, so no CI job runs it. It also skips by default, so an ordinary `cargo test-e2e-live` run starts no busy loops: each case prints `SKIP:` before any preflight unless `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` is set. Run it with its own nextest configuration, which runs the four cases one at a time and gives each 12 minutes:
+
+```bash
+DOT_AGENT_DECK_INBOX_LOAD_TEST=1 DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 \
+  cargo test-e2e-live --config-file tests/fixtures/inbox-load-nextest.toml --test e2e_inbox_load load_ --no-capture
+```
+
+`DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns a skipped case into a failure, so a missing credential cannot read as a pass. Run it after a change to the inbox, the doorbell or an agent's integration (hooks, plugin or extension); nothing schedules it.
+
+**A valid run reports `verdict: STARVED` on every case.** The busy loops are there to starve the machine, so the load-context block (issue #701) reads STARVED on a pass as well as on a failure. Its advice that a failure under STARVED is not evidence of a regression does not apply to this binary: delivering under that load is what each case asserts. Rerun a failed case alone first (CLAUDE.md rule 6), and treat a failure that repeats alone as a delivery defect.
+
+Recorded runs:
+
+| Date | `main` | Agents | Result |
+| --- | --- | --- | --- |
+| 2026-11-23 | `b96607c5` | Claude Code 2.1.330 (Haiku), OpenCode 2.2.7 (Haiku), Pi 1.4.0 (`gpt-5.6-luna`), Codex 0.169.0 (`gpt-5.6-luna`) | 4 of 4 passed in 547 s: 25 of 25 messages for Claude Code, 20 of 20 for each of the others, acknowledged and acted on. CPU stall (PSI `some`) 85 to 88 % of each case's window, 1-minute load average up to 58 on 16 CPUs, with other agents' work running on the machine. |
+
 ## Codex, Devin and `inbox fetch` on receipts (PRD #1666 part 3, H4)
 
 H4 moves the remaining mail takers onto the one-shot library Claude Code's hooks use (`src/inbox_oneshot.rs`). `engine::slot_for` maps `codex_hooks`, `devin_hooks` and `other` to `Slot::Hook`, which every hook receiver shares: it is registered by its own `inbox_receipt_fetch`, issued what that fetch asked for once (`hook_fetch`: queued mail no live receiver holds, and scheduled repeats), and never a `dispatch` target, never superseded and never superseding. It is not entered in the generation's `waiters`, so it is never counted as an armed native waiter and never holds off the doorbell. `MAX_LIVE_HOOKS` and the hook hold bound it as before. A non-Claude wait stays unsupported: a receipt wait from these components is refused `unsupported`, and their legacy `inbox_wait`, which only an older binary sends, keeps the legacy waiter until H5. The mapping grants none of them a native wake.

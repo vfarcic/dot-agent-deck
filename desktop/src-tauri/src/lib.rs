@@ -90,14 +90,13 @@ use tauri::{AppHandle, Emitter, Manager, State, Webview};
 use crate::agent_view::{AgentView, RECONCILE_INTERVAL};
 use crate::daemon_bridge::{DaemonLinks, bootstrap, get_snapshot, snapshot_with, trusted_daemon};
 use crate::dto::{
-    BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
-    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions,
-    DesktopNewAgentOptions, DesktopNewAgentOrchestrations, DesktopProjectListing,
-    DesktopResolvedProject, DesktopSnapshot, OrchestrationRoleInput, TerminalAttachResult,
-    desktop_agent_registry, ensure_desktop_orchestration_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, validate_agent_id,
-    validate_dimensions, validate_orchestration_shape, validate_pasted_project_path,
-    validate_start_fields,
+    BootstrapOptions, ConnectionStatus, DesktopAction, DesktopActionError, DesktopActionResult,
+    DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions, DesktopNewAgentOptions,
+    DesktopNewAgentOrchestrations, DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot,
+    OrchestrationRoleInput, TerminalAttachResult, desktop_agent_registry,
+    ensure_desktop_orchestration_platform_supported, map_project_listing, map_resolved_project,
+    mint_desktop_pane_id, safe_message, validate_agent_id, validate_dimensions,
+    validate_orchestration_shape, validate_pasted_project_path, validate_start_fields,
 };
 use crate::secrets::{
     KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
@@ -208,26 +207,10 @@ async fn prepare_orchestration_launch<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     name: &str,
     cwd: &str,
-    task_prompt: &str,
     requested: &[OrchestrationRoleInput],
     config_revision: Option<&str>,
 ) -> Result<(Vec<OrchestrationRoleInput>, PreparedOrchestration), String> {
-    // An EMPTY task is allowed (issue #1044), as it is by the daemon and by the
-    // TUI's `Ctrl+n`: the user starts the orchestration as-is and types the task
-    // into the coordinator's own input. What the coordinator context looks like
-    // without one is the daemon's call — it omits the whole `## Your task`
-    // section and sends the "wait for instructions" pointer — so the empty
-    // string goes to it verbatim and nothing here composes a stand-in.
-    let task_prompt = task_prompt.trim();
-    // A UI affordance, not the bound: the daemon applies its own
-    // `bounded_read::MAX_TASK_BYTES` before it touches a filesystem, and it is
-    // not entitled to trust this one.
-    if task_prompt.len() > COMMAND_MAX_BYTES || task_prompt.contains('\0') {
-        return Err(format!(
-            "task prompt must be at most {COMMAND_MAX_BYTES} bytes and contain no NUL"
-        ));
-    }
-    let prepare = daemon.prepare_orchestration(cwd, name, task_prompt, config_revision);
+    let prepare = daemon.prepare_orchestration(cwd, name, config_revision);
     // Issue #1233 item 4: bounded only against a deck that owns a deadline of
     // its own (`prepare-deadline`). That deck answers first, and a preparation
     // it did not finish in time is withdrawn rather than published late, so
@@ -377,7 +360,6 @@ trait OrchestrationDaemon {
         &self,
         cwd: &str,
         orchestration: &str,
-        task: &str,
         config_revision: Option<&str>,
     ) -> Result<PreparedOrchestration, String>;
 
@@ -449,10 +431,11 @@ impl OrchestrationDaemon for DaemonClient {
         &self,
         cwd: &str,
         orchestration: &str,
-        task: &str,
         config_revision: Option<&str>,
     ) -> Result<PreparedOrchestration, String> {
-        DaemonClient::prepare_orchestration(self, cwd, orchestration, task, config_revision)
+        // The desktop sends no task: the coordinator starts, reads its role
+        // and waits for the user to type the task into its pane, as in the TUI.
+        DaemonClient::prepare_orchestration(self, cwd, orchestration, "", config_revision)
             .await
             .map_err(|error| safe_message(error.to_string()))
     }
@@ -2055,6 +2038,55 @@ async fn interrupted_work_dismiss(
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
     crate::interrupted_work::dismiss(&daemon.client, &instance_id, ids).await
+}
+
+/// PRD #1790 stage 3: restore the attempts `agents` of interrupted item `id`
+/// on deck `deck_id` with their conversations, or with `dry_run` ask what
+/// that would do. The daemon starts the agent. Sent with no pane claim, and
+/// not behind the experimental flag (issue #2494).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn interrupted_work_restore(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    agents: Vec<String>,
+    mode: dot_agent_deck::interrupted_work::RestoreMode,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::RestoreOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::restore(&daemon.client, &instance_id, &id, agents, mode, dry_run).await
+}
+
+/// PRD #1790 stage 3: start attempt `agent` of interrupted item `id` on deck
+/// `deck_id` over in its folder, without its conversation, or with `dry_run`
+/// ask what that would do. Sent with no pane claim.
+#[tauri::command]
+async fn interrupted_work_start_over(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    agent: String,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::StartOverOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::start_over(&daemon.client, &instance_id, &id, &agent, dry_run).await
 }
 
 /// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
@@ -6612,7 +6644,6 @@ struct ActivateOrchestrationRequest {
     /// The run's name (issue #1044), absent when the form's Name is empty.
     display_title: Option<String>,
     cwd: String,
-    task_prompt: String,
     roles: Vec<OrchestrationRoleInput>,
     rows: Option<u16>,
     cols: Option<u16>,
@@ -6641,7 +6672,6 @@ async fn activate_orchestration_action(
         name,
         display_title,
         cwd,
-        task_prompt,
         roles,
         rows,
         cols,
@@ -6685,7 +6715,6 @@ async fn activate_orchestration_action(
         &launch_client,
         &name,
         &cwd,
-        &task_prompt,
         &roles,
         config_revision.as_deref(),
     )
@@ -7542,7 +7571,6 @@ async fn desktop_run_action(
             name,
             display_title,
             cwd,
-            task_prompt,
             roles,
             rows,
             cols,
@@ -7555,7 +7583,6 @@ async fn desktop_run_action(
                     name,
                     display_title,
                     cwd,
-                    task_prompt,
                     roles,
                     rows,
                     cols,
@@ -8044,6 +8071,8 @@ pub fn run() {
             interrupted_work_show,
             interrupted_work_reclaim,
             interrupted_work_dismiss,
+            interrupted_work_restore,
+            interrupted_work_start_over,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_reconnect_deck,
@@ -10718,7 +10747,6 @@ mod tests {
     struct PrepareRequest {
         cwd: String,
         orchestration: String,
-        task: String,
         config_revision: Option<String>,
     }
 
@@ -10821,13 +10849,11 @@ mod tests {
             &self,
             cwd: &str,
             orchestration: &str,
-            task: &str,
             config_revision: Option<&str>,
         ) -> Result<PreparedOrchestration, String> {
             self.prepare_requests.lock().unwrap().push(PrepareRequest {
                 cwd: cwd.to_string(),
                 orchestration: orchestration.to_string(),
-                task: task.to_string(),
                 config_revision: config_revision.map(str::to_string),
             });
             // Read and released before the await: the guard is not `Send`, and
@@ -11096,26 +11122,19 @@ command = "configured-planner"
         let cwd = project_dir.to_str().unwrap().to_string();
         let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
 
-        let (roles, prepared) = prepare_orchestration_launch(
-            &daemon,
-            "loop",
-            &cwd,
-            "  Build the requested feature.  ",
-            &requested,
-            Some("revision-7"),
-        )
-        .await
-        .unwrap();
+        let (roles, prepared) =
+            prepare_orchestration_launch(&daemon, "loop", &cwd, &requested, Some("revision-7"))
+                .await
+                .unwrap();
 
-        // The request went out verbatim — including the trimmed task and the
-        // revision the picker resolved against, which is what closes the window
-        // between the pick and the write.
+        // The request went out verbatim, including the revision the picker
+        // resolved against, which is what closes the window between the pick
+        // and the write.
         assert_eq!(
             *daemon.prepare_requests.lock().unwrap(),
             [PrepareRequest {
                 cwd: cwd.clone(),
                 orchestration: "loop".into(),
-                task: "Build the requested feature.".into(),
                 config_revision: Some("revision-7".into()),
             }]
         );
@@ -11153,7 +11172,6 @@ command = "configured-planner"
             // directory's — which is exactly what makes an empty orchestration
             // name resolve differently on the two spellings.
             "/home/dev/current",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11201,41 +11219,6 @@ command = "configured-planner"
                 Some("prep-token-1".to_string())
             ]
         );
-    }
-
-    /// Issue #1044. Scenario: the Runs form submits a blank task — nothing
-    /// typed, or only whitespace. The preparation must go to the daemon with
-    /// the empty string rather than being refused here, because the daemon and
-    /// the TUI allow it and the daemon decides what a task-less coordinator
-    /// context looks like; the launch then proceeds on the daemon's answer.
-    #[tokio::test]
-    async fn a_blank_task_is_prepared_by_the_daemon_rather_than_refused() {
-        for blank in ["", "  \n\t "] {
-            let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
-            let (roles, prepared) = prepare_orchestration_launch(
-                &daemon,
-                "loop",
-                "/home/dev/project",
-                blank,
-                &launch_roles("claude"),
-                None,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("a blank task {blank:?} was refused: {error}"));
-
-            assert_eq!(
-                *daemon.prepare_requests.lock().unwrap(),
-                [PrepareRequest {
-                    cwd: "/home/dev/project".into(),
-                    orchestration: "loop".into(),
-                    task: String::new(),
-                    config_revision: None,
-                }],
-                "a blank task reaches the daemon as the empty string"
-            );
-            assert_eq!(roles.len(), 2);
-            assert_eq!(prepared.prompt, prepared_orchestration().prompt);
-        }
     }
 
     /// Issue #1044. Scenario: launch from the Runs form once with a run name
@@ -11325,7 +11308,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/project",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11489,7 +11471,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/repo",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11519,7 +11500,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/repo",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11542,7 +11522,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/repo",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11565,7 +11544,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/gone",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11608,7 +11586,6 @@ command = "configured-planner"
                 &daemon,
                 "loop",
                 "/home/dev/project",
-                "Build it.",
                 &launch_roles("claude"),
                 None,
             )
@@ -11651,7 +11628,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/project",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11676,7 +11652,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/project",
-            "Build it.",
             &launch_roles("pi"),
             None,
         )

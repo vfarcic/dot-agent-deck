@@ -33,9 +33,9 @@ use crate::project_config::OrchestrationConfig;
 ///
 /// **The caller declares this; it is deliberately not inferred.** The obvious
 /// proxy — "a task was supplied at launch, so nobody is waiting to type one" —
-/// is wrong: the desktop's live-loop panel *requires* a task prompt before it
-/// will launch (`desktop/src/components/ConfigurationPanels.tsx`), and the person
-/// who typed it is sitting in front of the panes. Inferring from
+/// is wrong: a client can launch with a task its operator typed while sitting
+/// in front of the panes, as the desktop's Orchestrations editor did until
+/// issue #1310 removed its task field. Inferring from
 /// `task.is_some()` would tell that run nobody was watching it and strip the one
 /// gate its operator was there to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5254,8 +5254,8 @@ mod tests {
 
     /// The obvious cheap signal — "a task was supplied, so nobody is waiting to
     /// type one" — is WRONG, and this is the case that makes it wrong. The
-    /// desktop's live-loop panel refuses to launch without a task prompt, and
-    /// the person who typed it is sitting in front of the panes. Such a run gets
+    /// desktop's Orchestrations editor took a task until issue #1310, from a
+    /// person sitting in front of the panes, and any client may again. Such a run gets
     /// the precedence statement (it has two halves to arbitrate) and must NOT be
     /// told nobody is watching it.
     #[test]

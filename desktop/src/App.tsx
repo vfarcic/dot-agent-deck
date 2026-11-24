@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   ArrowRight,
   Blocks,
-  BookMarked,
   Bot,
   Check,
   CheckCircle2,
@@ -47,7 +46,7 @@ import { AddDaemonDialog, AddDaemonOpener } from "./components/AddDaemonDialog";
 import { HandoffRail } from "./components/HandoffRail";
 import { DeckAttention } from "./components/DeckAttention";
 import { SelectDeckNote } from "./components/SelectDeckNote";
-import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
+import { ProfilesPanel, ProjectsPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
@@ -70,7 +69,6 @@ import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { stopDaemonConfirmCopy, stopDaemonOffer } from "./lib/stopDaemon";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
-import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useQuestionNotifications } from "./hooks/useQuestionNotifications";
 import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
@@ -85,6 +83,7 @@ import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoice
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey, boundAgentKey, sameIncarnation } from "./lib/agentKey";
+import { confirmInboxActionFor, type InboxScreenNow } from "./lib/inboxVoice";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext, type VoiceActionContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -233,7 +232,7 @@ function evidenceOpenOnFirstLoad(): boolean {
  * rather than an overlay the Deck button and `Escape` silently leave open —
  * the property the `Record<DeckOverlay, …>` of setters this replaced carried.
  */
-const DECK_OVERLAYS = Object.keys({ projects: true, prompts: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
+const DECK_OVERLAYS = Object.keys({ projects: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
 
 /**
  * The registry entry voice's `open_deck` row invokes — typed against the
@@ -2097,8 +2096,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const projectsOpen = overlays.open.projects ?? false;
   const profilesOpen = overlays.open.profiles ?? false;
-  const promptsOpen = overlays.open.prompts ?? false;
-  const [selectedPromptId, setSelectedPromptId] = useState(""); // voice-registry-exempt: which stored prompt the library panel is editing — a selection within that panel
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
   const orchestrationOpen = overlays.open.orchestration ?? false;
   const [paletteOpen, setPaletteOpen] = useState(false); // voice-registry-exempt: the command palette is the registry's own surface: it lists entries and runs them, and opening it runs none
@@ -2222,7 +2219,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   // sit open while another run takes the title (PR #1333 review).
   const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
   orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
-  const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
@@ -2254,12 +2250,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       setSelectedEvidenceId(snapshot.evidence[0]?.id ?? "");
     }
   }, [selectedEvidenceId, snapshot.evidence]);
-
-  useEffect(() => {
-    if (!selectedPromptId || !prompts.some((prompt) => prompt.id === selectedPromptId)) {
-      setSelectedPromptId(prompts[0]?.id ?? "");
-    }
-  }, [prompts, selectedPromptId]);
 
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
@@ -2406,6 +2396,26 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    */
   const closeOverlays = () => DECK_OVERLAYS.forEach((overlay) => setOverlay(overlay, false));
   /**
+   * Issue #2148 — a spoken Retry or Cancel on an agent's deck messages: the
+   * confirmation listing them, which this screen draws as it draws its other
+   * confirmations, and whose button sends each one; the outcome is the toast's.
+   * The tile's own Retry and Cancel act on their one message directly.
+   *
+   * Defined here rather than inside the context below on purpose: `confirm`
+   * and the toast are not capabilities this member owns (every action that
+   * asks first opens `confirm`, and every outcome reports through the toast),
+   * so their setters must not become registry-owned by being named there.
+   */
+  const inboxScreenNow = useRef<InboxScreenNow>({ agents: snapshot.agents, allDecks, confirm });
+  inboxScreenNow.current = { agents: snapshot.agents, allDecks, confirm };
+  const confirmInboxAction: VoiceScreenContext["confirmInboxAction"] = (verb, target) => {
+    const question = confirmInboxActionFor(verb, target, { agents: snapshot.agents, allDecks, confirmationOpen, inboxAction: runtime.inboxAction }, (sentence) => setNotice(sentence), () => inboxScreenNow.current);
+    if (typeof question === "string") return question;
+    setConfirm(question);
+    return undefined;
+  };
+
+  /**
    * PRD #802 M2 — the deck's half of the action registry's context, and the one
    * place the rail buttons, the palette entries, the tile's open/close pair and
    * (since PRD #1195 M1) the in-panel controls reach their state from.
@@ -2449,6 +2459,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
     },
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
+    confirmInboxAction,
   };
 
   /**
@@ -2703,9 +2714,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       : "";
     setConfirm({
       title: `Activate ${config.displayName}?`,
-      // Issue #1044: the task is optional. Without one the orchestrator is still
-      // briefed — the daemon's context names its role and team — and then waits.
-      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and ${config.taskPrompt ? "sends your task prompt to the orchestrator" : "briefs the orchestrator with no task, so it waits for you to type one into its pane"}.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
+      // The orchestrator is briefed — the daemon's context names its role and
+      // team — and then waits for the user to type the task into its pane.
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and briefs the orchestrator, which then waits for you to type the task into its pane.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
       label: "Activate orchestration",
       busyLabel: "Activating…",
       action: async () => {
@@ -2893,7 +2904,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
        all five fields follow the one flag today; if they ever diverge, those
        doors need gates of their own. */
     ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose projects & orchestrations", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
-    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
     ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
     ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
@@ -3097,18 +3107,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         onConfigureOrchestration={() => { setOverlay("projects", false); VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext); }}
         allDecks={allDecks}
       />
-      <PromptLibraryPanel
-        open={promptsOpen}
-        prompts={prompts}
-        selectedId={selectedPromptId}
-        onSelect={setSelectedPromptId}
-        onClose={() => setOverlay("prompts", false)}
-        onAdd={() => setSelectedPromptId(addPrompt())}
-        onUpdate={updatePrompt}
-        onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
-      />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setOverlay("profiles", false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}

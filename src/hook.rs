@@ -2448,6 +2448,20 @@ fn build_event_typed_with_version(
     let from_subagent = subagent_id.is_some();
 
     let mut event_type = map_event_type(&hook_event_name)?;
+    // Issue #2435: a Codex `/compact` is a turn of its own, and it ends with
+    // `PostCompact` and no `Stop` [measured on Codex 0.164.0: `PreCompact` and
+    // `PostCompact`, both `"trigger":"manual"`, then nothing]. Read as
+    // `Thinking`, it left the card on Thinking with Codex idle at its prompt,
+    // so the doorbell never rang the role re-assert the compaction posted.
+    // An automatic compaction runs inside a turn whose own `Stop` follows, so
+    // it keeps `Thinking`.
+    if event_type == EventType::Thinking
+        && agent_type == AgentType::Codex
+        && hook_event_name == "PostCompact"
+        && extra.get("trigger").and_then(|t| t.as_str()) == Some("manual")
+    {
+        event_type = EventType::Idle;
+    }
     // PRD #20 W3-Pass-2 (finding #9): a FAILED tool call arrives as an ordinary
     // `PostToolUse` (→ `ToolEnd`) whose `tool_response` reports the failure.
     // Promote it to a mid-session `Error` (emitted before the process exits) so
@@ -7180,6 +7194,36 @@ mod tests {
                 "a FIFO is refused without blocking the hook"
             );
         }
+    }
+
+    /// Issue #2435: a Codex `/compact` ends with a manual `PostCompact` and no
+    /// `Stop`, so that `PostCompact` is the end of the turn (`Idle`). An
+    /// automatic one, another agent's, and one with no trigger keep `Thinking`.
+    #[test]
+    fn a_manual_codex_post_compact_ends_the_turn() {
+        let post = |agent: AgentType, trigger: Option<&str>| {
+            let mut input = claude_payload("PostCompact");
+            if let Some(trigger) = trigger {
+                input
+                    ._extra
+                    .insert("trigger".into(), Value::String(trigger.into()));
+            }
+            build_event_typed(input, agent).unwrap().event_type
+        };
+        assert_eq!(post(AgentType::Codex, Some("manual")), EventType::Idle);
+        assert_eq!(post(AgentType::Codex, Some("auto")), EventType::Thinking);
+        assert_eq!(post(AgentType::Codex, None), EventType::Thinking);
+        assert_eq!(
+            post(AgentType::ClaudeCode, Some("manual")),
+            EventType::Thinking
+        );
+        let mut pre = claude_payload("PreCompact");
+        pre._extra
+            .insert("trigger".into(), Value::String("manual".into()));
+        assert_eq!(
+            build_event_typed(pre, AgentType::Codex).unwrap().event_type,
+            EventType::Compacting
+        );
     }
 
     /// Issue #714: a Codex hook hands the daemon's rollout tailer its session

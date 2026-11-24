@@ -687,7 +687,6 @@ export type NewAgentOptions =
 export interface DesktopFeatures {
   showDeck: boolean;
   showProjects: boolean;
-  showPrompts: boolean;
   showOrchestrations: boolean;
   showAgentProfiles: boolean;
   /**
@@ -701,7 +700,6 @@ export interface DesktopFeatures {
 export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showDeck: false,
   showProjects: false,
-  showPrompts: false,
   showOrchestrations: false,
   showAgentProfiles: false,
   showAgentDetails: false,
@@ -1056,13 +1054,6 @@ export type NewAgentOrchestrations =
   | ({ kind: "project" } & DaemonResolvedProject)
   | { kind: "not_project" }
   | { kind: "unsupported"; reason: string };
-
-export interface DeckPrompt {
-  id: string;
-  name: string;
-  body: string;
-  note?: string;
-}
 
 export interface WorkflowStage {
   id: string;
@@ -1740,13 +1731,13 @@ export type DeckAction =
    */
   | { type: "allow_build_mismatch"; deckId?: string }
   /**
-   * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
-   * then composes a coordinator context with no task section and the
-   * coordinator waits for instructions, as under the TUI's `Ctrl+n`.
+   * The Runs screen's launch. It sends no task: the deck composes a
+   * coordinator context with no task section and the coordinator waits for
+   * the user to type one into its pane, as under the TUI's `Ctrl+n`.
    * `displayTitle` is the run's name — absent when the form's Name is empty, so
    * the run takes the orchestration's name, as `start_orchestration`'s does.
    */
-  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks
@@ -1869,8 +1860,6 @@ export interface OrchestrationLaunchConfig {
    * daemon, and is kept off the text nodes the same way any title is.
    */
   displayTitle?: string;
-  /** May be empty: the coordinator then waits for instructions (issue #1044). */
-  taskPrompt: string;
   roles: OrchestrationLaunchRole[];
   rows: number;
   cols: number;

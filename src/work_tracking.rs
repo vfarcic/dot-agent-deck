@@ -106,6 +106,13 @@ pub struct LaunchDetails<'a> {
     pub cwd_moved_from: Option<&'a str>,
     pub name: Option<&'a str>,
     pub membership: Option<&'a TabMembership>,
+    /// The agent's child process id and when it started, as spawned
+    /// ([`crate::launch_records::LaunchRecord::pid`]).
+    pub pid: Option<u32>,
+    pub pid_start: Option<u64>,
+    /// The launch nonce a restore handed the spawn
+    /// ([`crate::launch_records::LaunchRecord::launch_nonce`]).
+    pub launch_nonce: Option<&'a str>,
 }
 
 /// How a generation's end reads in the journal.
@@ -1046,6 +1053,9 @@ impl WorkTracker {
             orchestration,
             orchestration_id,
             ts_ms: crate::launch_records::now_ms(),
+            pid: launch.pid,
+            pid_start: launch.pid.and(launch.pid_start),
+            launch_nonce: launch.launch_nonce.map(str::to_string),
         };
         if let Err(error) = crate::launch_records::write(state_dir, &record) {
             tracing::warn!(

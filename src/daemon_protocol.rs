@@ -1334,6 +1334,17 @@ pub const CAP_DECK_OUTCOMES: &str = "deck-outcomes";
 /// reclaim runs Git, which every platform has.
 pub const CAP_INTERRUPTED_WORK: &str = "interrupted-work";
 
+/// Capability string for PRD #1790 stage 3's restore verbs:
+/// [`AttachRequest::RestoreInterrupted`] and
+/// [`AttachRequest::StartOverInterrupted`]. Each is withheld by
+/// [`crate::daemon_client::DaemonClient`] unless a fresh `Hello` on the
+/// connection that carries it named this and [`CAP_INTERRUPTED_WORK`], so no
+/// [`PROTOCOL_VERSION`] bump. Advertised on Unix only: a restore resumes an
+/// agent through the launch shim, which has no Windows form. Advertised
+/// whatever the experimental flag says: restore is not behind the flag in any
+/// client (issue #2494), and nothing in the daemon reads it.
+pub const CAP_RESTORE_AGENTS: &str = "restore-agents";
+
 /// Capability string for [`AttachRequest::AddressedMessage`] (issue #1947):
 /// message an orchestration's orchestrator, or a folder's one standalone
 /// agent, by folder and/or orchestration name. Held by
@@ -1544,6 +1555,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AGENT_CARDS_TREE,
     CAP_AGENT_CARDS_BATCH,
     CAP_INTERRUPTED_WORK,
+    CAP_RESTORE_AGENTS,
     CAP_REARM_ORCHESTRATOR,
     CAP_AGENT_OPENED,
 ];
@@ -2636,6 +2648,45 @@ pub enum AttachRequest {
         ids: Vec<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         all: bool,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+    },
+    /// PRD #1790 stage 3: bring an interrupted item's agents back with their
+    /// conversations — `agents` names their attempts, empty for every agent
+    /// of the item a restore is offered for — each posted `mode`'s restart
+    /// note once it confirmed its conversation; with `dry_run`, every check
+    /// and nothing started. Refused for an agent caller. Answered, once each
+    /// agent confirmed or was stopped, with
+    /// [`AttachResponse::interrupted_restore`]; every refusal is a report on
+    /// an `ok` response. See [`crate::agent_restore`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RESTORE_AGENTS`]** on the
+    /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    RestoreInterrupted {
+        id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+    },
+    /// PRD #1790 stage 3: start an interrupted item's agent (`agent`, its
+    /// attempt) over, without its conversation, in the folder it ran in, a
+    /// dispatched unit's saved task posted as its first message; with
+    /// `dry_run`, every check and nothing started. Refused for an agent
+    /// caller. Answered with [`AttachResponse::interrupted_start_over`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RESTORE_AGENTS`]** on the
+    /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    StartOverInterrupted {
+        id: String,
+        agent: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
         /// The calling agent's pane claim. Absent: a person.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<CallerClaim>,
@@ -4701,6 +4752,15 @@ pub struct AttachResponse {
     /// Additive and optional, and its request is capability-gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupted_dismiss: Option<crate::interrupted_work::DismissOutcome>,
+    /// PRD #1790 stage 3: the answer to [`AttachRequest::RestoreInterrupted`].
+    /// Additive and optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_restore: Option<crate::interrupted_work::RestoreOutcome>,
+    /// PRD #1790 stage 3: the answer to
+    /// [`AttachRequest::StartOverInterrupted`]. Additive and optional, and its
+    /// request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_start_over: Option<crate::interrupted_work::StartOverOutcome>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -8291,6 +8351,58 @@ async fn handle_connection(
                 crate::interrupted_work_daemon::dismiss(&registry, ids, all, caller.as_ref()).await;
             let resp = AttachResponse {
                 interrupted_dismiss: Some(outcome),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::RestoreInterrupted {
+            id,
+            agents,
+            mode,
+            dry_run,
+            caller,
+        } => {
+            // PRD #1790 stage 3: every check again, then start, confirm and
+            // deliver, or stop and refuse — see `crate::agent_restore`.
+            let outcome = crate::agent_restore::restore(
+                crate::agent_restore::Daemon {
+                    registry: &registry,
+                    state: &state,
+                    event_tx: &event_tx,
+                },
+                id,
+                agents,
+                mode,
+                dry_run,
+                caller.as_ref(),
+            )
+            .await;
+            let resp = AttachResponse {
+                interrupted_restore: Some(outcome),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::StartOverInterrupted {
+            id,
+            agent,
+            dry_run,
+            caller,
+        } => {
+            let outcome = crate::agent_restore::start_over(
+                crate::agent_restore::Daemon {
+                    registry: &registry,
+                    state: &state,
+                    event_tx: &event_tx,
+                },
+                id,
+                agent,
+                dry_run,
+                caller.as_ref(),
+            )
+            .await;
+            let resp = AttachResponse {
+                interrupted_start_over: Some(outcome),
                 ..AttachResponse::ok()
             };
             write_resp(&mut stream, &resp).await?
