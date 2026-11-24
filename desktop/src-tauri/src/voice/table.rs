@@ -1564,6 +1564,41 @@ mod tests {
                 ("add_card_action", "addCardAction", vec!["overview"]),
                 ("edit_card_action", "editCardAction", vec!["overview"]),
                 ("remove_card_action", "removeCardAction", vec!["overview"]),
+                (
+                    "choose_card_actions_daemon",
+                    "chooseCardActionsDaemon",
+                    vec!["overview"]
+                ),
+                (
+                    "refresh_card_actions",
+                    "refreshCardActions",
+                    vec!["overview"]
+                ),
+                (
+                    "choose_card_action_icon",
+                    "chooseCardActionIcon",
+                    vec!["overview"]
+                ),
+                (
+                    "ask_before_sending_card_action",
+                    "askBeforeSendingCardAction",
+                    vec!["overview"]
+                ),
+                (
+                    "send_card_action_without_asking",
+                    "sendCardActionWithoutAsking",
+                    vec!["overview"]
+                ),
+                (
+                    "offer_card_action_on_every_card",
+                    "offerCardActionOnEveryCard",
+                    vec!["overview"]
+                ),
+                (
+                    "offer_card_action_when_agents_choose",
+                    "offerCardActionWhenAgentsChoose",
+                    vec!["overview"]
+                ),
             ]
         );
     }
@@ -2569,7 +2604,14 @@ mod tests {
                 "open_card_actions_editor",
                 "add_card_action",
                 "edit_card_action",
-                "remove_card_action"
+                "remove_card_action",
+                "choose_card_actions_daemon",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose"
             ]
         );
         assert_eq!(

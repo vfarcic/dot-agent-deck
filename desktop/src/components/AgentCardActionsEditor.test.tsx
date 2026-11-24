@@ -81,7 +81,7 @@ function cardFor(id: string, name: string, instance: string): AgentCardEntry {
  * advertising the editor unless `catalogEdit` says otherwise, and a stubbed
  * catalog per daemon that `editCardCatalog` changes as a daemon would answer.
  */
-type Pending = { deckId: string; kind: "read" | "edit"; resolve: () => void; reject: (why: string) => void };
+type Pending = { deckId: string; kind: "read" | "edit"; resolve: () => void; reject: (why: string) => void; fail: (error: unknown) => void };
 
 function setup({ catalogEdit = true, remote, refuse, remoteFirst = false, deferred = false, readFails, catalogErrors = [] }: {
   catalogEdit?: boolean; remote?: { catalogEdit: boolean; catalog: EditableCatalog }; refuse?: string;
@@ -103,7 +103,7 @@ function setup({ catalogEdit = true, remote, refuse, remoteFirst = false, deferr
   if (remote) catalogs[FIXTURE_REMOTE_DAEMON_ID] = structuredClone(remote.catalog);
   const pending: Pending[] = [];
   const settle = <T,>(deckId: string, kind: Pending["kind"], answer: () => T): Promise<T> => (deferred
-    ? new Promise<T>((resolve, reject) => { pending.push({ deckId, kind, resolve: () => resolve(answer()), reject: (why) => reject(new Error(why)) }); })
+    ? new Promise<T>((resolve, reject) => { pending.push({ deckId, kind, resolve: () => resolve(answer()), reject: (why) => reject(new Error(why)), fail: reject }); })
     : Promise.resolve().then(answer));
   const readCardCatalog = vi.fn((deckId: string) => settle(deckId, "read", () => {
     if (readFails && deckId === FIXTURE_DAEMON_ID) throw new Error(readFails);
@@ -139,8 +139,11 @@ function setup({ catalogEdit = true, remote, refuse, remoteFirst = false, deferr
   const localName = deckName(fleet[0].connection);
   const remoteName = remote ? deckName(fleet[1].connection) : "";
   if (remoteFirst) fleet.reverse();
-  render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
-  return { readCardCatalog, editCardCatalog, localName, remoteName, pending };
+  const view = render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+  /* Issue #2399 review 5: the dashboard redrawn with no daemon's cards, then with them again. */
+  const daemonsGone = () => view.rerender(<AgentOverview runtime={{ ...live, agentCards: {} } as DeckRuntimeState} onNavigate={vi.fn()} />);
+  const daemonsBack = () => view.rerender(<AgentOverview runtime={{ ...live } as DeckRuntimeState} onNavigate={vi.fn()} />);
+  return { readCardCatalog, editCardCatalog, localName, remoteName, pending, catalogs, daemonsGone, daemonsBack };
 }
 
 async function openEditor() {
@@ -388,7 +391,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(calls.editCardCatalog).not.toHaveBeenCalled();
   });
 
-  /// Scenario: Edit Ship it, set its Placement to the overlay only and tick Offer on every card, and save: the update carries both. Reopen it: the form shows that placement and the box ticked; untick it and save: the update carries `always: false` and keeps the placement. A new action added with a non-default placement carries it too.
+  /// Scenario: Edit Ship it, set its Placement to the overlay only and tick Offer on every card, and save: the update carries both. Reopen it: the form shows that placement and the box ticked; untick it and save: the update carries `always: false` and keeps the placement. A new action added with a non-default placement carries it too. The two choices read Show on the card and Only in the overlay, and an action whose file says `compact` shows as on the card and keeps `compact` when saved without choosing again.
   it("desktop/agent-cards/066: the form round-trips Placement and Offer on every card", async () => {
     const calls = setup();
     let editor = await openEditor();
@@ -419,6 +422,17 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
     expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "add", action: expect.objectContaining({ name: "deploy", placement: "detail", always: false }) });
     expect(calls.editCardCatalog).toHaveBeenCalledTimes(3);
+
+    // Issue #2399 review 11: the two choices say what each does, and an action whose file says `compact`
+    // shows as on the card and keeps `compact` when saved without choosing again.
+    calls.catalogs[FIXTURE_DAEMON_ID].actions = calls.catalogs[FIXTURE_DAEMON_ID].actions.map((entry) => (entry.name === "ship" ? { ...entry, placement: "compact" } : entry));
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    expect([...placement().options].map((option) => [option.value, option.textContent])).toEqual([["card", "Show on the card"], ["detail", "Only in the overlay"]]);
+    expect(placement().value).toBe("card");
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "compact" }) });
   });
 
   /// Scenario: With a local and a remote daemon whose answers arrive late and out of order, open the editor and switch to the remote daemon before the local read answers: the remote catalog is shown, and the local answer arriving afterwards does not replace it. Save an edit on the local daemon and switch to the remote one before the save answers: the late answer changes nothing shown, and the next edit goes to the remote daemon only. A form open when the daemon changes is closed — switching to a daemon that cannot be edited offers no Save — so nothing typed for one daemon is written to another.
@@ -489,5 +503,114 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(within(editor).queryByDisplayValue("Typed for the local daemon")).toBeNull();
     expect(second.editCardCatalog).not.toHaveBeenCalled();
     expect(second.readCardCatalog.mock.calls.map(([deckId]) => deckId)).toEqual([FIXTURE_DAEMON_ID, FIXTURE_DAEMON_ID]);
+  });
+
+  /** Settle the first pending request of `kind` on `deckId`, the way its daemon answers. */
+  const settleFirst = async (calls: ReturnType<typeof setup>, deckId: string, kind: Pending["kind"], how: (waiting: Pending) => void = (waiting) => waiting.resolve()) => {
+    const at = calls.pending.findIndex((waiting) => waiting.deckId === deckId && waiting.kind === kind);
+    expect(at, `a pending ${kind} on ${deckId}`).toBeGreaterThanOrEqual(0);
+    const [waiting] = calls.pending.splice(at, 1);
+    await act(async () => { how(waiting); });
+  };
+  const lost = () => Object.assign(new Error("the deck did not answer within 15s; it may have been saved, so check the list before saving again"), { outcome: "unknown" });
+
+  /// Scenario: Hide Go ahead and have the deck's answer get lost after it was sent: the editor says Go ahead MAY have been hidden (not that it was not), reads the list once more without sending the hide again, and shows what the daemon then holds. Edit Ship it, type a new label and Save, and lose that answer too: the form stays open with the typed label and says it may have been saved, and the list is read once more. Press Refresh: the list is read again and the form keeps what it holds. A plain refusal still says the action was not hidden.
+  it("desktop/agent-cards/071: an edit whose answer was lost says it may have been saved, keeps the draft and reads the list again; Refresh reads it on demand", async () => {
+    const calls = setup({ deferred: true });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Card actions" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    let editor = screen.getByRole("dialog", { name: "Card actions" });
+
+    await act(async () => { fireEvent.click(within(row(editor, "go-ahead")).getByRole("button", { name: "Hide Go ahead" })); });
+    // The daemon did save it: the list it answers next has Go ahead hidden.
+    calls.catalogs[FIXTURE_DAEMON_ID].actions = calls.catalogs[FIXTURE_DAEMON_ID].actions.map((entry) => (entry.name === "go-ahead" ? { ...entry, hidden: true } : entry));
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.fail(lost()));
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    expect(within(editor).getByRole("alert")).toHaveTextContent("Go ahead may have been hidden");
+    expect(within(editor).getByRole("alert")).not.toHaveTextContent("was not hidden");
+    expect(calls.readCardCatalog).toHaveBeenCalledTimes(2);
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(row(editor, "go-ahead")).toHaveClass("is-hidden");
+    expect(calls.editCardCatalog, "the hide is never sent again").toHaveBeenCalledTimes(1);
+
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.fail(lost()));
+    const form = within(editor).getByTestId("agent-card-actions-editor-form");
+    expect(within(form).getByRole("alert")).toHaveTextContent("may have been saved");
+    expect(field(editor, "Label").value, "the draft is kept").toBe("Ship it now");
+    expect(calls.readCardCatalog).toHaveBeenCalledTimes(3);
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(field(editor, "Label").value).toBe("Ship it now");
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    expect(calls.readCardCatalog).toHaveBeenCalledTimes(4);
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(field(editor, "Label").value, "Refresh keeps the form").toBe("Ship it now");
+    fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+
+    await act(async () => { fireEvent.click(within(row(editor, "merge")).getByRole("button", { name: "Restore Merge it" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.reject("the user config changed since the editor read it"));
+    expect(within(editor).getByRole("alert")).toHaveTextContent("Merge it was not restored");
+    expect(calls.readCardCatalog, "a refusal wrote nothing, so nothing is read again").toHaveBeenCalledTimes(4);
+  });
+
+  /// Scenario: Edit Ship it, change its label and press Save; while the save is under way the form's fields are locked, no other action's Edit or Add opens another form, and Cancel closes this one. When the save is then refused, its reason is not attached to any form opened since; a new Add form opens empty, with no error.
+  it("desktop/agent-cards/072: a save's answer belongs to the form it was sent from, and no other form opens while it is saved", async () => {
+    const calls = setup({ deferred: true });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Card actions" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = screen.getByRole("dialog", { name: "Card actions" });
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(field(editor, "Label")).toBeDisabled();
+    fireEvent.change(field(editor, "Label"), { target: { value: "typed while saving" } });
+    expect(field(editor, "Label").value).toBe("Ship it now");
+    expect(within(row(editor, "go-ahead")).getByRole("button", { name: "Edit Go ahead" })).toBeDisabled();
+    fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+    expect(within(editor).queryByTestId("agent-card-actions-editor-form")).toBeNull();
+    expect(within(editor).getByRole("button", { name: "Add action" })).toBeDisabled();
+
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.reject("SHIP-REFUSED-2399"));
+    expect(screen.queryByText(/SHIP-REFUSED-2399/)).toBeNull();
+    fireEvent.click(within(editor).getByRole("button", { name: "Add action" }));
+    const form = within(editor).getByTestId("agent-card-actions-editor-form");
+    expect(within(form).queryByRole("alert")).toBeNull();
+    expect(field(editor, "Name").value).toBe("");
+    expect(calls.editCardCatalog).toHaveBeenCalledTimes(1);
+  });
+
+  /// Scenario: Open the editor, then have every daemon leave the dashboard: the editor goes. When the daemon comes back, the still-open editor reads its card actions again and lists them, rather than coming back empty.
+  it("desktop/agent-cards/073: the editor reads the catalog again when a daemon comes back after every daemon left", async () => {
+    const calls = setup();
+    await openEditor();
+    expect(calls.readCardCatalog).toHaveBeenCalledTimes(1);
+    await act(async () => { calls.daemonsGone(); });
+    expect(screen.queryByRole("dialog", { name: "Card actions" })).toBeNull();
+    await act(async () => { calls.daemonsBack(); });
+    const editor = screen.getByRole("dialog", { name: "Card actions" });
+    expect(calls.readCardCatalog).toHaveBeenCalledTimes(2);
+    expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge", "ship"]);
+  });
+
+  /// Scenario: Press Remove on Ship it. The confirmation takes focus, and while it is open the editor behind it is inert, so the keyboard cannot reach its other buttons; Escape closes only the confirmation, sends nothing and gives focus back to the Remove button that opened it.
+  it("desktop/agent-cards/074: the removal's confirmation is modal over the editor", async () => {
+    const calls = setup();
+    const editor = await openEditor();
+    const remove = within(row(editor, "ship")).getByRole("button", { name: "Remove Ship it" });
+    act(() => remove.focus());
+    fireEvent.click(remove);
+    const confirm = screen.getByRole("alertdialog", { name: "Remove Ship it?" });
+    expect(confirm.contains(document.activeElement), "focus moves into the confirmation").toBe(true);
+    expect(editor.closest("[inert]"), "the editor behind it is inert").not.toBeNull();
+    expect(confirm.closest("[inert]")).toBeNull();
+    fireEvent.keyDown(confirm, { key: "Escape" });
+    expect(screen.queryByRole("alertdialog", { name: "Remove Ship it?" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Card actions" })).toBeInTheDocument();
+    expect(editor.closest("[inert]")).toBeNull();
+    expect(remove).toHaveFocus();
+    expect(calls.editCardCatalog).not.toHaveBeenCalled();
   });
 });

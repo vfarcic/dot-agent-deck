@@ -340,4 +340,79 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(registry.confirmRemoveCardAction?.voice).not.toBe(true);
     expect(registry.saveCardAction?.voice).not.toBe(true);
   });
+
+  /// Scenario: Open the editor and Ship it's form by voice, then say an icon's name ("icon git merge"), "ask before sending", "offer on every card", their opposites, "refresh the card actions" and a daemon's name. The form's icon becomes git-merge and an unknown icon name is refused in words; each checkbox follows what was said, whatever it was before; Refresh reads the list again and keeps the form; the editor's daemon is chosen by its name, and a daemon not on the dashboard is refused in words. Nothing is written, and each of these entries is a voice entry with exactly one row (issue #2399 review 12).
+  it("desktop/agent-cards/075: voice chooses the editor's daemon, reads it again and sets the form's icon and checkboxes, writing nothing", async () => {
+    const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };
+    const readCardCatalog = vi.fn(async () => ({ actions: [ship], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
+    const editCardCatalog = vi.fn();
+    const filter = (name: string, words: string): VoiceResolvedParamDto => ({ name, kind: "filter_text", spoken: words, value: words, label: words });
+    const deck = (value: string, label: string): VoiceResolvedParamDto => ({ name: "deck", kind: "deck_ref", spoken: label, value, label });
+    const row = (action: string, invoke: string, params: VoiceResolvedParamDto[] = []) => ({ action, invoke, params });
+    const run = setup(
+      (agents) => [cardFor(agents[0].id, "coder-card")],
+      () => ({
+        "open the card actions editor": row("open_card_actions_editor", "openCardActionsEditor"),
+        "edit the ship it action": row("edit_card_action", "editCardAction", [actionParam("Ship it")]),
+        "icon git merge": row("choose_card_action_icon", "chooseCardActionIcon", [filter("icon", "git merge")]),
+        "icon unicorn": row("choose_card_action_icon", "chooseCardActionIcon", [filter("icon", "unicorn")]),
+        "ask before sending": row("ask_before_sending_card_action", "askBeforeSendingCardAction"),
+        "send without asking": row("send_card_action_without_asking", "sendCardActionWithoutAsking"),
+        "offer on every card": row("offer_card_action_on_every_card", "offerCardActionOnEveryCard"),
+        "only when agents suggest it": row("offer_card_action_when_agents_choose", "offerCardActionWhenAgentsChoose"),
+        "refresh the card actions": row("refresh_card_actions", "refreshCardActions"),
+        "card actions of the local daemon": row("choose_card_actions_daemon", "chooseCardActionsDaemon", [deck(FIXTURE_DAEMON_ID, "Local daemon")]),
+        "card actions of the moon": row("choose_card_actions_daemon", "chooseCardActionsDaemon", [deck("deck-not-on-the-dashboard", "moon")]),
+      }),
+      { extra: { readCardCatalog, editCardCatalog } },
+    );
+    await turnOnVoice();
+    await speak(run.voice, "open the card actions editor");
+    await speak(run.voice, "edit the ship it action");
+    const editor = screen.getByRole("dialog", { name: "Card actions" });
+    const box = (label: string) => within(editor).getByLabelText(label) as HTMLInputElement;
+
+    await speak(run.voice, "icon git merge");
+    expect(within(editor).getByTestId("agent-card-actions-editor-icon")).toHaveAttribute("data-icon", "git-merge");
+    await speak(run.voice, "icon unicorn");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/No single icon is called "unicorn"/);
+    expect(within(editor).getByTestId("agent-card-actions-editor-icon")).toHaveAttribute("data-icon", "git-merge");
+
+    await speak(run.voice, "ask before sending");
+    expect(box("Ask before sending")).toBeChecked();
+    await speak(run.voice, "ask before sending");
+    expect(box("Ask before sending"), "saying it again does not toggle it off").toBeChecked();
+    await speak(run.voice, "send without asking");
+    expect(box("Ask before sending")).not.toBeChecked();
+    await speak(run.voice, "offer on every card");
+    expect(box("Offer on every card")).toBeChecked();
+    await speak(run.voice, "only when agents suggest it");
+    expect(box("Offer on every card")).not.toBeChecked();
+
+    const reads = readCardCatalog.mock.calls.length;
+    await speak(run.voice, "refresh the card actions");
+    expect(readCardCatalog).toHaveBeenCalledTimes(reads + 1);
+    expect((within(editor).getByLabelText("Name") as HTMLInputElement).value, "the form is kept").toBe("ship");
+
+    await speak(run.voice, "card actions of the local daemon");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(/not on the dashboard/);
+    await speak(run.voice, "card actions of the moon");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That daemon is not on the dashboard.");
+    expect(editCardCatalog).not.toHaveBeenCalled();
+
+    const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean }>;
+    const rows: [string, string, { name: string; kind: string }[]][] = [
+      ["chooseCardActionsDaemon", "choose_card_actions_daemon", [{ name: "deck", kind: "deck_ref" }]],
+      ["refreshCardActions", "refresh_card_actions", []],
+      ["chooseCardActionIcon", "choose_card_action_icon", [{ name: "icon", kind: "filter_text" }]],
+      ["askBeforeSendingCardAction", "ask_before_sending_card_action", []],
+      ["sendCardActionWithoutAsking", "send_card_action_without_asking", []],
+      ["offerCardActionOnEveryCard", "offer_card_action_on_every_card", []],
+      ["offerCardActionWhenAgentsChoose", "offer_card_action_when_agents_choose", []],
+    ];
+    for (const [id, name, params] of rows) {
+      expect(registry[id]?.voice, id).toBe(true);
+      expectRow(name, id, ["overview"], params);
+    }
+  });
 });

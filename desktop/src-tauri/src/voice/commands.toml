@@ -3077,8 +3077,8 @@ try_saying  = "reply to {agent} go ahead"
 # PRD #2374 decision 2026-11-24 — the Card actions editor, where the user adds,
 # changes, hides and removes the actions agents offer on their cards (CLAUDE.md
 # rule 23). Voice OPENS: the editor, its form for a new action, one action's
-# form, and the confirmation of a removal. Nothing said here writes the
-# daemon's config — the form's Save, the removal's Remove, Hide and Restore
+# form, and the confirmation of a removal; the rows after these choose and set
+# what writes nothing. Nothing said here writes the daemon's config — the form's Save, the removal's Remove, Hide and Restore
 # are presses by hand — so a misheard word never becomes text an agent is sent
 # or takes an action off the cards.
 [[commands]]
@@ -3142,3 +3142,104 @@ try_saying  = "remove the {action} action"
   [[commands.params]]
   name = "action"
   kind = "card_action"
+
+# Issue #2399 review 12 — the rest of the Card actions editor's choices that
+# write nothing: which daemon's card actions it shows (by the daemon's name, a
+# `deck_ref` as the New agent dialog's Daemon field takes), reading the list
+# again, the form's icon (by the icon's name, held to the user's words as the
+# directory filter is) and its two checkboxes, one row per state so a spoken
+# "ask before sending" never unticks a box that was ticked. The form's Save
+# still writes, by hand.
+[[commands]]
+id          = "choose_card_actions_daemon"
+description = """In the open Card actions editor, show the card actions of another daemon: the editor's
+Daemon picker. Use for show the build box daemon's card actions, card actions of the local daemon,
+edit the remote daemon's card actions. Set `deck` to the daemon the user meant, exactly as listed in
+`decks`; a user may call a daemon a deck, and speech-to-text often writes daemon as demon. It only
+changes which daemon's actions the editor lists and closes an open form unsaved; it writes nothing.
+Changing which daemon the dashboard shows is `switch_deck`, not this one."""
+invoke      = "chooseCardActionsDaemon"
+screens     = ["overview"]
+unavailable_hint = "the Card actions editor's daemon is chosen while the editor is open, on the agent dashboard"
+report      = "Showing {deck}'s card actions."
+asks_to     = "show another daemon's card actions in the Card actions editor"
+try_saying  = "card actions of {deck}"
+  [[commands.params]]
+  name = "deck"
+  kind = "deck_ref"
+
+[[commands]]
+id          = "refresh_card_actions"
+description = """Read the open Card actions editor's list again from its daemon, keeping whatever the
+form holds. Use for refresh the card actions, reload the card actions, read the card actions again,
+check the card actions list. It writes nothing."""
+invoke      = "refreshCardActions"
+screens     = ["overview"]
+unavailable_hint = "the Card actions editor's list is read again while the editor is open, on the agent dashboard"
+report      = "Reading the card actions again."
+asks_to     = "read the Card actions editor's list again"
+try_saying  = "refresh the card actions"
+
+[[commands]]
+id          = "choose_card_action_icon"
+description = """In the Card actions editor's form, choose the action's icon by its name, such as rocket,
+git merge, play, bug or ship. Set `icon` to the icon's name as the user said it. It only sets the
+form's icon; nothing is saved until the user presses Save."""
+invoke      = "chooseCardActionIcon"
+screens     = ["overview"]
+unavailable_hint = "a card action's icon is chosen in the Card actions editor's form, on the agent dashboard"
+report      = "Icon: {icon}. Press Save to keep it."
+asks_to     = "choose the icon of the card action I am editing"
+try_saying  = "icon rocket"
+
+  [[commands.params]]
+  name = "icon"
+  kind = "filter_text"
+
+[[commands]]
+id          = "ask_before_sending_card_action"
+description = """In the Card actions editor's form, tick Ask before sending, so pressing the action asks
+the user to confirm before its text is sent. Use for ask before sending, ask first, confirm before
+sending. It only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "askBeforeSendingCardAction"
+screens     = ["overview"]
+unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard"
+report      = "Ask before sending is ticked. Press Save to keep it."
+asks_to     = "make the card action I am editing ask before sending"
+try_saying  = "ask before sending"
+
+[[commands]]
+id          = "send_card_action_without_asking"
+description = """In the Card actions editor's form, untick Ask before sending, so pressing the action
+sends its text at once. Use for don't ask before sending, send without asking, no confirmation. It
+only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "sendCardActionWithoutAsking"
+screens     = ["overview"]
+unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard"
+report      = "Ask before sending is unticked. Press Save to keep it."
+asks_to     = "make the card action I am editing send without asking"
+try_saying  = "send without asking"
+
+[[commands]]
+id          = "offer_card_action_on_every_card"
+description = """In the Card actions editor's form, tick Offer on every card, so every agent's card offers
+the action whether or not the agent suggests it. Use for offer on every card, show it on every card,
+always offer it. It only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "offerCardActionOnEveryCard"
+screens     = ["overview"]
+unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard"
+report      = "Offer on every card is ticked. Press Save to keep it."
+asks_to     = "offer the card action I am editing on every card"
+try_saying  = "offer on every card"
+
+[[commands]]
+id          = "offer_card_action_when_agents_choose"
+description = """In the Card actions editor's form, untick Offer on every card, so the action is offered
+only when an agent suggests it. Use for don't offer on every card, only when agents suggest it, not on
+every card. It only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "offerCardActionWhenAgentsChoose"
+screens     = ["overview"]
+unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard"
+report      = "Offer on every card is unticked. Press Save to keep it."
+asks_to     = "offer the card action I am editing only when agents suggest it"
+try_saying  = "only when agents suggest it"

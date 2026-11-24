@@ -1,5 +1,5 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
-import { X } from "lucide-react";
+import { RefreshCw, X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import type { CardActionFormValues, CardActionPlacement, CardActionsEditor, CardActionsEditorView } from "../hooks/useCardActionsEditor";
@@ -21,14 +21,15 @@ function sourceWords(action: EditableCardAction): string {
 
 /**
  * PRD #2374 decision 2026-11-24 — the Card actions editor: the card actions
- * of one daemon (the local one first; with several connected, a Daemon picker
+ * of one daemon (the local one at first; with several connected, a Daemon picker
  * chooses), each with where it came from, the exact text it sends and what
  * it may be changed by — Edit on every one, Remove on the user's own, Hide on
  * a deck default in use and Restore on one hidden or changed. Add action and
  * Edit open a form whose icon is chosen from a searchable grid of the icons
  * the app bundles. Every change is the daemon's: one edit is sent, and the
- * list shows what the daemon answers, or its reason for refusing. A daemon
- * from an earlier release is shown read-only, with a sentence saying so.
+ * list shows what the daemon answers, or its reason for refusing; Refresh
+ * reads the list again, keeping the form. A daemon from an earlier release is
+ * shown read-only, with a sentence saying so.
  */
 export function AgentCardActionsEditor({ view, editor }: { view: CardActionsEditorView; editor: Pick<CardActionsEditor, "controls" | "setField"> }) {
   /* Why the last press in the editor did nothing, said in the editor. */
@@ -87,26 +88,49 @@ export function AgentCardActionsEditor({ view, editor }: { view: CardActionsEdit
                   <ul>{catalog.errors.map((problem, index) => <li key={index}>{displayText(problem, DISPLAY_LIMITS.message)}</li>)}</ul>
                 </div>
               )}
-              {form
-                ? <ActionForm form={form} busy={view.busy} editor={{ controls, setField }} />
-                : <div className="card-actions-editor-toolbar"><button type="button" className="button secondary compact" disabled={view.busy} onClick={() => VOICE_ACTIONS.addCardAction.run(controls)}>Add action</button></div>}
+              <div className="card-actions-editor-toolbar">
+                {!form && <button type="button" className="button secondary compact" disabled={view.busy} onClick={() => VOICE_ACTIONS.addCardAction.run(controls)}>Add action</button>}
+                <button type="button" className="button secondary compact" title="Read this daemon's card actions again; what the form holds is kept" disabled={view.refreshing} data-testid="agent-card-actions-editor-refresh" onClick={() => VOICE_ACTIONS.refreshCardActions.run(controls)}><RefreshCw size={13} aria-hidden="true" />{view.refreshing ? "Reading…" : "Refresh"}</button>
+              </div>
+              {form && <ActionForm form={form} busy={view.busy} editor={{ controls, setField }} />}
               <ul className="card-actions-editor-list" aria-label={`${daemonName}'s card actions`}>
                 {catalog.actions.map((action) => <ActionRow key={action.name} action={action} busy={view.busy} editor={{ controls }} />)}
               </ul>
             </>
           )}
         </div>
-        {removing && (
-          <div className="card-actions-editor-confirm" role="alertdialog" aria-modal="true" aria-labelledby="card-actions-editor-remove-title" data-testid="agent-card-actions-editor-remove">
-            <h3 id="card-actions-editor-remove-title">Remove {displayText(removing.label, DISPLAY_LIMITS.name)}?</h3>
-            <p>Agents stop offering it on their cards. This removes it from the user config on {daemonName}'s machine.</p>
-            <div className="card-actions-editor-buttons">
-              <button type="button" className="button secondary" onClick={() => VOICE_ACTIONS.closeCardActionsEditor.run(controls)}>Cancel</button>
-              <button type="button" className="button danger" disabled={view.busy} onClick={() => VOICE_ACTIONS.confirmRemoveCardAction.run(controls)}>Remove</button>
-            </div>
-          </div>
-        )}
       </section>
+      {removing && <RemoveConfirm action={removing} daemonName={daemonName} busy={view.busy} controls={controls} />}
+    </div>
+  );
+}
+
+/**
+ * Issue #2399 review 13 — the confirmation of a removal: a dialog of its own,
+ * on the overlay stack over the editor, so the editor behind it is inert while
+ * it is open, focus moves into it, Escape or voice's `close` dismisses it
+ * (the editor's close member closes the removal first), and focus goes back
+ * to the Remove that opened it.
+ */
+function RemoveConfirm({ action, daemonName, busy, controls }: { action: EditableCardAction; daemonName: string; busy: boolean; controls: EditorControls }) {
+  const ref = useInertBackground<HTMLDivElement>(true, OVERLAY_LAYER.dialog, () => controls.closeCardActionsEditor());
+  const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Escape" || event.metaKey || event.ctrlKey || event.altKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    VOICE_ACTIONS.closeCardActionsEditor.run(controls);
+  };
+  const label = displayText(action.label, DISPLAY_LIMITS.name);
+  return (
+    <div className="dialog-backdrop card-actions-editor-remove-backdrop" role="presentation">
+      <div ref={ref} tabIndex={-1} className="card-actions-editor-confirm" role="alertdialog" aria-modal="true" aria-labelledby="card-actions-editor-remove-title" aria-describedby="card-actions-editor-remove-body" data-testid="agent-card-actions-editor-remove" onKeyDown={onKeyDown}>
+        <h3 id="card-actions-editor-remove-title">Remove {label}?</h3>
+        <p id="card-actions-editor-remove-body">Agents stop offering it on their cards. This removes it from the user config on {daemonName}'s machine.</p>
+        <div className="card-actions-editor-buttons">
+          <button type="button" className="button secondary" onClick={() => VOICE_ACTIONS.closeCardActionsEditor.run(controls)}>Cancel</button>
+          <button type="button" className="button danger" disabled={busy} onClick={() => VOICE_ACTIONS.confirmRemoveCardAction.run(controls)}>Remove</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -139,11 +163,15 @@ function ActionRow({ action, busy, editor }: { action: EditableCardAction; busy:
   );
 }
 
-/** The placements the form offers, in the catalog's words, with what each means. */
-const PLACEMENTS: readonly { value: CardActionPlacement; label: string }[] = [
-  { value: "card", label: "card (the default)" },
-  { value: "compact", label: "compact" },
-  { value: "detail", label: "detail" },
+/**
+ * Issue #2399 review 11 — where an action is offered, as the form says it:
+ * an icon on its agents' cards (`card`), or only in a card's overlay
+ * (`detail`). An action whose file says `compact` is shown as on the card and
+ * keeps `compact` unless the other choice is picked.
+ */
+const PLACEMENTS: readonly { value: "card" | "detail"; label: string }[] = [
+  { value: "card", label: "Show on the card" },
+  { value: "detail", label: "Only in the overlay" },
 ];
 
 /** The form for a new action, or for one listed action (its name fixed). */
@@ -162,6 +190,8 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
   return (
     <form className="card-actions-editor-form" aria-label={title} data-testid="agent-card-actions-editor-form" onSubmit={(event) => event.preventDefault()}>
       <h3>{title}</h3>
+      {/* Locked while it is being saved, so what is saved is what the form shows (issue #2399 review 6). */}
+      <fieldset disabled={busy}>
       <div className="card-actions-editor-field">
         <label htmlFor={id("name")}>Name</label>
         <input id={id("name")} value={values.name} readOnly={form.mode === "edit"} aria-describedby={`${id("name")}-hint`} maxLength={40} spellCheck={false} autoComplete="off" onChange={(event) => setField("name", event.target.value)} />
@@ -202,13 +232,14 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
       </div>
       <div className="card-actions-editor-field">
         <label htmlFor={id("placement")}>Placement</label>
-        <select id={id("placement")} value={values.placement} aria-describedby={`${id("placement")}-hint`} onChange={(event) => setField("placement", event.target.value as CardActionPlacement)}>
+        <select id={id("placement")} value={values.placement === "detail" ? "detail" : "card"} aria-describedby={`${id("placement")}-hint`} onChange={(event) => setField("placement", event.target.value as CardActionPlacement)}>
           {PLACEMENTS.map((placement) => <option key={placement.value} value={placement.value}>{placement.label}</option>)}
         </select>
-        <small id={`${id("placement")}-hint`}>The catalog's <code>placement</code> for this action, as the config file writes it.</small>
+        <small id={`${id("placement")}-hint`}>On the card, the action is an icon on each card that offers it (up to three per card); only in the overlay, it is listed when the card is opened, with no icon.</small>
       </div>
-      <label className="card-actions-editor-check"><input type="checkbox" checked={values.confirm} onChange={(event) => setField("confirm", event.target.checked)} />Ask before sending</label>
-      <label className="card-actions-editor-check"><input type="checkbox" checked={values.always} onChange={(event) => setField("always", event.target.checked)} />Offer on every card</label>
+      <label className="card-actions-editor-check"><input type="checkbox" checked={values.confirm} onChange={(event) => VOICE_ACTIONS[event.target.checked ? "askBeforeSendingCardAction" : "sendCardActionWithoutAsking"].run(controls)} />Ask before sending</label>
+      <label className="card-actions-editor-check"><input type="checkbox" checked={values.always} onChange={(event) => VOICE_ACTIONS[event.target.checked ? "offerCardActionOnEveryCard" : "offerCardActionWhenAgentsChoose"].run(controls)} />Offer on every card</label>
+      </fieldset>
       {form.error && <p className="card-actions-editor-error" role="alert">{form.error}</p>}
       <div className="card-actions-editor-buttons">
         <button type="button" className="button secondary" onClick={() => VOICE_ACTIONS.cancelCardActionForm.run(controls)}>Cancel</button>

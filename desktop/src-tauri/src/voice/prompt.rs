@@ -814,6 +814,13 @@ pub(crate) mod tests {
                 "add_card_action".to_string(),
                 "edit_card_action".to_string(),
                 "remove_card_action".to_string(),
+                "choose_card_actions_daemon".to_string(),
+                "refresh_card_actions".to_string(),
+                "choose_card_action_icon".to_string(),
+                "ask_before_sending_card_action".to_string(),
+                "send_card_action_without_asking".to_string(),
+                "offer_card_action_on_every_card".to_string(),
+                "offer_card_action_when_agents_choose".to_string(),
                 "none".to_string(),
             ]
         );
@@ -853,6 +860,8 @@ pub(crate) mod tests {
                 "needs_you".to_string(),
                 "action".to_string(),
                 "reply".to_string(),
+                // Issue #2399 review 12: the Card actions form's icon, by name.
+                "icon".to_string(),
             ]
         );
     }

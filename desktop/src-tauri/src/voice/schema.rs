@@ -498,6 +498,13 @@ mod tests {
                 "add_card_action".to_string(),
                 "edit_card_action".to_string(),
                 "remove_card_action".to_string(),
+                "choose_card_actions_daemon".to_string(),
+                "refresh_card_actions".to_string(),
+                "choose_card_action_icon".to_string(),
+                "ask_before_sending_card_action".to_string(),
+                "send_card_action_without_asking".to_string(),
+                "offer_card_action_on_every_card".to_string(),
+                "offer_card_action_when_agents_choose".to_string(),
                 "none".to_string(),
             ]
         );
@@ -633,6 +640,13 @@ mod tests {
                 "add_card_action",
                 "edit_card_action",
                 "remove_card_action",
+                "choose_card_actions_daemon",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
                 "none"
             ]
         );
@@ -890,6 +904,13 @@ mod tests {
                 ("add_card_action".to_string(), false),
                 ("edit_card_action".to_string(), false),
                 ("remove_card_action".to_string(), false),
+                ("choose_card_actions_daemon".to_string(), false),
+                ("refresh_card_actions".to_string(), false),
+                ("choose_card_action_icon".to_string(), false),
+                ("ask_before_sending_card_action".to_string(), false),
+                ("send_card_action_without_asking".to_string(), false),
+                ("offer_card_action_on_every_card".to_string(), false),
+                ("offer_card_action_when_agents_choose".to_string(), false),
             ]
         );
         assert_eq!(
@@ -995,6 +1016,13 @@ mod tests {
                 ("add_card_action".to_string(), true),
                 ("edit_card_action".to_string(), true),
                 ("remove_card_action".to_string(), true),
+                ("choose_card_actions_daemon".to_string(), true),
+                ("refresh_card_actions".to_string(), true),
+                ("choose_card_action_icon".to_string(), true),
+                ("ask_before_sending_card_action".to_string(), true),
+                ("send_card_action_without_asking".to_string(), true),
+                ("offer_card_action_on_every_card".to_string(), true),
+                ("offer_card_action_when_agents_choose".to_string(), true),
             ]
         );
         assert_eq!(
@@ -1093,6 +1121,13 @@ mod tests {
                 ("add_card_action".to_string(), false),
                 ("edit_card_action".to_string(), false),
                 ("remove_card_action".to_string(), false),
+                ("choose_card_actions_daemon".to_string(), false),
+                ("refresh_card_actions".to_string(), false),
+                ("choose_card_action_icon".to_string(), false),
+                ("ask_before_sending_card_action".to_string(), false),
+                ("send_card_action_without_asking".to_string(), false),
+                ("offer_card_action_on_every_card".to_string(), false),
+                ("offer_card_action_when_agents_choose".to_string(), false),
             ]
         );
     }

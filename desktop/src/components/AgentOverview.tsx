@@ -1904,7 +1904,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [decks, filtering]);
   const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
   /* PRD #2374 decision 2026-11-24 — the Card actions editor, over the daemons
-     whose cards the dashboard shows, in its order (the local daemon first). */
+     whose cards the dashboard shows, in the dashboard's order (which puts the
+     selected daemon first, not necessarily the local one). Each carries
+     whether it is this machine's daemon, from its deck kind, so the editor
+     opens on the local one wherever it is listed, and on the first listed
+     when none is local (issue #2399 review 3). */
   const cardActionDaemons = useMemo<CardActionsDaemon[]>(() => decks.flatMap((deck) => {
     const deckId = deck.snapshot.connection.deckId;
     const snapshot = deckId !== undefined ? runtime.agentCards?.[deckId] : undefined;

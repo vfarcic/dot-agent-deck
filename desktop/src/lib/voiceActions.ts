@@ -717,15 +717,19 @@ export type VoiceActionContext = {
   /*
    * PRD #2374 decision 2026-11-24 — the card actions editor. Each answers the
    * sentence saying why it did nothing, or `undefined`. Opening the editor and
-   * its forms is voice's; every press that writes a daemon's config (Save, a
-   * removal's confirmation, Hide, Restore) is the user's own, by hand.
+   * its forms, choosing its daemon, reading it again and setting the form's
+   * icon and checkboxes are voice's (issue #2399 review 12); every press that
+   * writes a daemon's config (Save, a removal's confirmation, Hide, Restore)
+   * is the user's own, by hand.
    */
   /** Open the Card actions editor on the local daemon's card actions. */
   openCardActionsEditor: () => string | undefined;
   /** Close the editor, or the removal it is asking to confirm. */
   closeCardActionsEditor: () => string | undefined;
-  /** Show the card actions of the daemon `deckId` in the editor. */
-  chooseCardActionsDaemon: (deckId: string) => string | undefined;
+  /** Show the card actions of the daemon `deckId` in the editor; `undefined` when voice named none. */
+  chooseCardActionsDaemon: (deckId: string | undefined) => string | undefined;
+  /** Read the shown daemon's card actions again, keeping the form. Writes nothing. */
+  refreshCardActions: () => string | undefined;
   /** Open the editor's form for a new action. */
   addCardAction: () => string | undefined;
   /** Open the editor's form for one listed action, by name (a button) or by label as spoken. */
@@ -742,8 +746,10 @@ export type VoiceActionContext = {
   saveCardAction: () => string | undefined;
   /** The form's Cancel: close it, writing nothing. */
   cancelCardActionForm: () => string | undefined;
-  /** One icon of the form's icon grid: set the form's icon to `name`. Writes nothing. */
+  /** Set the form's icon: a grid icon's own name, or an icon's name as spoken. Writes nothing. */
   chooseCardActionIcon: (name: string) => string | undefined;
+  /** Tick or untick one of the form's checkboxes — Ask before sending (`confirm`) or Offer on every card (`always`). Writes nothing. */
+  setCardActionFlag: (flag: "confirm" | "always", on: boolean) => string | undefined;
 };
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
@@ -809,6 +815,7 @@ export const CARD_REPLY_UNHEARD = "Say what to reply.";
 export const CARD_BATCH_UNHEARD = "Say which action to send to the card and every card under it, by the label on its button.";
 /** What the editor's voice members say when no action name was heard. */
 export const CARD_ACTION_EDIT_UNHEARD = "Say which card action, by its label in the Card actions editor.";
+export const CARD_ICON_UNHEARD = "Say which icon, by its name in the Card actions form's icon grid, such as rocket or git merge.";
 export const CARD_SELECTION_BATCH_UNHEARD = "Say which action to send to the selected cards, by the label on its button.";
 
 /** The card a target names: its deck, agent and, where known, the daemon process that listed it. */
@@ -1772,7 +1779,9 @@ export const VOICE_ACTIONS = {
 
   /* PRD #2374 decision 2026-11-24 — the card actions editor. Voice opens
      the editor, its form for a new action, an action's form and a removal's
-     confirmation; nothing it says writes the daemon's config. Every write —
+     confirmation, chooses its daemon, reads it again and sets the form's icon
+     and checkboxes (issue #2399 review 12); nothing it says writes the
+     daemon's config. Every write —
      Save, the removal's Remove, Hide and Restore — is a press by hand, so a
      misheard word can neither change what an agent is sent nor take an
      action away. */
@@ -1795,9 +1804,23 @@ export const VOICE_ACTIONS = {
 
   chooseCardActionsDaemon: {
     label: "Show another daemon's card actions in the editor",
-    no_voice: "the editor's Daemon picker, shown only with several daemons connected; the editor opens on the local daemon, and an action's spoken name says nothing about which daemon's catalog it is in, so choosing another daemon is a pick by hand from the list it shows",
+    voice: true,
     needs: ["chooseCardActionsDaemon"],
-    run: (context: Pick<VoiceActionContext, "chooseCardActionsDaemon">, deckId: string) => { context.chooseCardActionsDaemon(deckId); },
+    /* The Daemon picker passes the deck it lists; voice, the deck its `deck_ref` resolved to (`preselectDeckId`). */
+    run: (context: Pick<VoiceActionContext, "chooseCardActionsDaemon"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: string | Pick<VoiceDispatchTarget, "preselectDeckId">) => {
+      const refused = context.chooseCardActionsDaemon(typeof target === "string" ? target : target.preselectDeckId || undefined);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  refreshCardActions: {
+    label: "Read the Card actions editor's list again",
+    voice: true,
+    needs: ["refreshCardActions"],
+    run: (context: Pick<VoiceActionContext, "refreshCardActions"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.refreshCardActions();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
   },
 
   addCardAction: {
@@ -1882,10 +1905,55 @@ export const VOICE_ACTIONS = {
 
   chooseCardActionIcon: {
     label: "Choose the icon of the card action in the editor's form",
-    no_voice: "one icon in the form's icon grid, which only sets the form's icon field and writes nothing; icons are pictures chosen by eye from the grid, by a name such as `git-commit` or `circle-dot` nobody knows to say before seeing them, and the form that holds the choice is saved by hand (`saveCardAction`)",
+    voice: true,
     needs: ["chooseCardActionIcon"],
-    run: (context: Pick<VoiceActionContext, "chooseCardActionIcon"> & Partial<Pick<VoiceActionContext, "reportRefused">>, name: string) => {
-      const refused = context.chooseCardActionIcon(name);
+    /* The grid passes the icon it draws; voice, the icon's name as the user said it (`filterText`). */
+    run: (context: Pick<VoiceActionContext, "chooseCardActionIcon"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: string | Pick<VoiceDispatchTarget, "filterText">) => {
+      const said = typeof target === "string" ? target : target.filterText;
+      const refused = said ? context.chooseCardActionIcon(said) : CARD_ICON_UNHEARD;
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* The form's two checkboxes, one entry per state each, so a spoken "ask
+     before sending" never toggles a box that was already ticked. The boxes
+     dispatch the entry for the state they are being set to. */
+  askBeforeSendingCardAction: {
+    label: "Tick Ask before sending in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("confirm", true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  sendCardActionWithoutAsking: {
+    label: "Untick Ask before sending in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("confirm", false);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  offerCardActionOnEveryCard: {
+    label: "Tick Offer on every card in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("always", true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  offerCardActionWhenAgentsChoose: {
+    label: "Untick Offer on every card in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("always", false);
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -2567,7 +2635,7 @@ export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "cl
 export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
 
 /** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
-export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon";
+export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

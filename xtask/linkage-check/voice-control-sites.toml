@@ -1305,6 +1305,8 @@ reason = "The action icon button's own press: it hides the button's keyboard too
 # form holds is typed by hand, and its Save (`saveCardAction`, `no_voice`) is
 # the press that writes it, so a misheard word never becomes text an agent is
 # sent. These are keystrokes and choices inside that form, not capabilities.
+# The form's icon, its two checkboxes and the editor's daemon dispatch through
+# the registry and have voice rows of their own (issue #2399 review 12).
 
 [[site]]
 file = "desktop/src/components/AgentCardActionsEditor.tsx"
@@ -1332,18 +1334,6 @@ reason = "A keystroke into the Card actions form's When agents should offer it f
 
 [[site]]
 file = "desktop/src/components/AgentCardActionsEditor.tsx"
-handler = "onChange"
-code = '(event) => setField("confirm", event.target.checked)'
-reason = "The Card actions form's Ask before sending checkbox: a field of the form, set by hand and written only by the form's Save, like the text fields beside it."
-
-[[site]]
-file = "desktop/src/components/AgentCardActionsEditor.tsx"
-handler = "onChange"
-code = '(event) => setField("always", event.target.checked)'
-reason = "The Card actions form's Offer on every card checkbox: a field of the form, set by hand and written only by the form's Save, like the text fields beside it."
-
-[[site]]
-file = "desktop/src/components/AgentCardActionsEditor.tsx"
 handler = "onClick"
 code = "() => setPicking((open) => !open)"
 reason = "The Card actions form's Choose icon button: shows or hides the icon grid inside the form, a pointer aid for picking the form's icon field. It writes nothing; the form's Save does."
@@ -1358,7 +1348,7 @@ reason = "A keystroke into the icon grid's Search icons box, which only narrows 
 file = "desktop/src/components/AgentCardActionsEditor.tsx"
 handler = "onClick"
 code = '() => { VOICE_ACTIONS.chooseCardActionIcon.run(controls, name); setPicking(false); }'
-reason = "One icon in the Card actions form's icon grid: dispatches the choice through the registry (`chooseCardActionIcon`, whose `no_voice` says why icons are picked by eye) and then closes the grid, which is local to the form. Nothing is written until the form's Save."
+reason = "One icon in the Card actions form's icon grid: dispatches the choice through the registry (`chooseCardActionIcon`, whose `choose_card_action_icon` row chooses an icon by its name) and then closes the grid, which is local to the form. Nothing is written until the form's Save."
 
 [[site]]
 file = "desktop/src/components/AgentCardActionsEditor.tsx"
