@@ -1101,9 +1101,13 @@ fn dispatch_prompt(
          If that report later turns out to be wrong or stale — a test run finished after you \
          sent it, or the outcome changed — run the same command again with a corrected report \
          in a fresh file. It is delivered as an update to your report: the first report still \
-         stands and is not replaced, so say what changed. A unit may send {max_updates} updates, \
-         and running the command again with the same report sends nothing new.",
-        max_updates = crate::report_recovery::MAX_REPORT_UPDATES
+         stands and is not replaced, so say what changed. Running the command again with the \
+         same report sends nothing new. A unit may send up to {max_updates} updates, and from \
+         update {first_flagged} on each one tells whoever dispatched you that you have sent \
+         more updates than usual and may be looping, so send one only when the outcome really \
+         changed.",
+        max_updates = crate::report_recovery::MAX_REPORT_UPDATES,
+        first_flagged = crate::report_recovery::USUAL_REPORT_UPDATES + 1
     ));
     // Issue #550: the report above travels back over the wire and is deleted, so
     // it needs nowhere durable. Anything BIGGER than that does — the return edge

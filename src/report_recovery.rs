@@ -502,12 +502,23 @@ pub struct ReportUpdate {
     pub destination: Destination,
 }
 
-/// Issue #2260: how many updates a dispatched unit may send after its first
-/// report. A unit corrects a report it knows is stale or wrong, which in
-/// practice takes one or two (a test run that finished after the report, then
-/// the PR's state); three leaves room for that, while a unit that loops on
-/// `work-done` puts at most four turns into its dispatcher's conversation.
-pub const MAX_REPORT_UPDATES: usize = 3;
+/// Issues #2260 and #2485: how many updates a dispatched unit may send after
+/// its first report; one more different report is refused
+/// `report_updates_exhausted`. A unit corrects a report it knows is stale or
+/// wrong, and its work can keep moving after it reports (a late review
+/// finding, then the merge, then `main`'s run), so a refusal that comes early
+/// leaves the dispatcher acting on a report the unit knows is wrong. Twenty is
+/// far above what a healthy unit sends, while a unit that loops on `work-done`
+/// still puts at most twenty-one turns into its dispatcher's conversation; the
+/// dispatcher is told of a likely loop long before that, from the update after
+/// [`USUAL_REPORT_UPDATES`] on.
+pub const MAX_REPORT_UPDATES: usize = 20;
+
+/// Issue #2485: how many updates a healthy unit usually sends, in practice one
+/// or two (a test run that finished after the report, then the PR's state).
+/// Every update past this one is still delivered, and its post tells the
+/// dispatcher the unit has sent more updates than usual and may be looping.
+pub const USUAL_REPORT_UPDATES: usize = 3;
 
 /// The environment variable that lowers the per-instance tombstone bound (a
 /// test knob); the daemon-wide bound is sixteen times it.
