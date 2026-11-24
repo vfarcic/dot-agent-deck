@@ -25,7 +25,7 @@
 //!
 //! [`EventType::AgentCard`]: crate::event::EventType::AgentCard
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -837,6 +837,99 @@ pub struct CardFacts {
     pub pull_request: Option<crate::pull_request_info::PullRequestInfo>,
 }
 
+/// Issue #2418 (D2): what is under a card that has children — every
+/// descendant, not the card itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardRollup {
+    /// How many cards are under it, at any depth.
+    pub total: u32,
+    /// The most severe status among them, in the order
+    /// [`status_severity`] gives: a card status word (`waiting_for_input`,
+    /// `blocked`, …, `stopped`, `unknown`).
+    pub worst: String,
+    /// How many of them hold each status word. A word none holds is absent.
+    #[serde(default)]
+    pub counts: BTreeMap<String, u32>,
+    /// How many of them the card's own `needs_you` marks.
+    pub needs_you: u32,
+}
+
+/// Issue #2418 (D4): a pull request or issue an agent reported in a field of
+/// type `pull_request` or `issue`, beside what the deck found when it looked
+/// it up itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedReference {
+    /// The report field it came from.
+    pub field: String,
+    /// `pull_request` or `issue`: the field's type, or what a URL names.
+    pub kind: String,
+    /// The value as the agent reported it.
+    pub claim: String,
+    /// `owner/name`, once known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    /// The reference's page on github.com, once its repository is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub result: CheckResult,
+}
+
+/// Issue #2418 (D13): one label of a checked issue, as the daemon kept it.
+/// Repository text, so untrusted: the daemon caps the name's length and
+/// keeps `color` only when it is six hex digits (`d73a4a`, no `#`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueLabel {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// Issue #2418 (D5): what the deck's own lookup of a reference found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CheckResult {
+    /// Not looked up yet.
+    Pending,
+    /// Looked up on the daemon's host.
+    Checked {
+        /// `open`, `draft`, `merged` or `closed`. An issue is `open` or
+        /// `closed`, or `merged` when its number is a merged pull request.
+        state: crate::pull_request_info::PullRequestState,
+        /// A pull request's CI checks, when it has any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ci: Option<crate::pull_request_info::PullRequestChecks>,
+        /// A pull request's review decision, when GitHub reports one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<crate::pull_request_info::PullRequestReview>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// When the lookup that answered this finished.
+        checked_at: DateTime<Utc>,
+        /// A later lookup failed, so this is the last answer that
+        /// succeeded rather than a fresh one.
+        #[serde(default)]
+        stale: bool,
+        /// An issue's labels, read in the same lookup and bounded by the
+        /// daemon (round 2, D13). A pull request carries none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        labels: Vec<IssueLabel>,
+    },
+    /// The deck could not check it.
+    Unavailable {
+        /// `no_github_access`, `not_found` (not found, or private to the
+        /// daemon host's GitHub login), `rate_limited`, `unrecognised` (not a
+        /// GitHub reference) or `error`.
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// A result this build does not know, sent by a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
 /// One agent's card, as the daemon computed it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentCardEntry {
@@ -863,6 +956,25 @@ pub struct AgentCardEntry {
     pub actions: Vec<CardAction>,
     pub primary_action_id: String,
     pub facts: CardFacts,
+    /// Issue #2418 (D1): the key of the card that started this one — the
+    /// dispatcher of a dispatched unit, the orchestrator of an orchestration
+    /// role. Absent on a root, and on a card whose starter's card is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Issue #2418 review (D6): what this card is — `dispatcher` (the
+    /// dispatch records name it as the dispatcher of a unit, whether or not
+    /// that unit's card is still listed), `orchestrator` or `role` (its
+    /// orchestration seat), or `agent`. Sent with the tree, so absent from a
+    /// daemon that does not advertise `agent-cards-tree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Issue #2418 (D2): what is under this card; absent when nothing is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollup: Option<CardRollup>,
+    /// Issue #2418 (D4): the pull requests and issues the report names, in
+    /// field order, each with the deck's own check of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checked_refs: Vec<CheckedReference>,
     /// The actions invoked on this card, newest first, at most
     /// [`MAX_RECENT_DELIVERIES`] and [`MAX_RECENT_DELIVERY_BYTES`] of text.
     #[serde(default)]
@@ -877,7 +989,9 @@ impl AgentCardEntry {
     }
 }
 
-/// `list-agent-cards`'s answer: every live entry in display order.
+/// `list-agent-cards`'s answer: every live entry in display order — since
+/// issue #2418 (D3) the tree's: each card before the cards under it, roots
+/// and siblings in the order they were spawned.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentCardList {
     pub instance_id: String,
@@ -993,6 +1107,22 @@ struct StoredReport {
     report: AgentReport,
     published_at: DateTime<Utc>,
     publishes: u64,
+    /// Issue #2454: the user has dealt with this report's `waiting`, `done` or
+    /// `failed` status since it was published — the agent started working
+    /// again, or the user opened the agent — so it no longer makes the card
+    /// need the user. A new publish starts unset.
+    dealt_with: bool,
+}
+
+/// Issue #2454: the report statuses that make a card need the user until the
+/// user deals with them.
+fn report_needs_you(status: ReportStatus) -> Option<&'static str> {
+    match status {
+        ReportStatus::Waiting => Some("waiting"),
+        ReportStatus::Done => Some("done"),
+        ReportStatus::Failed => Some("failed"),
+        ReportStatus::Working => None,
+    }
 }
 
 /// One agent generation as the deck sees it, gathered before projection.
@@ -1008,6 +1138,20 @@ pub struct AgentFacts {
     /// Whether the daemon records a dispatched worktree for the agent, which
     /// is what offers "close, keeping the worktree".
     pub has_worktree: bool,
+    /// Issue #2418 (D4): the working directory the joined live session
+    /// reports, picked as `record.live` is. Daemon-only: a bare `#N`
+    /// reference resolves against it, else against `record.cwd`, as the
+    /// branch badge prefers a session's reported directory.
+    pub live_cwd: Option<String>,
+}
+
+impl AgentFacts {
+    /// The folder a bare `#N` reference on this agent's card resolves in:
+    /// its live session's reported directory, else the one the deck started
+    /// it in.
+    fn reference_cwd(&self) -> Option<&str> {
+        self.live_cwd.as_deref().or(self.record.cwd.as_deref())
+    }
 }
 
 /// A live dispatched unit, as projection needs it.
@@ -1242,13 +1386,11 @@ fn project_entry(
     if unanswered > 0 {
         reasons.push("question".into());
     }
-    if let Some(r) = report {
-        match r.report.status_or_default() {
-            ReportStatus::Waiting => reasons.push("waiting".into()),
-            ReportStatus::Done => reasons.push("done".into()),
-            ReportStatus::Failed => reasons.push("failed".into()),
-            ReportStatus::Working => {}
-        }
+    // A report's reason lasts until the user deals with it (issue #2454).
+    if let Some(r) = report.filter(|r| !r.dealt_with)
+        && let Some(reason) = report_needs_you(r.report.status_or_default())
+    {
+        reasons.push(reason.into());
     }
     if status == "blocked" {
         reasons.push("blocked".into());
@@ -1557,6 +1699,14 @@ fn project_entry(
             label: None,
         }
     };
+    // Issue #2418 review (D6): the card's kind, from exact identity. An
+    // orchestrator that also dispatches reads as an orchestrator.
+    let kind = match &orchestration {
+        Some((_, _, _, true)) => "orchestrator",
+        _ if is_dispatcher => "dispatcher",
+        Some(_) => "role",
+        None => "agent",
+    };
     let relations = CardRelations {
         dispatcher: dispatcher_rel,
         orchestration: orchestration.map(|(id, label, role, is_orchestrator)| {
@@ -1601,21 +1751,30 @@ fn project_entry(
             source: "deck".into(),
             pull_request,
         },
+        parent: None,
+        kind: Some(kind.to_string()),
+        rollup: None,
+        checked_refs: Vec::new(),
         recent_deliveries,
         revision: 0,
         updated_at: DateTime::<Utc>::UNIX_EPOCH,
     }
 }
 
-/// Every entry for `agents`, in display order: groups in order of their
-/// first-spawned member, within a group the entries that need the user first,
-/// then spawn order.
-fn project_all(
+/// Every entry for `agents`, in display order (issue #2418, D3): the tree's
+/// — each card right before the cards under it, roots and siblings in spawn
+/// order — with each card's parent (D1), roll-up (D2) and checked references
+/// (D4) filled in. Reads the references' lookups from `refs` and records in
+/// `wanted` what they needed; does no I/O.
+#[allow(clippy::too_many_arguments)]
+fn project_all_checked(
     agents: &[AgentFacts],
     slots: &HashMap<String, Slot>,
     catalog: &ResolvedCatalog,
     units: &[UnitFacts],
     instance_id: &str,
+    refs: &crate::reference_check::ReferenceView,
+    wanted: &mut crate::reference_check::WantedRefs,
 ) -> Vec<AgentCardEntry> {
     let names: HashMap<String, String> = agents
         .iter()
@@ -1630,27 +1789,248 @@ fn project_all(
         .iter()
         .map(|a| {
             let key = entry_key(&a.pane_id, &a.record.id);
-            project_entry(a, slots.get(&key), catalog, units, &names, instance_id)
+            let mut entry = project_entry(a, slots.get(&key), catalog, units, &names, instance_id);
+            entry.checked_refs = checked_references(&entry.fields, a.reference_cwd(), refs, wanted);
+            entry
         })
         .collect();
-    let mut group_first: HashMap<String, u64> = HashMap::new();
-    for e in &entries {
-        let order = spawn_order(&e.agent_id);
-        group_first
-            .entry(e.group.id.clone())
-            .and_modify(|o| *o = (*o).min(order))
-            .or_insert(order);
-    }
-    entries.sort_by(|a, b| {
-        let ga = group_first[&a.group.id];
-        let gb = group_first[&b.group.id];
-        ga.cmp(&gb)
-            .then_with(|| a.group.id.cmp(&b.group.id))
-            .then_with(|| b.needs_you.cmp(&a.needs_you))
-            .then_with(|| spawn_order(&a.agent_id).cmp(&spawn_order(&b.agent_id)))
-            .then_with(|| a.key.cmp(&b.key))
-    });
+    link_tree(&mut entries);
     entries
+}
+
+/// [`project_all_checked`] with no reference looked up yet.
+#[cfg(test)]
+fn project_all(
+    agents: &[AgentFacts],
+    slots: &HashMap<String, Slot>,
+    catalog: &ResolvedCatalog,
+    units: &[UnitFacts],
+    instance_id: &str,
+) -> Vec<AgentCardEntry> {
+    project_all_checked(
+        agents,
+        slots,
+        catalog,
+        units,
+        instance_id,
+        &crate::reference_check::ReferenceView::default(),
+        &mut crate::reference_check::WantedRefs::default(),
+    )
+}
+
+/// Issue #2418 (D4): the references among a card's `fields` — those whose
+/// type is `pull_request` or `issue` — each with the deck's check of it.
+/// Text in any other field is not read as a reference.
+fn checked_references(
+    fields: &[CardField],
+    cwd: Option<&str>,
+    refs: &crate::reference_check::ReferenceView,
+    wanted: &mut crate::reference_check::WantedRefs,
+) -> Vec<CheckedReference> {
+    fields
+        .iter()
+        .filter_map(|field| {
+            let kind = FieldType::parse(&field.field_type)
+                .and_then(crate::github_refs::ReferenceKind::of_field_type)?;
+            let claim = field.value.as_str()?;
+            Some(crate::reference_check::check_reference(
+                &field.name,
+                claim,
+                kind,
+                cwd,
+                refs,
+                wanted,
+            ))
+        })
+        .collect()
+}
+
+/// Issue #2418 (D2): how severe a card status word is, most severe first —
+/// the order a roll-up's `worst` follows.
+pub fn status_severity(status: &str) -> u8 {
+    match status {
+        "waiting_for_input" => 0,
+        "blocked" => 1,
+        "error" => 2,
+        "waiting" => 3,
+        "working" => 4,
+        "thinking" => 5,
+        "compacting" => 6,
+        "idle" => 7,
+        "stopped" => 8,
+        "unknown" => 9,
+        _ => 10,
+    }
+}
+
+/// Issue #2418 (D1): the key of the card that started `entry`, from exact
+/// identity — an orchestration's instance and seat, a dispatched unit's
+/// dispatcher pane and generation — never from names. `orchestrators` maps an
+/// orchestration instance to its orchestrator's card.
+fn starter_of(entry: &AgentCardEntry, orchestrators: &HashMap<&str, &str>) -> Option<String> {
+    if let Some(o) = &entry.relations.orchestration
+        && !o.is_orchestrator
+    {
+        // A role hangs under its orchestrator, or nowhere when that card is
+        // gone — not under the dispatcher of the orchestration.
+        return orchestrators.get(o.id.as_str()).map(|k| k.to_string());
+    }
+    entry.relations.dispatcher.as_ref().map(|d| d.key.clone())
+}
+
+/// Issue #2418: set each entry's `parent` (D1) and `rollup` (D2), and order
+/// the entries as the tree (D3).
+fn link_tree(entries: &mut Vec<AgentCardEntry>) {
+    let order_of = |e: &AgentCardEntry| (spawn_order(&e.agent_id), e.key.clone());
+    // Each orchestration's orchestrator: a live generation over a stopped
+    // one, then the latest.
+    let mut orchestrators: HashMap<&str, &AgentCardEntry> = HashMap::new();
+    for e in entries.iter() {
+        let Some(o) = e
+            .relations
+            .orchestration
+            .as_ref()
+            .filter(|o| o.is_orchestrator)
+        else {
+            continue;
+        };
+        let rank = |e: &AgentCardEntry| (e.status != "stopped", spawn_order(&e.agent_id));
+        orchestrators
+            .entry(o.id.as_str())
+            .and_modify(|best| {
+                if rank(e) > rank(best) {
+                    *best = e;
+                }
+            })
+            .or_insert(e);
+    }
+    let orchestrators: HashMap<&str, &str> = orchestrators
+        .into_iter()
+        .map(|(id, e)| (id, e.key.as_str()))
+        .collect();
+    let index: HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.key.clone(), i))
+        .collect();
+    // A starter whose card is gone, or the card itself, is no parent.
+    let mut parent: Vec<Option<usize>> = entries
+        .iter()
+        .map(|e| {
+            starter_of(e, &orchestrators)
+                .and_then(|k| index.get(&k).copied())
+                .filter(|p| entries[*p].key != e.key)
+        })
+        .collect();
+
+    let mut by_order: Vec<usize> = (0..entries.len()).collect();
+    by_order.sort_by_key(|i| order_of(&entries[*i]));
+    let mut rank = vec![0usize; entries.len()];
+    for (position, &i) in by_order.iter().enumerate() {
+        rank[i] = position;
+    }
+
+    // Break every cycle of starters, which exact identity should never form.
+    // Walking up from each card either reaches a root, a card already known
+    // to reach one, or a card already on this walk: then the walk from that
+    // card on is a cycle, and its earliest-spawned card becomes a root. Only
+    // a card ON a cycle is cut, once per cycle; a card whose starters lead
+    // into a cycle keeps its starter.
+    let mut reaches_root = vec![false; entries.len()];
+    let mut on_walk = vec![false; entries.len()];
+    for &start in &by_order {
+        let mut walk: Vec<usize> = Vec::new();
+        let mut at = start;
+        loop {
+            if reaches_root[at] {
+                break;
+            }
+            if on_walk[at] {
+                let from = walk.iter().position(|&n| n == at).unwrap_or(0);
+                if let Some(&cut) = walk[from..].iter().min_by_key(|&&n| rank[n]) {
+                    parent[cut] = None;
+                }
+                break;
+            }
+            on_walk[at] = true;
+            walk.push(at);
+            match parent[at] {
+                Some(p) => at = p,
+                None => break,
+            }
+        }
+        for n in walk {
+            on_walk[n] = false;
+            reaches_root[n] = true;
+        }
+    }
+
+    // Walk the forest from its roots, in spawn order.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    for &c in &by_order {
+        if let Some(p) = parent[c] {
+            children[p].push(c);
+        }
+    }
+    let mut visited = vec![false; entries.len()];
+    let mut preorder: Vec<usize> = Vec::with_capacity(entries.len());
+    for &start in by_order.iter().filter(|&&i| parent[i].is_none()) {
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if visited[node] {
+                continue;
+            }
+            visited[node] = true;
+            preorder.push(node);
+            stack.extend(children[node].iter().rev().copied());
+        }
+    }
+
+    // Roll-ups, children before parents: each node adds itself and what is
+    // under it to its parent's tally.
+    #[derive(Default, Clone)]
+    struct Tally {
+        total: u32,
+        counts: BTreeMap<String, u32>,
+        needs_you: u32,
+    }
+    let mut tallies: Vec<Tally> = vec![Tally::default(); entries.len()];
+    for &node in preorder.iter().rev() {
+        let Some(p) = parent[node] else { continue };
+        let below = tallies[node].clone();
+        let tally = &mut tallies[p];
+        tally.total += 1 + below.total;
+        *tally
+            .counts
+            .entry(entries[node].status.clone())
+            .or_default() += 1;
+        for (word, n) in below.counts {
+            *tally.counts.entry(word).or_default() += n;
+        }
+        tally.needs_you += u32::from(entries[node].needs_you) + below.needs_you;
+    }
+    let keys: Vec<String> = entries.iter().map(|e| e.key.clone()).collect();
+    for (i, entry) in entries.iter_mut().enumerate() {
+        entry.parent = parent[i].map(|p| keys[p].clone());
+        let tally = std::mem::take(&mut tallies[i]);
+        entry.rollup = (tally.total > 0).then(|| CardRollup {
+            total: tally.total,
+            worst: tally
+                .counts
+                .keys()
+                .min_by_key(|w| (status_severity(w), (*w).clone()))
+                .cloned()
+                .unwrap_or_default(),
+            counts: tally.counts,
+            needs_you: tally.needs_you,
+        });
+    }
+    let mut slots: Vec<Option<AgentCardEntry>> =
+        std::mem::take(entries).into_iter().map(Some).collect();
+    *entries = preorder
+        .into_iter()
+        .filter_map(|i| slots[i].take())
+        .collect();
 }
 
 fn content_hash(entry: &AgentCardEntry) -> u64 {
@@ -1814,6 +2194,8 @@ impl StoreInner {
         retry: bool,
         now: DateTime<Utc>,
         instant: Instant,
+        refs: &crate::reference_check::ReferenceView,
+        wanted: &mut crate::reference_check::WantedRefs,
     ) -> Option<(AgentCardList, Vec<Doorbell>)> {
         if retry && self.epoch != read_at {
             return None;
@@ -1835,7 +2217,15 @@ impl StoreInner {
                 }
             }
         }
-        let mut entries = project_all(agents, &self.slots, catalog, units, instance_id);
+        let mut entries = project_all_checked(
+            agents,
+            &self.slots,
+            catalog,
+            units,
+            instance_id,
+            refs,
+            wanted,
+        );
         let removed: Vec<String> = self
             .computed
             .keys()
@@ -1930,6 +2320,8 @@ pub struct CardStore {
     serial: tokio::sync::Mutex<()>,
     broadcast: Mutex<Option<broadcast::Sender<BroadcastMsg>>>,
     worktrees: Mutex<Option<crate::issue_dispatch_run::WorktreeRegistry>>,
+    /// Issue #2418: the deck's checks of the references reports name.
+    references: crate::reference_check::ReferenceChecks,
 }
 
 impl std::fmt::Debug for CardStore {
@@ -1941,6 +2333,12 @@ impl std::fmt::Debug for CardStore {
 impl CardStore {
     fn lock(&self) -> MutexGuard<'_, StoreInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Issue #2418: the cache of reference checks the projection reads and
+    /// [`crate::reference_check::run_reference_monitor`] fills.
+    pub fn references(&self) -> &crate::reference_check::ReferenceChecks {
+        &self.references
     }
 
     /// The cheap checks a NEW request id passes before it is claimed, so a
@@ -2043,9 +2441,68 @@ impl CardStore {
             report,
             published_at: Utc::now(),
             publishes: slot.publishes,
+            dealt_with: false,
         });
         slot.answered.clear();
         slot.epoch = epoch;
+    }
+
+    /// Issue #2454: mark the report of the generation `agent_id` in `pane_id`
+    /// dealt with, when its status is one that makes the card need the user
+    /// (`waiting`, `done`, `failed`) and it is not marked already. Answers
+    /// whether anything changed. With `published_before`, only a report
+    /// published before that moment is marked. The live reasons (stopped, a
+    /// question, blocked) are not the report's and are untouched.
+    fn mark_dealt_with(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        published_before: Option<DateTime<Utc>>,
+    ) -> bool {
+        let mut inner = self.lock();
+        let Some(report) = inner
+            .slots
+            .get_mut(&entry_key(pane_id, agent_id))
+            .and_then(|slot| slot.report.as_mut())
+        else {
+            return false;
+        };
+        if report.dealt_with
+            || report_needs_you(report.report.status_or_default()).is_none()
+            || published_before.is_some_and(|at| report.published_at >= at)
+        {
+            return false;
+        }
+        report.dealt_with = true;
+        true
+    }
+
+    /// Whether the report of `agent_id` in `pane_id` is marked dealt with;
+    /// `None` when there is no report.
+    #[cfg(test)]
+    pub(crate) fn report_dealt_with_for_test(&self, pane_id: &str, agent_id: &str) -> Option<bool> {
+        self.lock()
+            .slots
+            .get(&entry_key(pane_id, agent_id))
+            .and_then(|slot| slot.report.as_ref())
+            .map(|report| report.dealt_with)
+    }
+
+    /// Issue #2454: the agent `agent_id` in `pane_id` started its next turn
+    /// at `turn_began_at` (the daemon's clock), which deals with a report it
+    /// published before then; a report published since belongs to this turn
+    /// and keeps its reason. Called by the daemon's hook ingest under the
+    /// state lock, so it takes only the store's own lock; the change reaches
+    /// clients with the next refresh's doorbell.
+    pub fn note_turn_started(&self, pane_id: &str, agent_id: &str, turn_began_at: DateTime<Utc>) {
+        if self.mark_dealt_with(pane_id, agent_id, Some(turn_began_at)) {
+            tracing::debug!(
+                target: "agent_cards",
+                pane_id,
+                agent_id,
+                "the agent started working again; its report no longer needs the user"
+            );
+        }
     }
 
     fn record_delivery(&self, key: &str, record: CardDeliveryRecord) {
@@ -2211,16 +2668,18 @@ async fn gather(
     registry: &Arc<AgentPtyRegistry>,
     state: &crate::state::SharedState,
 ) -> (Vec<AgentFacts>, Vec<UnitFacts>) {
-    let mut records: Vec<(AgentRecord, bool)> = registry
+    let mut records: Vec<(AgentRecord, bool, Option<String>)> = registry
         .agent_records_including_exited()
         .into_iter()
         .filter(|(record, _, unconfirmed)| !unconfirmed && record.pane_id_env.is_some())
-        .map(|(record, exited, _)| (record, exited))
+        .map(|(record, exited, _)| (record, exited, None))
         .collect();
     {
         let guard = state.read().await;
-        for (record, _) in &mut records {
-            record.live = guard.live_session_for(&record.id, record.pane_id_env.as_deref());
+        for (record, _, live_cwd) in &mut records {
+            let pane = record.pane_id_env.as_deref();
+            record.live = guard.live_session_for(&record.id, pane);
+            *live_cwd = guard.live_session_cwd_for(&record.id, pane);
         }
     }
     let worktrees = registry
@@ -2232,7 +2691,7 @@ async fn gather(
     let inbox = registry.inbox();
     let agents = records
         .into_iter()
-        .map(|(record, exited)| {
+        .map(|(record, exited, live_cwd)| {
             let pane_id = record.pane_id_env.clone().unwrap_or_default();
             let summary = inbox.summary(&pane_id, &record.id);
             let has_worktree = worktrees.as_ref().is_some_and(|w| {
@@ -2246,6 +2705,7 @@ async fn gather(
                 stopped: exited || record.crashed == Some(true),
                 undelivered_messages: summary.queued + summary.fetched,
                 has_worktree,
+                live_cwd,
                 pane_id,
                 record,
             }
@@ -2351,6 +2811,8 @@ async fn refresh_in_turn(
         // Between this reading and its commit (review R4's interleaving test).
         registry.pause_point(GATHERED_PAUSE).await;
         let states = delivery_states(registry);
+        let refs = store.references().view();
+        let mut wanted = crate::reference_check::WantedRefs::default();
         let committed = store.lock().commit(
             &agents,
             &units,
@@ -2361,10 +2823,13 @@ async fn refresh_in_turn(
             attempt < REFRESH_ATTEMPTS,
             Utc::now(),
             Instant::now(),
+            &refs,
+            &mut wanted,
         );
         let Some((list, doorbells)) = committed else {
             continue;
         };
+        store.references().set_wanted(wanted);
         if let Some(tx) = store.sender() {
             for bell in doorbells {
                 // Errs only when nobody is subscribed, which is not a failure.
@@ -2430,6 +2895,36 @@ pub fn spawn_watcher(
             }
         }
     })
+}
+
+/// Issue #2454: the user opened the agent in `pane_id` in a client, which
+/// deals with the reason its card report raised. `agent_id` is the generation
+/// the client showed, when it knows one; nothing changes when the pane's
+/// current agent is another, or the pane has none. A change is announced like
+/// any other, by a refresh and its doorbell.
+pub async fn agent_opened(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &crate::state::SharedState,
+    pane_id: &str,
+    agent_id: Option<&str>,
+) {
+    let Some(current) = registry.pane_current_agent_id(pane_id) else {
+        return;
+    };
+    if agent_id.is_some_and(|named| named != current) {
+        return;
+    }
+    let store = registry.agent_cards();
+    let _turn = store.serial.lock().await;
+    if store.mark_dealt_with(pane_id, &current, None) {
+        tracing::debug!(
+            target: "agent_cards",
+            pane_id,
+            agent_id = %current,
+            "the user opened the agent; its report no longer needs the user"
+        );
+        refresh_in_turn(registry, state).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3147,6 +3642,7 @@ mod tests {
             stopped: false,
             undelivered_messages: 0,
             has_worktree: false,
+            live_cwd: None,
         }
     }
 
@@ -3156,6 +3652,7 @@ mod tests {
                 report: report(json),
                 published_at: Utc::now(),
                 publishes: 1,
+                dealt_with: false,
             }),
             ..Slot::default()
         }
@@ -3163,7 +3660,12 @@ mod tests {
 
     #[test]
     fn an_entry_resolves_actions_needs_you_and_primary() {
-        let catalog = resolve(None);
+        // Explain is no longer a default (#2418 D15): a user catalog adds it,
+        // always offered, so the always-offered step keeps its place below.
+        let catalog = resolve(Some(
+            "[[catalog.actions]]\nname = \"explain\"\ndescription = \"d\"\nprompt = \"Explain.\"\nalways = true\n",
+        ));
+        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
         let mut slots = HashMap::new();
         slots.insert(
             "p1/1".to_string(),
@@ -3250,8 +3752,12 @@ mod tests {
         assert!(e.action("close-keep-worktree").is_some());
     }
 
+    /// Issue #2418 (D3): the list is the tree in order, a parent before its
+    /// children and siblings in spawn order, so a unit that needs the user
+    /// no longer moves ahead of the dispatcher that started it. The group a
+    /// card belongs to is unchanged.
     #[test]
-    fn dispatcher_groups_order_needs_you_first() {
+    fn dispatcher_groups_keep_parents_before_children() {
         let catalog = resolve(None);
         let units = vec![UnitFacts {
             dispatcher_pane: "p1".into(),
@@ -3269,14 +3775,694 @@ mod tests {
             "i",
         );
         let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, ["p3/3", "p1/1", "p2/2"]);
+        assert_eq!(keys, ["p1/1", "p3/3", "p2/2"]);
         assert_eq!(entries[0].group.id, "dispatcher:p1/1");
         assert_eq!(entries[1].group.id, "dispatcher:p1/1");
+        assert!(entries[1].needs_you);
         assert_eq!(
-            entries[0].relations.dispatcher.as_ref().unwrap().key,
+            entries[1].relations.dispatcher.as_ref().unwrap().key,
             "p1/1"
         );
         assert_eq!(entries[2].group.id, "standalone");
+    }
+
+    // ---- Issue #2418: the tree (D1, D3) and its roll-ups (D2) ----
+
+    /// A generation in pane `pane` holding role `role` of orchestration
+    /// instance `instance`.
+    fn role(id: &str, pane: &str, instance: &str, role: &str, orchestrator: bool) -> AgentFacts {
+        let mut f = facts(id, pane);
+        f.record = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "pane_id_env": pane,
+            "tab_membership": {
+                "kind": "orchestration",
+                "name": "team",
+                "role_index": 0,
+                "role_name": role,
+                "is_start_role": orchestrator,
+                "orchestration_id": instance,
+            },
+        }))
+        .unwrap();
+        f
+    }
+
+    /// `f` with live status `status` (a `SessionStatus` variant name).
+    fn with_status(mut f: AgentFacts, status: &str) -> AgentFacts {
+        f.record.live = Some(
+            serde_json::from_value(serde_json::json!({ "status": status, "tool_count": 0 }))
+                .unwrap(),
+        );
+        f
+    }
+
+    fn single_unit(dispatcher: (&str, &str), unit: (&str, &str)) -> UnitFacts {
+        UnitFacts {
+            dispatcher_pane: dispatcher.0.into(),
+            dispatcher_agent: dispatcher.1.into(),
+            single: Some((unit.0.into(), unit.1.into())),
+            orchestration_id: None,
+        }
+    }
+
+    fn orchestration_unit(dispatcher: (&str, &str), instance: &str) -> UnitFacts {
+        UnitFacts {
+            dispatcher_pane: dispatcher.0.into(),
+            dispatcher_agent: dispatcher.1.into(),
+            single: None,
+            orchestration_id: Some(instance.into()),
+        }
+    }
+
+    /// Every entry's key and parent, in list order.
+    fn tree(entries: &[AgentCardEntry]) -> Vec<(&str, Option<&str>)> {
+        entries
+            .iter()
+            .map(|e| (e.key.as_str(), e.parent.as_deref()))
+            .collect()
+    }
+
+    /// T1 (D1): parent links come from exact identity — a dispatcher's
+    /// single unit and a dispatcher it started hang under it; an orchestration
+    /// it dispatched hangs its orchestrator under it and the roles under the
+    /// orchestrator; an orchestration started directly is a root with its
+    /// roles under its orchestrator; a standalone agent is a root.
+    #[test]
+    fn parent_links_follow_dispatches_and_orchestrations() {
+        let catalog = resolve(None);
+        let agents = [
+            facts("1", "d1"),                                // dispatcher, root
+            facts("2", "s1"),                                // standalone, root
+            facts("3", "u1"),                                // single unit of d1
+            facts("4", "d2"),                                // dispatcher started by d1
+            facts("5", "u2"),                                // single unit of d2
+            role("6", "o1", "orch-a", "orchestrator", true), // dispatched by d1
+            role("7", "r1", "orch-a", "coder", false),
+            role("8", "r2", "orch-a", "tester", false),
+            role("9", "o2", "orch-b", "orchestrator", true), // started directly
+            role("10", "r3", "orch-b", "coder", false),
+        ];
+        let units = [
+            single_unit(("d1", "1"), ("u1", "3")),
+            single_unit(("d1", "1"), ("d2", "4")),
+            single_unit(("d2", "4"), ("u2", "5")),
+            orchestration_unit(("d1", "1"), "orch-a"),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(
+            tree(&entries),
+            [
+                ("d1/1", None),
+                ("u1/3", Some("d1/1")),
+                ("d2/4", Some("d1/1")),
+                ("u2/5", Some("d2/4")),
+                ("o1/6", Some("d1/1")),
+                ("r1/7", Some("o1/6")),
+                ("r2/8", Some("o1/6")),
+                ("s1/2", None),
+                ("o2/9", None),
+                ("r3/10", Some("o2/9")),
+            ]
+        );
+        // The flat grouping a client of the first slice reads is unchanged:
+        // dispatcher wins for every member of a dispatched orchestration.
+        assert_eq!(one(&entries, "r1/7").group.id, "dispatcher:d1/1");
+        assert_eq!(one(&entries, "r3/10").group.id, "orch-b");
+    }
+
+    /// Issue #2418 review (desktop 6): each card carries its kind, computed
+    /// from exact identity — a dispatcher by the dispatch records whether or
+    /// not any card it dispatched is still listed, an orchestrator or a role
+    /// by its orchestration seat, anything else an agent.
+    #[test]
+    fn each_card_carries_its_kind_from_the_dispatch_records() {
+        let catalog = resolve(None);
+        let agents = [
+            facts("1", "d1"),
+            facts("2", "s1"),
+            facts("3", "u1"),
+            facts("4", "d2"),
+            role("6", "o1", "orch-a", "orchestrator", true),
+            role("7", "r1", "orch-a", "coder", false),
+        ];
+        let units = [
+            single_unit(("d1", "1"), ("u1", "3")),
+            orchestration_unit(("d1", "1"), "orch-a"),
+            // d2 dispatched a unit that is no longer listed.
+            single_unit(("d2", "4"), ("gone", "5")),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        let kind = |key: &str| one(&entries, key).kind;
+        assert_eq!(kind("d1/1").as_deref(), Some("dispatcher"));
+        assert_eq!(kind("d2/4").as_deref(), Some("dispatcher"));
+        assert_eq!(kind("s1/2").as_deref(), Some("agent"));
+        assert_eq!(kind("u1/3").as_deref(), Some("agent"));
+        assert_eq!(kind("o1/6").as_deref(), Some("orchestrator"));
+        assert_eq!(kind("r1/7").as_deref(), Some("role"));
+        // The kind does not depend on which other cards are listed.
+        let alone = project_all(&agents[..1], &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(alone[0].kind.as_deref(), Some("dispatcher"));
+        let wire = serde_json::to_value(&alone[0]).unwrap();
+        assert_eq!(wire["kind"], "dispatcher");
+    }
+
+    /// T1 (D1): a child whose parent's entry is gone becomes a root rather
+    /// than pointing at nothing — a unit whose dispatcher was closed, and a
+    /// role whose orchestrator was closed.
+    #[test]
+    fn an_orphaned_child_becomes_a_root() {
+        let catalog = resolve(None);
+        let agents = [facts("3", "u1"), role("7", "r1", "orch-a", "coder", false)];
+        let units = [
+            single_unit(("d1", "1"), ("u1", "3")),
+            orchestration_unit(("d1", "1"), "orch-a"),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(tree(&entries), [("u1/3", None), ("r1/7", None)]);
+        assert!(entries.iter().all(|e| e.rollup.is_none()));
+    }
+
+    /// T1 (D3): roots and siblings keep spawn order whatever their status or
+    /// needs-you, so nothing moves when a status changes.
+    #[test]
+    fn roots_and_siblings_stay_in_spawn_order() {
+        let catalog = resolve(None);
+        let units = [
+            single_unit(("d", "2"), ("u1", "4")),
+            single_unit(("d", "2"), ("u2", "5")),
+        ];
+        let order = |stopped: &[&str], blocked: &[&str]| {
+            let agents: Vec<AgentFacts> =
+                [("1", "a"), ("2", "d"), ("3", "b"), ("4", "u1"), ("5", "u2")]
+                    .into_iter()
+                    .map(|(id, pane)| {
+                        let mut f = facts(id, pane);
+                        f.stopped = stopped.contains(&pane);
+                        if blocked.contains(&pane) {
+                            f = with_status(f, "Blocked");
+                        }
+                        f
+                    })
+                    // The registry's order is not spawn order.
+                    .rev()
+                    .collect();
+            let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+            entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>()
+        };
+        let calm = order(&[], &[]);
+        assert_eq!(calm, ["a/1", "d/2", "u1/4", "u2/5", "b/3"]);
+        assert_eq!(order(&["b"], &["u2"]), calm);
+        assert_eq!(order(&["d"], &["a"]), calm);
+    }
+
+    /// T2 (D2): a parent's roll-up counts every descendant, not itself, by
+    /// status word; `worst` is the most severe of them in D2's order;
+    /// `needs_you` counts descendants the existing predicate marks; and a
+    /// grandchild that needs the user surfaces at the root. A card with no
+    /// children has no roll-up.
+    #[test]
+    fn a_rollup_summarises_every_descendant() {
+        let catalog = resolve(None);
+        let mut slots = HashMap::new();
+        // The grandchild asks a question: it needs the user.
+        slots.insert(
+            "r2/8".to_string(),
+            slot_with(
+                r#"{"questions": [{"id": "q", "text": "Which?", "options": [{"id": "a", "label": "A"}]}]}"#,
+            ),
+        );
+        let agents = [
+            with_status(facts("1", "d1"), "Error"),
+            with_status(role("6", "o1", "orch-a", "orchestrator", true), "Idle"),
+            with_status(role("7", "r1", "orch-a", "coder", false), "Working"),
+            with_status(role("8", "r2", "orch-a", "tester", false), "Thinking"),
+            with_status(facts("3", "u1"), "Working"),
+            {
+                let mut f = facts("4", "u2");
+                f.stopped = true;
+                f
+            },
+        ];
+        let units = [
+            orchestration_unit(("d1", "1"), "orch-a"),
+            single_unit(("d1", "1"), ("u1", "3")),
+            single_unit(("d1", "1"), ("u2", "4")),
+        ];
+        let entries = project_all(&agents, &slots, &catalog, &units, "i");
+        let root = one(&entries, "d1/1");
+        let rollup = root.rollup.expect("the dispatcher has children");
+        assert_eq!(rollup.total, 5);
+        assert_eq!(
+            rollup.counts,
+            BTreeMap::from([
+                ("idle".to_string(), 1),
+                ("stopped".to_string(), 1),
+                ("thinking".to_string(), 1),
+                ("working".to_string(), 2),
+            ])
+        );
+        // Not the root's own `error`: the roll-up is over descendants only.
+        assert_eq!(rollup.worst, "working");
+        // The stopped unit and the questioning grandchild.
+        assert_eq!(rollup.needs_you, 2);
+        let orchestrator = one(&entries, "o1/6").rollup.expect("roles under it");
+        assert_eq!(orchestrator.total, 2);
+        assert_eq!(orchestrator.needs_you, 1);
+        assert_eq!(orchestrator.worst, "working");
+        assert!(one(&entries, "r2/8").rollup.is_none());
+        assert!(one(&entries, "u1/3").rollup.is_none());
+    }
+
+    /// T2 (D2): `worst` follows the maintainer's order, most severe first:
+    /// needs input, blocked, error, waiting, working, thinking, compacting,
+    /// idle, stopped, unknown.
+    #[test]
+    fn worst_follows_the_severity_order() {
+        let catalog = resolve(None);
+        let order = [
+            "WaitingForInput",
+            "Blocked",
+            "Error",
+            "Waiting",
+            "Working",
+            "Thinking",
+            "Compacting",
+            "Idle",
+        ];
+        let words = [
+            "waiting_for_input",
+            "blocked",
+            "error",
+            "waiting",
+            "working",
+            "thinking",
+            "compacting",
+            "idle",
+        ];
+        for (at, word) in words.iter().enumerate() {
+            // The parent's children hold this status and every less severe one.
+            let mut agents = vec![facts("1", "d")];
+            let mut units = Vec::new();
+            for (i, status) in order[at..].iter().enumerate().rev() {
+                let id = (10 + i).to_string();
+                let pane = format!("u{i}");
+                agents.push(with_status(facts(&id, &pane), status));
+                units.push(single_unit(("d", "1"), (&pane, &id)));
+            }
+            let mut stopped = facts("2", "us");
+            stopped.stopped = true;
+            agents.push(stopped);
+            units.push(single_unit(("d", "1"), ("us", "2")));
+            agents.push(facts("3", "uu"));
+            units.push(single_unit(("d", "1"), ("uu", "3")));
+            let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+            assert_eq!(one(&entries, "d/1").rollup.unwrap().worst, *word);
+        }
+        // Below every status: stopped, then unknown.
+        let units = [
+            single_unit(("d", "1"), ("us", "2")),
+            single_unit(("d", "1"), ("uu", "3")),
+        ];
+        let mut stopped = facts("2", "us");
+        stopped.stopped = true;
+        let entries = project_all(
+            &[facts("1", "d"), stopped, facts("3", "uu")],
+            &HashMap::new(),
+            &catalog,
+            &units[..],
+            "i",
+        );
+        assert_eq!(one(&entries, "d/1").rollup.unwrap().worst, "stopped");
+        let entries = project_all(
+            &[facts("1", "d"), facts("3", "uu")],
+            &HashMap::new(),
+            &catalog,
+            &units[1..],
+            "i",
+        );
+        assert_eq!(one(&entries, "d/1").rollup.unwrap().worst, "unknown");
+    }
+
+    /// T2 (D2): a roll-up is computed in the same turn as the statuses it
+    /// summarises, so a grandchild's change reaches the root's entry — whose
+    /// content, and so its revision and doorbell, change with it.
+    #[test]
+    fn a_grandchild_change_changes_the_roots_entry() {
+        let catalog = resolve(None);
+        let units = [
+            single_unit(("d1", "1"), ("d2", "2")),
+            single_unit(("d2", "2"), ("u", "3")),
+        ];
+        let project = |status: &str| {
+            let agents = [
+                facts("1", "d1"),
+                facts("2", "d2"),
+                with_status(facts("3", "u"), status),
+            ];
+            one(
+                &project_all(&agents, &HashMap::new(), &catalog, &units, "i"),
+                "d1/1",
+            )
+        };
+        let before = project("Working");
+        let after = project("Blocked");
+        assert_eq!(before.rollup.as_ref().unwrap().worst, "working");
+        let rollup = after.rollup.as_ref().unwrap();
+        assert_eq!(rollup.worst, "blocked");
+        assert_eq!(rollup.needs_you, 1);
+        assert_ne!(content_hash(&before), content_hash(&after));
+    }
+
+    /// Review R5 (D1): of several orchestrator generations of one
+    /// orchestration instance, the roles hang under a live one over a stopped
+    /// one, then the latest; the others stay where their own starter puts
+    /// them.
+    #[test]
+    fn roles_hang_under_the_orchestrators_live_generation() {
+        let catalog = resolve(None);
+        let mut stopped = role("2", "o1", "orch-a", "orchestrator", true);
+        stopped.stopped = true;
+        let agents = [
+            facts("1", "d"),
+            stopped,
+            role("3", "r1", "orch-a", "coder", false),
+            // A later live generation of the orchestrator, in another pane.
+            role("4", "o2", "orch-a", "orchestrator", true),
+        ];
+        let units = [orchestration_unit(("d", "1"), "orch-a")];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(
+            tree(&entries),
+            [
+                ("d/1", None),
+                ("o1/2", Some("d/1")),
+                ("o2/4", Some("d/1")),
+                ("r1/3", Some("o2/4")),
+            ]
+        );
+        // Both live: the latest.
+        let agents = [
+            role("2", "o1", "orch-a", "orchestrator", true),
+            role("3", "r1", "orch-a", "coder", false),
+            role("4", "o2", "orch-a", "orchestrator", true),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &[], "i");
+        assert_eq!(
+            tree(&entries),
+            [("o1/2", None), ("o2/4", None), ("r1/3", Some("o2/4"))]
+        );
+    }
+
+    /// Review R5 (D1): a unit hangs under the dispatcher GENERATION that
+    /// dispatched it, not under whatever runs in that pane now — and with
+    /// that generation gone it is a root, not the new generation's child.
+    #[test]
+    fn a_unit_hangs_under_its_dispatchers_generation_not_its_pane() {
+        let catalog = resolve(None);
+        let units = [single_unit(("d", "1"), ("u", "2"))];
+        // The pane `d` runs a later generation too.
+        let agents = [facts("1", "d"), facts("2", "u"), facts("3", "d")];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(
+            tree(&entries),
+            [("d/1", None), ("u/2", Some("d/1")), ("d/3", None)]
+        );
+        // The dispatching generation closed; the pane reused.
+        let agents = [facts("2", "u"), facts("3", "d")];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(tree(&entries), [("u/2", None), ("d/3", None)]);
+    }
+
+    /// Review R5 (D1): two orchestrations with the same display name are
+    /// told apart by their instance tokens; each role hangs under its own.
+    #[test]
+    fn orchestrations_sharing_a_name_keep_their_own_roles() {
+        let catalog = resolve(None);
+        // `role` names every orchestration "team".
+        let agents = [
+            role("1", "o1", "orch-a", "orchestrator", true),
+            role("2", "o2", "orch-b", "orchestrator", true),
+            role("3", "r1", "orch-b", "coder", false),
+            role("4", "r2", "orch-a", "coder", false),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &[], "i");
+        assert_eq!(
+            tree(&entries),
+            [
+                ("o1/1", None),
+                ("r2/4", Some("o1/1")),
+                ("o2/2", None),
+                ("r1/3", Some("o2/2")),
+            ]
+        );
+    }
+
+    /// Review R5/R6 (D1): starters that point at themselves or round in a
+    /// circle — which exact identity should never produce — still give a
+    /// forest. A self-link is no parent; a cycle is cut once, at its
+    /// earliest-spawned card; and a card whose starters lead into a cycle,
+    /// without being on it, keeps its starter.
+    #[test]
+    fn self_links_and_cycles_still_give_a_forest() {
+        let catalog = resolve(None);
+        // Self-link.
+        let units = [single_unit(("a", "1"), ("a", "1"))];
+        let entries = project_all(&[facts("1", "a")], &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(tree(&entries), [("a/1", None)]);
+        assert!(entries[0].rollup.is_none());
+
+        // A two-card cycle: the earlier one is the root.
+        let units = [
+            single_unit(("a", "1"), ("b", "2")),
+            single_unit(("b", "2"), ("a", "1")),
+        ];
+        let entries = project_all(
+            &[facts("2", "b"), facts("1", "a")],
+            &HashMap::new(),
+            &catalog,
+            &units,
+            "i",
+        );
+        assert_eq!(tree(&entries), [("a/1", None), ("b/2", Some("a/1"))]);
+
+        // A tail into a cycle, the tail spawned first: `c` stays under `a`,
+        // the cycle `a`/`b` is cut at `a`, and nothing else is cut.
+        let units = [
+            single_unit(("a", "2"), ("c", "1")),
+            single_unit(("a", "2"), ("b", "3")),
+            single_unit(("b", "3"), ("a", "2")),
+        ];
+        let entries = project_all(
+            &[facts("1", "c"), facts("2", "a"), facts("3", "b")],
+            &HashMap::new(),
+            &catalog,
+            &units,
+            "i",
+        );
+        assert_eq!(
+            tree(&entries),
+            [("a/2", None), ("c/1", Some("a/2")), ("b/3", Some("a/2"))]
+        );
+        assert_eq!(one(&entries, "a/2").rollup.unwrap().total, 2);
+
+        // A three-card cycle with a tail of two: one cut, at its earliest.
+        let units = [
+            single_unit(("x", "4"), ("y", "5")),
+            single_unit(("y", "5"), ("z", "6")),
+            single_unit(("z", "6"), ("x", "4")),
+            single_unit(("y", "5"), ("t1", "1")),
+            single_unit(("t1", "1"), ("t2", "2")),
+        ];
+        let agents = [
+            facts("1", "t1"),
+            facts("2", "t2"),
+            facts("4", "x"),
+            facts("5", "y"),
+            facts("6", "z"),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(
+            tree(&entries),
+            [
+                ("x/4", None),
+                ("y/5", Some("x/4")),
+                ("t1/1", Some("y/5")),
+                ("t2/2", Some("t1/1")),
+                ("z/6", Some("y/5")),
+            ]
+        );
+    }
+
+    /// Review R5 (D2): in the store, a grandchild's status change gives the
+    /// root's entry a new revision and rings its doorbell — not only a new
+    /// content hash.
+    #[test]
+    fn a_grandchild_change_bumps_the_roots_revision_and_doorbell() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        let units = [
+            single_unit(("d1", "1"), ("d2", "2")),
+            single_unit(("d2", "2"), ("u", "3")),
+        ];
+        let agents = |status: &str| {
+            [
+                facts("1", "d1"),
+                facts("2", "d2"),
+                with_status(facts("3", "u"), status),
+            ]
+        };
+        let start = Instant::now();
+        let commit = |status: &str, instant: Instant| {
+            let mut inner = store.lock();
+            let read_at = inner.epoch;
+            let (list, bells) = inner
+                .commit(
+                    &agents(status),
+                    &units,
+                    &HashMap::new(),
+                    &catalog,
+                    "i",
+                    read_at,
+                    false,
+                    Utc::now(),
+                    instant,
+                    &Default::default(),
+                    &mut Default::default(),
+                )
+                .unwrap();
+            let root = one(&list.entries, "d1/1").revision;
+            let rang: Vec<String> = bells.into_iter().map(|b| b.key).collect();
+            (root, rang)
+        };
+        let (before, _) = commit("Working", start);
+        let (same, rang) = commit("Working", start + Duration::from_secs(2));
+        assert_eq!(same, before);
+        assert!(rang.is_empty(), "{rang:?}");
+        let (after, rang) = commit("Blocked", start + Duration::from_secs(4));
+        assert!(after > before, "{after} > {before}");
+        assert!(rang.contains(&"d1/1".to_string()), "{rang:?}");
+        assert!(rang.contains(&"d2/2".to_string()), "{rang:?}");
+    }
+
+    /// Review R1 (D4): a bare `#N` resolves in the folder the agent's live
+    /// session reports, as the branch badge does, and only without one in
+    /// the folder the deck started it in. The two folders' repositories give
+    /// different answers for the same number, so the wrong one shows.
+    #[test]
+    fn a_bare_reference_resolves_in_the_live_sessions_folder() {
+        use crate::github_refs::{ReferenceKind, ResolvedReference};
+        use crate::pull_request::LookupEntry;
+        use crate::pull_request_info::PullRequestState;
+        use crate::reference_check::{RefAnswer, ReferenceView, WantedRefs};
+
+        let catalog = resolve(None);
+        let mut slots = HashMap::new();
+        slots.insert(
+            "p1/1".to_string(),
+            slot_with(r##"{"fields": [{"name": "pull-request", "value": "#7"}]}"##),
+        );
+        let mut view = ReferenceView::default();
+        view.origins
+            .insert("/launched".into(), Some("o/launched".into()));
+        view.origins
+            .insert("/working".into(), Some("o/working".into()));
+        for (repo, state) in [
+            ("o/launched", PullRequestState::Merged),
+            ("o/working", PullRequestState::Open),
+        ] {
+            let mut entry = LookupEntry::<RefAnswer>::default();
+            entry.record(
+                RefAnswer {
+                    state,
+                    ci: None,
+                    review: None,
+                    title: None,
+                    labels: Vec::new(),
+                    url: format!("https://github.com/{repo}/pull/7"),
+                    checked_at: Utc::now(),
+                },
+                Instant::now(),
+            );
+            let key = ResolvedReference {
+                repo: repo.into(),
+                kind: ReferenceKind::PullRequest,
+                number: 7,
+            };
+            view.answers.insert(key, entry);
+        }
+        let agent = |live_cwd: Option<&str>| {
+            let mut f = facts("1", "p1");
+            f.record.cwd = Some("/launched".into());
+            f.live_cwd = live_cwd.map(str::to_string);
+            f
+        };
+        let check = |f: AgentFacts| {
+            let mut wanted = WantedRefs::default();
+            let entries = project_all_checked(&[f], &slots, &catalog, &[], "i", &view, &mut wanted);
+            (one(&entries, "p1/1").checked_refs[0].clone(), wanted)
+        };
+
+        let (checked, wanted) = check(agent(Some("/working")));
+        assert_eq!(checked.repo.as_deref(), Some("o/working"));
+        assert!(matches!(
+            checked.result,
+            CheckResult::Checked {
+                state: PullRequestState::Open,
+                ..
+            }
+        ));
+        assert!(wanted.cwds.contains("/working"));
+        assert!(!wanted.cwds.contains("/launched"));
+
+        // No live folder: the one the deck started it in.
+        let (checked, _) = check(agent(None));
+        assert_eq!(checked.repo.as_deref(), Some("o/launched"));
+        assert!(matches!(
+            checked.result,
+            CheckResult::Checked {
+                state: PullRequestState::Merged,
+                ..
+            }
+        ));
+    }
+
+    /// Issue #2418 (D13): a checked issue's labels ride the `checked` result
+    /// as `labels: [{name, color}]`, `color` omitted when the daemon kept none
+    /// and `labels` omitted when empty, and a result from a daemon that sends
+    /// no labels still reads.
+    #[test]
+    fn a_checked_issues_labels_are_an_optional_wire_field() {
+        let checked = |labels: Vec<IssueLabel>| CheckResult::Checked {
+            state: crate::pull_request_info::PullRequestState::Open,
+            ci: None,
+            review: None,
+            title: None,
+            checked_at: "2026-11-21T10:00:00Z".parse().unwrap(),
+            stale: false,
+            labels,
+        };
+        let with = serde_json::to_value(checked(vec![
+            IssueLabel {
+                name: "bug".into(),
+                color: Some("d73a4a".into()),
+            },
+            IssueLabel {
+                name: "plain".into(),
+                color: None,
+            },
+        ]))
+        .unwrap();
+        assert_eq!(
+            with["labels"],
+            serde_json::json!([{"name": "bug", "color": "d73a4a"}, {"name": "plain"}])
+        );
+        let without = serde_json::to_value(checked(Vec::new())).unwrap();
+        assert!(without.get("labels").is_none(), "{without}");
+        let older: CheckResult = serde_json::from_value(without).unwrap();
+        assert_eq!(older, checked(Vec::new()));
+        let back: CheckResult = serde_json::from_value(with).unwrap();
+        assert!(matches!(back, CheckResult::Checked { labels, .. } if labels.len() == 2));
     }
 
     #[test]
@@ -3576,6 +4762,198 @@ mod tests {
         assert_eq!(project(&store).report.unwrap().revision, 3);
     }
 
+    /// Issue #2454: a report's `waiting`, `done` or `failed` reason clears
+    /// once the agent starts working again, and only the report's reason: a
+    /// newer report raises its reason again, and a `working` report or no
+    /// report has nothing to clear.
+    #[test]
+    fn a_report_reason_clears_when_the_agent_starts_working_again() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        let project = |store: &CardStore| {
+            let inner = store.lock();
+            one(
+                &project_all(&[facts("1", "p1")], &inner.slots, &catalog, &[], "i"),
+                "p1/1",
+            )
+        };
+        // Nothing published: nothing to clear, and nothing breaks.
+        store.note_turn_started("p1", "1", Utc::now());
+        assert!(!project(&store).needs_you);
+
+        for (status, reason) in [
+            ("waiting", "waiting"),
+            ("done", "done"),
+            ("failed", "failed"),
+        ] {
+            store.publish(
+                "p1",
+                "1",
+                report(&format!(r#"{{"status": "{status}", "summary": "s"}}"#)),
+            );
+            let raised = project(&store);
+            assert_eq!(raised.needs_you_reasons, [reason], "{status}");
+            store.note_turn_started("p1", "1", Utc::now());
+            let cleared = project(&store);
+            assert!(
+                !cleared.needs_you,
+                "{status}: {:?}",
+                cleared.needs_you_reasons
+            );
+            // The report itself is kept: only its reason is dealt with.
+            assert_eq!(cleared.report.as_ref().unwrap().status, status);
+            // Another generation in another pane is not this one.
+            store.note_turn_started("p2", "1", Utc::now());
+        }
+        // A newer report raises its reason again.
+        store.publish(
+            "p1",
+            "1",
+            report(r#"{"status": "done", "summary": "again"}"#),
+        );
+        assert_eq!(project(&store).needs_you_reasons, ["done"]);
+        // A `working` report raised nothing, so nothing is marked on it, and
+        // the `done` that follows it still needs the user.
+        store.publish("p1", "1", report(r#"{"status": "working"}"#));
+        assert!(!store.mark_dealt_with("p1", "1", None));
+        store.publish("p1", "1", report(r#"{"status": "done"}"#));
+        assert_eq!(project(&store).needs_you_reasons, ["done"]);
+    }
+
+    /// Issue #2454: dealing with a report leaves the live reasons alone — an
+    /// agent that stopped, or a question still unanswered on its card, needs
+    /// the user whatever was done about its report.
+    #[test]
+    fn dealing_with_a_report_leaves_the_live_reasons() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        let mut stopped = facts("1", "p1");
+        stopped.stopped = true;
+        store.publish("p1", "1", report(r#"{"status": "failed"}"#));
+        store.publish(
+            "p2",
+            "2",
+            report(
+                r#"{"status": "waiting", "questions": [{"id": "q", "text": "Which?", "options": [{"id": "a", "label": "A"}]}]}"#,
+            ),
+        );
+        let project = |store: &CardStore| {
+            let inner = store.lock();
+            project_all(
+                &[stopped.clone(), facts("2", "p2")],
+                &inner.slots,
+                &catalog,
+                &[],
+                "i",
+            )
+        };
+        let before = project(&store);
+        assert_eq!(
+            one(&before, "p1/1").needs_you_reasons,
+            ["stopped", "failed"]
+        );
+        assert_eq!(
+            one(&before, "p2/2").needs_you_reasons,
+            ["question", "waiting"]
+        );
+        assert!(store.mark_dealt_with("p1", "1", None));
+        assert!(store.mark_dealt_with("p2", "2", None));
+        assert!(
+            !store.mark_dealt_with("p2", "2", None),
+            "already dealt with"
+        );
+        let after = project(&store);
+        assert_eq!(one(&after, "p1/1").needs_you_reasons, ["stopped"]);
+        assert_eq!(one(&after, "p2/2").needs_you_reasons, ["question"]);
+    }
+
+    /// Issue #2418 on top of #2454: a role whose `done` report was dealt with
+    /// stops counting in its orchestrator's roll-up, so the closed card above
+    /// it no longer says something under it needs the user, and a new report
+    /// counts again.
+    #[test]
+    fn a_dealt_with_report_leaves_its_starters_rollup() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        store.publish("r1", "7", report(r#"{"status": "done"}"#));
+        let agents = [
+            with_status(role("6", "o1", "orch-a", "orchestrator", true), "Idle"),
+            with_status(role("7", "r1", "orch-a", "coder", false), "Idle"),
+        ];
+        let rollup = |store: &CardStore| {
+            let inner = store.lock();
+            let entries = project_all(&agents, &inner.slots, &catalog, &[], "i");
+            (
+                one(&entries, "r1/7").needs_you,
+                one(&entries, "o1/6")
+                    .rollup
+                    .expect("the role is under its orchestrator")
+                    .needs_you,
+            )
+        };
+        assert_eq!(rollup(&store), (true, 1));
+        assert!(store.mark_dealt_with("r1", "7", None));
+        assert_eq!(rollup(&store), (false, 0));
+        store.publish("r1", "7", report(r#"{"status": "done"}"#));
+        assert_eq!(rollup(&store), (true, 1));
+    }
+
+    /// Issue #2454: the user opening the agent (`agent-opened`) clears its
+    /// report's reason for the pane's current agent only, and the refresh it
+    /// runs shows the change; a request naming another generation, or a pane
+    /// with no agent, changes nothing.
+    #[tokio::test]
+    async fn opening_the_agent_clears_its_report_reason() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let agent = registry.insert_idle_member_for_test("p1", "team-1", true);
+        let key = entry_key("p1", &agent);
+        let needs_you = |list: &AgentCardList| {
+            list.entries
+                .iter()
+                .find(|e| e.key == key)
+                .expect("the agent's card")
+                .needs_you_reasons
+                .clone()
+        };
+        let reply = publish(
+            &registry,
+            &state,
+            "p1",
+            &agent,
+            report(r#"{"status": "done"}"#),
+        )
+        .await;
+        assert!(reply.accepted, "{reply:?}");
+        assert_eq!(needs_you(&refresh(&registry, &state).await), ["done"]);
+
+        agent_opened(&registry, &state, "p1", Some("not-the-agent")).await;
+        agent_opened(&registry, &state, "no-such-pane", None).await;
+        assert_eq!(
+            needs_you(&refresh(&registry, &state).await),
+            ["done"],
+            "another generation's open, or an unknown pane's, dealt with this report"
+        );
+
+        agent_opened(&registry, &state, "p1", Some(&agent)).await;
+        assert!(needs_you(&refresh(&registry, &state).await).is_empty());
+
+        // A newer report raises it again, and an open without the agent's id
+        // (the TUI's) deals with it too.
+        publish(
+            &registry,
+            &state,
+            "p1",
+            &agent,
+            report(r#"{"status": "waiting"}"#),
+        )
+        .await;
+        assert_eq!(needs_you(&refresh(&registry, &state).await), ["waiting"]);
+        agent_opened(&registry, &state, "p1", None).await;
+        assert!(needs_you(&refresh(&registry, &state).await).is_empty());
+    }
+
     /// Audit F5: an entry keeps a bounded number and size of deliveries,
     /// however many actions are invoked on it.
     #[test]
@@ -3635,6 +5013,8 @@ mod tests {
             true,
             now,
             instant,
+            &Default::default(),
+            &mut Default::default(),
         );
         assert!(
             retried.is_none(),
@@ -3652,6 +5032,8 @@ mod tests {
                 false,
                 now,
                 instant,
+                &Default::default(),
+                &mut Default::default(),
             )
             .unwrap();
         assert!(
@@ -3673,6 +5055,8 @@ mod tests {
                 true,
                 now,
                 instant,
+                &Default::default(),
+                &mut Default::default(),
             )
             .unwrap();
         assert!(!inner.slots.contains_key("p2/2"));

@@ -512,6 +512,10 @@ pub enum ClaudeEnvSource {
     File(PathBuf),
     /// A directory of `*.json` settings files (the managed drop-ins).
     DropIns(PathBuf),
+    /// A file whose `settings` member is a settings document whose `env`
+    /// Claude applies: the server-managed settings Claude Code caches for an
+    /// organisation sign-in ([`claude_settings_member_env`]).
+    SettingsMember(PathBuf),
 }
 
 /// What one read of a [`ClaudeEnvSource`] found, as far as Claude's
@@ -532,7 +536,9 @@ pub enum EnvRead {
     /// starting with [`DECK_ENV_PREFIX`] in any case, at any depth, a line
     /// comment ended by a lone carriage return, or one
     /// holding a line or paragraph separator. These are the forms found so
-    /// far, not every way two parsers can differ.
+    /// far, not every way two parsers can differ. Also a document naming a
+    /// policy helper ([`CLAUDE_POLICY_HELPER`]), whose `env` Claude computes
+    /// as it starts rather than reading it from any file.
     Suspect,
     /// The file or directory exists but can't be read.
     Unreadable(Unreadable),
@@ -580,17 +586,39 @@ pub type ClaudeEnvRead = Vec<(PathBuf, EnvRead)>;
 ///   server-managed settings Claude caches in
 ///   `$HOME/.claude/remote-settings.json`, a plain settings document (seen
 ///   on 2.1.319, which rewrote it at each start for an account whose
-///   organisation sends settings).
+///   organisation sends settings), and, since 2.1.330, the ones it caches
+///   for an organisation sign-in in `$HOME/.claude/state/hybrid-settings.json`
+///   (and the `-custom-oauth`, `-staging-oauth` and `-local-oauth` names it
+///   gives that file under other endpoints), whose `settings` member is the
+///   settings document ([`ClaudeEnvSource::SettingsMember`]).
+///
+/// What the deck leaves out, read from the pinned 2.1.318 and the installed
+/// 2.1.330 binaries' strings and run in a sandbox (issue #2131):
+///
+/// - the settings of an `--add-dir` directory: Claude reads its
+///   `.claude/settings.json` and `settings.local.json` for plugins,
+///   marketplaces, skills, agents and further directories, never for
+///   `env`, and with `{"env": {"VISUAL": …}}` in both, Ctrl+G opened the
+///   inherited editor on 2.1.318 and 2.1.330;
+/// - settings a policy helper (`policyHelper`, `policyHelpers`) computes as
+///   Claude starts, which no file holds: a managed settings file naming one
+///   is held instead ([`CLAUDE_POLICY_HELPER`]);
+/// - `remote-settings.json` at another path: the function that would move
+///   it is a stub in the public 2.1.318 and 2.1.330 builds, and the variable
+///   an internal build reads for it, `CLAUDE_CODE_REMOTE_SETTINGS_PATH`, is
+///   held ([`CLAUDE_MOVING_ENV`]).
 ///
 /// The flag source is a launch argument ([`claude_args_move_settings`]).
 /// [`Hold::Unmeasured`] as [`claude_keybindings_path`] holds (a
-/// `CLAUDE_CONFIG_DIR`, or no absolute `HOME`), and for a relative `cwd`.
+/// `CLAUDE_CONFIG_DIR`, or no absolute `HOME`), for a
+/// `CLAUDE_CODE_REMOTE_SETTINGS_PATH`, empty included, and for a relative
+/// `cwd`.
 pub fn claude_env_sources(
     env: impl Fn(&str) -> Option<OsString>,
     cwd: &Path,
 ) -> Result<Vec<ClaudeEnvSource>, Hold> {
     let keybindings = claude_keybindings_path(&env)?;
-    if !cwd.is_absolute() {
+    if env(CLAUDE_REMOTE_SETTINGS_PATH_ENV).is_some() || !cwd.is_absolute() {
         return Err(Hold::Unmeasured);
     }
     let config = keybindings
@@ -602,7 +630,7 @@ pub fn claude_env_sources(
         ClaudeEnvSource::File(config.join("cowork_settings.json")),
         ClaudeEnvSource::File(config.join(".config.json")),
     ];
-    for suffix in ["", "-custom-oauth", "-staging-oauth", "-local-oauth"] {
+    for suffix in CLAUDE_ENDPOINT_SUFFIXES {
         sources.push(ClaudeEnvSource::File(
             home.join(format!(".claude{suffix}.json")),
         ));
@@ -622,8 +650,25 @@ pub fn claude_env_sources(
     sources.push(ClaudeEnvSource::File(managed.join("managed-settings.json")));
     sources.push(ClaudeEnvSource::DropIns(managed.join("managed-settings.d")));
     sources.push(ClaudeEnvSource::File(config.join("remote-settings.json")));
+    for suffix in CLAUDE_ENDPOINT_SUFFIXES {
+        sources.push(ClaudeEnvSource::SettingsMember(
+            config
+                .join("state")
+                .join(format!("hybrid-settings{suffix}.json")),
+        ));
+    }
     Ok(sources)
 }
+
+/// The suffixes Claude Code gives its global config and its organisation
+/// sign-in's cached settings under its endpoints: none for the production
+/// one, then the custom-OAuth, staging and local ones.
+const CLAUDE_ENDPOINT_SUFFIXES: [&str; 4] = ["", "-custom-oauth", "-staging-oauth", "-local-oauth"];
+
+/// The variable an internal Claude Code build reads for where it caches its
+/// server-managed settings instead of `remote-settings.json`; the public
+/// 2.1.318 and 2.1.330 builds ignore it (issue #2131).
+const CLAUDE_REMOTE_SETTINGS_PATH_ENV: &str = "CLAUDE_CODE_REMOTE_SETTINGS_PATH";
 
 /// Whether a Claude Code launch's arguments (after the program) name a
 /// settings source the deck doesn't read: `--settings` (a file or inline
@@ -644,6 +689,14 @@ pub fn read_claude_env(sources: &[ClaudeEnvSource]) -> ClaudeEnvRead {
     for source in sources {
         match source {
             ClaudeEnvSource::File(path) => reads.push((path.clone(), claude_env_file(path))),
+            ClaudeEnvSource::SettingsMember(path) => reads.push((
+                path.clone(),
+                match read_source_within(path, CLAUDE_ENV_BYTES) {
+                    SourceRead::Absent => EnvRead::NoEnv,
+                    SourceRead::Unreadable(why) => EnvRead::Unreadable(why),
+                    SourceRead::Present { contents, .. } => claude_settings_member_env(&contents),
+                },
+            )),
             ClaudeEnvSource::DropIns(dir) => match std::fs::read_dir(dir) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     reads.push((dir.clone(), EnvRead::NoEnv));
@@ -780,14 +833,68 @@ pub fn claude_env_member(contents: &[u8]) -> EnvRead {
     }
 }
 
+/// The `env` of the settings document in the `settings` member of a
+/// [`ClaudeEnvSource::SettingsMember`] file, as [`claude_env_member`] reads
+/// a settings document: the whole file is first read as
+/// [`claude_env_member`] reads one, so a document it holds on
+/// ([`EnvRead::Suspect`], [`EnvRead::Unparsable`]) holds here too, and a
+/// member name it holds on anywhere in the file, `settings` included, makes
+/// it [`EnvRead::Suspect`]. No `settings` member, or an empty file, has no
+/// `env`; `settings` named twice is [`EnvRead::Unparsable`], and so is a
+/// `settings` that isn't an object (2.1.330 skips one, so this over-holds).
+pub fn claude_settings_member_env(contents: &[u8]) -> EnvRead {
+    match claude_env_member(contents) {
+        EnvRead::NoEnv | EnvRead::Env(_) => {}
+        held => return held,
+    }
+    let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
+    let Some(cleaned) = without_json_comments(contents) else {
+        return EnvRead::Suspect;
+    };
+    if cleaned
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        return EnvRead::NoEnv;
+    }
+    #[derive(serde::Deserialize)]
+    struct Wrapper<'a> {
+        #[serde(borrow)]
+        settings: Option<&'a serde_json::value::RawValue>,
+    }
+    match serde_json::from_slice::<Wrapper<'_>>(&cleaned) {
+        Ok(Wrapper { settings: None }) => EnvRead::NoEnv,
+        Ok(Wrapper {
+            settings: Some(settings),
+        }) => claude_env_member(settings.get().as_bytes()),
+        Err(_) => EnvRead::Unparsable,
+    }
+}
+
+/// The member names that configure a Claude Code policy helper: an
+/// executable Claude runs as it starts, whose output it applies as managed
+/// settings, `env` included (issue #2131). Run in a sandbox, 2.1.318 and
+/// 2.1.330 ran the helper named by `/etc/claude-code/managed-settings.json`
+/// (2.1.330 also from a `managed-settings.d` drop-in) and opened the
+/// `VISUAL` its output's `env` named on Ctrl+G, over an inherited `VISUAL`;
+/// 2.1.330 ran none named by `~/.claude/settings.json`, since Claude honours
+/// one only from its administrator's sources (the managed files, the
+/// server-managed settings, and on other systems a plist or registry key).
+/// No file holds what a helper returns, so the deck holds a document naming
+/// one, in any case, at any depth, in every file it reads
+/// ([`suspect_name`]), the user's own included.
+pub const CLAUDE_POLICY_HELPER: [&str; 2] = ["policyHelper", "policyHelpers"];
+
 /// Whether a member name is one [`claude_env_member`] holds on wherever it
-/// appears: `__proto__`, `VISUAL` or `EDITOR` in any case, or a name
-/// starting with [`DECK_ENV_PREFIX`] in any case.
+/// appears: `__proto__`, `VISUAL` or `EDITOR` in any case, a name starting
+/// with [`DECK_ENV_PREFIX`] in any case, or one of [`CLAUDE_POLICY_HELPER`]
+/// in any case.
 fn suspect_name(name: &str) -> bool {
     name == "__proto__"
         || EDITOR_ENV
             .iter()
-            .any(|editor| name.eq_ignore_ascii_case(editor))
+            .chain(&CLAUDE_POLICY_HELPER)
+            .any(|held| name.eq_ignore_ascii_case(held))
         || names_deck_variable(name.as_bytes())
 }
 
@@ -1015,9 +1122,13 @@ pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
 /// can move where Claude reads its configuration (the revcxfix2 review's
 /// LOW-1): `CLAUDE_CONFIG_DIR`, which in the pinned 2.1.318 moved where
 /// `keybindings.json` was read from (a `Ctrl+E` bound to the editor in the
-/// named folder's file opened it, measured in cxfix3's sandbox), and `HOME`,
-/// which there didn't but is held as well.
-pub const CLAUDE_MOVING_ENV: [&str; 2] = ["HOME", "CLAUDE_CONFIG_DIR"];
+/// named folder's file opened it, measured in cxfix3's sandbox), `HOME`,
+/// which there didn't but is held as well, and
+/// `CLAUDE_CODE_REMOTE_SETTINGS_PATH`, which an internal build reads for
+/// where it caches server-managed settings and the public builds ignore
+/// (issue #2131).
+pub const CLAUDE_MOVING_ENV: [&str; 3] =
+    ["HOME", "CLAUDE_CONFIG_DIR", CLAUDE_REMOTE_SETTINGS_PATH_ENV];
 
 /// The variables that, set in Codex's `$CODEX_HOME/.env`, can move the home
 /// Codex reads its key bindings and keeps its editor folder in, or the

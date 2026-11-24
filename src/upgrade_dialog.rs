@@ -18,9 +18,9 @@
 //! [`check`] and the upgrade itself run on tokio tasks, and the dialog is a
 //! plain state machine the TUI feeds keys and results into.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -162,6 +162,7 @@ pub async fn refresh(state: &SharedState) {
         return;
     }
     let id = LAST_CHECK_ID.fetch_add(1, Ordering::SeqCst) + 1;
+    *LAST_CHECK_STARTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
     if let Ok(found) = check().await {
         let mut state = state.write().await;
         let state = &mut *state;
@@ -190,15 +191,58 @@ pub fn publish(
     true
 }
 
+/// When the last check started, by the wall clock: [`refresh`] sets it, and
+/// [`run_checker`] reads it when the terminal reports focus.
+static LAST_CHECK_STARTED: Mutex<Option<SystemTime>> = Mutex::new(None);
+
+/// Woken by [`focus_gained`].
+static FOCUS_GAINED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Issue #2450: tell the checker the terminal reported focus-in, so it checks
+/// again when the last check is older than [`focus_recheck_floor`]. Called by
+/// the TUI's event loop; cheap, and never blocks.
+pub fn focus_gained() {
+    FOCUS_GAINED.notify_one();
+}
+
+/// Whether a focus-in at `now` warrants a check, given when the last one
+/// started. Measured on the wall clock, which keeps running while the machine
+/// sleeps; a clock that moved backwards counts as due, since how long it has
+/// been is then unknown.
+pub fn focus_check_due(last_started: Option<SystemTime>, now: SystemTime, floor: Duration) -> bool {
+    match last_started {
+        None => true,
+        Some(last) => now
+            .duration_since(last)
+            .map_or(true, |since| since >= floor),
+    }
+}
+
 /// Check at start, then every [`recheck_interval`] for as long as the TUI
-/// runs, as the desktop app does.
+/// runs, as the desktop app does. Also check when the terminal reports focus
+/// and the last check started at least [`focus_recheck_floor`] ago (issue
+/// #2450): the interval is a tokio timer, which does not advance while the
+/// machine sleeps, so after a laptop wakes the next check could otherwise be
+/// hours away.
 pub async fn run_checker(state: SharedState) {
     if !checks_enabled() {
         return;
     }
     loop {
         refresh(&state).await;
-        tokio::time::sleep(recheck_interval()).await;
+        let interval = tokio::time::sleep(recheck_interval());
+        tokio::pin!(interval);
+        loop {
+            tokio::select! {
+                () = &mut interval => break,
+                () = FOCUS_GAINED.notified() => {
+                    let last = *LAST_CHECK_STARTED.lock().unwrap_or_else(|e| e.into_inner());
+                    if focus_check_due(last, SystemTime::now(), focus_recheck_floor()) {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -209,17 +253,33 @@ pub async fn run(plan: UpgradePlan, this_tui: bool) -> RunResult {
     let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
         let host = SystemHost::default();
+        let (source, staging_root) = (
+            ReleaseSource::from_build(),
+            PlanOptions::default_staging_root(),
+        );
         let outcome = handle.block_on(crate::self_upgrade::execute::execute(
             &host,
             &plan,
-            &ReleaseSource::from_build(),
-            &PlanOptions::default_staging_root(),
+            &source,
+            &staging_root,
         ));
         match outcome {
             Ok(outcome) => {
+                // Issue #2064: a release collector beside the CLI moves with it.
+                let mut after = handle
+                    .block_on(crate::self_upgrade::collector::after_upgrade(
+                        &host,
+                        &plan,
+                        &outcome,
+                        &source,
+                        &staging_root,
+                    ))
+                    .lines;
                 // R-3: a CLI the upgrade installed refreshes the agents' hooks.
-                let hooks = crate::self_upgrade::agent_hooks::after_upgrade(&host, &plan, &outcome);
-                RunResult::from_outcome_and_hooks(&plan, &outcome, hooks, this_tui)
+                after.extend(crate::self_upgrade::agent_hooks::after_upgrade(
+                    &host, &plan, &outcome,
+                ));
+                RunResult::from_outcome_and_hooks(&plan, &outcome, after, this_tui)
             }
             Err(error) => RunResult::from_error(&error),
         }
@@ -258,6 +318,26 @@ pub fn recheck_interval() -> Duration {
         return Duration::from_secs(secs);
     }
     crate::self_upgrade::UPDATE_RECHECK_INTERVAL
+}
+
+/// How old the last check must be before a terminal focus-in checks again
+/// (issue #2450): an hour, so switching windows does not ask GitHub each time.
+/// The desktop app uses the same floor (`FOCUS_RECHECK_FLOOR_SECS` in
+/// `desktop/src/hooks/useSelfUpgradeCheck.ts`).
+pub const FOCUS_RECHECK_FLOOR: Duration = Duration::from_secs(60 * 60);
+
+/// [`FOCUS_RECHECK_FLOOR`]. Under the `e2e` feature only,
+/// `DOT_AGENT_DECK_TEST_FOCUS_RECHECK_FLOOR_SECS` shortens it, so an L2 test
+/// can watch a focus-in check again without waiting an hour.
+pub fn focus_recheck_floor() -> Duration {
+    #[cfg(feature = "e2e")]
+    if let Some(secs) = std::env::var("DOT_AGENT_DECK_TEST_FOCUS_RECHECK_FLOOR_SECS")
+        .ok()
+        .and_then(|secs| secs.parse::<u64>().ok())
+    {
+        return Duration::from_secs(secs);
+    }
+    FOCUS_RECHECK_FLOOR
 }
 
 /// A button in the dialog.

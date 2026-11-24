@@ -15465,6 +15465,64 @@ mod tests {
         );
     }
 
+    /// Scenario: on the Daemons screen the user says "retry the message to
+    /// the tester" or "cancel the message to the tester", and the model picks
+    /// the matching row. Each dispatches its confirmation entry for the
+    /// tester, since neither retries or cancels anything until the user
+    /// presses the confirmation's button; on the dashboard, which draws no
+    /// deck message, each is refused as not available here (issue #2148).
+    #[tokio::test]
+    async fn voice_outcome_inbox_retry_and_cancel_name_the_agent_and_only_ask() {
+        for (said, row, entry) in [
+            (
+                "retry the message to the tester",
+                "retry_inbox_message",
+                "confirmRetryInboxMessage",
+            ),
+            (
+                "cancel the message to the tester",
+                "cancel_inbox_message",
+                "confirmCancelInboxMessage",
+            ),
+        ] {
+            let pick = || IntentAnswer::new(row).with_param("agent", "tester");
+            let outcome = heard_as_user_said(said, pick(), Screen::Deck, &fleet(), None).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                    if action == row && invoke == entry
+                    && params.iter().any(|param| param.name == "agent" && param.value == "1")),
+                "{said}: {outcome:?}"
+            );
+            let outcome = heard_as_user_said(said, pick(), Screen::Overview, &fleet(), None).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Unavailable { action, .. } if action == row),
+                "{said} on the dashboard: {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: on the Daemons screen the user says a bare "cancel", or
+    /// "cancel the tester", and the model picks the deck message's Cancel.
+    /// No message is cancelled: "cancel" alone is `close`'s, so the row
+    /// needs the message named (`must_name`, issue #2148).
+    #[tokio::test]
+    async fn voice_outcome_a_cancel_that_names_no_message_cancels_none() {
+        for said in ["cancel", "cancel the tester"] {
+            let outcome = heard_as_user_said(
+                said,
+                IntentAnswer::new("cancel_inbox_message").with_param("agent", "tester"),
+                Screen::Deck,
+                &fleet(),
+                None,
+            )
+            .await;
+            assert!(
+                !matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "cancel_inbox_message"),
+                "{said}: {outcome:?}"
+            );
+        }
+    }
+
     /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
     /// or scratch phrase is not intercepted locally; it goes to the model,
     /// and a pick of the row is refused with the row's own hint.
@@ -18934,6 +18992,9 @@ mod tests {
     const STAR_PROMPT_TS: &str = include_str!("../../../src/lib/starPrompt.ts");
     /// PRD #211 — the Antigravity notice's words, which its buttons render.
     const ANTIGRAVITY_NOTICE_TS: &str = include_str!("../../../src/lib/antigravityNotice.ts");
+    /// Issue #2148 — the deck messages' words, which the tile's Retry and
+    /// Cancel buttons render.
+    const INBOX_WORDS_TS: &str = include_str!("../../../src/lib/inboxWords.ts");
     /// The one rail, shown beside the overview as well as the deck (#1197).
     const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
@@ -18962,7 +19023,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 39] = [
+    const CONTROL_LABELS: [ControlLabel; 38] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -19168,7 +19229,9 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "aria-label={`Open ${name} agent`}",
+            // Issue #2454: the dashboard row's own accessible name, now that
+            // the row (not an icon) is the keyboard route that opens it.
+            source: "const rowName = openAgent ? `Open ${name} agent` : name;",
             file: AGENT_OVERVIEW_TSX,
             said: "Open tester agent",
             row: "open_agent",
@@ -19227,15 +19290,9 @@ mod tests {
             row: "close",
             over_the_form: false,
         },
-        // PRD #2119 — Generate config on a dashboard row ("Generate config
-        // with <name> agent") and in the open pane ("Generate config").
-        ControlLabel {
-            source: "aria-label={`Generate config with ${name} agent`}",
-            file: AGENT_OVERVIEW_TSX,
-            said: "Generate config with tester agent",
-            row: "generate_config",
-            over_the_form: false,
-        },
+        // PRD #2119 — Generate config in the open pane ("Generate config").
+        // Issue #2454 took the dashboard row's button away; voice still
+        // reaches the row's agent by name ("generate config with the tester").
         ControlLabel {
             source: "<FileCog size={14} aria-hidden=\"true\" /> Generate config</button>",
             file: AGENT_TILE_TSX,
@@ -19243,19 +19300,23 @@ mod tests {
             row: "generate_config",
             over_the_form: false,
         },
-        // The same two controls when the project already has a config.
-        ControlLabel {
-            source: "aria-label={`Update config with ${name} agent`}",
-            file: AGENT_OVERVIEW_TSX,
-            said: "Update config with tester agent",
-            row: "generate_config",
-            over_the_form: false,
-        },
+        // The same control when the project already has a config.
         ControlLabel {
             source: "<FileCog size={14} aria-hidden=\"true\" /> Update config</button>",
             file: AGENT_TILE_TSX,
             said: "Update config",
             row: "generate_config",
+            over_the_form: false,
+        },
+        // Issue #2148 — Retry beside a deck message on the Daemons screen's
+        // tile. Its neighbour Cancel is not a voice phrase on its own: a bare
+        // "cancel" is `close`'s, and `cancel_inbox_message` needs the message
+        // named (voice-first-design.md section 5 lists it).
+        ControlLabel {
+            source: "retry: \"Retry\"",
+            file: INBOX_WORDS_TS,
+            said: "Retry",
+            row: "retry_inbox_message",
             over_the_form: false,
         },
     ];
@@ -19500,6 +19561,10 @@ mod tests {
             // PRD #2119 — the Generate config button's words.
             ("generate_config", "generate config"),
             ("generate_config", "update config"),
+            // Issue #2148 — the deck message's Retry button, and Cancel with
+            // the message named.
+            ("retry_inbox_message", "retry"),
+            ("cancel_inbox_message", "cancel the message"),
             ("close", "deny it"),
             ("close", "decline"),
         ] {

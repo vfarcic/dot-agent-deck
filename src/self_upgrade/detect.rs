@@ -64,6 +64,16 @@ impl Platform {
             Self::LinuxArm64 | Self::MacosAmd64 => None,
         }
     }
+
+    /// The release asset holding the resource collector, on the platforms
+    /// it runs on: Linux only (`release.yml`'s "Package the collector").
+    pub fn collector_asset(self) -> Option<&'static str> {
+        match self {
+            Self::LinuxAmd64 => Some("dot-agent-deck-collector-linux-amd64"),
+            Self::LinuxArm64 => Some("dot-agent-deck-collector-linux-arm64"),
+            Self::MacosAmd64 | Self::MacosArm64 => None,
+        }
+    }
 }
 
 /// Which of the two separately installed copies this is.
@@ -399,7 +409,7 @@ fn gather_inputs(
 
 /// The package `dpkg-query -S` says owns `path`. Its answer is
 /// `<package>[:<arch>][, <package>…]: <path>`; the first package is taken.
-fn dpkg_owner(host: &dyn Host, dpkg_query: &Path, path: &Path) -> Option<String> {
+pub(crate) fn dpkg_owner(host: &dyn Host, dpkg_query: &Path, path: &Path) -> Option<String> {
     let output = host
         .run(dpkg_query, &[OsStr::new("-S"), path.as_os_str()])
         .ok()?;

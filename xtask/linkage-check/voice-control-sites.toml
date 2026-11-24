@@ -311,6 +311,12 @@ reason = "Dismisses the dashboard's Generate config result notice (PRD #2119): a
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
+code = "cards.dismissNotice"
+reason = "Dismisses the dashboard's notice saying why a press on a card did nothing, such as a checked reference that did not open (issue #2418): a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
 code = "onUpgrade"
 reason = "A daemon card's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
 
@@ -437,12 +443,6 @@ reason = "An orchestration card's Close: raises the close-orchestration confirma
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
-code = "() => openAgent(agent)"
-reason = "A row's open button: `openAgent` dispatches VOICE_ACTIONS.openAgent (`open_agent`); the ratchet sees only the call."
-
-[[site]]
-file = "desktop/src/components/AgentOverview.tsx"
-handler = "onClick"
 code = "() => stopControls.stopAgent(agent)"
 reason = "A row's Close: raises the stop-agent confirmation; voice raises the same one with `stop_agent`."
 
@@ -450,7 +450,7 @@ reason = "A row's Close: raises the stop-agent confirmation; voice raises the sa
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
 code = "openFromRow"
-reason = "Clicking a dashboard row: `openFromRow` calls the `OpenAgentContext` value, which dispatches VOICE_ACTIONS.openAgent (`open_agent`)."
+reason = "Clicking a dashboard row: `openFromRow` calls the `OpenAgentContext` value, which dispatches VOICE_ACTIONS.openAgent (`open_agent`). The row's Enter/Space (`openFromRowKey`, issue #2454) calls the same value; the ratchet does not read keyboard handlers."
 
 # --- desktop/src/components/AgentTile.tsx ---
 
@@ -458,13 +458,13 @@ reason = "Clicking a dashboard row: `openFromRow` calls the `OpenAgentContext` v
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
 code = '() => void act("retry")'
-reason = "Gap: Retry on an inbox message the deck could not deliver to this agent. No row addresses an inbox item yet."
+reason = "Retry on the one deck message its row lists, pressed by hand: it acts on that message at once. Voice reaches Retry through VOICE_ACTIONS.confirmRetryInboxMessage (`retry_inbox_message`, issue #2148), which names the message by the agent it was sent to and opens a confirmation listing every message it would retry, so a spoken Retry never acts without a press."
 
 [[site]]
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
 code = '() => void act("cancel")'
-reason = "Gap: Cancel on an inbox message the deck could not deliver to this agent. No row addresses an inbox item yet."
+reason = "Cancel on the one deck message its row lists, pressed by hand: it acts on that message at once. Voice reaches Cancel through VOICE_ACTIONS.confirmCancelInboxMessage (`cancel_inbox_message`, issue #2148), which names the message by the agent it was sent to and opens a confirmation listing every message it would cancel; a bare spoken \"cancel\" stays `close`'s."
 
 [[site]]
 file = "desktop/src/components/AgentTile.tsx"

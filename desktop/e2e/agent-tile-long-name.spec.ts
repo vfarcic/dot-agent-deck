@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { openOverview } from "./support/overview";
+import { openOverview, ROW_EDGE } from "./support/overview";
 
 /**
  * Issue #2001 made the tile's title the agent's name, which the daemon accepts
@@ -21,7 +21,7 @@ test.describe("agent pane header with a long name at 400x780", () => {
   test("cuts a long name and keeps the status in view", async ({ page }) => {
     const longName = "an-agent-whose-name-is-far-too-long-to-fit-beside-its-status-on-a-phone-width-pane";
     await openOverview(page, "connected");
-    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
+    await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: ROW_EDGE });
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
 
@@ -49,7 +49,7 @@ test.describe("agent pane header with a long name at 400x780", () => {
    */
   test("keeps the rename pencil inside a crowded header", async ({ page }) => {
     await openOverview(page, "connected");
-    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
+    await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: ROW_EDGE });
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
 
@@ -85,7 +85,7 @@ test.describe("agent pane header with a long name at 400x780", () => {
   test("wraps a not-delivered notice so its exit code shows", async ({ page }) => {
     const notice = "not delivered: the command started in the agent's pane exited (code 7) before taking this message";
     await openOverview(page, "connected");
-    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
+    await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: ROW_EDGE });
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
 

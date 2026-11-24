@@ -136,7 +136,7 @@ describe("terminal viewports across a deck restart that reuses an agent id", () 
     const deck = harness();
     const { rerender } = render(<DeckShell runtime={deck.runtime("process-a")} initialView={{ kind: "overview" }} />);
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-b")} initialView={{ kind: "overview" }} />); });
-    fireEvent.click(screen.getByRole("button", { name: "Open Successor run agent" }));
+    fireEvent.click(screen.getByRole("row", { name: "Open Successor run agent" }));
     const pane = screen.getByTestId("agent-pane-overlay");
     expect(within(pane).getByTestId("terminal-planner")).toHaveAttribute("data-incarnation", "process-b");
     expect(planners().every((mount) => mount.incarnation === "process-b")).toBe(true);
