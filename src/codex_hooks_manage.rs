@@ -1039,6 +1039,52 @@ fn list_hooks_in_within(
     list_hooks_with(Path::new("codex"), home, cwd, timeout)
 }
 
+/// The `codex app-server` command [`list_hooks_with`] runs, in `cwd` with
+/// `CODEX_HOME` = `home`, given the names of the variables in this process's
+/// environment (`inherited`).
+///
+/// Issue #2002: this probe gets no `wrap::CODEX_EMBEDDED_ARGS`, because it
+/// is outside the wrapper's direct-launch seam and is not a pane session.
+/// `codex app-server` on stdio serves this one connection itself; choosing a
+/// shared background server is what Codex's interactive startup does, which
+/// the pair is there to stop. The probe asks for `hooks/list` only, starts
+/// no thread or turn, so runs none of the deck's hooks, and is killed once
+/// it answers or the wait runs out.
+///
+/// A listing is the deck's own probe, not a Codex session of the user's:
+/// Codex exports its own telemetry when an `OTEL_*` endpoint is in its
+/// environment, and this one would reach the user's backend as a
+/// `codex-app-server` service the user never ran. For the same reason it
+/// never carries a restore's one-shot resume request
+/// ([`crate::telemetry::shim::RESUME_ENV_KEYS`], PRD #1790 stage 3), nor a
+/// Start over's fresh-start request ([`crate::telemetry::shim::FRESH_ENV_KEYS`]):
+/// the wrapper probes in the restored pane's environment, before the agent
+/// starts, and the request is the agent's launch's to claim, not this call's.
+fn probe_command(
+    codex: &Path,
+    home: &Path,
+    cwd: &Path,
+    inherited: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Command {
+    let mut command = Command::new(codex);
+    for key in inherited {
+        if key.to_string_lossy().starts_with("OTEL_") {
+            command.env_remove(key);
+        }
+    }
+    for key in crate::telemetry::shim::RESUME_ENV_KEYS
+        .into_iter()
+        .chain(crate::telemetry::shim::FRESH_ENV_KEYS)
+    {
+        command.env_remove(key);
+    }
+    command
+        .arg("app-server")
+        .current_dir(cwd)
+        .env("CODEX_HOME", home);
+    command
+}
+
 /// [`list_hooks_in_within`] with the `codex` program named, so a test can hand
 /// it a stand-in without rewriting this process's `PATH`.
 fn list_hooks_with(
@@ -1047,28 +1093,7 @@ fn list_hooks_with(
     cwd: &Path,
     timeout: Duration,
 ) -> std::io::Result<HooksListing> {
-    let mut command = Command::new(codex);
-    // Issue #2002: this probe gets no `wrap::CODEX_EMBEDDED_ARGS`, because it
-    // is outside the wrapper's direct-launch seam and is not a pane session.
-    // `codex app-server` on stdio serves this one connection itself; choosing a
-    // shared background server is what Codex's interactive startup does, which
-    // the pair is there to stop. The probe asks for `hooks/list` only, starts
-    // no thread or turn, so runs none of the deck's hooks, and is killed once
-    // it answers or the wait runs out.
-    //
-    // A listing is the deck's own probe, not a Codex session of the user's:
-    // Codex exports its own telemetry when an `OTEL_*` endpoint is in its
-    // environment, and this one would reach the user's backend as a
-    // `codex-app-server` service the user never ran.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("OTEL_") {
-            command.env_remove(key);
-        }
-    }
-    let mut child = command
-        .arg("app-server")
-        .current_dir(cwd)
-        .env("CODEX_HOME", home)
+    let mut child = probe_command(codex, home, cwd, std::env::vars_os().map(|(key, _)| key))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2759,6 +2784,55 @@ fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
 
 #[cfg(test)]
 mod tests {
+
+    /// PRD #1790 stage 3, lane-2 `journal/restore/017`'s failed run: the
+    /// hooks trust probe runs in a restored Codex pane's environment, before
+    /// the agent, so it must not carry the restore's one-shot resume request
+    /// (nor `OTEL_*`), or the launch shim spends the request on the probe.
+    #[test]
+    fn the_app_server_probe_carries_no_resume_request_and_no_otel() {
+        let inherited = [
+            "PATH",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "DOT_AGENT_DECK_RESUME_TOKEN",
+        ]
+        .map(std::ffi::OsString::from);
+        let command = probe_command(
+            Path::new("codex"),
+            Path::new("/codex-home"),
+            Path::new("/work"),
+            inherited,
+        );
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for removed in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "DOT_AGENT_DECK_RESUME_AGENT",
+            "DOT_AGENT_DECK_RESUME_SESSION",
+            "DOT_AGENT_DECK_RESUME_TOKEN",
+            // Round 4 (audit S2): a Start over's fresh-start request too.
+            "DOT_AGENT_DECK_FRESH_AGENT",
+            "DOT_AGENT_DECK_FRESH_SESSION",
+            "DOT_AGENT_DECK_FRESH_TOKEN",
+        ] {
+            assert!(
+                envs.contains(&(removed.to_string(), None)),
+                "{removed} reaches the probe: {envs:?}"
+            );
+        }
+        assert!(!envs.iter().any(|(k, _)| k == "PATH"), "{envs:?}");
+        assert!(envs.contains(&("CODEX_HOME".to_string(), Some("/codex-home".to_string()))));
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["app-server"]);
+        assert_eq!(command.get_current_dir(), Some(Path::new("/work")));
+    }
 
     /// Scenario: The daemon's startup trust write is still running when an installed Codex generation spawns. The spawn's wait for it returns once the write is done, not before; with no write in flight it returns at once; a write that outlasts the bound leaves the wait after the bound, reporting it still runs (PRD #1666 part 3, loc10's window).
     #[spec("inbox/probe/014")]

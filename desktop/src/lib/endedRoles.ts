@@ -1,4 +1,5 @@
 import type { EndedRole } from "../types";
+import { DISPLAY_LIMITS, displayText } from "./displayText";
 
 /**
  * Issue #1965 — the words both clients use for an orchestration role whose
@@ -28,4 +29,24 @@ export function endedRolesOf(endedRoles: readonly EndedRole[] | undefined, orche
     byRole.set(role.roleIndex, role);
   }
   return [...byRole.values()].sort((left, right) => left.roleIndex - right.roleIndex);
+}
+
+/**
+ * Issue #1965 — the exited role a card is for: the same pane and the same
+ * agent generation. A role restarted since then is another agent, so its
+ * card matches nothing.
+ */
+export function endedRoleOfCard(endedRoles: readonly EndedRole[] | undefined, entry: { pane_id: string; agent_id: string }): EndedRole | undefined {
+  return endedRoles?.find((role) => role.paneId === entry.pane_id && role.agentId === entry.agent_id);
+}
+
+/**
+ * Issue #1965 on the compact card (issue #2418): an exited role's reason and
+ * last output as one line of text, to sit on the card's status line, which
+ * truncates rather than wraps; the overlay shows them in full.
+ */
+export function endedRoleLine(role: EndedRole): string {
+  const reason = `${ENDED_ROLE_WORDS.status}: ${displayText(role.reason, DISPLAY_LIMITS.title)}`;
+  if (role.lastOutput.length === 0) return reason;
+  return `${reason} · ${ENDED_ROLE_WORDS.lastOutput}: ${role.lastOutput.map((line) => displayText(line, DISPLAY_LIMITS.title)).join(" ⏎ ")}`;
 }

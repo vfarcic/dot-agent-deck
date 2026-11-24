@@ -1083,3 +1083,37 @@ fn upgrade_dialog_015_the_result_names_the_hooks_remedy_before_the_tui_restart()
     assert!(at("Then restart the affected agents.") < at("Quit the TUI and start it again"));
     insta::assert_snapshot!("upgrade_dialog_015_hooks_remedy", text);
 }
+
+/// Scenario: The terminal reports focus-in after the machine slept. A check is due when none has started yet, or when the last one started at least an hour ago by the wall clock; a focus-in within the hour asks nothing, so switching windows does not query GitHub each time.
+#[spec("upgrade/upgrade-dialog/016")]
+#[test]
+fn upgrade_dialog_016_focus_in_rechecks_only_after_the_floor() {
+    use dot_agent_deck::upgrade_dialog::{
+        FOCUS_RECHECK_FLOOR, focus_check_due, focus_recheck_floor,
+    };
+    use std::time::{Duration, SystemTime};
+
+    assert_eq!(FOCUS_RECHECK_FLOOR, Duration::from_secs(60 * 60));
+    assert_eq!(focus_recheck_floor(), FOCUS_RECHECK_FLOOR);
+
+    let floor = FOCUS_RECHECK_FLOOR;
+    let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    assert!(
+        focus_check_due(None, last, floor),
+        "no check has started yet"
+    );
+    assert!(!focus_check_due(Some(last), last, floor));
+    assert!(
+        !focus_check_due(Some(last), last + floor - Duration::from_secs(1), floor),
+        "a focus-in within the hour checks nothing"
+    );
+    assert!(focus_check_due(Some(last), last + floor, floor));
+    assert!(
+        focus_check_due(Some(last), last + Duration::from_secs(5 * 60 * 60), floor),
+        "five hours asleep: due"
+    );
+    assert!(
+        focus_check_due(Some(last), last - Duration::from_secs(1), floor),
+        "a clock that moved backwards counts as due"
+    );
+}

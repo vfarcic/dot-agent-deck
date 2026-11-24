@@ -13847,6 +13847,146 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
 }
 
+/// PRD #1790 stage 3 (brief §11-Q1, option b; catalog `journal/restore/018`):
+/// whether the daemon-empty saved-workspace restore leaves `saved` for the
+/// restore question instead of starting its command again as a blank agent.
+/// True only for a saved pane whose folder and exact command are those of a
+/// launch record that `interrupted` lists as an agent offered a resume,
+/// joined by both the item's work id and the agent's attempt. A Start-over or any other
+/// verdict, a different folder or command, or a record of another attempt
+/// or work starts the pane as before. It starts nothing and checks no
+/// process: the daemon's own checks run when the restore is asked for.
+pub fn should_defer_saved_agent_restore(
+    saved: &config::SavedPane,
+    interrupted: &crate::interrupted_work::InterruptedList,
+    launches: &[crate::launch_records::LaunchRecord],
+) -> bool {
+    interrupted.items.iter().any(|item| {
+        item.agents.iter().any(|agent| {
+            agent.restore == crate::interrupted_work::RestoreVerdict::Resume
+                && launches.iter().any(|record| {
+                    record.work == item.id
+                        && record.attempt == agent.attempt
+                        && record.cwd.as_deref() == Some(saved.dir.as_str())
+                        && record.command.as_deref() == Some(saved.command.as_str())
+                })
+        })
+    })
+}
+
+/// The bound on the interrupted work list the saved-workspace restore asks
+/// for before it starts saved panes ([`saved_restore_deferral`]).
+const SAVED_RESTORE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// PRD #1790 stage 3: what [`should_defer_saved_agent_restore`] decides
+/// from — the attached daemon's interrupted work list and the launch records
+/// in this user's state directory — or `None` when no saved pane is left for
+/// the restore question.
+///
+/// It defers only when it can read the list. When the daemon does not answer
+/// within [`SAVED_RESTORE_LIST_TIMEOUT`], the request fails or the launch
+/// records cannot be read, every saved pane starts as it did before PRD #1790
+/// stage 3, fresh, and a `warn!` names the reason (PR #2497 review): holding
+/// back saved panes on a list nobody read would drop them silently. The
+/// person then closes the fresh pane and restores the agent from Interrupted
+/// work, as `docs/session-management.md` says.
+///
+/// The launch records are read locally, but only a record whose work id and
+/// attempt are those of an item and agent this daemon listed can match: a
+/// work id carries the deck id of the state directory that minted it and 64
+/// random bits, so a record of another deck's (a remote daemon's) matches
+/// nothing.
+fn saved_restore_deferral(
+    saved: &config::SavedSession,
+) -> Option<(
+    crate::interrupted_work::InterruptedList,
+    Vec<crate::launch_records::LaunchRecord>,
+)> {
+    if !saved
+        .panes
+        .iter()
+        .any(|pane| pane.orchestration.is_none() && !pane.command.is_empty())
+    {
+        return None;
+    }
+    let answered = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("no async runtime to ask the daemon on: {error}"))
+        .map(|handle| {
+            let client = crate::daemon_client::DaemonClient::new(
+                crate::endpoint_resolve::client_attach_socket_path(),
+            )
+            .with_protocol_gate();
+            handle.block_on(async {
+                tokio::time::timeout(
+                    SAVED_RESTORE_LIST_TIMEOUT,
+                    client.list_interrupted_work(false, None),
+                )
+                .await
+                .ok()
+            })
+        });
+    match answered.and_then(|answered| {
+        saved_restore_deferral_from(answered, || {
+            crate::launch_records::read_all(&config::state_dir())
+        })
+    }) {
+        Ok(deferral) => deferral,
+        Err(reason) => {
+            tracing::warn!(
+                reason = %reason,
+                "saved workspace: no saved pane was deferred for the restore question because \
+                 the interrupted work list could not be read; saved panes start fresh"
+            );
+            None
+        }
+    }
+}
+
+/// PRD #1790 stage 3 (PR #2497 review): [`saved_restore_deferral`]'s
+/// decision from the daemon's answer, `None` when it gave none within its
+/// bound. `Ok(Some(..))` defers by what was read; `Ok(None)` has nothing to
+/// defer, because the daemon does not list interrupted work or offers no
+/// resume; `Err` names why the list or the launch records could not be read,
+/// and defers nothing either.
+pub fn saved_restore_deferral_from(
+    answered: Option<
+        Result<
+            crate::daemon_client::GatedQuery<crate::interrupted_work::InterruptedList>,
+            crate::daemon_client::ClientError,
+        >,
+    >,
+    read_launches: impl FnOnce() -> std::io::Result<Vec<crate::launch_records::LaunchRecord>>,
+) -> Result<
+    Option<(
+        crate::interrupted_work::InterruptedList,
+        Vec<crate::launch_records::LaunchRecord>,
+    )>,
+    String,
+> {
+    let list = match answered {
+        None => {
+            return Err(format!(
+                "the daemon did not answer within {}s",
+                SAVED_RESTORE_LIST_TIMEOUT.as_secs()
+            ));
+        }
+        Some(Err(error)) => return Err(error.to_string()),
+        Some(Ok(crate::daemon_client::GatedQuery::Unsupported)) => return Ok(None),
+        Some(Ok(crate::daemon_client::GatedQuery::Answered(list))) => list,
+    };
+    let offers_resume = list.items.iter().any(|item| {
+        item.agents
+            .iter()
+            .any(|agent| agent.restore == crate::interrupted_work::RestoreVerdict::Resume)
+    });
+    if !offers_resume {
+        return Ok(None);
+    }
+    let launches = read_launches()
+        .map_err(|error| format!("the deck's launch records could not be read: {error}"))?;
+    Ok(Some((list, launches)))
+}
+
 /// PRD #89 M2b.3 — rebuild one saved orchestration tab on the daemon-empty
 /// restore path: the orchestrator and role panes in saved order, the saved
 /// prompt replayed to the start role, the start cursor. Answers the tab's
@@ -15796,6 +15936,10 @@ pub fn run_tui(
         // into the unconditional read without entangling the gate. Two loads by
         // design; see the note at the top-of-function read.
         let saved = config::SavedSession::load();
+        // PRD #1790 stage 3: a saved agent the daemon can resume is left for
+        // the restore question rather than started blank, when the deck can
+        // read the interrupted work list now; otherwise it starts fresh.
+        let restore_deferral = saved_restore_deferral(&saved);
         // PRD #89 M2b.3 — the first orchestration tab rebuilt from the snapshot,
         // so we can land on it (start cursor) after the loop rather than snapping
         // back to the dashboard — mirroring the hydration block's landing logic.
@@ -15900,6 +16044,11 @@ pub fn run_tui(
             if let Some(ref mode_name) = saved_pane.mode {
                 ui.session_warnings
                     .push(legacy_mode_restore_warning(&saved_pane.name, mode_name));
+            }
+            if let Some((interrupted, launches)) = &restore_deferral
+                && should_defer_saved_agent_restore(saved_pane, interrupted, launches)
+            {
+                continue;
             }
             let cmd = if saved_pane.command.is_empty() {
                 None
@@ -16978,6 +17127,13 @@ pub fn run_tui(
             // event is handled below exactly as it was before.
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
                 embedded.report_focus(&ev, std::time::Instant::now());
+            }
+
+            // Issue #2450: a terminal focus-in lets the upgrade checker check
+            // again when its last check is more than an hour old, since its
+            // interval timer does not advance while the machine sleeps.
+            if matches!(ev, Event::FocusGained) {
+                crate::upgrade_dialog::focus_gained();
             }
 
             // PRD #84 M4 (invariant 4): a terminal resize is now just a
@@ -22369,10 +22525,11 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         }
         // PRD #1790 stage 2: reclaim's and dismiss all's `y` only once
         // flushed frames showed every row of the question, in one frame or
-        // over several as it was scrolled through.
+        // over several as it was scrolled through. Stage 3: so do the restore
+        // question's `c`, `o` and `w`.
         UiMode::InterruptedWork => {
             let refused = interrupted_work_view::asks(ui)
-                && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+                && matches!(key.code, KeyCode::Char('y' | 'Y' | 'c' | 'o' | 'w'))
                 && !interrupted_work_view::question_shown(ui);
             return refused.then_some(Action::Continue);
         }
@@ -30519,6 +30676,9 @@ pub fn render_restart_notice_key_sequence_to_buffers(
 /// key pressed, a daemon answer delivered where the background request would
 /// deliver it, or the event stream attaching to a daemon process.
 #[doc(hidden)]
+// A test seam built a handful of steps at a time: the size of a step does not
+// matter, and boxing the large variants would only add noise to every test.
+#[allow(clippy::large_enum_variant)]
 pub enum InterruptedSeamStep {
     Key(KeyEvent),
     /// These steps, one after another, with no frame drawn before, between or
@@ -30544,6 +30704,15 @@ pub enum InterruptedSeamStep {
     /// The TUI's event stream attached to the daemon process of this name
     /// (the seam starts attached to [`INTERRUPTED_SEAM_FIRST_DAEMON`]).
     Attach(String),
+    /// PRD #1790 stage 3: the newest restore request answered this.
+    Restored(crate::interrupted_work::RestoreOutcome),
+    /// PRD #1790 stage 3: the newest start-over request answered this.
+    StartedOver(crate::interrupted_work::StartOverOutcome),
+    /// PRD #1790 stage 3: whether the attached daemon process advertises
+    /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`], as a list answer from
+    /// it says in production: what the TUI checks before it sends a restore
+    /// or start-over.
+    RestoreCapability(bool),
 }
 
 /// PRD #1790 stage 2 L1 seam: the daemon process the seam starts attached to.
@@ -30558,6 +30727,8 @@ pub enum InterruptedSeamKind {
     Show,
     Reclaim,
     Dismiss,
+    Restore,
+    StartOver,
 }
 
 /// PRD #1790 stage 2: a request the TUI sends the daemon about interrupted
@@ -30565,10 +30736,35 @@ pub enum InterruptedSeamKind {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterruptedSeamRequest {
-    List { git: bool },
-    Show { id: String, reports_from: usize },
-    Reclaim { id: String, dry_run: bool },
-    Dismiss { ids: Vec<String>, all: bool },
+    List {
+        git: bool,
+    },
+    Show {
+        id: String,
+        reports_from: usize,
+    },
+    Reclaim {
+        id: String,
+        dry_run: bool,
+    },
+    Dismiss {
+        ids: Vec<String>,
+        all: bool,
+    },
+    /// PRD #1790 stage 3: restore the item's agents `agents` (their
+    /// attempts) with their conversations; sent with no caller claim.
+    RestoreInterrupted {
+        id: String,
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        dry_run: bool,
+    },
+    /// PRD #1790 stage 3: start the item's agent `agent` over.
+    StartOverInterrupted {
+        id: String,
+        agent: String,
+        dry_run: bool,
+    },
 }
 
 impl InterruptedSeamRequest {
@@ -30578,6 +30774,8 @@ impl InterruptedSeamRequest {
             InterruptedSeamRequest::Show { .. } => InterruptedSeamKind::Show,
             InterruptedSeamRequest::Reclaim { .. } => InterruptedSeamKind::Reclaim,
             InterruptedSeamRequest::Dismiss { .. } => InterruptedSeamKind::Dismiss,
+            InterruptedSeamRequest::RestoreInterrupted { .. } => InterruptedSeamKind::Restore,
+            InterruptedSeamRequest::StartOverInterrupted { .. } => InterruptedSeamKind::StartOver,
         }
     }
 }
@@ -30784,6 +30982,9 @@ fn seam_interrupted_step(
         }
         InterruptedSeamStep::Attach(process) => {
             *attached = crate::daemon_client::Incarnation::from(Some(process.clone()));
+        }
+        InterruptedSeamStep::RestoreCapability(supported) => {
+            interrupted_work_view::learn_restore_capability(ui, *supported);
         }
         InterruptedSeamStep::AnswerTo(index, answer) => {
             if let Some(answer) = interrupted_work_view::seam_answer(ui, Some(*index), answer) {

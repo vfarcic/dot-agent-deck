@@ -33,7 +33,7 @@ test.describe("desktop navigation rail", () => {
     await expect(page.getByTestId("agent-tile-planner")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
     const entries = await rail(page).locator("nav button").allTextContents();
-    expect(entries).toEqual(["Dashboard", "Daemons", "Projects", "Prompts", "Orchestrations", "Agent Profiles", "Settings"]);
+    expect(entries).toEqual(["Dashboard", "Daemons", "Projects", "Orchestrations", "Agent Profiles", "Settings"]);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Daemons");
 
     await page.getByTestId("open-overview").click();

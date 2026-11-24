@@ -20,6 +20,7 @@ mod agent_hook_config;
 pub mod agent_notice;
 pub mod agent_pty;
 pub mod agent_registry;
+pub mod agent_restore;
 // PRD #211: the Antigravity CLI's hook installer.
 pub mod antigravity_hooks_manage;
 // PRD #211: the Antigravity experimental notice's words, shared by both clients.
@@ -108,6 +109,8 @@ pub mod event_subscriber;
 // PRD #1666 part 3 round 5-wake: whether a parsed frame was drawn for the PTY's current width.
 pub mod evidence_state;
 pub mod features;
+// Issue #2418: strict parsing of the PR/issue references agents report on cards.
+pub mod github_refs;
 pub mod guarded;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
@@ -199,9 +202,11 @@ pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
 pub mod pull_request;
 pub mod pull_request_info;
+// Issue #2418: the daemon's own check of the PR/issue references cards name.
 pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
+pub mod reference_check;
 // PRD #1666 part 3 round 5-wake: an agent's release, read off its start-up header.
 pub mod release_scanner;
 pub mod remote;
@@ -211,6 +216,8 @@ pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod report_recovery;
 pub mod retained_store;
+// Issue #2110: spacing between orchestration workers' agent starts.
+pub mod role_start_pacing;
 pub mod roles_cli;
 // Issue #1897: each agent run in a cgroup of its own, where systemd delegated one.
 pub mod run_cgroup;

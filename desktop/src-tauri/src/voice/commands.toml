@@ -113,9 +113,11 @@
 #                    `close_orchestration` stops every role of a run, and
 #                    "close the billing agent" must never stop it. Words of the
 #                    row's own `id` or `description`, which `table.rs` checks.
-#                    Two rows use it: that one, and
+#                    Three rows use it: that one,
 #                    `approve_project_commands` (PRD #1885), which needs the
-#                    word "approve" so that a bare start never approves
+#                    word "approve" so that a bare start never approves, and
+#                    `cancel_inbox_message` (issue #2148), which needs the
+#                    message named so that a bare "cancel" stays `close`'s
 #                    (`voice_table_conjunctive_rows_are_the_deliberate_set`).
 #   must_not_say     a REFUSE-ONLY guard: a pick is refused when the
 #                    transcript contains one of these, whatever the check
@@ -923,6 +925,39 @@ unavailable_hint = "report pages turn in an item's details in the Interrupted wo
 report      = "Showing the previous reports."
 asks_to     = "show the previous page of an interrupted item's reports"
 try_saying  = "previous reports"
+
+# PRD #1790 stage 3 — Restore in the Interrupted work dialog: brings an
+# agent a restart stopped back with its conversation, or starts it over in
+# its folder without it. **Voice asks the question only**: the dialog shows
+# the restore question for the item the words name, with its choices, and
+# starting the agent waits for the person's click or key on that question
+# (PRD #802 D5) — Restore and
+# continue, Restore only and Start over in this worktree are registry
+# entries of their own (`restoreAndContinueInterrupted`,
+# `restoreOnlyInterrupted`, `startOverInterrupted`), with no row. `item` as
+# `reclaim_interrupted`'s.
+[[commands]]
+id          = "restore_interrupted"
+description = """In the open Interrupted work dialog, ask to Restore an interrupted agent: the dialog asks whether to
+bring that agent back with its conversation, or to start it over in its folder when its conversation
+cannot come back, and the user chooses on screen. Use for restore the agent, restore it, restore the
+second one, bring back fix-login, resume fix-login's conversation, bring that agent back. Set `item` to
+the words the user used for which item, and only those: an ordinal ("second", "the last one") or the
+item's name or branch as they said it; leave `item` out when they named none. Never add a name the
+user did not say. It is not `reclaim_interrupted`, which removes a worktree, and not
+`dismiss_interrupted`."""
+invoke      = "askRestoreInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "restoring works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Asking whether to restore it."
+asks_to     = "restore an interrupted agent"
+try_saying  = "restore the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
 
 # PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
 # voice. The drop-down dispatches through the same registry entry
@@ -2619,6 +2654,76 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
   name = "orchestration"
   kind = "orchestration_ref"
 
+# Issue #2148 — the voice forms of Retry and Cancel on a deck message that
+# waits on the user (PRD #1666 §6.4): one the deck is not sure reached the
+# agent, one that ran out of attempts, one held for an hour, or one the agent
+# never started on. The Daemons screen lists them on the agent's tile, which
+# is the only place their buttons are drawn, so both rows run there alone.
+#
+# **Which message.** A deck message has no name a user would say — its subject
+# and sender are whatever another agent wrote — so a row names it by the agent
+# it was sent TO, an `agent_ref`, and acts on every message that agent's tile
+# lists for the verb: all of them for Cancel, all but those out of attempts for
+# Retry. Nothing about a message reaches the command model: the subjects and
+# senders are shown in the confirmation, on screen, and nowhere else.
+#
+# **Both only OPEN a confirmation**, as the stops and Generate config do: Retry
+# can deliver a message twice, Cancel stops a delivery for good, and either may
+# cover several messages, so the confirmation lists each one by sender and
+# subject and nothing happens until the user presses its button
+# (`voice_table_d5_rows_only_ask`). A click on a row's own button acts on that
+# one message at once, as it did before.
+#
+# **"Cancel" is a view word.** `close` owns "cancel" and "never mind", and the
+# confirmation is closed by them, so `cancel_inbox_message` needs the message
+# NAMED (`must_name`): a bare "cancel" closes what is on top and cancels no
+# message. That makes the Cancel button's bare label the one on this surface
+# that is not its own voice phrase; "Retry" is.
+[[commands]]
+id          = "retry_inbox_message"
+description = """Retry the deck messages waiting on the user for one agent on the Daemons screen —
+the voice form of the Retry button beside a deck message whose delivery is uncertain or that may
+not have reached the agent. Use for retry, retry the message, retry the message to the tester,
+retry the tester's message, send the coder's deck message again, resend the message to the
+reviewer. Set `agent` to the agent the message was sent TO, the way `open_agent` does. It never
+sends anything by itself: the app shows a confirmation listing every message it would retry and
+the user confirms by hand. Not for posting a new message, typing to an agent or opening one;
+cancelling a message is `cancel_inbox_message`."""
+invoke      = "confirmRetryInboxMessage"
+screens     = ["deck"]
+unavailable_hint = "retrying a deck message works from the Daemons screen, where each agent's tile lists the messages waiting on you"
+report      = "Confirm retrying the deck messages to {agent} — nothing has been sent yet."
+asks_to     = "retry a deck message"
+try_saying  = "retry the message to {agent}"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "cancel_inbox_message"
+description = """Cancel the deck messages waiting on the user for one agent on the Daemons screen,
+so the deck stops delivering them — the voice form of the Cancel button beside a deck message whose
+delivery is uncertain, that ran out of attempts or that may not have reached the agent. Use for
+cancel the message to the tester, cancel the tester's deck message, cancel the messages to the
+coder, drop the message to the reviewer, give up on the message to the tester. Set `agent` to the
+agent the message was sent TO, the way `open_agent` does. The user must say "message": a bare
+"cancel" or "never mind" is `close`, which closes what is on top and cancels no message. It never
+cancels anything by itself: the app shows a confirmation listing every message it would cancel and
+the user confirms by hand. Not for stopping an agent (`stop_agent`); retrying a message is
+`retry_inbox_message`."""
+invoke      = "confirmCancelInboxMessage"
+screens     = ["deck"]
+unavailable_hint = "cancelling a deck message works from the Daemons screen, where each agent's tile lists the messages waiting on you"
+report      = "Confirm cancelling the deck messages to {agent} — nothing has been cancelled yet."
+asks_to     = "cancel a deck message"
+try_saying  = "cancel the message to {agent}"
+must_name   = ["message", "messages"]
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
 # PRD #2374 — the agent dashboard's cards.
 #
 # None of them sends anything the user cannot see first: `run_card_action`
@@ -2643,8 +2748,8 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
 [[commands]]
 id          = "set_overview_mode"
 description = """Switch the agent dashboard between its two views: the table (one row per agent)
-and the cards (one card per agent, grouped by dispatcher or orchestration, showing what each
-agent reported and what it needs). Use when the user asks to show cards, the card view, switch to
+and the cards (one card per agent, the agents each one started in a tree under it, showing what
+each agent is doing and what it needs). Use when the user asks to show cards, the card view, switch to
 cards, show the table, the list view, or back to the table. Set `view` to "table" or "cards".
 Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`."""
 invoke      = "setOverviewMode"
@@ -2714,8 +2819,8 @@ try_saying  = "next one that needs me"
 
 [[commands]]
 id          = "filter_needs_you_cards"
-description = """Turn the cards view's Needs you filter on or off: on shows only the agents' cards
-that need the user, off shows every card. Use for only the ones that need me, show only the cards
+description = """Turn the cards view's Needs you only on or off: on opens the way to every agent's
+card that needs the user and fades the others, off shows every card as usual. Use for only the ones that need me, show only the cards
 that need me, just the ones needing my attention (`needs_you` = "on"), or show all cards, every card,
 clear the needs you filter (`needs_you` = "off"). It shows the cards view when turned on. Filtering the
 table by status is `filter_dashboard`."""
@@ -2741,10 +2846,83 @@ report      = "Closed the card."
 asks_to     = "close the open card"
 try_saying  = "close the card"
 
+# Issue #2418 — the Cards tree. Opening and closing the tree under a card
+# changes what the dashboard shows and sends nothing; opening a card's pull
+# request or issue opens the app's GitHub browser on the address the deck
+# itself checked, never on the agent's own text.
+[[commands]]
+id          = "open_card_tree"
+description = """In the agent dashboard's cards, open the TREE under one agent's card: show the
+agents it started (a dispatcher's units, an orchestrator's roles) under it. Use for open the
+dispatcher's tree, expand the queue, show what is under the coder, show the agents under the
+orchestrator. Set `agent` to the user's words for the agent whose tree to open. Opening the card's
+own overlay is `show_agent_card`; opening an agent's terminal pane is `open_agent`."""
+invoke      = "openCardTree"
+screens     = ["overview"]
+unavailable_hint = "a card's tree opens on the agent dashboard's cards"
+report      = "Opened {agent}'s tree."
+asks_to     = "show the agents under one agent's card"
+try_saying  = "open {agent}'s tree"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "close_card_tree"
+description = """In the agent dashboard's cards, close the TREE under one agent's card, hiding the
+agents it started. Use for close the dispatcher's tree, collapse the queue, hide what is under the
+orchestrator. Set `agent` to the user's words for the agent whose tree to close. Closing the card
+overlay is `close_agent_card`."""
+invoke      = "closeCardTree"
+screens     = ["overview"]
+unavailable_hint = "a card's tree closes on the agent dashboard's cards"
+report      = "Closed {agent}'s tree."
+asks_to     = "hide the agents under one agent's card"
+try_saying  = "close {agent}'s tree"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_card_pull_request"
+description = """Open, in the app's GitHub browser, the pull request an agent reported on its CARD,
+as the deck checked it. Use when the user names an agent's card and its pull request — "open the
+pull request on the coder's card", "show the PR the tester reported". The pull request of the
+agent's own branch, from its badge on the dashboard or its pane, is `open_pr`. Set `agent` to the
+user's words for the agent."""
+invoke      = "openCardPullRequest"
+screens     = ["overview"]
+unavailable_hint = "a card's pull request opens from the agent dashboard's cards"
+report      = "Opening the pull request on {agent}'s card."
+asks_to     = "open the pull request an agent reported on its card"
+try_saying  = "open the pull request on {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_card_issue"
+description = """Open, in the app's GitHub browser, the issue an agent reported on its CARD, as the
+deck checked it. Use for open the issue on the coder's card, show the tester's issue, which issue
+is the dispatcher's unit working on. Set `agent` to the user's words for the agent."""
+invoke      = "openCardIssue"
+screens     = ["overview"]
+unavailable_hint = "a card's issue opens from the agent dashboard's cards"
+report      = "Opening the issue on {agent}'s card."
+asks_to     = "open the issue an agent reported on its card"
+try_saying  = "open the issue on {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
 [[commands]]
 id          = "run_card_action"
 description = """Press one of the buttons on an agent's card: an action the agent or the deck
-offers (such as "Merge it", "Go ahead", "Explain") or an answer to a question the agent asked on
+offers (such as "Merge it", "Go ahead", "Close") or an answer to a question the agent asked on
 its card. Use when the user names both the action and the agent — "send merge it to the coder",
 "press go ahead on the tester's card", "answer main to the coder". Set `agent` to the user's
 words for the agent and `action` to the button's label as the user said it. A catalog action is

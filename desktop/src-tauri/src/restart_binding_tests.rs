@@ -429,7 +429,6 @@ async fn handshake_013_runs_launch_never_starts_on_the_preparations_successor() 
             name: "review".into(),
             display_title: None,
             cwd: "/project".into(),
-            task_prompt: "list the files".into(),
             roles: vec![crate::dto::OrchestrationRoleInput {
                 role: "orchestrator".into(),
                 command: "claude".into(),

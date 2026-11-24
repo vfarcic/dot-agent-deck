@@ -204,10 +204,41 @@ pub fn classify(url: &Url) -> Navigation {
     }
 }
 
-/// Whether `url` is a pull request page this browser may be OPENED on:
-/// `https://github.com/<owner>/<repo>/pull/<number>`, nothing else. The
-/// daemon's URL comes from `gh`, so this is a check rather than a filter.
+/// Whether `url` is a pull request page this browser may be OPENED on: a
+/// github.com address whose path starts `/<owner>/<repo>/pull/<number>` (see
+/// [`is_numbered_github_page`] for what else passes). The daemon's URL comes
+/// from `gh`, so this is a check rather than a filter.
 pub fn is_pull_request_url(url: &Url) -> bool {
+    is_numbered_github_page(url, "pull")
+}
+
+/// Issue #2418: whether `url` is an issue page this browser may be opened on —
+/// the address of an issue an agent reported, as the daemon checked it with
+/// `gh`. Exactly `https://github.com/<owner>/<repo>/issues/<number>`, the
+/// number 1 or more with no leading zero, and at most a trailing `/` after
+/// it: no other segment, no query and no fragment (not even an empty one).
+/// An explicit `:443` is the default port, which URL parsing drops, so it
+/// reads as the same address. The same rule as the webview's `isIssueUrl`.
+pub fn is_issue_url(url: &Url) -> bool {
+    if !is_numbered_github_page(url, "issues") || url.query().is_some() || url.fragment().is_some()
+    {
+        return false;
+    }
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|parts| parts.collect())
+        .unwrap_or_default();
+    match segments.as_slice() {
+        [_, _, _, number] | [_, _, _, number, ""] => !number.starts_with('0'),
+        _ => false,
+    }
+}
+
+/// Whether `url`'s path starts `https://github.com/<owner>/<repo>/<section>/<number>`,
+/// with no login, port other than the default, or other host. It checks that
+/// prefix only: segments after the number, a query and a fragment pass, and
+/// a caller wanting the page itself checks those (as [`is_issue_url`] does).
+fn is_numbered_github_page(url: &Url, section: &str) -> bool {
     if url.scheme() != "https"
         || !url
             .host_str()
@@ -224,8 +255,8 @@ pub fn is_pull_request_url(url: &Url) -> bool {
         .unwrap_or_default();
     matches!(
         segments.as_slice(),
-        [owner, repo, "pull", number, ..]
-            if !owner.is_empty() && !repo.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        [owner, repo, kind, number, ..]
+            if *kind == section && !owner.is_empty() && !repo.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
     )
 }
 
@@ -1199,8 +1230,8 @@ pub async fn open<R: Runtime>(
 ) -> Result<u64, String> {
     let bounds = bounds.checked()?;
     let url = Url::parse(url).map_err(|_| "That pull request address is not a URL.".to_string())?;
-    if !is_pull_request_url(&url) {
-        return Err("Only a pull request on github.com opens in the app.".into());
+    if !is_pull_request_url(&url) && !is_issue_url(&url) {
+        return Err("Only a pull request or an issue on github.com opens in the app.".into());
     }
     let _session = SESSION.lock().await;
     admit_open(&CLEARING)?;
@@ -2343,6 +2374,37 @@ mod tests {
             "javascript:alert(1)",
         ] {
             assert!(!is_pull_request_url(&url(bad)), "{bad}");
+        }
+    }
+
+    /// Scenario: ask whether issue addresses may open the in-app browser. Only a github.com issue's own numbered page may, with at most a trailing slash, and an explicit :443 is the same address; a page under it, a query, a fragment, number 0 or a leading zero, a pull request page, another site, plain http, a login or another port may not.
+    #[test]
+    fn a_github_issue_opens_the_browser_too() {
+        for good in [
+            "https://github.com/vfarcic/dot-agent-deck/issues/2418",
+            "https://github.com/o/r/issues/1",
+            "https://github.com/o/r/issues/3/",
+            "https://github.com:443/o/r/issues/3",
+        ] {
+            assert!(is_issue_url(&url(good)), "{good}");
+        }
+        for bad in [
+            "https://github.com/o/r/issues/1/anything",
+            "https://github.com/o/r/issues/1?return_to=https://example.com",
+            "https://github.com/o/r/issues/1?",
+            "https://github.com/o/r/issues/3#issuecomment-1",
+            "https://github.com/o/r/issues/1#",
+            "https://github.com/o/r/issues/0",
+            "https://github.com/o/r/issues/01",
+            "https://github.com/vfarcic/dot-agent-deck/pull/2418",
+            "https://github.com/o/r/issues/abc",
+            "https://github.com/o/r/issues",
+            "https://github.com.evil.example/o/r/issues/1",
+            "http://github.com/o/r/issues/1",
+            "https://user:pass@github.com/o/r/issues/1",
+            "https://github.com:8443/o/r/issues/1",
+        ] {
+            assert!(!is_issue_url(&url(bad)), "{bad}");
         }
     }
 
