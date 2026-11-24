@@ -2190,9 +2190,13 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-header .agent-card-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; }
 .agent-card-toggle, .agent-card-close { flex: 0 0 auto; width: 22px; height: 20px; }
 .agent-card-header .agent-card-needs-you { flex: none; white-space: nowrap; }
-/* PRD #2374 decision 2026-11-24: a card's action icons, at the end of its status line, right under Close, so the name keeps the header. The line keeps its height. */
+/* PRD #2374 decision 2026-11-24: the status line keeps its height whatever it holds. */
 .agent-card-meta-row { flex: none; height: 18px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .agent-card-meta-row .agent-card-meta { flex: 1 1 auto; width: auto; min-width: 0; }
+/* Issue #2399 review 2 — the card's bottom row: the roll-up (or nothing), then the action icons at its right end. Its height is fixed, so a card with icons is the height of one without. */
+.agent-card-foot { flex: none; height: 18px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.agent-card-foot > .agent-card-rollup-block { flex: 1 1 auto; min-width: 0; }
+.agent-card-foot-actions { flex: none; margin-left: auto; }
 .agent-card-action-icons { flex: none; display: inline-flex; align-items: center; gap: 2px; }
 .agent-card-action-icon { width: 22px; height: 18px; color: var(--muted); }
 .agent-card-action-icon:hover:not(:disabled):not([aria-disabled="true"]), .agent-card-action-icon:focus-visible { color: var(--teal); border-color: var(--teal); }
@@ -2424,7 +2428,11 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .card-actions-editor-icon-option { width: 100%; height: 32px; color: var(--ink); }
 .card-actions-editor-icon-option.is-chosen, .card-actions-editor-icon-option:hover, .card-actions-editor-icon-option:focus-visible { color: var(--teal); border-color: var(--teal); }
 .card-actions-editor-check { display: flex; align-items: center; gap: 6px; font-size: var(--text-sm); }
-.card-actions-editor-confirm { position: absolute; inset: auto 16px 16px; display: grid; gap: 8px; padding: 12px; border: 1px solid var(--red); border-radius: 6px; background: var(--paper-strong); box-shadow: 0 10px 30px rgb(var(--scrim-rgb) / .28); }
+/* Issue #2399 review 13: the removal's confirmation is a dialog of its own over the editor, which it fences. */
+.card-actions-editor-remove-backdrop { align-items: center; }
+.card-actions-editor-confirm { width: min(440px, 100%); display: grid; gap: 8px; padding: 12px; border: 1px solid var(--red); border-radius: 6px; background: var(--paper-strong); box-shadow: 0 10px 30px rgb(var(--scrim-rgb) / .28); }
+.card-actions-editor-confirm:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
+.card-actions-editor-form fieldset { display: contents; }
 .card-actions-editor-confirm h3 { margin: 0; overflow-wrap: anywhere; }
 .card-actions-editor-confirm p { margin: 0; font-size: var(--text-sm); }
 @media (max-width: 640px) { .card-actions-editor-backdrop { padding: 0; } .card-actions-editor { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }

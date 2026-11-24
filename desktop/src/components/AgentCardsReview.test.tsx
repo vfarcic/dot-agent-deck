@@ -203,7 +203,7 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     const icon = screen.getByRole("button", { name: "Go ahead" });
     expect(icon).toHaveAttribute("data-testid", "agent-card-action-icon");
     expect(icon.textContent).toBe("");
-    expect(icon.title).toContain("Go on.");
+    expect(icon.getAttribute("data-tip")).toContain("Go on.");
     expect(screen.queryByText("Go on.")).toBeNull();
     // Issue #2418: the fields are the overlay's, under the agent's label.
     expect(screen.queryByText("low")).toBeNull();

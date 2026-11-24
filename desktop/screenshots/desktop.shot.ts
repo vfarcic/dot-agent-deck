@@ -104,7 +104,7 @@ desktopScenario("agent-cards", async (page) => {
   await expect(page.locator("article[data-card-key]")).toHaveCount(4);
   await expect(page.getByTestId("agent-card-issue-label").first()).toHaveText("enhancement");
   await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
-  // PRD #2374 decision 2026-11-24: each card's prompt actions are icons beside Close, drawn whole.
+  // PRD #2374 decision 2026-11-24: each card's prompt actions are icons in its bottom row (issue #2399 review 2), drawn whole.
   const icons = page.getByTestId("agent-card-action-icon");
   expect(await icons.count()).toBeGreaterThan(0);
   for (const icon of await icons.all()) await expect(icon).toBeInViewport({ ratio: 1 });
@@ -139,7 +139,7 @@ async function openCardsBatch(page: Page): Promise<void> {
 }
 
 // Decision 2026-11-24: batch buttons are icons named by the action's label,
-// with no text; each is drawn whole, with its icon, and its hover names it.
+// with no text; each is drawn whole, with its icon, and its hover (`data-tip`) names it.
 async function expectBatchIcons(scope: Locator, labels: readonly string[]): Promise<void> {
   const buttons = scope.getByRole("button");
   await expect(buttons).toHaveCount(labels.length);
@@ -148,7 +148,7 @@ async function expectBatchIcons(scope: Locator, labels: readonly string[]): Prom
     await expect(button).toHaveAccessibleName(label);
     await expect(button).toHaveText("");
     await expect(button.locator("svg")).toHaveCount(1);
-    expect(await button.getAttribute("title")).toContain(label);
+    expect(await button.getAttribute("data-tip")).toContain(label);
     await expect(button).toBeInViewport({ ratio: 1 });
   }
 }

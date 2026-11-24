@@ -111,6 +111,39 @@ export function searchCardIcons(query: string): string[] {
 const HOVER_PROMPT_CHARS = 1200;
 
 /**
+ * The exact text a hover quotes of `prompt` — every invisible or reordering
+ * character as its marker, as the overlay shows it — and whether it had to
+ * stop short. It stops at {@link HOVER_PROMPT_CHARS} shown characters, and
+ * only between two segments or inside plain text: a marker is quoted whole
+ * or not at all, so a cut never leaves half of one looking like plain text.
+ */
+export function hoverPromptText(prompt: string): { quoted: string; cut: boolean } {
+  let room = HOVER_PROMPT_CHARS;
+  let quoted = "";
+  for (const segment of exactTextSegments(prompt)) {
+    const chars = Array.from(segment.shown);
+    if (chars.length <= room) {
+      quoted += segment.shown;
+      room -= chars.length;
+      continue;
+    }
+    if (!segment.escaped) quoted += chars.slice(0, room).join("");
+    return { quoted, cut: true };
+  }
+  return { quoted, cut: false };
+}
+
+/**
+ * Whether a hover of `prompt` cannot quote all of it. An icon whose hover is
+ * cut does not send on a press: it opens the action's review step, which
+ * shows the whole text first, whatever the action's `confirm` says (issue
+ * #2399 audit 1).
+ */
+export function hoverCutsPrompt(prompt: string | null | undefined): boolean {
+  return !!prompt && hoverPromptText(prompt).cut;
+}
+
+/**
  * A card action icon's hover: its label, then the exact text it sends with
  * its line breaks kept and every invisible or reordering character shown as a
  * marker (as the overlay shows it), then `notes` — that it asks first, why it
@@ -119,11 +152,9 @@ const HOVER_PROMPT_CHARS = 1200;
 export function cardActionHover(label: string, prompt: string | null | undefined, notes: readonly (string | false | null | undefined)[] = []): string {
   const lines = [displayText(label, DISPLAY_LIMITS.name)];
   if (prompt) {
-    const shown = exactTextSegments(prompt).map((segment) => segment.shown).join("");
-    const chars = Array.from(shown);
-    const cut = chars.length > HOVER_PROMPT_CHARS;
-    const quoted = (cut ? chars.slice(0, HOVER_PROMPT_CHARS).join("") : shown).split("\n").map((line) => sanitizeText(line)).join("\n");
-    lines.push(`Sends: ${quoted}${cut ? "… (open the card to read all of it)" : ""}`);
+    const { quoted, cut } = hoverPromptText(prompt);
+    const shown = quoted.split("\n").map((line) => sanitizeText(line)).join("\n");
+    lines.push(`Sends: ${shown}${cut ? "… (too long to quote here: pressing it shows all of it before anything is sent)" : ""}`);
   }
   for (const note of notes) if (note) lines.push(displayText(note, DISPLAY_LIMITS.message));
   return lines.join("\n");

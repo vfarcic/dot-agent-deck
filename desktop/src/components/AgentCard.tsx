@@ -6,7 +6,7 @@ import { cardStatusClass, cardStatusLabel, disabledReasonSentence, exactTextSegm
 import { cardTone, issueLabels, referenceUrl, referenceView, rollupSegments, rollupSentence, type CardKind, type IssueLabelView } from "../lib/agentCardsTree";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "../lib/voiceActions";
-import { CardActionIcon, cardActionHover, cardIconName } from "../lib/cardIcons";
+import { CardActionIcon, cardActionHover, cardIconName, hoverCutsPrompt } from "../lib/cardIcons";
 import { endedRoleLine } from "../lib/endedRoles";
 import type { AgentCardAction, AgentCardCheckedRef, AgentCardEntry, AgentCardRollup, EndedRole } from "../types";
 import { ActionTipButton } from "./ActionTipButton";
@@ -223,21 +223,24 @@ function CardRollup({ rollup }: { rollup: AgentCardRollup }) {
 }
 
 /**
- * PRD #2374 decision 2026-11-24 — the most action icons a card draws beside
- * Close; past it, one `+N` control opens the card's overlay, which lists every
- * action. Three keeps the card's name readable on a 224-pixel card.
+ * PRD #2374 decision 2026-11-24 — the most action icons a card draws in its
+ * bottom row; past it, one `+N` control opens the card's overlay, which lists
+ * every action. Three, with `+N`, leave room for the roll-up beside them on a
+ * 224-pixel card.
  */
 export const CARD_ICON_LIMIT = 3;
 
 /**
  * The actions a card draws as icons: every prompt action its agent offers now,
  * in the daemon's order — never a reply (or any action that takes the user's
- * own words), Open, an answer to the agent's own question, or a close, which
- * keeps its own control. They are the overlay's actions, pressed the same way.
+ * own words), Open, an answer to the agent's own question, a close, which
+ * keeps its own control, or an action whose catalog `placement` is `detail`,
+ * which is offered only in the card's overlay. They are the overlay's
+ * actions, pressed the same way.
  */
 export function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
   const options = new Set(entry.questions.flatMap((question) => question.options.map((option) => option.action_id)));
-  return entry.actions.filter((action) => action.kind === "prompt" && !action.text_input && !options.has(action.id));
+  return entry.actions.filter((action) => action.kind === "prompt" && !action.text_input && !options.has(action.id) && action.placement !== "detail");
 }
 
 /** A card action's hover, in the overlay's words: its label, the exact text, whether it asks first, why it is disabled. */
@@ -282,8 +285,8 @@ export interface CardPlace {
  * pull requests and issues its agent reported as the deck checked them, the
  * first checked issue's labels, what is under it (closed, with its roll-up),
  * an icon for each prompt action its agent offers (up to
- * {@link CARD_ICON_LIMIT}, then a `+N`) at the end of its status line, right
- * under Close, and Close. Everything comes from the daemon's entry as received;
+ * {@link CARD_ICON_LIMIT}, then a `+N`) in its bottom row, beside the
+ * roll-up, and Close. Everything comes from the daemon's entry as received;
  * nothing here decides status, needs-you, roll-ups or references.
  *
  * Round 2 (D11, D12): the name opens the agent, as a table row does; a click
@@ -331,10 +334,12 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
      never resizes a card or moves a root (issue #2418 review). A cut line's
      text is in its tooltip. References and labels that do not fit are not
      cut: a `+N` counts them, and the overlay lists them all. */
-  /* The prompt actions the agent offers now, as icons beside Close (PRD
-     #2374 decision 2026-11-24): each is pressed exactly as its overlay button
-     is, so one that asks first, or whose text the agent wrote, opens the
-     overlay at its review instead of sending. The text is only in the hover. */
+  /* The prompt actions the agent offers now, as icons in the card's bottom
+     row (PRD #2374 decision 2026-11-24, placed there by issue #2399 review 2
+     so the name and the status keep their lines): each is pressed exactly as
+     its overlay button is, so one that asks first, or whose text the agent
+     wrote, opens the overlay at its review instead of sending — and so does
+     one whose text is too long for its hover to quote whole (audit 1). */
   const iconActions = cardIconActions(entry);
   const icons = iconActions.slice(0, CARD_ICON_LIMIT);
   const moreActions = iconActions.length - icons.length;
@@ -403,7 +408,6 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
           </span>
         )}
       </header>
-      {/* PRD #2374 decision 2026-11-24 — the status line carries the action icons at its end, under Close, so the name keeps the header. */}
       <div className="agent-card-meta-row">
         {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the overlay.
             Its name starts with the kind and status it shows, so a screen reader announces them and a spoken label of what is visible matches it (round 2 review). */}
@@ -412,8 +416,18 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
           <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status">{statusText}</span>
           {ended && endedText && <span className="agent-card-ended" data-testid="agent-card-ended" title={displayTitle(ended.headline)}>{endedText}</span>}
         </button>
+      </div>
+      {place.tree && (refs.length > 0
+        ? <CardReferences card={card} refs={refs} name={name} controls={controls} />
+        : <div className="agent-card-refs is-empty" aria-hidden="true" />)}
+      {place.tree && (labelled
+        ? <CardLabels labels={labelled.labels} issue={labelled.reference.number !== undefined ? `#${labelled.reference.number}` : labelled.reference.claim} />
+        : <div className="agent-card-labels is-empty" aria-hidden="true" />)}
+      {/* Issue #2399 review 2 — the bottom row: the roll-up where the card has one, and the action icons at its right end. Drawn on every card, empty or not, so a report never resizes one. */}
+      <div className="agent-card-foot" data-testid="agent-card-foot">
+        {place.tree && (rollup ? <CardRollup rollup={rollup} /> : <div className="agent-card-rollup-block is-empty" aria-hidden="true" />)}
         {icons.length > 0 && (
-          <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
+          <span className="agent-card-control agent-card-foot-actions" onClick={(event) => event.stopPropagation()}>
             <span className="agent-card-action-icons">
               {icons.map((action) => (
                 <ActionTipButton
@@ -425,7 +439,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
                   aria-label={displayText(action.label, DISPLAY_LIMITS.name)}
                   tip={actionHover(action)}
                   unavailable={!action.enabled}
-                  onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token })}
+                  onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token, ...(hoverCutsPrompt(action.prompt) ? { cardActionReview: true } : {}) })}
                 ><CardActionIcon name={action.icon} /></ActionTipButton>
               ))}
               {moreActions > 0 && (
@@ -442,13 +456,6 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
           </span>
         )}
       </div>
-      {place.tree && (refs.length > 0
-        ? <CardReferences card={card} refs={refs} name={name} controls={controls} />
-        : <div className="agent-card-refs is-empty" aria-hidden="true" />)}
-      {place.tree && (labelled
-        ? <CardLabels labels={labelled.labels} issue={labelled.reference.number !== undefined ? `#${labelled.reference.number}` : labelled.reference.claim} />
-        : <div className="agent-card-labels is-empty" aria-hidden="true" />)}
-      {place.tree && (rollup ? <CardRollup rollup={rollup} /> : <div className="agent-card-rollup-block is-empty" aria-hidden="true" />)}
     </article>
   );
 }

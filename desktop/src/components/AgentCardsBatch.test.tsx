@@ -15,7 +15,7 @@ const CHILD_TEXT = "CHILD-EXACT-2399: proceed with the child.";
 // Test-local wire types let this RED suite load before the additive DTOs exist.
 type BatchEntry = {
   pane_id: string; agent_id: string; outcome: "included" | "skipped" | "delivered" | "failed";
-  name?: string; prompt?: string; action_token?: string; instance_id?: string;
+  name?: string; prompt?: string; prompt_source?: string; action_token?: string; instance_id?: string;
   code?: string; message?: string; message_id?: string; state?: string;
 };
 type BatchOptions = { mode: "preview" | "execute"; entries: { pane_id: string; agent_id: string; action_token?: string; instance_id?: string }[]; requestId: string };
@@ -522,14 +522,14 @@ describe("batch card actions (#2399)", () => {
       expect(button.textContent).toBe("");
       expect(button.querySelector("svg")).not.toBeNull();
       expect(button).toHaveAttribute("data-icon", icon);
-      expect(button.title).toContain("Go ahead");
+      expect(button.getAttribute("data-tip")).toContain("Go ahead");
     };
     const calls = setup();
     selectRoot();
     const toolbar = selectionAction("Go ahead");
     expectIcon(toolbar);
-    expect(toolbar.title).toContain(same);
-    expect(toolbar.title).not.toMatch(/differs/);
+    expect(toolbar.getAttribute("data-tip")).toContain(same);
+    expect(toolbar.getAttribute("data-tip")).not.toMatch(/differs/);
     await act(async () => { fireEvent.click(toolbar); });
     expect(screen.getByTestId("agent-cards-batch-confirm")).toBeInTheDocument();
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
@@ -538,8 +538,8 @@ describe("batch card actions (#2399)", () => {
     fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
     const overlayButton = overlayBatchAction("Go ahead");
     expectIcon(overlayButton);
-    expect(overlayButton.title).toContain(same);
-    expect(overlayButton.title).not.toMatch(/differs/);
+    expect(overlayButton.getAttribute("data-tip")).toContain(same);
+    expect(overlayButton.getAttribute("data-tip")).not.toMatch(/differs/);
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
     cleanup();
 
@@ -549,15 +549,15 @@ describe("batch card actions (#2399)", () => {
     selectRoot();
     const mixed = selectionAction("Go ahead");
     expectIcon(mixed);
-    expect(mixed.title).toMatch(/text differs per agent/);
-    expect(mixed.title).not.toContain(same);
-    expect(mixed.title).not.toContain("Other words for the child.");
+    expect(mixed.getAttribute("data-tip")).toMatch(/text differs per agent/);
+    expect(mixed.getAttribute("data-tip")).not.toContain(same);
+    expect(mixed.getAttribute("data-tip")).not.toContain("Other words for the child.");
     fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
     const mixedOverlay = overlayBatchAction("Go ahead");
     expectIcon(mixedOverlay);
-    expect(mixedOverlay.title).toMatch(/text differs per agent/);
-    expect(mixedOverlay.title).not.toContain(same);
-    expect(mixedOverlay.title).not.toContain("Other words for the child.");
+    expect(mixedOverlay.getAttribute("data-tip")).toMatch(/text differs per agent/);
+    expect(mixedOverlay.getAttribute("data-tip")).not.toContain(same);
+    expect(mixedOverlay.getAttribute("data-tip")).not.toContain("Other words for the child.");
     expect(mixedCalls.invokeCardAction).not.toHaveBeenCalled();
     expect(mixedCalls.invokeCardActionBatch).not.toHaveBeenCalled();
     cleanup();
@@ -625,5 +625,25 @@ describe("batch card actions (#2399)", () => {
     }
     expect(within(dialog).getByText(SKIPPED.message!)).toBeInTheDocument();
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Start a batch whose preview gives the root and the child the same exact text, the root's written by the catalog and the child's by its agent. The confirmation quotes the text once, then lists both agents, and the child's row still carries the badge saying its agent wrote the text (issue #2399 review 9).
+  it("desktop/agent-cards/068: the same text from different sources is quoted once, each agent keeping its source badge", async () => {
+    const SAME = "SAME-ANY-SOURCE-2399: proceed.";
+    const preview: BatchEntry[] = [
+      { ...INCLUDED[0], prompt: SAME, prompt_source: "catalog" },
+      { ...INCLUDED[1], prompt: SAME, prompt_source: "agent" },
+      SKIPPED,
+    ];
+    setup({ preview });
+    const dialog = await startSelectedBatch();
+    expect(within(dialog).getAllByTestId("agent-cards-batch-prompt").map((node) => node.textContent)).toEqual([SAME]);
+    const entries = within(dialog).getAllByTestId("agent-cards-batch-entry");
+    const child = entries.find((node) => within(node).queryByText("child", { exact: true }));
+    const root = entries.find((node) => within(node).queryByText("root", { exact: true }));
+    expect(child, "the child is listed").toBeDefined();
+    expect(root, "the root is listed").toBeDefined();
+    expect(within(child!).getByText("agent says")).toBeInTheDocument();
+    expect(within(root!).queryByText("agent says")).toBeNull();
   });
 });

@@ -469,7 +469,7 @@ test.describe("desktop/agent-cards/024 — an agent-written prompt is shown whol
     // The card shows the action as an icon whose hover holds the text; none of the text is on the card (PRD #2374, 2026-11-24).
     const icon = card.getByRole("button", { name: "Go ahead" });
     await expect(icon).toBeVisible();
-    expect(await icon.getAttribute("title")).toContain(prompt);
+    expect(await icon.getAttribute("data-tip")).toContain(prompt);
     await expect(card).not.toContainText("Run tests");
     await expect(card.getByRole("button", { name: "Close bench" })).toBeVisible();
     // Pressing the icon sends nothing: it opens the review step with the whole text.
@@ -730,8 +730,8 @@ for (const width of [375, 1440] as const) {
  */
 test.describe("desktop/agent-cards/061 — card action icons and the card actions editor in the browser", () => {
   for (const width of [375, 1440] as const) {
-    /// Scenario: At this width, give a card a catalog action that asks first, with the rocket icon. The card draws its icon whole beside a whole Close, with the exact text in its hover and none on the card; pressing it opens the confirmation quoting the text, and nothing is sent; the page never scrolls sideways.
-    test(`a card's action icon fits beside Close and asks first at ${width}px`, async ({ page }) => {
+    /// Scenario: At this width, give a card a catalog action that asks first, with the rocket icon. The card draws its icon whole, and Close whole, with the exact text in its hover and none on the card; pressing it opens the confirmation quoting the text, and nothing is sent; the page never scrolls sideways.
+    test(`a card's action icon fits in the card with Close and asks first at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
       await openCardsTree(page);
       const prompt = "DEPLOY-BROWSER-2399: deploy it, then update your card.";
@@ -745,7 +745,7 @@ test.describe("desktop/agent-cards/061 — card action icons and the card action
       await expect(icon).toBeVisible();
       await expect(icon).toHaveAttribute("data-testid", "agent-card-action-icon");
       await expect(icon).toHaveAttribute("data-icon", "rocket");
-      expect(await icon.getAttribute("title")).toContain(prompt);
+      expect(await icon.getAttribute("data-tip")).toContain(prompt);
       await expect(card).not.toContainText("DEPLOY-BROWSER-2399");
       const close = card.getByRole("button", { name: "Close bench" });
       const [cardBox, iconBox, closeBox] = await Promise.all([card.boundingBox(), icon.boundingBox(), close.boundingBox()]);
@@ -864,6 +864,85 @@ test.describe("desktop/agent-cards/061 — card action icons and the card action
       await expect(overlay).toBeVisible();
       for (const id of ["a1", "a2", "a3", "a4", "a5"]) await expect(overlay.getByTestId(`agent-card-action-${id}`)).toBeVisible();
       await expect(page.getByTestId("agent-card-action-result")).toHaveCount(0);
+      await expectNoSidewaysScroll(page);
+    });
+  }
+});
+
+/*
+ * Issue #2399 review 2 — a card's action icons have a row of their own at the
+ * card's bottom, sharing it with the roll-up, so the name keeps the header and
+ * the status keeps its line however many actions an agent offers.
+ */
+test.describe("desktop/agent-cards/076 — the card's action row at its fullest", () => {
+  for (const width of [375, 1440] as const) {
+    /// Scenario: At this width, give a root that has agents under it (so it shows the tree toggle and a roll-up) a long name, Needs you, a long status and five actions. The name still shows its start across at least a few characters, the status is drawn whole on its own line, three icons and `+2` sit in the bottom row to the right of the roll-up, no two controls overlap, every control is inside the card, and Close and `+2` can be pressed; the page never scrolls sideways.
+    test(`a root with a long name, Needs you, the tree toggle and five actions keeps its name and status readable at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await openCardsTree(page);
+      const key = await keyOf(page, "docs-site");
+      await pushCards(page, `
+        const root = byName("docs-site");
+        root.name = "docs-site-orchestration-with-a-very-long-name";
+        root.status = "waiting_for_input";
+        root.needs_you = true;
+        root.needs_you_reasons = ["waiting"];
+        const offered = (id, label, extra) => Object.assign({ id, label, kind: "prompt", prompt: "FULL-ROW-2399 " + id + ": do it.", prompt_source: "catalog", text_input: false,
+          confirm: false, confirm_detail: null, icon: null, placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: "tok-" + id }, extra);
+        root.actions = [offered("r1", "Go ahead", { icon: "play" }), offered("r2", "Merge it", { icon: "git-merge" }), offered("r3", "Deploy it", { icon: "rocket" }), offered("r4", "Fourth"), offered("r5", "Fifth"), ...root.actions];
+      `);
+      const card = page.locator(`article[data-card-key="${key}"]`);
+      await expect(card.getByTestId("agent-card-action-icon")).toHaveCount(3);
+      await expect(card.getByTestId("agent-card-needs-you")).toBeVisible();
+      await expect(card.getByTestId("agent-card-toggle")).toBeVisible();
+      const geometry = await card.evaluate((node) => {
+        const box = (element: Element | null) => {
+          if (!element) return null;
+          const at = element.getBoundingClientRect();
+          return { left: at.left, right: at.right, top: at.top, bottom: at.bottom, width: at.width };
+        };
+        const name = node.querySelector<HTMLElement>("[data-testid='agent-card-open-agent']")!;
+        const meta = node.querySelector<HTMLElement>("[data-testid='agent-card-details']")!;
+        const status = node.querySelector<HTMLElement>("[data-testid='agent-card-status']")!;
+        const foot = node.querySelector<HTMLElement>("[data-testid='agent-card-foot']")!;
+        return {
+          card: box(node)!,
+          name: box(name)!,
+          nameVisible: Math.min(name.clientWidth, name.scrollWidth),
+          meta: box(meta)!,
+          status: box(status)!,
+          rollup: box(foot.querySelector("[data-testid='agent-card-rollup']")),
+          foot: box(foot)!,
+          controls: [
+            ...[...node.querySelectorAll("header button, header [data-testid='agent-card-needs-you']")].map((element) => ({ what: element.getAttribute("data-testid") ?? element.textContent ?? "", at: box(element)! })),
+            ...[...foot.querySelectorAll("[data-testid='agent-card-action-icon'], [data-testid='agent-card-actions-more']")].map((element) => ({ what: element.getAttribute("data-testid") ?? "", at: box(element)! })),
+          ],
+        };
+      });
+      expect(geometry.nameVisible, "the name shows more than a few characters").toBeGreaterThanOrEqual(48);
+      expect(geometry.status.width, "the status is drawn").toBeGreaterThan(0);
+      expect(geometry.status.right, "the status is drawn whole on its line").toBeLessThanOrEqual(geometry.meta.right + TOLERANCE);
+      expect(geometry.rollup, "the roll-up is in the bottom row").not.toBeNull();
+      expect(geometry.rollup!.width, "the roll-up keeps some room").toBeGreaterThan(0);
+      for (const control of geometry.controls) {
+        expect(control.at.width, `${control.what} is drawn`).toBeGreaterThan(0);
+        expect(control.at.left, `${control.what} starts inside the card`).toBeGreaterThanOrEqual(geometry.card.left - TOLERANCE);
+        expect(control.at.right, `${control.what} ends inside the card`).toBeLessThanOrEqual(geometry.card.right + TOLERANCE);
+      }
+      for (const icon of geometry.controls.filter((control) => control.what === "agent-card-action-icon" || control.what === "agent-card-actions-more")) {
+        expect(icon.at.top, "the icons are in the bottom row").toBeGreaterThanOrEqual(geometry.foot.top - TOLERANCE);
+        expect(icon.at.left, "the icons are to the right of the roll-up").toBeGreaterThanOrEqual(geometry.rollup!.right - TOLERANCE);
+      }
+      for (const [at, one] of geometry.controls.entries()) {
+        for (const other of geometry.controls.slice(at + 1)) {
+          const apart = one.at.right <= other.at.left + TOLERANCE || other.at.right <= one.at.left + TOLERANCE
+            || one.at.bottom <= other.at.top + TOLERANCE || other.at.bottom <= one.at.top + TOLERANCE;
+          expect(apart, `${one.what} and ${other.what} do not overlap`).toBe(true);
+        }
+      }
+      await card.getByRole("button", { name: /^Close/ }).click({ trial: true });
+      await card.getByTestId("agent-card-actions-more").click();
+      await expect(page.getByTestId("agent-card-overlay")).toBeVisible();
       await expectNoSidewaysScroll(page);
     });
   }

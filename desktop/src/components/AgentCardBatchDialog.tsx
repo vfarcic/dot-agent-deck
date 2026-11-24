@@ -94,7 +94,8 @@ function rowName(row: BatchRow, names: ReadonlyMap<string, string>): string {
 
 /**
  * Decision 2026-11-24 — the included rows grouped by what each agent gets:
- * the same exact text (from the same source) or, with no text, the same kind
+ * the same exact text, whoever wrote it (issue #2399 review 9: each agent's
+ * own row still carries its source badge), or, with no text, the same kind
  * of action. Groups keep the order of their first agent, and agents keep the
  * preview's order within a group.
  */
@@ -102,7 +103,7 @@ function sameText(rows: readonly BatchRow[]): BatchRow[][] {
   const groups = new Map<string, BatchRow[]>();
   for (const row of rows) {
     const key = row.entry.prompt !== undefined && row.entry.prompt !== null
-      ? `text\u0000${row.entry.prompt_source ?? ""}\u0000${row.entry.prompt}`
+      ? `text\u0000${row.entry.prompt}`
       : `kind\u0000${row.entry.kind ?? ""}`;
     groups.set(key, [...(groups.get(key) ?? []), row]);
   }

@@ -18,31 +18,48 @@ function tipPosition(box: DOMRect): CSSProperties {
 }
 
 /**
- * Issue #2399 review (finding 7) — an action's icon button whose explanation
- * (the action's label and the exact text it sends, and that it asks first or
- * why it is disabled) reaches the keyboard as well as the pointer. A pointer
- * gets the native `title`; keyboard focus shows the same text as a tooltip
- * drawn over the page (so no card clips it), which the button names as its
- * description, until focus leaves, Escape is pressed or the button is pressed
- * (a pointer press focuses it in some browsers). `unavailable` marks an
- * action the daemon disabled: it is announced as disabled (`aria-disabled`)
- * but keeps its place in the Tab order and its explanation, which a native
- * `disabled` button would lose, and a press does nothing.
+ * Issue #2399 review (findings 7 and 10, audit 1) — an action's icon button
+ * whose explanation (the action's label and the exact text it sends, and that
+ * it asks first or why it is disabled) reaches the pointer and the keyboard
+ * alike. Hovering it or focusing it draws the text as a tooltip over the page
+ * (so no card clips it) until the pointer and focus have both left, Escape is
+ * pressed or the button is pressed; the same text is always the button's
+ * accessible description, so a screen reader reads it with the label whether
+ * the tooltip is drawn or not. There is no native `title`, which would draw a
+ * second tooltip over this one. `unavailable` marks an action the daemon
+ * disabled: it is announced as disabled (`aria-disabled`) but keeps its place
+ * in the Tab order and its explanation, which a native `disabled` button
+ * would lose, and a press does nothing.
  */
-export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, onBlur, onKeyDown, ...button }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, "disabled" | "title" | "type"> & {
-  /** The explanation: the native hover's text and the tooltip's. */
+export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, onBlur, onKeyDown, onMouseEnter, onMouseLeave, ...button }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, "disabled" | "title" | "type"> & {
+  /** The explanation: the tooltip's text and the button's accessible description. */
   tip: string;
   unavailable?: boolean;
 }) {
   const id = useId();
   const [at, setAt] = useState<CSSProperties | undefined>(undefined);
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const place = (target: HTMLButtonElement) => setAt(tipPosition(target.getBoundingClientRect()));
   const show = (event: FocusEvent<HTMLButtonElement>) => {
     onFocus?.(event);
-    setAt(tipPosition(event.currentTarget.getBoundingClientRect()));
+    setFocused(true);
+    place(event.currentTarget);
   };
   const hide = (event: FocusEvent<HTMLButtonElement>) => {
     onBlur?.(event);
-    setAt(undefined);
+    setFocused(false);
+    if (!hovered) setAt(undefined);
+  };
+  const enter = (event: MouseEvent<HTMLButtonElement>) => {
+    onMouseEnter?.(event);
+    setHovered(true);
+    place(event.currentTarget);
+  };
+  const leave = (event: MouseEvent<HTMLButtonElement>) => {
+    onMouseLeave?.(event);
+    setHovered(false);
+    if (!focused) setAt(undefined);
   };
   const key = (event: KeyboardEvent<HTMLButtonElement>) => {
     onKeyDown?.(event);
@@ -61,15 +78,19 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
       <button
         {...button}
         type="button"
-        title={tip}
         aria-disabled={unavailable ? true : undefined}
-        aria-describedby={at ? id : undefined}
+        aria-describedby={id}
+        data-tip={tip}
         onFocus={show}
         onBlur={hide}
+        onMouseEnter={enter}
+        onMouseLeave={leave}
         onKeyDown={key}
         onClick={press}
       />
-      {at && createPortal(<div id={id} role="tooltip" className="action-tip" style={at}>{tip}</div>, document.body)}
+      {/* The description lives outside the card, so it is never part of the card's own text. */}
+      {createPortal(<span id={id} hidden>{tip}</span>, document.body)}
+      {at && createPortal(<div role="tooltip" className="action-tip" data-testid="action-tip" style={at}>{tip}</div>, document.body)}
     </>
   );
 }
