@@ -474,6 +474,8 @@ mod tests {
                 "stop_agent".to_string(),
                 "generate_config".to_string(),
                 "close_orchestration".to_string(),
+                "retry_inbox_message".to_string(),
+                "cancel_inbox_message".to_string(),
                 "set_overview_mode".to_string(),
                 "show_agent_card".to_string(),
                 "next_agent_card".to_string(),
@@ -598,6 +600,8 @@ mod tests {
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",
+                "retry_inbox_message",
+                "cancel_inbox_message",
                 "set_overview_mode",
                 "show_agent_card",
                 "next_agent_card",
@@ -843,6 +847,9 @@ mod tests {
                 ("stop_agent".to_string(), false),
                 ("generate_config".to_string(), false),
                 ("close_orchestration".to_string(), false),
+                // Issue #2148: Retry and Cancel on a deck message, on the Daemons screen only.
+                ("retry_inbox_message".to_string(), true),
+                ("cancel_inbox_message".to_string(), true),
                 ("set_overview_mode".to_string(), false),
                 ("show_agent_card".to_string(), false),
                 ("next_agent_card".to_string(), false),
@@ -935,6 +942,9 @@ mod tests {
                 ("stop_agent".to_string(), true),
                 ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), true),
+                // Issue #2148: Retry and Cancel on a deck message, on the Daemons screen only.
+                ("retry_inbox_message".to_string(), false),
+                ("cancel_inbox_message".to_string(), false),
                 // PRD #2374: the agent cards, on the dashboard only.
                 ("set_overview_mode".to_string(), true),
                 ("show_agent_card".to_string(), true),
@@ -1021,6 +1031,9 @@ mod tests {
                 ("stop_agent".to_string(), true),
                 ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), false),
+                // Issue #2148: Retry and Cancel on a deck message, on the Daemons screen only.
+                ("retry_inbox_message".to_string(), false),
+                ("cancel_inbox_message".to_string(), false),
                 ("set_overview_mode".to_string(), false),
                 ("show_agent_card".to_string(), false),
                 ("next_agent_card".to_string(), false),
