@@ -35,7 +35,12 @@ export interface CardActionForm {
   generation: number;
   mode: "add" | "edit";
   values: CardActionFormValues;
-  /** The action as listed when its form opened (edit). */
+  /**
+   * The action as the editor last read it (edit): as listed when the form
+   * opened, then as a Refresh read it. A Save sends it as the edit's `base`,
+   * so the daemon refuses the save when the file's action is no longer this
+   * one (issue #2399 re-review N5). `undefined` once a read no longer lists it.
+   */
   original?: EditableCardAction;
   /** Why the daemon refused the last Save; the form keeps what was typed. */
   error?: string;
@@ -52,11 +57,26 @@ export interface CardActionsEditorView {
   error?: string;
   /** The catalog is being read again, keeping the form (Refresh, or after an edit whose outcome is unknown). */
   refreshing: boolean;
+  /**
+   * The last reading-again of the list, said apart from any write's error
+   * (issue #2399 re-review N3): under way, read, or failed and why. `check`
+   * is the reading-again after an edit whose outcome is unknown.
+   */
+  reread?: CardActionsReread;
   form?: CardActionForm;
   /** The action whose removal the editor is asking to confirm. */
   removing?: EditableCardAction;
   /** An edit is being written. */
   busy: boolean;
+}
+
+/** A reading-again of the list and how it went. */
+export interface CardActionsReread {
+  /** `refresh`: Refresh asked for it; `check`: an edit whose answer was lost did. */
+  kind: "refresh" | "check";
+  status: "reading" | "read" | "failed";
+  /** Why the read failed. */
+  reason?: string;
 }
 
 /** What {@link useCardActionsEditor} hands the overview. */
@@ -168,13 +188,20 @@ export function useCardActionsEditor({ runtime, daemons }: {
   const [catalog, setCatalog] = useState<EditableCardCatalog | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [rereadState, setReread] = useState<CardActionsReread | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
   const [form, setForm] = useState<CardActionForm | undefined>(undefined);
   const [removing, setRemoving] = useState<EditableCardAction | undefined>(undefined);
   const [busy, setBusy] = useState(false);
-  /* Which read is current: an answer to an earlier one (another daemon, a
-     closed editor) is dropped. */
+  /* Which daemon's answers count: an answer for an earlier one (another
+     daemon, a closed editor) is dropped. */
   const readSeq = useRef(0);
+  /* Issue #2399 re-review N1: the order of one daemon's answers. Each applied
+     write answer bumps `writeEpoch`, and a read that began before it is
+     dropped, because the write's answer is newer; each reading-again bumps
+     `rereadSeq`, and only the newest one's answer counts. */
+  const writeEpoch = useRef(0);
+  const rereadSeq = useRef(0);
   /* The generation the next form gets: a Save's answer changes only the form
      it was sent from (issue #2399 review 6). */
   const formSeq = useRef(0);
@@ -189,6 +216,8 @@ export function useCardActionsEditor({ runtime, daemons }: {
     setForm(undefined);
     setRemoving(undefined);
     setRefreshing(false);
+    setReread(undefined);
+    rereadSeq.current += 1;
     if (!target || !target.editable || !read) { setLoading(false); return; }
     setLoading(true);
     read(target.deckId).then((answer) => {
@@ -203,20 +232,34 @@ export function useCardActionsEditor({ runtime, daemons }: {
   }, [read]);
 
   /* Read the list again, keeping the form and what it holds: Refresh, and
-     once after an edit whose outcome is unknown. One read, never the edit. */
-  const reread = useCallback((target: CardActionsDaemon, note?: string) => {
+     once after an edit whose outcome is unknown (`check`). One read, never
+     the edit. Its progress and outcome are said on their own line, whatever
+     error a form shows (issue #2399 re-review N3). A newer reading-again
+     supersedes it, and a write answered since it began makes its answer
+     older than the list shown, so it is dropped (N1). An open form's base
+     becomes the action as read, so a Save after Refresh is checked against
+     what the user now sees (N5). */
+  const reread = useCallback((target: CardActionsDaemon, kind: CardActionsReread["kind"]) => {
     if (!read || !target.editable) return;
     const seq = readSeq.current;
+    const mine = ++rereadSeq.current;
+    const epoch = writeEpoch.current;
     setRefreshing(true);
+    setReread({ kind, status: "reading" });
     read(target.deckId).then((answer) => {
-      if (seq !== readSeq.current) return;
+      if (seq !== readSeq.current || mine !== rereadSeq.current) return;
+      setRefreshing(false);
+      if (epoch !== writeEpoch.current) { setReread(undefined); return; }
       setCatalog(answer);
-      setRefreshing(false);
-      if (note === undefined) setError(undefined);
+      if (kind === "refresh") setError(undefined);
+      setReread(kind === "check" ? { kind, status: "read" } : undefined);
+      setForm((current) => (current?.mode === "edit"
+        ? { ...current, original: answer.actions.find((action) => action.name === current.values.name) }
+        : current));
     }, (failure: unknown) => {
-      if (seq !== readSeq.current) return;
+      if (seq !== readSeq.current || mine !== rereadSeq.current) return;
       setRefreshing(false);
-      setError(`${note ? `${note} ` : ""}The card actions could not be read again: ${reason(failure)}`);
+      setReread({ kind, status: "failed", reason: reason(failure) });
     });
   }, [read]);
 
@@ -242,6 +285,9 @@ export function useCardActionsEditor({ runtime, daemons }: {
   const latest = useRef({ open, daemon, catalog, form, removing, busy, shown, refreshing });
   latest.current = { open, daemon, catalog, form, removing, busy, shown, refreshing };
 
+  /* The action of `name` as the editor last read it, the `base` an edit sends; `null`: none. */
+  const asRead = (name: string): EditableCardAction | null => latest.current.catalog?.actions.find((action) => action.name === name) ?? null;
+
   /*
    * Send one edit to the daemon shown. `onDone` runs with its answer;
    * `onFailed` with the reason and whether the edit may have been saved
@@ -253,9 +299,11 @@ export function useCardActionsEditor({ runtime, daemons }: {
     if (!target || !write) return;
     const seq = readSeq.current;
     setBusy(true);
+    setReread(undefined);
     write(target.deckId, edit).then((answer) => {
       setBusy(false);
       if (seq !== readSeq.current) return;
+      writeEpoch.current += 1;
       setCatalog(answer);
       setError(undefined);
       onDone?.();
@@ -264,7 +312,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
       if (seq !== readSeq.current) return;
       const unknown = outcomeUnknown(failure);
       onFailed(reason(failure), unknown);
-      if (unknown) reread(target, "");
+      if (unknown) reread(target, "check");
     });
   }, [reread, write]);
 
@@ -333,9 +381,9 @@ export function useCardActionsEditor({ runtime, daemons }: {
 
   const unknown = (wanted: { name?: string; label?: string }) => `No single card action is called "${displayText(wanted.label ?? wanted.name ?? "", DISPLAY_LIMITS.name)}" in the editor.`;
 
-  /* What a failed Remove, Hide or Restore says: it was not done (a refusal), or it may have been. */
+  /* What a failed Remove, Hide or Restore says: it was not done (a refusal), or it may have been; the reading-again says the rest. */
   const outcome = (label: string, done: string) => (why: string, unsure: boolean) => setError(unsure
-    ? `${displayText(label, DISPLAY_LIMITS.name)} may have been ${done}: ${why} The list below was read again; check it before trying again.`
+    ? `${displayText(label, DISPLAY_LIMITS.name)} may have been ${done}: ${why}`
     : `${displayText(label, DISPLAY_LIMITS.name)} was not ${done}: ${why}`);
 
   const controls: Pick<VoiceActionContext, CardActionsEditorMember> = {
@@ -344,7 +392,9 @@ export function useCardActionsEditor({ runtime, daemons }: {
       if (!latest.current.open) return NOT_OPEN;
       if (latest.current.removing) { setRemoving(undefined); return undefined; }
       readSeq.current += 1;
+      rereadSeq.current += 1;
       pending.current = undefined;
+      setReread(undefined);
       setOpen(false);
       setCatalog(undefined);
       setForm(undefined);
@@ -369,7 +419,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
       if (!now.open) return NOT_OPEN;
       if (!now.daemon?.editable) return readOnly(displayText(now.daemon?.name ?? "This", DISPLAY_LIMITS.name));
       if (!now.catalog) { load(now.daemon); return undefined; }
-      reread(now.daemon);
+      reread(now.daemon, "refresh");
       return undefined;
     },
     addCardAction: () => {
@@ -400,7 +450,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
       if (!action) return NOT_ASKING;
       if (latest.current.busy) return STILL_SAVING;
       setRemoving(undefined);
-      send({ kind: "remove", name: action.name }, outcome(action.label, "removed"), () => {
+      send({ kind: "remove", name: action.name, base: asRead(action.name) }, outcome(action.label, "removed"), () => {
         setForm((current) => (current?.original?.name === action.name ? undefined : current));
       });
       return undefined;
@@ -409,14 +459,14 @@ export function useCardActionsEditor({ runtime, daemons }: {
       const action = listed.actions.find((candidate) => candidate.name === name);
       if (!action?.default) return unknown({ name });
       if (latest.current.busy) return STILL_SAVING;
-      send({ kind: "hide", name }, outcome(action.label, "hidden"));
+      send({ kind: "hide", name, base: action }, outcome(action.label, "hidden"));
       return undefined;
     }),
     restoreCardAction: (name) => editing((listed) => {
       const action = listed.actions.find((candidate) => candidate.name === name);
       if (!action?.default) return unknown({ name });
       if (latest.current.busy) return STILL_SAVING;
-      send({ kind: "restore", name }, outcome(action.label, "restored"), () => {
+      send({ kind: "restore", name, base: action }, outcome(action.label, "restored"), () => {
         setForm((current) => (current?.original?.name === name ? undefined : current));
       });
       return undefined;
@@ -426,11 +476,13 @@ export function useCardActionsEditor({ runtime, daemons }: {
       if (!current) return NO_FORM;
       if (latest.current.busy) return STILL_SAVING;
       if (!latest.current.daemon?.editable) return readOnly(displayText(latest.current.daemon?.name ?? "This", DISPLAY_LIMITS.name));
-      const edit: CardCatalogEdit = { kind: current.mode === "add" ? "add" : "update", action: formInput(current) };
+      const edit: CardCatalogEdit = current.mode === "add"
+        ? { kind: "add", action: formInput(current) }
+        : { kind: "update", action: formInput(current), base: current.original ?? null };
       const sentFrom = current.generation;
       const ours = (now: CardActionForm | undefined) => now !== undefined && now.generation === sentFrom;
       setForm({ ...current, error: undefined });
-      send(edit, (why, unsure) => setForm((now) => (ours(now) ? { ...now!, error: unsure ? `This may have been saved: ${why} The list below was read again; check it before saving again.` : why } : now)), () => setForm((now) => (ours(now) ? undefined : now)));
+      send(edit, (why, unsure) => setForm((now) => (ours(now) ? { ...now!, error: unsure ? `This may have been saved: ${why}` : why } : now)), () => setForm((now) => (ours(now) ? undefined : now)));
       return undefined;
     },
     cancelCardActionForm: () => {
@@ -453,8 +505,8 @@ export function useCardActionsEditor({ runtime, daemons }: {
   }, []);
 
   const view = useMemo<CardActionsEditorView | undefined>(() => (open && shown && daemon
-    ? { daemons, daemon, ...(catalog ? { catalog } : {}), loading, refreshing, ...(error ? { error } : {}), ...(form ? { form } : {}), ...(removing ? { removing } : {}), busy }
-    : undefined), [busy, catalog, daemon, daemons, error, form, loading, open, refreshing, removing, shown]);
+    ? { daemons, daemon, ...(catalog ? { catalog } : {}), loading, refreshing, ...(rereadState ? { reread: rereadState } : {}), ...(error ? { error } : {}), ...(form ? { form } : {}), ...(removing ? { removing } : {}), busy }
+    : undefined), [busy, catalog, daemon, daemons, error, form, loading, open, refreshing, rereadState, removing, shown]);
 
   return { shown, view, controls, setField };
 }

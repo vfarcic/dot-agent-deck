@@ -989,8 +989,14 @@ export interface CardActionInput {
 
 /** One change the card actions editor asks a daemon to make to its user catalog. */
 export type CardCatalogEdit =
-  | { kind: "add" | "update"; action: CardActionInput }
-  | { kind: "remove" | "hide" | "restore"; name: string };
+  | { kind: "add"; action: CardActionInput }
+  /*
+   * Issue #2399 re-review N5: `base` is the action as the editor read it
+   * (`null`: it read none); the daemon refuses an edit whose base is not the
+   * file's action of that name any more. Left out, the daemon does not check.
+   */
+  | { kind: "update"; action: CardActionInput; base?: EditableCardAction | null }
+  | { kind: "remove" | "hide" | "restore"; name: string; base?: EditableCardAction | null };
 
 /**
  * Issue #2399 — one card a batch names, in the daemon's own words: its pane

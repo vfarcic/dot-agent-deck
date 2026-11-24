@@ -2,7 +2,7 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { RefreshCw, X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
-import type { CardActionFormValues, CardActionPlacement, CardActionsEditor, CardActionsEditorView } from "../hooks/useCardActionsEditor";
+import type { CardActionFormValues, CardActionPlacement, CardActionsEditor, CardActionsEditorView, CardActionsReread } from "../hooks/useCardActionsEditor";
 import { CardActionIcon, CARD_ICON_NAMES, cardIconName, GENERIC_CARD_ICON, searchCardIcons } from "../lib/cardIcons";
 import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
@@ -79,6 +79,7 @@ export function AgentCardActionsEditor({ view, editor }: { view: CardActionsEdit
           {daemon.editable && view.loading && <p role="status">Reading {daemonName}'s card actions…</p>}
           {notice && <p className="card-actions-editor-notice" role="status" data-testid="agent-card-actions-editor-notice">{displayText(notice, DISPLAY_LIMITS.message)}</p>}
           {view.error && !form?.error && <p className="card-actions-editor-error" role="alert">{view.error}</p>}
+          {view.reread && <RereadNote reread={view.reread} />}
           {daemon.editable && catalog && (
             <>
               {catalog.user_config && <p className="card-actions-editor-file">Saved in <code>{displayText(catalog.user_config, DISPLAY_LIMITS.detail)}</code> on {daemonName}'s machine.</p>}
@@ -102,6 +103,29 @@ export function AgentCardActionsEditor({ view, editor }: { view: CardActionsEdit
       </section>
       {removing && <RemoveConfirm action={removing} daemonName={daemonName} busy={view.busy} controls={controls} />}
     </div>
+  );
+}
+
+/**
+ * Issue #2399 re-review N3 — how reading the list again went, said on its own
+ * line whatever error the form shows: under way and read only after an edit
+ * whose outcome is unknown (Refresh says it on its button), failed for either.
+ * "Read again" is said only once a read has answered; what the form holds is
+ * kept, and Refresh stays offered.
+ */
+function RereadNote({ reread }: { reread: CardActionsReread }) {
+  if (reread.status === "failed") {
+    return (
+      <p className="card-actions-editor-error" role="alert" data-testid="agent-card-actions-editor-reread">
+        {reread.kind === "check" ? "Whether the change was saved is not known yet: the" : "The"} card actions could not be read again: {reread.reason} What the form holds is kept; press Refresh to try again.
+      </p>
+    );
+  }
+  if (reread.kind === "refresh") return null;
+  return (
+    <p className="card-actions-editor-notice" role="status" data-testid="agent-card-actions-editor-reread">
+      {reread.status === "reading" ? "Reading the list again to see whether the change was saved…" : "The list below was read again; check it before saving again."}
+    </p>
   );
 }
 

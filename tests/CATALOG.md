@@ -15777,7 +15777,7 @@ The desktop app's card actions editor (PRD #2374 decision 2026-11-24, issue #239
 - **Layer:** L2 headless daemon, lane 1.
 - **Agent:** none.
 - **Asserts:** after the editor's read, another writer changes the user's `explain` prompt and hides `merge` in the file; an update of `explain`, a remove of `explain` and a restore of `merge`, each carrying the action as read in `base`, are refused with a reason saying it changed since the editor read it and naming Refresh, and the file stays byte for byte as the other writer left it; after a fresh read the same update, with the new `base`, is saved and the other writer's hide is kept (issue #2399 re-review N5).
-- **Does not assert:** the cross-process lock between two cooperating writers (the `card_catalog` unit test `a_catalog_edit_and_config_set_interleaved_after_their_reads_both_land`); the desktop's Refresh offer (`desktop/agent-cards/057`).
+- **Does not assert:** the cross-process lock between two cooperating writers (the `card_catalog` unit test `a_catalog_edit_and_config_set_interleaved_after_their_reads_both_land`); the desktop's Refresh offer (`desktop/agent-cards/079`).
 - **Platform coverage:** mac+linux.
 
 #### agent-report/live
@@ -17627,6 +17627,27 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop browser (production build, `vite preview`).
 - **Asserts:** a root with agents under it, given a long name, Needs you, a long status and five actions, shows at least 48 px of its name, draws its status whole inside its line, draws the roll-up and, to its right in the bottom row, three icons and `+2`; every header and bottom-row control is inside the card and none overlaps another; Close can be pressed and `+2` opens the overlay; the page never scrolls sideways (issue #2399 review 2).
 - **Does not assert:** other widths.
+
+##### desktop/agent-cards/077 — A read that began before a newer write or read answers is dropped.
+
+- **Test:** vitest `desktop/agent-cards/077: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** desktop overview (jsdom), a catalog bridge whose reads answer the catalog as it was when asked, settled when the test says.
+- **Asserts:** a Refresh still out when a Hide is sent, answered after the hide's answer with the list from before the hide, leaves the action hidden, and the Refresh is over; of two reads of one daemon (a Refresh, then the check after an edit whose answer was lost), the newer answering first and the older last leaves the newer's list; nothing is sent again (issue #2399 re-review N1).
+- **Does not assert:** reads of two daemons (067).
+
+##### desktop/agent-cards/078 — A failed reading-again after an uncertain save is shown beside the form's message.
+
+- **Test:** vitest `desktop/agent-cards/078: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** desktop overview (jsdom), a catalog bridge that answers when the test says.
+- **Asserts:** a Save whose answer is lost keeps the form's "may have been saved" message and the typed label; while the list is read again the editor says it is reading it, and nothing says it was read again; that read failing shows its reason in an alert of its own, saying whether the change was saved is not known, beside the form's message; the draft is kept and Refresh stays enabled; a Refresh that then reads the list clears the failure; one edit is sent (issue #2399 re-review N3).
+- **Does not assert:** a real lost answer from a daemon.
+
+##### desktop/agent-cards/079 — An edit carries the action as the editor read it, and Refresh brings that up to date.
+
+- **Test:** vitest `desktop/agent-cards/079: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`; `055`, `056`, `058` and `067` also check each edit's `base`.
+- **Layer:** desktop overview (jsdom), a catalog bridge that answers when the test says.
+- **Asserts:** a Save of an edited action sends the action as listed as `base`; the daemon's refusal that it changed since the editor read it is shown in the form, naming Refresh, with the typed label kept; Refresh lists the other writer's text and keeps the draft, and the next Save sends the action as just read as `base`; Remove, Hide and Restore send the listed action as `base` (issue #2399 re-review N5).
+- **Does not assert:** the daemon's refusal itself (`agent-report/catalog-edit/005`).
 
 ## Desktop native driver scenarios
 
