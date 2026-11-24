@@ -2531,7 +2531,7 @@ describe("DeckShell", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
     await waitFor(() => expect(railEntries()).toEqual([
-      "Dashboard", "Daemons", "Projects", "Prompts", "Orchestrations", "Agent Profiles", "Settings",
+      "Dashboard", "Daemons", "Projects", "Orchestrations", "Agent Profiles", "Settings",
     ]));
   });
 

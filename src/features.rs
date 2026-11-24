@@ -143,15 +143,6 @@ pub fn show_desktop_projects() -> bool {
     experimental_enabled()
 }
 
-/// Production wrapper for the desktop app's **Prompts** library (issue
-/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
-/// show_desktop_prompts` finds every gate at graduation — see the
-/// `graduate-desktop-prompts` issue. A presentation switch, carried to the
-/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
-pub fn show_desktop_prompts() -> bool {
-    experimental_enabled()
-}
-
 /// Production wrapper for the desktop app's **Orchestrations** surface (issue
 /// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
 /// show_desktop_orchestrations` finds every gate at graduation — see the

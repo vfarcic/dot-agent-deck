@@ -878,9 +878,6 @@ impl VoiceOutcome {
         }
     }
 
-    /// The action exists and needs names the voice settings withhold (PRD
-    /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
-    /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
     /// Issue #1198 — a pick of the row whose screen the experimental flag
     /// hides, refused with [`DECK_HIDDEN_HINT`] rather than dispatched.
     fn hidden_by_flag(transcript: Transcript, row: &CommandRow) -> Self {
@@ -912,6 +909,9 @@ impl VoiceOutcome {
         }
     }
 
+    /// The action exists and needs names the voice settings withhold (PRD
+    /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
+    /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
     fn labels_withheld(transcript: Transcript, row: &CommandRow) -> Self {
         Self::Unavailable {
             sentence: format!("Not here — {LABELS_WITHHELD_HINT}."),
@@ -19201,7 +19201,7 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "<span>Open daemons</span>",
+            source: "aria-label=\"Open daemons\"",
             file: AGENT_OVERVIEW_TSX,
             said: "Open daemons",
             row: "open_deck",
