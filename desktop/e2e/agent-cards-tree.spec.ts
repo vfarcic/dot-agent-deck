@@ -763,7 +763,7 @@ test.describe("desktop/agent-cards/061 — card action icons and the card action
       await expectNoSidewaysScroll(page);
     });
 
-    /// Scenario: At this width, press Card actions on the Cards view. The editor lists the deck's Go ahead and Merge it as deck actions; adding Deploy it with its text over two lines and the rocket chosen from the searched icon grid lists it as the user's, and the editor fits the window with no sideways scroll.
+    /// Scenario: At this width, press Card actions on the Cards view. The editor lists the deck's Go ahead and Merge it, each visibly labelled as the deck's; adding Deploy it with its text over two lines and the rocket chosen from the searched icon grid lists it, visibly labelled, as the user's, and the editor fits the window with no sideways scroll.
     test(`the card actions editor adds an action chosen with the icon picker at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
       await openCardsTree(page);
@@ -773,6 +773,12 @@ test.describe("desktop/agent-cards/061 — card action icons and the card action
       const row = (name: string) => editor.locator(`[data-testid="agent-card-actions-editor-row"][data-action="${name}"]`);
       await expect(row("go-ahead")).toHaveAttribute("data-source", "deck");
       await expect(row("merge")).toHaveAttribute("data-source", "deck");
+      // The source is shown, in words, not only carried as an attribute.
+      for (const name of ["go-ahead", "merge"]) {
+        const source = row(name).getByTestId("agent-card-actions-editor-source");
+        await expect(source).toBeVisible();
+        await expect(source).toHaveText(/\bdeck\b/i);
+      }
       await editor.getByRole("button", { name: "Add action" }).click();
       await editor.getByLabel("Name", { exact: true }).fill("deploy");
       await editor.getByLabel("Label", { exact: true }).fill("Deploy it");
@@ -785,10 +791,79 @@ test.describe("desktop/agent-cards/061 — card action icons and the card action
       await editor.getByRole("button", { name: "Save" }).click();
       await expect(row("deploy")).toHaveAttribute("data-source", "user");
       await expect(row("deploy")).toContainText("Deploy it");
+      const added = row("deploy").getByTestId("agent-card-actions-editor-source");
+      await expect(added).toBeVisible();
+      await expect(added).toHaveText(/\b(yours|user)\b/i);
       const box = await editor.boundingBox();
       expect(box).not.toBeNull();
       expect(box!.x).toBeGreaterThanOrEqual(-TOLERANCE);
       expect(box!.x + box!.width).toBeLessThanOrEqual(width + TOLERANCE);
+      await expectNoSidewaysScroll(page);
+    });
+    /// Scenario: At this width, give a card five prompt actions with long labels, one asking first and one the daemon disabled. The card draws three icons, a `+2` and Close, none overlapping another and all inside the card; Tab reaches each icon, and focus on one shows a tooltip with its label and exact text — the disabled one saying why — while `+2` opens the overlay listing all five and Close stays pressable; the page never scrolls sideways.
+    test(`three icons, +2 and Close fit a card and each icon explains itself on keyboard focus at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await openCardsTree(page);
+      await pushCards(page, `
+        const bench = byName("bench");
+        const offered = (id, label, extra) => Object.assign({ id, label, kind: "prompt", prompt: "FIVE-BROWSER-2399 " + id + ": do it, then update your card.", prompt_source: "catalog", text_input: false,
+          confirm: false, confirm_detail: null, icon: null, placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: "tok-" + id }, extra);
+        bench.actions = [
+          offered("a1", "A long first action label that will not fit"),
+          offered("a2", "Deploy it", { confirm: true, icon: "rocket" }),
+          offered("a3", "Ship it", { enabled: false, disabled_reason: "agent_stopped", icon: "ship" }),
+          offered("a4", "Fourth"),
+          offered("a5", "Fifth"),
+          ...bench.actions,
+        ];
+      `);
+      const card = await cardNamed(page, "bench");
+      const icons = card.getByTestId("agent-card-action-icon");
+      await expect(icons).toHaveCount(3);
+      const more = card.getByTestId("agent-card-actions-more");
+      await expect(more).toHaveText("+2");
+      const close = card.getByRole("button", { name: "Close bench" });
+      const boxes = await Promise.all([card, icons.nth(0), icons.nth(1), icons.nth(2), more, close].map((locator) => locator.boundingBox()));
+      const [cardBox, ...controls] = boxes;
+      for (const [at, box] of controls.entries()) {
+        expect(box, `control ${at} is drawn`).not.toBeNull();
+        expect(box!.width, `control ${at} has width`).toBeGreaterThan(0);
+        expect(box!.x, `control ${at} starts inside the card`).toBeGreaterThanOrEqual(cardBox!.x - TOLERANCE);
+        expect(box!.x + box!.width, `control ${at} ends inside the card`).toBeLessThanOrEqual(cardBox!.x + cardBox!.width + TOLERANCE);
+        for (const [other, next] of controls.entries()) {
+          if (other <= at) continue;
+          const apart = box!.x + box!.width <= next!.x + TOLERANCE || next!.x + next!.width <= box!.x + TOLERANCE
+            || box!.y + box!.height <= next!.y + TOLERANCE || next!.y + next!.height <= box!.y + TOLERANCE;
+          expect(apart, `controls ${at} and ${other} do not overlap`).toBe(true);
+        }
+      }
+
+      for (const [label, note] of [["A long first action label that will not fit", undefined], ["Deploy it", /confirm/i], ["Ship it", /not running/]] as const) {
+        const icon = card.getByRole("button", { name: label });
+        await icon.focus();
+        await expect(icon, `${label} takes keyboard focus`).toBeFocused();
+        const tip = page.getByRole("tooltip");
+        await expect(tip).toBeVisible();
+        await expect(tip).toContainText(label);
+        await expect(tip).toContainText("do it, then update your card.");
+        if (note) await expect(tip).toContainText(note);
+        const tipBox = await tip.boundingBox();
+        expect(tipBox!.x, "the tooltip starts inside the window").toBeGreaterThanOrEqual(-TOLERANCE);
+        expect(tipBox!.x + tipBox!.width, "the tooltip ends inside the window").toBeLessThanOrEqual(width + TOLERANCE);
+      }
+      // Tab moves on from an icon to the next control, the disabled icon included.
+      await card.getByRole("button", { name: "Deploy it" }).focus();
+      await page.keyboard.press("Tab");
+      await expect(card.getByRole("button", { name: "Ship it" })).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("tooltip")).toHaveCount(0);
+
+      await close.click({ trial: true });
+      await more.click();
+      const overlay = page.getByTestId("agent-card-overlay");
+      await expect(overlay).toBeVisible();
+      for (const id of ["a1", "a2", "a3", "a4", "a5"]) await expect(overlay.getByTestId(`agent-card-action-${id}`)).toBeVisible();
+      await expect(page.getByTestId("agent-card-action-result")).toHaveCount(0);
       await expectNoSidewaysScroll(page);
     });
   }

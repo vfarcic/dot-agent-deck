@@ -515,13 +515,13 @@ describe("batch card actions (#2399)", () => {
     expect(within(results).getByRole("status")).not.toHaveTextContent(/failed/);
   });
 
-  /// Scenario: Select a closed root whose three cards all list Go ahead with the same text, then open the root's overlay. The selection toolbar's and the overlay's Go ahead are icon buttons named Go ahead, with no text, whose hover says the label and that exact text; with a child whose Go ahead sends other words, the hover says the text differs per agent instead. Pressing an icon still only opens the confirmation.
+  /// Scenario: Select a closed root whose three cards all list Go ahead with the same text, then open the root's overlay. The selection toolbar's and the overlay's Go ahead are icon buttons named Go ahead, with no text, whose hover says the label and that exact text; with a child whose Go ahead sends other words, both surfaces' hover says the text differs per agent instead. An action with the catalog's `git-merge` icon draws it on both surfaces, and one with no icon or an icon the app does not bundle draws the generic icon on both. Pressing an icon still only opens the confirmation.
   it("desktop/agent-cards/051: the selection toolbar's and the overlay's batch buttons are icons with the label and text on hover", async () => {
     const same = action.prompt!;
-    const expectIcon = (button: HTMLElement) => {
+    const expectIcon = (button: HTMLElement, icon = "generic") => {
       expect(button.textContent).toBe("");
       expect(button.querySelector("svg")).not.toBeNull();
-      expect(button).toHaveAttribute("data-icon", "generic");
+      expect(button).toHaveAttribute("data-icon", icon);
       expect(button.title).toContain("Go ahead");
     };
     const calls = setup();
@@ -539,21 +539,50 @@ describe("batch card actions (#2399)", () => {
     const overlayButton = overlayBatchAction("Go ahead");
     expectIcon(overlayButton);
     expect(overlayButton.title).toContain(same);
+    expect(overlayButton.title).not.toMatch(/differs/);
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
     cleanup();
 
-    // A child whose Go ahead sends other words: the hover says so rather than quoting one agent's text.
+    // A child whose Go ahead sends other words: both surfaces' hover says so rather than quoting one agent's text.
     const differing = { ...CHILD, actions: [{ ...action, prompt: "Other words for the child." }] };
-    setup({ entries: [ROOT, differing, STOPPED, OUTSIDE] });
+    const mixedCalls = setup({ entries: [ROOT, differing, STOPPED, OUTSIDE] });
     selectRoot();
     const mixed = selectionAction("Go ahead");
     expectIcon(mixed);
     expect(mixed.title).toMatch(/text differs per agent/);
     expect(mixed.title).not.toContain(same);
     expect(mixed.title).not.toContain("Other words for the child.");
-    expect(calls.invokeCardAction).not.toHaveBeenCalled();
+    fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
+    const mixedOverlay = overlayBatchAction("Go ahead");
+    expectIcon(mixedOverlay);
+    expect(mixedOverlay.title).toMatch(/text differs per agent/);
+    expect(mixedOverlay.title).not.toContain(same);
+    expect(mixedOverlay.title).not.toContain("Other words for the child.");
+    expect(mixedCalls.invokeCardAction).not.toHaveBeenCalled();
+    expect(mixedCalls.invokeCardActionBatch).not.toHaveBeenCalled();
+    cleanup();
+
+    // The icon rule on both surfaces: a known catalog icon draws itself; no icon, or one the app does not bundle, draws the generic icon.
+    const svg = (button: HTMLElement) => button.querySelector("svg")?.outerHTML;
+    const drawn: Record<string, string | undefined> = {};
+    for (const [icon, shown] of [["git-merge", "git-merge"], ["no-such-icon-2399", "generic"], [null, "generic"]] as const) {
+      const withIcon = (one: AgentCardEntry): AgentCardEntry => ({ ...one, actions: one.actions.map((offered) => ({ ...offered, icon })) });
+      setup({ entries: ENTRIES.map(withIcon) });
+      selectRoot();
+      const onToolbar = selectionAction("Go ahead");
+      expectIcon(onToolbar, shown);
+      fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
+      const onOverlay = overlayBatchAction("Go ahead");
+      expectIcon(onOverlay, shown);
+      expect(svg(onOverlay), `${icon}: one drawing on both surfaces`).toBe(svg(onToolbar));
+      drawn[String(icon)] = svg(onToolbar);
+      cleanup();
+    }
+    expect(drawn["no-such-icon-2399"]).toBe(drawn["null"]);
+    expect(drawn["git-merge"]).not.toBe(drawn["null"]);
   });
 
-  /// Scenario: Start a batch whose preview gives the root and the child the same text, then one that also includes an unrelated agent with other text. When every included agent gets the same text, the confirmation quotes it once and then lists the agents that get it; otherwise each distinct text is quoted once, above the agents that get it. Skipped agents keep their reason, and Send still sends exactly the previewed entries.
+  /// Scenario: Start a batch whose preview gives the root and the child the same text, then one that also includes an unrelated agent with other text. When every included agent gets the same text, the confirmation quotes it exactly once and then lists the agents that get it; otherwise every agent is shown with its own exact text, unambiguously, whether quoted per agent or once per group of agents sharing it. Skipped agents keep their reason, and Send still sends exactly the previewed entries.
   it("desktop/agent-cards/052: the confirmation quotes text every agent shares once, with the list of agents", async () => {
     const SAME = "SAME-EXACT-2399: proceed.\nThen report.";
     const OTHER = "OTHER-EXACT-2399: wait for review.";
@@ -570,25 +599,30 @@ describe("batch card actions (#2399)", () => {
     }));
     cleanup();
 
-    // Two texts: each quoted once, above the agents that get it.
+    // Two texts: every agent is shown with its own exact text, unambiguously — a quotation per agent, or one per
+    // group of agents sharing a text; neither the order nor how the quotations are grouped is pinned.
     const outside: BatchEntry = { pane_id: OUTSIDE.pane_id, agent_id: OUTSIDE.agent_id, name: OUTSIDE.name, outcome: "included", prompt: OTHER, action_token: "tok-preview-outside", instance_id: INSTANCE };
     calls = setup({ preview: [shared[0], outside, shared[1], SKIPPED] });
     selectRoot();
     fireEvent.click(card(OUTSIDE).getByRole("checkbox", { name: "Select outside" }));
     await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     dialog = screen.getByTestId("agent-cards-batch-confirm");
-    const quoted = within(dialog).getAllByTestId("agent-cards-batch-prompt");
-    expect(quoted.map((node) => node.textContent)).toEqual([SAME, OTHER]);
-    const groups = within(dialog).getAllByTestId("agent-cards-batch-group");
-    const groupOf = (text: string) => groups.find((group) => within(group).queryAllByTestId("agent-cards-batch-prompt").some((node) => node.textContent === text));
-    const sameGroup = groupOf(SAME);
-    const otherGroup = groupOf(OTHER);
-    expect(sameGroup).toBeDefined();
-    expect(otherGroup).toBeDefined();
-    for (const name of ["root", "child"]) expect(within(sameGroup!).getByText(name, { exact: true })).toBeInTheDocument();
-    expect(within(sameGroup!).queryByText("outside", { exact: true })).toBeNull();
-    expect(within(otherGroup!).getByText("outside", { exact: true })).toBeInTheDocument();
-    expect(within(otherGroup!).queryByText("root", { exact: true })).toBeNull();
+    const quoted = within(dialog).getAllByTestId("agent-cards-batch-prompt").map((node) => node.textContent);
+    expect(new Set(quoted)).toEqual(new Set([SAME, OTHER]));
+    expect(quoted.length, "at most one quotation per included agent").toBeLessThanOrEqual(3);
+    /* The quotation an agent's name is shown with: the nearest enclosing block that holds any quotation must hold exactly one text. */
+    const quotationOf = (name: string) => {
+      let node: HTMLElement | null = within(dialog).getByText(name, { exact: true });
+      while (node && node !== dialog.parentElement) {
+        const texts = new Set(within(node).queryAllByTestId("agent-cards-batch-prompt").map((found) => found.textContent));
+        if (texts.size > 0) return texts;
+        node = node.parentElement;
+      }
+      return new Set<string | null>();
+    };
+    for (const [name, text] of [["root", SAME], ["child", SAME], ["outside", OTHER]] as const) {
+      expect(quotationOf(name), `${name} is shown with exactly its own text`).toEqual(new Set([text]));
+    }
     expect(within(dialog).getByText(SKIPPED.message!)).toBeInTheDocument();
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });

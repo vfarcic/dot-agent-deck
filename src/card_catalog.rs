@@ -2497,4 +2497,305 @@ icon = \"rocket\"
             "{written}"
         );
     }
+
+    /// Issue #2399 review (finding 2): an update is validated exactly as an
+    /// add is — a user action that exists, and a deck default's override,
+    /// each refused with every malformed value — an add of a name the user
+    /// already has is refused, and the largest values the catalog accepts are
+    /// accepted by both, so the editor refuses no more than the file does.
+    #[test]
+    fn an_update_is_validated_as_an_add_is_and_the_limits_are_accepted() {
+        let update = |action: CatalogActionInput| CatalogActionEdit::Update { action };
+        for name in ["ship", "go-ahead"] {
+            let cases: Vec<(&str, CatalogActionInput, &str)> = vec![
+                (
+                    "empty description",
+                    CatalogActionInput {
+                        description: String::new(),
+                        ..input(name)
+                    },
+                    "description",
+                ),
+                (
+                    "over-long description",
+                    CatalogActionInput {
+                        description: "d".repeat(MAX_DESCRIPTION_CHARS + 1),
+                        ..input(name)
+                    },
+                    "description",
+                ),
+                (
+                    "empty prompt",
+                    CatalogActionInput {
+                        prompt: String::new(),
+                        ..input(name)
+                    },
+                    "prompt",
+                ),
+                (
+                    "over-long prompt",
+                    CatalogActionInput {
+                        prompt: "p".repeat(MAX_PROMPT_CHARS + 1),
+                        ..input(name)
+                    },
+                    "prompt",
+                ),
+                (
+                    "control character in the prompt",
+                    CatalogActionInput {
+                        prompt: "Ship\u{1b}[2Jit".into(),
+                        ..input(name)
+                    },
+                    "prompt",
+                ),
+                (
+                    "over-long label",
+                    CatalogActionInput {
+                        label: Some("l".repeat(MAX_CATALOG_LABEL_CHARS + 1)),
+                        ..input(name)
+                    },
+                    "label",
+                ),
+                (
+                    "multi-line label",
+                    CatalogActionInput {
+                        label: Some("Ship\nit".into()),
+                        ..input(name)
+                    },
+                    "label",
+                ),
+                (
+                    "bad icon",
+                    CatalogActionInput {
+                        icon: Some("../../etc".into()),
+                        ..input(name)
+                    },
+                    "icon",
+                ),
+            ];
+            for (case, action, needle) in cases {
+                match apply_action_edit(Some(EDITED_CONFIG), &update(action)) {
+                    Ok(saved) => panic!("{name}: {case}: refused, not written as:\n{saved}"),
+                    Err(reason) => assert!(
+                        reason.to_lowercase().contains(needle),
+                        "{name}: {case}: the reason names {needle:?}: {reason}"
+                    ),
+                }
+            }
+        }
+        for (case, edit, needle) in [
+            ("a bad name", update(input("Ship It")), "ship it"),
+            (
+                "an add of a name the user has",
+                CatalogActionEdit::Add {
+                    action: input("ship"),
+                },
+                "ship",
+            ),
+        ] {
+            match apply_action_edit(Some(EDITED_CONFIG), &edit) {
+                Ok(saved) => panic!("{case}: refused, not written as:\n{saved}"),
+                Err(reason) => assert!(
+                    reason.to_lowercase().contains(needle),
+                    "{case}: the reason names {needle:?}: {reason}"
+                ),
+            }
+        }
+
+        // The largest values the catalog reads are accepted, by an add and by
+        // an update, and read back whole.
+        let largest = |name: &str| CatalogActionInput {
+            label: Some("L".repeat(MAX_CATALOG_LABEL_CHARS)),
+            description: "d".repeat(MAX_DESCRIPTION_CHARS),
+            prompt: format!("{}\n\tend", "p".repeat(MAX_PROMPT_CHARS - 5)),
+            icon: Some("i".repeat(MAX_ICON_CHARS)),
+            ..input(name)
+        };
+        assert_eq!(largest("x").prompt.chars().count(), MAX_PROMPT_CHARS);
+        let added = apply_action_edit(
+            Some(EDITED_CONFIG),
+            &CatalogActionEdit::Add {
+                action: largest("deploy"),
+            },
+        )
+        .expect("an add at every limit is written");
+        let updated = apply_action_edit(Some(&added), &update(largest("ship")))
+            .expect("an update at every limit is written");
+        let resolved = resolve(Some(&updated));
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        for name in ["deploy", "ship"] {
+            let action = resolved.action(name).unwrap();
+            assert_eq!(action.prompt, largest(name).prompt, "{name}");
+            assert_eq!(action.label, "L".repeat(MAX_CATALOG_LABEL_CHARS), "{name}");
+        }
+    }
+
+    const COMMENTED_CONFIG: &str = "\
+[catalog]
+remove = [\"progress\"] # no progress field
+
+[[catalog.fields]]
+# the risk field comment
+name = \"risk\"
+description = \"How risky the change is.\"
+type = \"text\"
+
+[[catalog.actions]]
+# the ship comment
+name = \"ship\"
+description = \"Offer when it is ready.\" # when to ship
+prompt = \"Ship it.\"
+
+[[catalog.actions]]
+# the deploy comment
+name = \"deploy\"
+description = \"Offer when it can be deployed.\"
+prompt = \"Deploy it.\"
+";
+
+    /// Issue #2399 review (finding 3): the writer's destructive paths keep
+    /// what they do not change. Updating an action keeps its own comments and
+    /// its neighbour's; hiding and restoring a default keep a field the user
+    /// removed (`progress`) removed, and every comment; removing an action
+    /// keeps its neighbour's comment and the fields'.
+    #[test]
+    fn update_hide_restore_and_remove_keep_comments_and_an_unrelated_removal() {
+        let kept = |saved: &str, what: &str, comments: &[&str]| {
+            for comment in comments {
+                assert!(
+                    saved.contains(comment),
+                    "{what}: {comment:?} kept:\n{saved}"
+                );
+            }
+            assert_eq!(
+                removed_names(saved).first().map(String::as_str),
+                Some("progress"),
+                "{what}: the field stays removed:\n{saved}"
+            );
+            let resolved = resolve(Some(saved));
+            assert!(resolved.errors.is_empty(), "{what}: {:?}", resolved.errors);
+            assert!(
+                resolved.field("progress").is_none(),
+                "{what}: progress stays hidden"
+            );
+            assert!(
+                resolved.field("risk").is_some(),
+                "{what}: the user's field stays"
+            );
+        };
+        let all = [
+            "remove = [\"progress\"",
+            "# no progress field",
+            "# the risk field comment",
+            "# the ship comment",
+            "# when to ship",
+            "# the deploy comment",
+        ];
+        let updated = apply_action_edit(
+            Some(COMMENTED_CONFIG),
+            &CatalogActionEdit::Update {
+                action: CatalogActionInput {
+                    label: Some("Ship it now".into()),
+                    description: "Offer when it is ready.".into(),
+                    prompt: "Ship it now.".into(),
+                    ..input("ship")
+                },
+            },
+        )
+        .expect("the update is written");
+        kept(&updated, "update", &all);
+        assert_eq!(
+            resolve(Some(&updated)).action("ship").unwrap().prompt,
+            "Ship it now."
+        );
+
+        let overridden = apply_action_edit(
+            Some(&updated),
+            &CatalogActionEdit::Update {
+                action: CatalogActionInput {
+                    prompt: "Carry on.".into(),
+                    ..input("go-ahead")
+                },
+            },
+        )
+        .expect("a default's override is written");
+        kept(&overridden, "override", &all);
+
+        let hidden = apply_action_edit(
+            Some(&overridden),
+            &CatalogActionEdit::Hide {
+                name: "go-ahead".into(),
+            },
+        )
+        .expect("hiding is written");
+        kept(&hidden, "hide", &all);
+        assert_eq!(removed_names(&hidden), ["progress", "go-ahead"], "{hidden}");
+
+        let restored = apply_action_edit(
+            Some(&hidden),
+            &CatalogActionEdit::Restore {
+                name: "go-ahead".into(),
+            },
+        )
+        .expect("restoring is written");
+        kept(&restored, "restore", &all);
+        assert_eq!(removed_names(&restored), ["progress"], "{restored}");
+        assert_eq!(
+            resolve(Some(&restored)).action("go-ahead").unwrap().source,
+            CatalogSource::Default
+        );
+
+        let removed = apply_action_edit(
+            Some(&restored),
+            &CatalogActionEdit::Remove {
+                name: "ship".into(),
+            },
+        )
+        .expect("removing is written");
+        kept(
+            &removed,
+            "remove",
+            &[
+                "# no progress field",
+                "# the risk field comment",
+                "# the deploy comment",
+            ],
+        );
+        assert!(resolve(Some(&removed)).action("ship").is_none());
+    }
+
+    /// Issue #2399 review (finding 4): a user config the daemon cannot read
+    /// for a reason of the file system — here its path is a directory, which
+    /// opens and then fails to read — is refused for an edit with the reason,
+    /// and nothing is put in its place; a read still answers, the deck
+    /// defaults with the problem in `errors`.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_the_file_system_will_not_read_is_refused_and_never_replaced() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("inside"), "kept").unwrap();
+        let refused = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("ship"),
+            }),
+        )
+        .expect_err("an edit of a file that cannot be read is refused");
+        assert!(refused.contains("could not be read"), "{refused}");
+        assert!(path.is_dir(), "nothing replaced it");
+        assert_eq!(
+            std::fs::read_to_string(path.join("inside")).unwrap(),
+            "kept"
+        );
+        let read = edit_user_catalog_at(&path, None).expect("a read still answers");
+        assert_eq!(read.actions.len(), default_actions().len());
+        assert!(
+            read.errors.iter().any(|e| e.contains("could not be read")),
+            "{:?}",
+            read.errors
+        );
+        assert!(path.is_dir(), "a read writes nothing");
+    }
 }

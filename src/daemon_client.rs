@@ -7595,13 +7595,18 @@ mod tests {
     /// `agent-cards-catalog-edit`, and the card-action editor's request (a
     /// read or an edit) goes only on a connection whose `Hello` named it and
     /// `hello-follow-on`: against a daemon that names neither, only one, or
-    /// the cards capabilities without it, the call answers Unsupported and
-    /// nothing follows the Hello. Against one that names both, exactly the
-    /// one `card-catalog-edit` request follows, carrying the edit as given.
+    /// the cards capabilities without it, the call answers
+    /// [`GatedQuery::Unsupported`] itself — not some other error — and nothing
+    /// follows the Hello. Against one that names both, exactly the one
+    /// `card-catalog-edit` request follows, carrying the edit as given, and
+    /// the daemon's populated answer comes back whole: each action's source
+    /// and flags, the catalog's problems and the file it names. A refusal
+    /// comes back as [`ClientError::Server`] carrying the daemon's reason
+    /// unchanged (issue #2399 review, finding 12).
     #[cfg(unix)]
     #[test]
     fn a_catalog_edit_is_sent_only_to_a_daemon_that_advertises_it() {
-        use crate::card_catalog::{CatalogActionEdit, CatalogActionInput};
+        use crate::card_catalog::{CatalogActionEdit, CatalogActionInput, CatalogSource};
         use crate::daemon_protocol::{
             CAP_AGENT_CARDS, CAP_AGENT_CARDS_BATCH, CAP_AGENT_CARDS_CATALOG_EDIT,
             CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON, DAEMON_CAPABILITIES,
@@ -7616,6 +7621,8 @@ mod tests {
                 ..Default::default()
             },
         };
+        const REASON: &str =
+            "catalog.actions \"Ship It\": bad name; use 1 to 40 lowercase letters, digits and '-'";
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -7635,8 +7642,11 @@ mod tests {
                 Some(&[CAP_AGENT_CARDS_CATALOG_EDIT][..]),
             ] {
                 for edit in [None, Some(add.clone())] {
-                    let (answered, sent) = catalog_edit_request(advertised, edit).await;
-                    assert!(!answered, "{advertised:?}: Unsupported");
+                    let (result, sent) = catalog_edit_request(advertised, edit, None).await;
+                    assert!(
+                        matches!(result, Ok(GatedQuery::Unsupported)),
+                        "{advertised:?}: Unsupported, not {result:?}"
+                    );
                     assert!(
                         sent.is_empty(),
                         "{advertised:?}: nothing follows the Hello: {sent:?}"
@@ -7644,31 +7654,75 @@ mod tests {
                 }
             }
             let both = Some(&[CAP_AGENT_CARDS_CATALOG_EDIT, CAP_HELLO_FOLLOW_ON][..]);
-            let (answered, sent) = catalog_edit_request(both, None).await;
-            assert!(answered);
+            let (result, sent) = catalog_edit_request(both, None, None).await;
+            let Ok(GatedQuery::Answered(catalog)) = result else {
+                panic!("a read is answered: {result:?}");
+            };
             assert_eq!(sent.len(), 1, "{sent:?}");
             assert_eq!(sent[0]["op"], "card-catalog-edit");
             assert!(
                 sent[0].get("edit").is_none_or(|edit| edit.is_null()),
                 "a read carries no edit: {sent:?}"
             );
-            let (answered, sent) = catalog_edit_request(both, Some(add.clone())).await;
-            assert!(answered);
+            // The populated answer, read whole.
+            assert_eq!(
+                catalog
+                    .actions
+                    .iter()
+                    .map(|a| (
+                        a.action.name.as_str(),
+                        a.action.source,
+                        a.default,
+                        a.overridden,
+                        a.hidden
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    ("go-ahead", CatalogSource::User, true, true, false),
+                    ("merge", CatalogSource::Default, true, false, true),
+                    ("ship", CatalogSource::User, false, false, false),
+                ]
+            );
+            let ship = &catalog.actions[2].action;
+            assert_eq!(ship.label, "Ship it");
+            assert_eq!(ship.prompt, "Ship it.\nThen update your card.");
+            assert_eq!(ship.icon.as_deref(), Some("rocket"));
+            assert!(ship.confirm && !ship.always);
+            assert_eq!(catalog.errors, ["catalog.fields \"risk\": an unknown type"]);
+            assert_eq!(
+                catalog.user_config.as_deref(),
+                Some("/srv/deck/config.toml")
+            );
+
+            let (result, sent) = catalog_edit_request(both, Some(add.clone()), None).await;
+            assert!(matches!(result, Ok(GatedQuery::Answered(_))), "{result:?}");
             assert_eq!(sent.len(), 1, "{sent:?}");
             assert_eq!(sent[0]["op"], "card-catalog-edit");
             assert_eq!(sent[0]["edit"], serde_json::to_value(&add).unwrap());
+
+            let (result, sent) = catalog_edit_request(both, Some(add.clone()), Some(REASON)).await;
+            match result {
+                Err(ClientError::Server(reason)) => assert_eq!(reason, REASON),
+                other => panic!("a refusal is the daemon's reason: {other:?}"),
+            }
+            assert_eq!(sent.len(), 1, "the edit was sent once: {sent:?}");
         });
     }
 
     /// The card-action editor's request against a fake daemon whose `Hello`
-    /// advertises `advertised`: whether it was answered, and every request
-    /// that followed the Hello. The answer is written as raw JSON, so the fake
-    /// needs nothing of the response the daemon will send but its key.
+    /// advertises `advertised`: what the call returned, and every request
+    /// that followed the Hello. The daemon answers a populated catalog, or
+    /// refuses with `refuse`. The answer is written as raw JSON, so the fake
+    /// pins the wire the daemon sends, not the client's own types.
     #[cfg(unix)]
     async fn catalog_edit_request(
         advertised: Option<&'static [&'static str]>,
         edit: Option<crate::card_catalog::CatalogActionEdit>,
-    ) -> (bool, Vec<serde_json::Value>) {
+        refuse: Option<&'static str>,
+    ) -> (
+        Result<GatedQuery<crate::card_catalog::EditableCardCatalog>, ClientError>,
+        Vec<serde_json::Value>,
+    ) {
         let (_dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let dir = tempfile::tempdir().unwrap();
@@ -7701,11 +7755,23 @@ mod tests {
                         .unwrap()
                     } else {
                         recorded.lock().unwrap().push(request.clone());
-                        let mut ok = serde_json::to_value(AttachResponse::ok()).unwrap();
-                        if op == "card-catalog-edit" {
-                            ok["card_catalog_edit"] = serde_json::json!({"actions": [], "errors": [], "user_config": null});
+                        if let Some(reason) = refuse.filter(|_| op == "card-catalog-edit") {
+                            serde_json::to_value(AttachResponse::err(reason)).unwrap()
+                        } else {
+                            let mut ok = serde_json::to_value(AttachResponse::ok()).unwrap();
+                            if op == "card-catalog-edit" {
+                                ok["card_catalog_edit"] = serde_json::json!({
+                                    "actions": [
+                                        {"name": "go-ahead", "label": "Go ahead", "description": "Offer when you may continue.", "prompt": "Proceed.", "icon": "play", "placement": "card", "confirm": false, "always": false, "source": "user", "default": true, "overridden": true, "hidden": false},
+                                        {"name": "merge", "label": "Merge it", "description": "Offer when your work is ready to merge.", "prompt": "Merge it.", "icon": "git-merge", "placement": "card", "confirm": false, "always": false, "source": "default", "default": true, "overridden": false, "hidden": true},
+                                        {"name": "ship", "label": "Ship it", "description": "Offer when it is ready.", "prompt": "Ship it.\nThen update your card.", "icon": "rocket", "placement": "card", "confirm": true, "always": false, "source": "user", "default": false, "overridden": false, "hidden": false},
+                                    ],
+                                    "errors": ["catalog.fields \"risk\": an unknown type"],
+                                    "user_config": "/srv/deck/config.toml",
+                                });
+                            }
+                            ok
                         }
-                        ok
                     };
                     let bytes = serde_json::to_vec(&response).unwrap();
                     if crate::daemon_protocol::write_frame(
@@ -7722,13 +7788,10 @@ mod tests {
             }
         });
         let client = DaemonClient::new(path);
-        let answered = matches!(
-            client.card_catalog_edit(edit).await,
-            Ok(GatedQuery::Answered(_))
-        );
+        let result = client.card_catalog_edit(edit).await;
         server.abort();
         let sent = sent.lock().unwrap().clone();
-        (answered, sent)
+        (result, sent)
     }
 
     /// Issue #2418 (T8) — [`tree_gate`] keeps the tree fields from a daemon

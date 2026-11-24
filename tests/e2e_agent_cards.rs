@@ -624,89 +624,106 @@ fn agent_report_catalog_edit_002_hide_override_and_restore_a_default() {
     );
 }
 
-/// Scenario: Send the editor's request with edits the catalog refuses or that cannot apply — a bad or reserved name, an empty description, an over-long prompt, a bad icon, an unknown key such as a file path or a command, an unknown kind of edit, adding over a default, removing a default, hiding or restoring a name that is no default. Each is answered with a reason naming the problem, and the user config and the catalog stay exactly as they were.
+/// Scenario: Send the editor's request with edits the catalog refuses or that cannot apply — through an add and through an update of the user's existing `explain`: a bad or reserved name, an empty description, an over-long prompt or label, a bad icon or placement, an unknown key such as a file path or a command, an unknown kind of edit, adding a name that exists or over a default, removing a default, hiding or restoring a name that is no default. Each is refused with a reason (naming the field or value where the daemon can), and the user config and the catalog stay exactly as they were. Then name a file of the test's own as a `path` beside the request, beside the edit and inside the action: that file is never touched, and an edit the daemon takes lands in its own user config.
 #[spec("agent-report/catalog-edit/003")]
 #[test]
 fn agent_report_catalog_edit_003_a_refused_edit_writes_nothing() {
     let (daemon, dir) = daemon_with_config(EDITOR_CONFIG);
     let before = user_config_text(&dir);
     let catalog_before = resolved_catalog(&daemon);
-    let action_with = |overrides: Value| {
+    let edit_with = |kind: &str, name: &str, overrides: Value| {
         let mut action =
-            json!({"name": "ship", "description": "Offer when it is ready.", "prompt": "Ship it."});
+            json!({"name": name, "description": "Offer when it is ready.", "prompt": "Ship it."});
         for (k, v) in overrides.as_object().unwrap() {
             action[k] = v.clone();
         }
-        json!({"kind": "add", "action": action})
+        json!({"kind": kind, "action": action})
     };
-    let cases: Vec<(&str, Value, &str)> = vec![
-        ("bad name", action_with(json!({"name": "Ship It"})), "name"),
+    let action_with = |overrides: Value| edit_with("add", "ship", overrides);
+    // `None`: the reason is only checked to be there — a request the daemon
+    // cannot parse is refused with the parser's words, which may not name
+    // the key.
+    let mut cases: Vec<(String, Value, Option<&str>)> = vec![
         (
-            "reserved name",
+            "reserved name".into(),
             action_with(json!({"name": "close"})),
-            "reserved",
+            Some("reserved"),
         ),
         (
-            "empty description",
-            action_with(json!({"description": ""})),
-            "description",
-        ),
-        (
-            "over-long prompt",
-            action_with(json!({"prompt": "p".repeat(2001)})),
-            "prompt",
-        ),
-        (
-            "over-long label",
-            action_with(json!({"label": "l".repeat(41)})),
-            "label",
-        ),
-        (
-            "bad icon",
-            action_with(json!({"icon": "../../etc"})),
-            "icon",
-        ),
-        (
-            "a file path",
-            action_with(json!({"path": "/etc/passwd"})),
-            "",
-        ),
-        ("a command", action_with(json!({"command": "rm -rf ~"})), ""),
-        (
-            "an unknown edit",
+            "an unknown edit".into(),
             json!({"kind": "write_file", "name": "ship"}),
-            "",
+            Some("write_file"),
         ),
         (
-            "add over a default",
+            "add over a default".into(),
             action_with(json!({"name": "merge"})),
-            "merge",
+            Some("merge"),
         ),
         (
-            "remove a default",
+            "add of a name the user has".into(),
+            edit_with("add", "explain", json!({})),
+            Some("explain"),
+        ),
+        (
+            "remove a default".into(),
             json!({"kind": "remove", "name": "merge"}),
-            "merge",
+            Some("merge"),
         ),
         (
-            "hide a non-default",
+            "hide a non-default".into(),
             json!({"kind": "hide", "name": "explain"}),
-            "explain",
+            Some("explain"),
         ),
         (
-            "restore a non-default",
+            "restore a non-default".into(),
             json!({"kind": "restore", "name": "nope"}),
-            "nope",
+            Some("nope"),
         ),
     ];
+    // The same malformed values through an add and through an update of the
+    // user's own `explain`, which exists: an update is validated as an add is.
+    for (kind, name) in [("add", "ship"), ("update", "explain")] {
+        let malformed: Vec<(&str, Value, Option<&str>)> = vec![
+            ("bad name", json!({"name": "Ship It"}), Some("ship it")),
+            (
+                "empty description",
+                json!({"description": ""}),
+                Some("description"),
+            ),
+            (
+                "over-long prompt",
+                json!({"prompt": "p".repeat(2001)}),
+                Some("prompt"),
+            ),
+            (
+                "over-long label",
+                json!({"label": "l".repeat(41)}),
+                Some("label"),
+            ),
+            ("bad icon", json!({"icon": "../../etc"}), Some("icon")),
+            ("bad placement", json!({"placement": "../../etc"}), None),
+            ("a file path", json!({"path": "/etc/passwd"}), Some("path")),
+            ("a command", json!({"command": "rm -rf ~"}), Some("command")),
+        ];
+        for (case, overrides, needle) in malformed {
+            cases.push((
+                format!("{kind}: {case}"),
+                edit_with(kind, name, overrides),
+                needle,
+            ));
+        }
+    }
     for (case, edit, needle) in cases {
         let response = catalog_edit(&daemon, Some(edit));
         assert_eq!(response["ok"], false, "{case}: refused: {response:#}");
         let error = response["error"].as_str().unwrap_or_default();
         assert!(!error.is_empty(), "{case}: a reason: {response:#}");
-        assert!(
-            error.to_lowercase().contains(needle),
-            "{case}: the reason names {needle:?}: {error}"
-        );
+        if let Some(needle) = needle {
+            assert!(
+                error.to_lowercase().contains(needle),
+                "{case}: the reason names {needle:?}: {error}"
+            );
+        }
         assert_eq!(
             user_config_text(&dir),
             before,
@@ -719,9 +736,56 @@ fn agent_report_catalog_edit_003_a_refused_edit_writes_nothing() {
         editable_names(&catalog_edit_ok(&daemon, None)),
         ["go-ahead", "merge", "explain"]
     );
+
+    // A path from the client is never written: beside the request and beside
+    // the edit it is ignored and the daemon's own file is edited; inside the
+    // action it is refused.
+    let elsewhere = common::harness_tempdir().expect("sentinel tempdir");
+    let sentinel = elsewhere.path().join("sentinel.toml");
+    const SENTINEL: &str = "# SENTINEL-2399: not the daemon's config\n";
+    std::fs::write(&sentinel, SENTINEL).unwrap();
+    let path = sentinel.to_string_lossy().into_owned();
+    let request = json!({"op": "card-catalog-edit", "path": path,
+        "edit": edit_with("add", "beside-request", json!({}))});
+    let beside_request = inbox::attach(&daemon, request);
+    let mut beside_edit = edit_with("add", "beside-edit", json!({}));
+    beside_edit["path"] = json!(path);
+    let beside_edit = catalog_edit(&daemon, Some(beside_edit));
+    let inside = catalog_edit(
+        &daemon,
+        Some(edit_with("add", "inside-action", json!({"path": path}))),
+    );
+    assert_eq!(
+        inside["ok"], false,
+        "a path inside the action is refused: {inside:#}"
+    );
+    for (case, response, name) in [
+        ("beside the request", &beside_request, "beside-request"),
+        ("beside the edit", &beside_edit, "beside-edit"),
+    ] {
+        if response["ok"] == true {
+            assert!(
+                user_config_text(&dir).contains(name),
+                "{case}: the daemon's own config took the edit"
+            );
+        }
+    }
+    let saved = user_config_text(&dir);
+    assert!(!saved.contains("inside-action"), "{saved}");
+    assert_settings_kept(&saved);
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        SENTINEL,
+        "the file the client named is untouched"
+    );
+    assert_eq!(
+        std::fs::read_dir(elsewhere.path()).unwrap().count(),
+        1,
+        "nothing was written beside it"
+    );
 }
 
-/// Scenario: Point the daemon at a user config that is not valid TOML, then at one that is not UTF-8, and ask the editor's request to add an action: each is refused with a reason, and the file is left byte for byte as it was. Then point a daemon at a user config that does not exist yet: adding an action creates the file, and `card catalog` lists the action.
+/// Scenario: Point the daemon at a user config that is not valid TOML, then at one that is not UTF-8, then at a path the file system will not read as a file (a directory), and ask the editor's request to add an action: each is refused with a reason, and the file is left byte for byte as it was, both after the refusal and after a read that reports the problem. Then point a daemon at a user config that does not exist yet: adding an action creates the file, and `card catalog` lists the action.
 #[spec("agent-report/catalog-edit/004")]
 #[test]
 fn agent_report_catalog_edit_004_an_unreadable_file_is_refused_and_a_missing_one_created() {
@@ -738,7 +802,7 @@ fn agent_report_catalog_edit_004_an_unreadable_file_is_refused_and_a_missing_one
         (
             "not UTF-8",
             b"default_command = \"\xff\xfe\"\n".to_vec(),
-            "",
+            "utf-8",
         ),
     ];
     for (case, bytes, needle) in unreadable {
@@ -746,7 +810,6 @@ fn agent_report_catalog_edit_004_an_unreadable_file_is_refused_and_a_missing_one
         let response = catalog_edit(&daemon, Some(add.clone()));
         assert_eq!(response["ok"], false, "{case}: refused: {response:#}");
         let error = response["error"].as_str().unwrap_or_default();
-        assert!(!error.is_empty(), "{case}: a reason: {response:#}");
         assert!(error.to_lowercase().contains(needle), "{case}: {error}");
         assert_eq!(
             std::fs::read(config_path(&dir)).unwrap(),
@@ -759,7 +822,36 @@ fn agent_report_catalog_edit_004_an_unreadable_file_is_refused_and_a_missing_one
             read["errors"].as_array().is_some_and(|e| !e.is_empty()),
             "{case}: the read names the problem: {read:#}"
         );
+        assert_eq!(
+            std::fs::read(config_path(&dir)).unwrap(),
+            bytes,
+            "{case}: the read wrote nothing"
+        );
     }
+
+    // A read the file system refuses: the config's path is a directory.
+    std::fs::remove_file(config_path(&dir)).unwrap();
+    std::fs::create_dir(config_path(&dir)).unwrap();
+    std::fs::write(config_path(&dir).join("inside"), "kept").unwrap();
+    let response = catalog_edit(&daemon, Some(add.clone()));
+    assert_eq!(response["ok"], false, "a directory: refused: {response:#}");
+    let error = response["error"].as_str().unwrap_or_default();
+    assert!(error.contains("could not be read"), "a directory: {error}");
+    let read = catalog_edit_ok(&daemon, None);
+    assert!(
+        read["errors"].as_array().is_some_and(|e| e
+            .iter()
+            .any(|e| e.as_str().is_some_and(|e| e.contains("could not be read")))),
+        "a directory: the read names the problem: {read:#}"
+    );
+    assert!(
+        config_path(&dir).is_dir(),
+        "a directory: nothing replaced it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path(&dir).join("inside")).unwrap(),
+        "kept"
+    );
 
     let home = common::harness_tempdir().expect("config tempdir");
     let missing = home.path().join("config.toml");

@@ -75,6 +75,9 @@ struct Script {
     silent_catalog_edit: bool,
     /// A `card-catalog-edit` is answered with this refusal.
     refuse_catalog_edit: Option<&'static str>,
+    /// A `list-agent-cards` is answered with an empty card list (issue #2399
+    /// review: the cards snapshot carries the editor's capability).
+    list_cards: bool,
     /// PR #2491 review: every `Hello` names this attach protocol, when set —
     /// a deck the establishment handshake classifies incompatible.
     hello_protocol: Option<u32>,
@@ -352,6 +355,20 @@ impl RestartingDeck {
                                         .unwrap_or_else(|| {
                                             AttachResponse::with_id("m-config".into())
                                         })
+                                } else if op == "list-agent-cards"
+                                    && script.lock().unwrap().list_cards
+                                {
+                                    AttachResponse {
+                                        agent_cards: Some(
+                                            dot_agent_deck::agent_cards::AgentCardList {
+                                                instance_id: process.to_string(),
+                                                revision: 1,
+                                                entries: Vec::new(),
+                                                catalog_errors: Vec::new(),
+                                            },
+                                        ),
+                                        ..AttachResponse::ok()
+                                    }
                                 } else if op == "card-catalog-edit" {
                                     match script.lock().unwrap().refuse_catalog_edit {
                                         Some(refusal) => AttachResponse::err(refusal),
@@ -2276,4 +2293,100 @@ async fn a_card_catalog_edit_the_deck_never_answers_is_bounded() {
         2,
         "each request was sent once"
     );
+}
+
+/// Scenario (issue #2399 review, finding 1): the Card actions editor reads and
+/// saves the deck it names. With deck A selected, a read and an edit naming A
+/// reach A alone; a read or an edit naming deck B, which the app is not
+/// observing, is refused and reaches neither deck. Once B is the selected deck,
+/// its read and edit reach B alone, and a form still naming A — the deck it
+/// was opened on — is refused rather than written to the deck now selected.
+#[tokio::test]
+async fn a_card_catalog_edit_reaches_only_the_deck_it_names() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let a = RestartingDeck::start("catalog-edit-route-a", "a");
+    let b = RestartingDeck::start("catalog-edit-route-b", "b");
+    for deck in [&a, &b] {
+        deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    }
+    let sent = |deck: &RestartingDeck| deck.script.lock().unwrap().catalog_edit_requests.clone();
+    let a_wire = crate::dto::deck_wire_id(&a.endpoint());
+    let b_wire = crate::dto::deck_wire_id(&b.endpoint());
+    assert_ne!(a_wire, b_wire, "precondition: two decks");
+
+    let selected = select(&a);
+    let state = DesktopState::default();
+    crate::agent_card_catalog_edit_on(&state, &a_wire, None)
+        .await
+        .expect("a read of the selected deck is answered");
+    crate::agent_card_catalog_edit_on(&state, &a_wire, Some(catalog_add()))
+        .await
+        .expect("an edit of the selected deck is answered");
+    assert_eq!(sent(&a).len(), 2, "A got its read and its edit");
+    assert_eq!(
+        sent(&a)[1]["edit"],
+        serde_json::to_value(catalog_add()).unwrap()
+    );
+    for edit in [None, Some(catalog_add())] {
+        let refused = crate::agent_card_catalog_edit_on(&state, &b_wire, edit)
+            .await
+            .expect_err("a deck the app does not observe is not edited");
+        assert!(
+            refused.contains("not one this app is observing"),
+            "{refused}"
+        );
+    }
+    assert_eq!(sent(&a).len(), 2, "nothing meant for B reached A");
+    assert!(sent(&b).is_empty(), "nothing reached the unobserved B");
+    drop(selected);
+
+    let _selected = select(&b);
+    let state = DesktopState::default();
+    crate::agent_card_catalog_edit_on(&state, &b_wire, None)
+        .await
+        .expect("a read of the newly selected deck is answered");
+    crate::agent_card_catalog_edit_on(&state, &b_wire, Some(catalog_add()))
+        .await
+        .expect("an edit of the newly selected deck is answered");
+    let stale = crate::agent_card_catalog_edit_on(&state, &a_wire, Some(catalog_add()))
+        .await
+        .expect_err("a form opened on A is not written once A is gone");
+    assert!(stale.contains("not one this app is observing"), "{stale}");
+    assert_eq!(sent(&b).len(), 2, "B got its read and its edit");
+    assert_eq!(sent(&a).len(), 2, "A got nothing after it left");
+}
+
+/// Scenario (issue #2399 review, finding 1): the cards snapshot the webview
+/// draws says whether the deck's daemon advertised the Card actions editor,
+/// which is what makes the editor editable or read-only for that deck: a deck
+/// advertising it reads `catalogEdit: true`, one that does not reads `false`.
+#[tokio::test]
+async fn the_card_catalog_edit_capability_reaches_the_cards_snapshot() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    for advertise in [true, false] {
+        let deck = RestartingDeck::start("catalog-edit-snapshot", "a");
+        {
+            let mut script = deck.script.lock().unwrap();
+            script.catalog_edit_capability = Some(advertise);
+            script.list_cards = true;
+        }
+        let _local = select(&deck);
+        let state = DesktopState::default();
+        state.consume_agent_cards();
+        let wire = crate::dto::deck_wire_id(&deck.endpoint());
+        let cards = crate::agent_cards_list_on(&state, &wire)
+            .await
+            .expect("the deck's cards are read")
+            .expect("the deck advertises cards");
+        let snapshot = serde_json::to_value(&cards).unwrap();
+        assert_eq!(snapshot["deckId"], wire.as_str());
+        assert_eq!(
+            snapshot["catalogEdit"], advertise,
+            "advertised {advertise}: {snapshot:#}"
+        );
+        assert!(
+            deck.script.lock().unwrap().catalog_edit_requests.is_empty(),
+            "reading cards sends no catalog request"
+        );
+    }
 }

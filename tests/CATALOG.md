@@ -15758,7 +15758,7 @@ The desktop app's card actions editor (PRD #2374 decision 2026-11-24, issue #239
 - **Test:** `agent_report_catalog_edit_003_a_refused_edit_writes_nothing` in `tests/e2e_agent_cards.rs`.
 - **Layer:** L2 headless daemon, lane 1.
 - **Agent:** none.
-- **Asserts:** a bad or reserved name, an empty description, a prompt over 2,000 characters, a label over 40, an icon that is not one, an extra key carrying a file path or a command, an unknown kind of edit, adding over a default's name, removing a default, hiding a non-default and restoring an unknown name are each refused (`ok: false`) with a reason naming the problem where there is one to name; after each the user config is byte for byte what it was, and the catalog `card catalog` prints is unchanged.
+- **Asserts:** through an add and through an update of the user's existing `explain`, a bad name, an empty description, a prompt over 2,000 characters, a label over 40, an icon or a placement that is not one, and an extra key carrying a file path or a command are each refused (`ok: false`); so are a reserved name, an unknown kind of edit, adding a name the user has, adding over a default's name, removing a default, hiding a non-default and restoring an unknown name. Each reason names the field, key or value at fault, except a bad placement's, which is only checked to be there; after each the user config is byte for byte what it was, and the catalog `card catalog` prints is unchanged. A `path` naming a test-owned file beside the request or beside the edit leaves that file untouched while the edit lands in the daemon's own user config, and one inside the action is refused (issue #2399 review, findings 2 and 14).
 - **Does not assert:** every validation message's wording (the catalog's own validation, `agent-report/catalog/001`).
 - **Platform coverage:** mac+linux.
 
@@ -15767,8 +15767,8 @@ The desktop app's card actions editor (PRD #2374 decision 2026-11-24, issue #239
 - **Test:** `agent_report_catalog_edit_004_an_unreadable_file_is_refused_and_a_missing_one_created` in `tests/e2e_agent_cards.rs`.
 - **Layer:** L2 headless daemon, lane 1.
 - **Agent:** none.
-- **Asserts:** with a user config that is not valid TOML, then one that is not UTF-8, an add is refused with a reason and the file is left byte for byte as it was, while a read still answers and names the problem in `errors`; with no user config yet, an add creates it and `card catalog --json` lists the action with no errors.
-- **Does not assert:** an oversized file (the `card_catalog` unit test `the_catalog_file_is_replaced_whole_and_one_it_cannot_read_is_never_written`); file permissions.
+- **Asserts:** with a user config that is not valid TOML, then one that is not UTF-8, an add is refused with a reason naming TOML or UTF-8 and the file is left byte for byte as it was, both after the refusal and after a read that still answers and names the problem in `errors`; with the config's path a directory, which the file system will not read as a file, an add is refused as "could not be read", a read names the problem, and the directory and its contents are left as they were; with no user config yet, an add creates it and `card catalog --json` lists the action with no errors (issue #2399 review, findings 4 and 14).
+- **Does not assert:** an oversized file (the `card_catalog` unit test `the_catalog_file_is_replaced_whole_and_one_it_cannot_read_is_never_written`); file permissions, which a test running as root would not see.
 - **Platform coverage:** mac+linux.
 
 #### agent-report/live
@@ -17420,7 +17420,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/048: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** a stopped agent's prompt action the daemon disabled is a disabled icon whose hover holds its text and the reason in the overlay's words ("the agent is not running"); pressing it sends nothing and opens nothing.
+- **Asserts:** a running agent's prompt action the daemon disabled is an icon marked `aria-disabled` but not natively disabled, so keyboard focus still reaches it, whose hover holds its label, its text and the reason in the overlay's words ("the agent is not running"); pressing it sends nothing and opens nothing (issue #2399 review, finding 7).
 - **Does not assert:** the daemon's enablement rules (`agent_cards` unit tests).
 
 ##### desktop/agent-cards/049 — An action with no icon, or an icon the app does not bundle, gets the generic icon.
@@ -17435,27 +17435,27 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Test:** vitest `desktop/agent-cards/050: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
 - **Asserts:** a card offering five prompt actions shows the first three as icons, in the daemon's order, and `+2` (`agent-card-actions-more`, named "… 2 more actions …") beside a whole Close; pressing `+2` opens the card's overlay listing all five and sends nothing.
-- **Does not assert:** geometry at narrow widths (061 checks one icon).
+- **Does not assert:** geometry at narrow widths (061), or the three/four boundary and a changed card (064).
 
 ##### desktop/agent-cards/051 — The batch buttons are icons, with the label and text on hover.
 
 - **Test:** vitest `desktop/agent-cards/051: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed batch bridge.
-- **Asserts:** the selection toolbar's and a root overlay's Go ahead are icon buttons named Go ahead with no text, an SVG and the generic icon, whose hover holds the label and, when every selected card lists the same text, that text; when a child's text differs the hover says "text differs per agent" and quotes neither; pressing the toolbar icon only opens the confirmation (PRD #2374 decision 2026-11-24 (3)). `desktop/agent-cards/028`–`045` find these buttons by the same accessible name.
+- **Asserts:** the selection toolbar's and a root overlay's Go ahead are icon buttons named Go ahead with no text and an SVG, whose hover holds the label and, when every selected card lists the same text, that text; when a child's text differs, both surfaces' hover says "text differs per agent" and quotes neither; on both surfaces an action with the catalog icon `git-merge` draws it, and one with no icon or an icon the app does not bundle draws the generic icon, the same drawing on both; pressing the toolbar icon only opens the confirmation, and nothing is invoked as a single press (PRD #2374 decision 2026-11-24 (3); issue #2399 review, finding 8). `desktop/agent-cards/028`–`045` find these buttons by the same accessible name.
 - **Does not assert:** the daemon's preview text (030).
 
-##### desktop/agent-cards/052 — The confirmation quotes text every agent shares once, above the agents that get it.
+##### desktop/agent-cards/052 — The confirmation quotes text every agent shares once, and ties each agent to its own text.
 
 - **Test:** vitest `desktop/agent-cards/052: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed batch bridge.
-- **Asserts:** when the preview gives the root and the child the same text, the confirmation quotes it once and names both agents, the skipped agent keeps its reason, and Send executes exactly the previewed entries; with a third agent getting other text, each text is quoted once in its own group (`agent-cards-batch-group`) naming only the agents that get it (PRD #2374 decision 2026-11-24 (4)).
+- **Asserts:** when the preview gives the root and the child the same text, the confirmation quotes it once and names both agents, the skipped agent keeps its reason, and Send executes exactly the previewed entries; with a third agent getting other text, both texts are quoted, at most once per included agent, and each agent's name sits in the nearest block holding exactly its own text — a quotation per agent or one per group sharing a text both pass, in any order (PRD #2374 decision 2026-11-24 (4); loosened by issue #2399 review, finding 13).
 - **Does not assert:** the results view, which is unchanged (031, 038–045).
 
 ##### desktop/agent-cards/053 — The card actions editor lists each action with where it came from.
 
 - **Test:** vitest `desktop/agent-cards/053: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed `readCardCatalog` / `editCardCatalog`.
-- **Asserts:** the Cards toolbar's Card actions button (`agent-cards-actions-editor-open`) opens the editor, which reads the local daemon's catalog once; rows list Go ahead and a hidden Merge it as `deck` and Ship it as `user`, in order, with each label and exact text and the user config path; Ship it offers Edit and Remove, Go ahead Edit and Hide, the hidden Merge it Restore, and no row exists for Reply, Open or either Close; nothing is written.
+- **Asserts:** the Cards toolbar's Card actions button (`agent-cards-actions-editor-open`) opens the editor, which reads the local daemon's catalog once; rows list Go ahead and a hidden Merge it as `deck` and Ship it as `user`, in order, each with a visible source label (`agent-card-actions-editor-source`) saying deck for the defaults and yours/user for Ship it, its label and exact text, and the user config path; Ship it offers Edit and Remove, Go ahead Edit and Hide, the hidden Merge it Restore, and no row exists for Reply, Open or either Close; nothing is written.
 - **Does not assert:** the daemon's listing (`agent-report/catalog-edit/001`).
 
 ##### desktop/agent-cards/054 — Adding an action with an icon from the picker sends one add.
@@ -17469,7 +17469,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/055: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed catalog bridge.
-- **Asserts:** editing Ship it shows its name read-only and every field filled, the multi-line text and icon included, and saving a new label sends one `update` carrying the rest unchanged; editing the deck's Go ahead and saving sends an `update` of `go-ahead`, after which its row reads `user` and offers Restore.
+- **Asserts:** editing Ship it shows its name read-only and every field filled, the multi-line text and icon included, and saving a new label sends one `update` carrying the rest unchanged; editing the deck's Go ahead and saving sends an `update` of `go-ahead`, after which its row reads `user`, its visible source label names both the deck and the user's version, and it offers Restore.
 - **Does not assert:** the file the daemon writes (`agent-report/catalog-edit/002`).
 
 ##### desktop/agent-cards/056 — Removing asks first; hiding and restoring send their edit.
@@ -17490,7 +17490,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/058: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), two fixture daemons, stubbed catalog bridge.
-- **Asserts:** the Daemon picker starts on the local daemon, whose catalog is read and listed; choosing the remote daemon reads and lists its own catalog and user config path, and a Hide then goes to the remote daemon only.
+- **Asserts:** with the remote daemon first in the fleet, the Daemon picker still starts on the local daemon, whose catalog alone is read and listed; choosing the remote daemon reads and lists its own catalog and user config path, and a Hide then goes to the remote daemon only.
 - **Does not assert:** a real remote daemon's file (the daemon writes the file of the machine it runs on; `agent-report/catalog-edit/*` run one daemon).
 
 ##### desktop/agent-cards/059 — A daemon without the editor is shown read-only and sent nothing.
@@ -17502,17 +17502,59 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 ##### desktop/agent-cards/060 — Voice opens the card actions editor, its forms and a removal's confirmation.
 
-- **Test:** vitest `desktop/agent-cards/060: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`; phrase fixtures `card-actions-editor-open` and `card-actions-editor-add` in `desktop/src-tauri/src/voice/phrase_fixtures.toml`.
+- **Test:** vitest `desktop/agent-cards/060: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`; phrase fixtures `card-actions-editor-open`, `card-actions-editor-add`, `card-actions-editor-edit-by-label` and `card-actions-editor-remove-by-label` in `desktop/src-tauri/src/voice/phrase_fixtures.toml`.
 - **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
-- **Asserts:** `open_card_actions_editor` opens the editor on the local daemon's catalog; `add_card_action` opens an empty form; `edit_card_action` opens Ship it's form; `remove_card_action` opens the "Remove Ship it?" confirmation and writes nothing; `openCardActionsEditor`, `addCardAction`, `editCardAction` and `removeCardAction` are `voice: true` with matching `commands.toml` rows, the removal's press (`confirmRemoveCardAction`) is `no_voice`, and `saveCardAction` is either a voice row or carries a `no_voice` reason (CLAUDE.md rule 23). Pressing a card's action icon by voice is the existing `run_card_action` row (`desktop/agent-cards/008`).
+- **Asserts:** `open_card_actions_editor` opens the editor on the local daemon's catalog; `add_card_action` opens an empty form; `edit_card_action` opens Ship it's form; `remove_card_action` opens the "Remove Ship it?" confirmation and writes nothing; Ship it, which the editor lists and no card offers, resolves by label; `openCardActionsEditor`, `addCardAction`, `editCardAction` and `removeCardAction` are `voice: true`, each with exactly one `commands.toml` row, parsed row by row, invoking it on `overview` with its parameters (`action` of kind `card_action` for edit and remove); Save, the removal's Remove, Hide, Restore, choosing the daemon, choosing an icon, Cancel and Close each have one row or a written `no_voice` reason, and Save and Remove stay off voice (CLAUDE.md rule 23; issue #2399 review, finding 9). Pressing a card's action icon by voice is the existing `run_card_action` row (`desktop/agent-cards/008`).
 - **Does not assert:** that the model picks these rows for the words (the phrase fixtures, run with a credential).
 
 ##### desktop/agent-cards/061 — Card action icons and the card actions editor work in the browser.
 
-- **Test:** Playwright `desktop/agent-cards/061 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (two tests at 375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
+- **Test:** Playwright `desktop/agent-cards/061 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (three tests at 375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** a pushed catalog action with `confirm` and icon `rocket` draws as an icon whole inside its card beside a whole Close, its exact text in its hover and none on the card, and pressing it opens the confirmation quoting the text with nothing sent; the Card actions editor lists Go ahead and Merge it as `deck`, adds Deploy it with a two-line text and the `rocket` picked from the searched grid, then lists it as `user`, and fits the window; the page never scrolls sideways.
+- **Asserts:** a pushed catalog action with `confirm` and icon `rocket` draws as an icon whole inside its card beside a whole Close, its exact text in its hover and none on the card, and pressing it opens the confirmation quoting the text with nothing sent; the Card actions editor lists Go ahead and Merge it with a visible deck source label, adds Deploy it with a two-line text and the `rocket` picked from the searched grid, then lists it with a visible user source label, and fits the window; a card offering five long-labelled actions draws three icons, `+2` and Close inside the card with no two overlapping; keyboard focus reaches each icon, the disabled one included, and shows a tooltip inside the window with its label and exact text (and that it asks first, or why it is disabled), Tab moves between icons and Escape hides it; `+2` opens the overlay with all five and Close stays pressable; the page never scrolls sideways (issue #2399 review, findings 6, 7 and 11).
 - **Does not assert:** a real daemon writing the file (`agent-report/catalog-edit/*`).
+
+##### desktop/agent-cards/062 — The Card actions editor's production bridge sends the deck and the edit as given.
+
+- **Test:** vitest `desktop/agent-cards/062: …` in `desktop/src/lib/bridgeCardCatalog.test.ts`; Rust `a_card_catalog_edit_reaches_only_the_deck_it_names` and `the_card_catalog_edit_capability_reaches_the_cards_snapshot` beside the other card-catalog transport tests in `desktop/src-tauri/src/restart_binding_tests.rs`.
+- **Layer:** the TS `TauriDeckBridge` with Tauri's `invoke` mocked; the Tauri backend against fake daemons (`RestartingDeck`).
+- **Asserts:** `readCardCatalog` invokes `agent_card_catalog_edit` with `{ deckId, edit: null }` and `editCardCatalog` with `{ deckId, edit }` for every kind of edit, each answer returned as given; a rejected invoke becomes an Error whose message is the daemon's reason unchanged; `normalizeAgentCards` keeps `catalogEdit` only when it is `true`. In the backend, a read and an edit naming the selected deck reach it alone, one naming a deck the app does not observe is refused and reaches no deck, and after the selection moves a request naming the old deck is refused rather than sent to the new one; the cards snapshot reads `catalogEdit` true or false as the deck advertised it, and reading cards sends no catalog request (issue #2399 review, finding 1).
+- **Does not assert:** two decks observed at once (a remote deck needs the SSH tunnel the driver tier sets up).
+
+##### desktop/agent-cards/063 — Keyboard focus on an action icon shows its label and exact text.
+
+- **Test:** vitest `desktop/agent-cards/063: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** focusing an ordinary icon, a confirm-first one and one the daemon disabled on a running agent shows a `tooltip` the icon names as its description (`aria-describedby`), holding the label and the exact text, plus that it asks first or why it is disabled; each takes focus; blurring hides it; the confirm-first and disabled icons' hover names the label too (issue #2399 review, finding 7).
+- **Does not assert:** where the tooltip is drawn (061).
+
+##### desktop/agent-cards/064 — The icon limit's boundary, and a card whose offered actions change.
+
+- **Test:** vitest `desktop/agent-cards/064: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom), the dashboard rerendered with a new snapshot.
+- **Asserts:** three prompt actions draw three icons and no `+N`; four draw three and `+1`; when the daemon sends the four-action card again with one gone, one re-tokened and one disabled, the card draws the three that remain with no `+N`, the new text and the disabled reason in their hovers, and pressing the re-tokened icon sends the new token (issue #2399 review, finding 11).
+- **Does not assert:** geometry (061).
+
+##### desktop/agent-cards/065 — A catalog read with problems, or one that fails, says so.
+
+- **Test:** vitest `desktop/agent-cards/065: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed catalog bridge.
+- **Asserts:** a read answering `errors` shows each problem, visibly, in the problems block with what to do (fix the file), beside the listed actions; a read that fails shows an alert with the reason and "could not be read", lists no rows and offers no Add; nothing is written (issue #2399 review, finding 4).
+- **Does not assert:** the daemon's read of an unreadable file (`agent-report/catalog-edit/004`).
+
+##### desktop/agent-cards/066 — The form round-trips Placement and Offer on every card.
+
+- **Test:** vitest `desktop/agent-cards/066: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed catalog bridge.
+- **Asserts:** the form's Placement control offers `card` and `detail` and shows the action's own; setting `detail` and ticking Offer on every card sends both in the update; reopening shows them; unticking sends `always: false` and keeps the placement; an add with a non-default placement sends it (issue #2399 review, finding 5).
+- **Does not assert:** what placement does on a card.
+
+##### desktop/agent-cards/067 — Late answers after the daemon changed are dropped, and every write goes to the daemon shown.
+
+- **Test:** vitest `desktop/agent-cards/067: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** desktop overview (jsdom), two fixture daemons, a catalog bridge whose reads and edits answer when the test says, in any order.
+- **Asserts:** switching to the remote daemon before the local read answers shows the remote catalog, and the late local answer does not replace it; a form open when the daemon changes is closed; a local save answering after switching to the remote daemon changes nothing shown, and the next edit goes to the remote daemon only; switching, with a form open, to a daemon that cannot be edited offers no Save, sends nothing, and switching back brings no stale form (issue #2399 review, finding 10).
+- **Does not assert:** the backend's routing (062).
 
 ## Desktop native driver scenarios
 

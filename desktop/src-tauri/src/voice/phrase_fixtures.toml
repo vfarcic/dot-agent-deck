@@ -78,6 +78,25 @@ screen = "overview"
 action = "add_card_action"
 outcome = "dispatch"
 
+# Issue #2399 review (finding 9): editing and removing name the action by its
+# label, which resolves from the editor's catalog — Ship it and Deploy it are
+# actions no card offers in the planted world.
+[[fixtures]]
+name = "card-actions-editor-edit-by-label"
+utterance = "edit the ship it card action"
+screen = "overview"
+action = "edit_card_action"
+outcome = "dispatch"
+resolved_card_action = "ship it"
+
+[[fixtures]]
+name = "card-actions-editor-remove-by-label"
+utterance = "remove the deploy it card action"
+screen = "overview"
+action = "remove_card_action"
+outcome = "dispatch"
+resolved_card_action = "deploy it"
+
 [[fixtures]]
 name = "open-agent-zoom"
 utterance = "zoom the tester"

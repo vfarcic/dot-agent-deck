@@ -32,6 +32,13 @@ import { AgentOverview } from "./AgentOverview";
  *   searchable grid (listbox "Icons", search box "Search icons") of the icons
  *   the app bundles; "Save" sends the edit;
  * - removing asks first, in the editor's own confirmation, named "Remove <label>?".
+ *
+ * Issue #2399 review (findings 4, 5, 6 and 10) added `065`–`067` and tightened
+ * `053`, `055` and `058`: each row shows its source in words
+ * (`agent-card-actions-editor-source`); a failed read or a read with problems
+ * says so; the form has a Placement choice; the editor opens on the local
+ * daemon wherever it is listed; and answers that arrive after the daemon
+ * changed are dropped.
  */
 
 const INSTANCE = "daemon-instance-editor";
@@ -74,16 +81,36 @@ function cardFor(id: string, name: string, instance: string): AgentCardEntry {
  * advertising the editor unless `catalogEdit` says otherwise, and a stubbed
  * catalog per daemon that `editCardCatalog` changes as a daemon would answer.
  */
-function setup({ catalogEdit = true, remote, refuse }: { catalogEdit?: boolean; remote?: { catalogEdit: boolean; catalog: EditableCatalog }; refuse?: string } = {}) {
+type Pending = { deckId: string; kind: "read" | "edit"; resolve: () => void; reject: (why: string) => void };
+
+function setup({ catalogEdit = true, remote, refuse, remoteFirst = false, deferred = false, readFails, catalogErrors = [] }: {
+  catalogEdit?: boolean; remote?: { catalogEdit: boolean; catalog: EditableCatalog }; refuse?: string;
+  /** The remote daemon is first in the fleet, so "the first" and "the local one" differ. */
+  remoteFirst?: boolean;
+  /** Reads and edits wait in `pending` until the test settles them, in any order. */
+  deferred?: boolean;
+  /** The local daemon's read is refused with this reason. */
+  readFails?: string;
+  /** The problems the local daemon's catalog read reports. */
+  catalogErrors?: string[];
+} = {}) {
   const [local, far] = createFixtureFleet("fleet");
   const fleet = [{ ...local, connection: { ...local.connection, incarnation: INSTANCE } }];
   if (remote) fleet.push({ ...far, connection: { ...far.connection, incarnation: REMOTE_INSTANCE } });
   const localCard = cardFor("1", "coder", INSTANCE);
   fleet[0] = { ...fleet[0], agents: [createFixtureStartedAgent({ id: "1", daemonId: FIXTURE_DAEMON_ID, displayName: "coder", command: "claude", cwd: "/w" })] };
-  const catalogs: Record<string, EditableCatalog> = { [FIXTURE_DAEMON_ID]: structuredClone(CATALOG) };
+  const catalogs: Record<string, EditableCatalog> = { [FIXTURE_DAEMON_ID]: { ...structuredClone(CATALOG), errors: [...catalogErrors] } };
   if (remote) catalogs[FIXTURE_REMOTE_DAEMON_ID] = structuredClone(remote.catalog);
-  const readCardCatalog = vi.fn(async (deckId: string) => structuredClone(catalogs[deckId]));
-  const editCardCatalog = vi.fn(async (deckId: string, edit: Edit) => {
+  const pending: Pending[] = [];
+  const settle = <T,>(deckId: string, kind: Pending["kind"], answer: () => T): Promise<T> => (deferred
+    ? new Promise<T>((resolve, reject) => { pending.push({ deckId, kind, resolve: () => resolve(answer()), reject: (why) => reject(new Error(why)) }); })
+    : Promise.resolve().then(answer));
+  const readCardCatalog = vi.fn((deckId: string) => settle(deckId, "read", () => {
+    if (readFails && deckId === FIXTURE_DAEMON_ID) throw new Error(readFails);
+    return structuredClone(catalogs[deckId]);
+  }));
+  const editCardCatalog = vi.fn((deckId: string, edit: Edit) => settle(deckId, "edit", () => applyEdit(deckId, edit)));
+  const applyEdit = (deckId: string, edit: Edit) => {
     if (refuse) throw new Error(refuse);
     const catalog = catalogs[deckId];
     if (edit.kind === "add") catalog.actions.push(editable(String(edit.action.name), edit.action as Partial<EditableAction>));
@@ -92,7 +119,7 @@ function setup({ catalogEdit = true, remote, refuse }: { catalogEdit?: boolean; 
     if (edit.kind === "hide") catalog.actions = catalog.actions.map((entry) => (entry.name === edit.name ? { ...entry, hidden: true } : entry));
     if (edit.kind === "restore") catalog.actions = catalog.actions.map((entry) => (entry.name === edit.name ? { ...entry, hidden: false, overridden: false, source: "default" } : entry));
     return structuredClone(catalog);
-  });
+  };
   const agentCards: Record<string, unknown> = {
     [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: [localCard], catalogErrors: [], tree: true, batch: true, catalogEdit },
   };
@@ -109,8 +136,11 @@ function setup({ catalogEdit = true, remote, refuse }: { catalogEdit?: boolean; 
     setZoom: vi.fn(async (level: number) => level), desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES },
     agentCards, invokeCardAction: vi.fn(), invokeCardActionBatch: vi.fn(), readCardCatalog, editCardCatalog,
   } as unknown as DeckRuntimeState;
+  const localName = deckName(fleet[0].connection);
+  const remoteName = remote ? deckName(fleet[1].connection) : "";
+  if (remoteFirst) fleet.reverse();
   render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
-  return { readCardCatalog, editCardCatalog, localName: deckName(fleet[0].connection), remoteName: remote ? deckName(fleet[1].connection) : "" };
+  return { readCardCatalog, editCardCatalog, localName, remoteName, pending };
 }
 
 async function openEditor() {
@@ -125,6 +155,12 @@ const row = (editor: HTMLElement, name: string) => {
   return found;
 };
 const field = (scope: HTMLElement, label: string | RegExp) => within(scope).getByLabelText(label) as HTMLInputElement;
+/** The source a row SHOWS (issue #2399 review, finding 6): its visible label's text, not an attribute. */
+const shownSource = (listed: HTMLElement) => {
+  const label = within(listed).getByTestId("agent-card-actions-editor-source");
+  expect(label).toBeVisible();
+  return label.textContent ?? "";
+};
 
 beforeEach(() => {
   window.localStorage.clear();
@@ -134,7 +170,7 @@ beforeEach(() => {
 afterEach(() => { cleanup(); window.localStorage.clear(); });
 
 describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
-  /// Scenario: On the Cards view, press Card actions. The editor reads the local daemon's catalog and lists Go ahead and a hidden Merge it as deck defaults and Ship it as the user's, each with its label, source and the exact text it sends, names the user config it edits, offers only the buttons each source allows, and lists none of the deck's own Reply, Open or Close.
+  /// Scenario: On the Cards view, press Card actions. The editor reads the local daemon's catalog and lists Go ahead and a hidden Merge it as deck defaults and Ship it as the user's, each with its label, a visible source label and the exact text it sends, names the user config it edits, offers only the buttons each source allows, and lists none of the deck's own Reply, Open or Close.
   it("desktop/agent-cards/053: the editor lists each card action with where it came from", async () => {
     const calls = setup();
     expect(screen.getByTestId("agent-cards-actions-editor-open")).toHaveAccessibleName("Card actions");
@@ -143,6 +179,12 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(calls.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
     expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge", "ship"]);
     expect(rows(editor).map((node) => node.getAttribute("data-source"))).toEqual(["deck", "deck", "user"]);
+    for (const name of ["go-ahead", "merge"]) {
+      expect(shownSource(row(editor, name)), name).toMatch(/\bdeck\b/i);
+      expect(shownSource(row(editor, name)), name).not.toMatch(/\b(your|yours|user)\b/i);
+    }
+    expect(shownSource(row(editor, "ship"))).toMatch(/\b(yours|user)\b/i);
+    expect(shownSource(row(editor, "ship"))).not.toMatch(/\bdeck\b/i);
     expect(within(editor).getByText(USER_CONFIG, { exact: false })).toBeInTheDocument();
     const ship = within(row(editor, "ship"));
     expect(ship.getByText("Ship it", { exact: true })).toBeInTheDocument();
@@ -201,7 +243,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(within(listed).getByText("Deploy it", { exact: true })).toBeInTheDocument();
   });
 
-  /// Scenario: Edit the user's Ship it: its name is shown but cannot be changed, and the form holds its label, multi-line text, description, icon and confirmation; changing the label and saving sends one update carrying the rest unchanged. Then edit the deck's Go ahead and change its text: saving sends an update of the same name, which the list shows as the user's version of the deck default with Restore offered.
+  /// Scenario: Edit the user's Ship it: its name is shown but cannot be changed, and the form holds its label, multi-line text, description, icon and confirmation; changing the label and saving sends one update carrying the rest unchanged. Then edit the deck's Go ahead and change its text: saving sends an update of the same name, which the list shows, in words, as the user's version of the deck default with Restore offered.
   it("desktop/agent-cards/055: editing keeps the name fixed and an edited default becomes the user's version", async () => {
     const calls = setup();
     let editor = await openEditor();
@@ -231,6 +273,9 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     });
     const go = row(screen.getByRole("dialog", { name: "Card actions" }), "go-ahead");
     expect(go).toHaveAttribute("data-source", "user");
+    // An overridden default says both: it is the deck's, in the user's version.
+    expect(shownSource(go)).toMatch(/\bdeck\b/i);
+    expect(shownSource(go)).toMatch(/\b(your|yours|user)\b/i);
     expect(within(go).getByRole("button", { name: "Restore Go ahead" })).toBeInTheDocument();
     expect(calls.editCardCatalog).toHaveBeenCalledTimes(2);
   });
@@ -276,13 +321,14 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge", "ship"]);
   });
 
-  /// Scenario: With a local and a remote daemon connected, open the editor: it edits the local daemon by default and says so; choosing the remote daemon reads that daemon's catalog and lists it, and an edit made then goes to the remote daemon only.
+  /// Scenario: With a remote and then a local daemon on the dashboard, in that order, open the editor: it edits the local daemon by default, not the first listed, and says so; choosing the remote daemon reads that daemon's catalog and lists it, and an edit made then goes to the remote daemon only.
   it("desktop/agent-cards/058: with several daemons the editor edits the one picked, the local one by default", async () => {
     const remoteCatalog: EditableCatalog = { actions: [GO_AHEAD, { ...MERGE, hidden: false }, editable("deploy", { label: "Deploy it" })], errors: [], user_config: "/srv/deck/config.toml" };
-    const calls = setup({ remote: { catalogEdit: true, catalog: remoteCatalog } });
+    const calls = setup({ remote: { catalogEdit: true, catalog: remoteCatalog }, remoteFirst: true });
     let editor = await openEditor();
     const picker = within(editor).getByRole("combobox", { name: "Daemon" }) as HTMLSelectElement;
     expect(picker.selectedOptions[0]).toHaveTextContent(calls.localName);
+    expect(calls.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
     expect(calls.readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID);
     expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge", "ship"]);
     const remoteOption = [...picker.options].find((option) => option.textContent?.includes(calls.remoteName));
@@ -317,5 +363,131 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(within(editor).queryByTestId("agent-card-actions-editor-readonly")).toBeNull();
     expect(within(editor).getByRole("button", { name: "Add action" })).toBeInTheDocument();
     expect(calls.readCardCatalog.mock.calls.map(([deckId]) => deckId)).toEqual([FIXTURE_REMOTE_DAEMON_ID]);
+  });
+  /// Scenario: Open the editor on a daemon whose catalog read reports a problem in the file: the problem is shown, with what to do about it, beside the actions. Then open it on a daemon whose read fails: the editor shows the reason and lists nothing — not the deck defaults, not an empty list — and offers no Add.
+  it("desktop/agent-cards/065: a catalog read with problems, or one that fails, says so instead of showing a healthy catalog", async () => {
+    const problem = "catalog: the user config /home/user/.config/dot-agent-deck/config.toml could not be read, so the deck defaults apply: it is not UTF-8 text";
+    let calls = setup({ catalogErrors: [problem] });
+    let editor = await openEditor();
+    const shown = within(editor).getByText(problem);
+    expect(shown).toBeVisible();
+    expect(within(editor).getByTestId("agent-card-actions-editor-problems")).toHaveTextContent(/fix/i);
+    expect(rows(editor).length).toBeGreaterThan(0);
+    expect(calls.editCardCatalog).not.toHaveBeenCalled();
+    cleanup();
+
+    const why = "the deck did not answer within 10s";
+    calls = setup({ readFails: why });
+    editor = await openEditor();
+    const alert = within(editor).getByRole("alert");
+    expect(alert).toBeVisible();
+    expect(alert).toHaveTextContent(why);
+    expect(alert).toHaveTextContent(/could not be read/);
+    expect(rows(editor)).toHaveLength(0);
+    expect(within(editor).queryByRole("button", { name: "Add action" })).toBeNull();
+    expect(calls.editCardCatalog).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Edit Ship it, set its Placement to the overlay only and tick Offer on every card, and save: the update carries both. Reopen it: the form shows that placement and the box ticked; untick it and save: the update carries `always: false` and keeps the placement. A new action added with a non-default placement carries it too.
+  it("desktop/agent-cards/066: the form round-trips Placement and Offer on every card", async () => {
+    const calls = setup();
+    let editor = await openEditor();
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    const placement = () => within(screen.getByRole("dialog", { name: "Card actions" })).getByRole("combobox", { name: "Placement" }) as HTMLSelectElement;
+    expect(placement().value).toBe("card");
+    expect([...placement().options].map((option) => option.value)).toEqual(expect.arrayContaining(["card", "detail"]));
+    fireEvent.change(placement(), { target: { value: "detail" } });
+    expect(field(editor, "Offer on every card")).not.toBeChecked();
+    fireEvent.click(field(editor, "Offer on every card"));
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "detail", always: true }) });
+
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    expect(placement().value).toBe("detail");
+    expect(field(editor, "Offer on every card")).toBeChecked();
+    fireEvent.click(field(editor, "Offer on every card"));
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "detail", always: false }) });
+
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    fireEvent.click(within(editor).getByRole("button", { name: "Add action" }));
+    fireEvent.change(field(editor, "Name"), { target: { value: "deploy" } });
+    fireEvent.change(field(editor, "Text it sends"), { target: { value: "Deploy it." } });
+    fireEvent.change(field(editor, "When agents should offer it"), { target: { value: "Offer when it can be deployed." } });
+    fireEvent.change(placement(), { target: { value: "detail" } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "add", action: expect.objectContaining({ name: "deploy", placement: "detail", always: false }) });
+    expect(calls.editCardCatalog).toHaveBeenCalledTimes(3);
+  });
+
+  /// Scenario: With a local and a remote daemon whose answers arrive late and out of order, open the editor and switch to the remote daemon before the local read answers: the remote catalog is shown, and the local answer arriving afterwards does not replace it. Save an edit on the local daemon and switch to the remote one before the save answers: the late answer changes nothing shown, and the next edit goes to the remote daemon only. A form open when the daemon changes is closed — switching to a daemon that cannot be edited offers no Save — so nothing typed for one daemon is written to another.
+  it("desktop/agent-cards/067: answers that arrive after the daemon changed are dropped, and every write goes to the daemon shown", async () => {
+    const remoteCatalog: EditableCatalog = { actions: [GO_AHEAD, editable("deploy", { label: "Deploy it" })], errors: [], user_config: "/srv/deck/config.toml" };
+    const calls = setup({ remote: { catalogEdit: true, catalog: remoteCatalog }, deferred: true });
+    const settle = async (deckId: string, kind: Pending["kind"]) => {
+      const at = calls.pending.findIndex((waiting) => waiting.deckId === deckId && waiting.kind === kind);
+      expect(at, `a pending ${kind} on ${deckId}`).toBeGreaterThanOrEqual(0);
+      const [waiting] = calls.pending.splice(at, 1);
+      await act(async () => { waiting.resolve(); });
+    };
+    const shownNames = () => rows(screen.getByRole("dialog", { name: "Card actions" })).map((node) => node.getAttribute("data-action"));
+    const choose = async (deckId: string) => {
+      const picker = within(screen.getByRole("dialog", { name: "Card actions" })).getByRole("combobox", { name: "Daemon" }) as HTMLSelectElement;
+      const option = [...picker.options].find((candidate) => candidate.textContent?.includes(deckId === FIXTURE_DAEMON_ID ? calls.localName : calls.remoteName));
+      await act(async () => { fireEvent.change(picker, { target: { value: option!.value } }); });
+    };
+
+    await openEditor();
+    await choose(FIXTURE_REMOTE_DAEMON_ID);
+    await settle(FIXTURE_REMOTE_DAEMON_ID, "read");
+    expect(shownNames()).toEqual(["go-ahead", "deploy"]);
+    await settle(FIXTURE_DAEMON_ID, "read");
+    expect(shownNames(), "the late local answer is dropped").toEqual(["go-ahead", "deploy"]);
+    expect(within(screen.getByRole("dialog", { name: "Card actions" })).getByText("/srv/deck/config.toml", { exact: false })).toBeInTheDocument();
+
+    // A form open on the remote daemon is closed when the daemon changes.
+    let editor = screen.getByRole("dialog", { name: "Card actions" });
+    fireEvent.click(within(row(editor, "deploy")).getByRole("button", { name: "Edit Deploy it" }));
+    expect(within(editor).getByRole("button", { name: "Save" })).toBeInTheDocument();
+    await choose(FIXTURE_DAEMON_ID);
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    expect(within(editor).queryByRole("button", { name: "Save" })).toBeNull();
+    await settle(FIXTURE_DAEMON_ID, "read");
+    expect(shownNames()).toEqual(["go-ahead", "merge", "ship"]);
+
+    // A save on the local daemon whose answer arrives after switching to the remote one.
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({ kind: "update" }));
+    await choose(FIXTURE_REMOTE_DAEMON_ID);
+    await settle(FIXTURE_REMOTE_DAEMON_ID, "read");
+    await settle(FIXTURE_DAEMON_ID, "edit");
+    expect(shownNames(), "the late local save changes nothing shown").toEqual(["go-ahead", "deploy"]);
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    await act(async () => { fireEvent.click(within(row(editor, "go-ahead")).getByRole("button", { name: "Hide Go ahead" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID, { kind: "hide", name: "go-ahead" });
+    expect(calls.editCardCatalog.mock.calls.map(([deckId]) => deckId)).toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID]);
+    cleanup();
+
+    // Switching to a daemon that cannot be edited, with a form open: no Save, nothing sent, and switching back opens no stale form.
+    const second = setup({ remote: { catalogEdit: false, catalog: remoteCatalog } });
+    editor = await openEditor();
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Typed for the local daemon" } });
+    const picker = within(editor).getByRole("combobox", { name: "Daemon" }) as HTMLSelectElement;
+    const remoteOption = [...picker.options].find((option) => option.textContent?.includes(second.remoteName));
+    await act(async () => { fireEvent.change(picker, { target: { value: remoteOption!.value } }); });
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    expect(within(editor).getByTestId("agent-card-actions-editor-readonly")).toBeInTheDocument();
+    expect(within(editor).queryByRole("button", { name: "Save" })).toBeNull();
+    expect(within(editor).queryByDisplayValue("Typed for the local daemon")).toBeNull();
+    const localOption = [...picker.options].find((option) => option.textContent?.includes(second.localName));
+    await act(async () => { fireEvent.change(picker, { target: { value: localOption!.value } }); });
+    editor = screen.getByRole("dialog", { name: "Card actions" });
+    expect(within(editor).queryByDisplayValue("Typed for the local daemon")).toBeNull();
+    expect(second.editCardCatalog).not.toHaveBeenCalled();
+    expect(second.readCardCatalog.mock.calls.map(([deckId]) => deckId)).toEqual([FIXTURE_DAEMON_ID, FIXTURE_DAEMON_ID]);
   });
 });

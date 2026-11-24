@@ -34,6 +34,27 @@ const INSTANCE = "daemon-instance-batch-voice";
 const MODE_KEY = "dot-agent-deck.overview.mode";
 const commandsSource = readFileSync(resolve("src-tauri/src/voice/commands.toml"), "utf8");
 
+type Row = { id: string; invoke: string; screens: string[]; params: { name: string; kind: string }[] };
+
+/** The `[[commands]]` rows of the table, one at a time, with the keys these tests read (as `AgentCardsVoice.test.tsx` parses them). */
+function commandRows(): Row[] {
+  return commandsSource.split(/^\[\[commands\]\]\s*$/m).slice(1).map((chunk) => {
+    const value = (key: string) => chunk.match(new RegExp(`^${key}\\s*=\\s*"([^"]*)"`, "m"))?.[1] ?? "";
+    const screens = chunk.match(/^screens\s*=\s*\[([^\]]*)\]/m)?.[1] ?? "";
+    const params = [...chunk.matchAll(/\[\[commands\.params\]\]\s*\n\s*name\s*=\s*"([^"]+)"\s*\n\s*kind\s*=\s*"([^"]+)"/g)].map((found) => ({ name: found[1], kind: found[2] }));
+    return { id: value("id"), invoke: value("invoke"), screens: [...screens.matchAll(/"([^"]+)"/g)].map((found) => found[1]), params };
+  });
+}
+
+/** The one row with `id`, which must invoke `invoke`, on `screens`, with exactly `params`. */
+function expectRow(id: string, invoke: string, screens: string[], params: { name: string; kind: string }[]) {
+  const found = commandRows().filter((row) => row.id === id);
+  expect(found, `one row ${id}`).toHaveLength(1);
+  expect(found[0].invoke, `${id} invokes`).toBe(invoke);
+  expect(found[0].screens, `${id} screens`).toEqual(screens);
+  expect(found[0].params, `${id} params`).toEqual(params);
+}
+
 function microphone() {
   const queue: string[] = [];
   let recording = false;
@@ -244,12 +265,14 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
     for (const [id, row] of [["selectAgentCard", "select_agent_card"], ["unselectAgentCard", "unselect_agent_card"], ["runSelectionBatch", "run_card_action_on_selection"]]) {
       expect(registry[id]?.voice, id).toBe(true);
-      expect(commandsSource).toMatch(new RegExp(`id\\s*=\\s*"${row}"[\\s\\S]*?invoke\\s*=\\s*"${id}"`));
+      const found = commandRows().filter((candidate) => candidate.id === row);
+      expect(found, `one row ${row}`).toHaveLength(1);
+      expect(found[0].invoke, row).toBe(id);
     }
     expect(registry.sendCardBatch?.no_voice).toBeTruthy();
   });
 
-  /// Scenario: By voice, open the card actions editor, open the form for a new action, open Ship it for editing, and ask to remove Ship it. The editor opens on the local daemon's catalog, each request opens what it names, and the removal only opens the editor's own confirmation: nothing is written until it is pressed by hand. The registry entries behind each are voice-enabled with matching command rows, and the confirmation's press stays off voice.
+  /// Scenario: By voice, open the card actions editor, open the form for a new action, open Ship it for editing, and ask to remove Ship it. The editor opens on the local daemon's catalog, each request opens what it names, and the removal only opens the editor's own confirmation: nothing is written until it is pressed by hand. The registry entries behind each are voice-enabled with one matching command row each, parsed row by row with its screen and parameter, Ship it resolves from the editor although no card offers it, and every other control of the editor — Save, the removal's Remove, Hide, Restore, choosing the daemon, choosing an icon — is either a row or carries a written reason it is not.
   it("desktop/agent-cards/060: voice opens the card actions editor, its forms and a removal's confirmation, and writes nothing", async () => {
     const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };
     const goDefault = { ...ship, name: "go-ahead", label: "Go ahead", prompt: "Go ahead.", icon: "play", source: "default", default: true };
@@ -283,16 +306,38 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(editCardCatalog).not.toHaveBeenCalled();
     expect(run.invokeCardAction).not.toHaveBeenCalled();
 
+    // Ship it is in the editor's catalog but offered on no card: the spoken edit and removal resolve it from the editor's list.
+    expect(screen.queryByRole("button", { name: "Ship it" })).toBeNull();
+
+    // The registry and the command table agree, row by row: each voice entry has one row invoking it, on the dashboard, with its parameters.
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
-    for (const [id, row] of [["openCardActionsEditor", "open_card_actions_editor"], ["addCardAction", "add_card_action"], ["editCardAction", "edit_card_action"], ["removeCardAction", "remove_card_action"]]) {
+    const rows: [string, string, { name: string; kind: string }[]][] = [
+      ["openCardActionsEditor", "open_card_actions_editor", []],
+      ["addCardAction", "add_card_action", []],
+      ["editCardAction", "edit_card_action", [{ name: "action", kind: "card_action" }]],
+      ["removeCardAction", "remove_card_action", [{ name: "action", kind: "card_action" }]],
+    ];
+    for (const [id, row, params] of rows) {
       expect(registry[id]?.voice, id).toBe(true);
-      expect(commandsSource).toMatch(new RegExp(`id\\s*=\\s*"${row}"[\\s\\S]*?invoke\\s*=\\s*"${id}"`));
+      expectRow(row, id, ["overview"], params);
     }
-    // The press that writes a removal is the user's hand; saving the form is either a voice row or says why it is not.
-    expect(registry.confirmRemoveCardAction?.no_voice).toBeTruthy();
-    const save = registry.saveCardAction;
-    expect(save, "saveCardAction is in the registry").toBeDefined();
-    if (save?.voice) expect(commandsSource).toMatch(/invoke\s*=\s*"saveCardAction"/);
-    else expect(save?.no_voice).toBeTruthy();
+    // Every other control of the editor is reachable by voice through a row of its own, or says, in a reason someone can
+    // disagree with, why it is not (CLAUDE.md rule 23): the presses that write the daemon's config, choosing the daemon,
+    // choosing an icon, and closing the form or the editor.
+    for (const id of ["confirmRemoveCardAction", "saveCardAction", "hideCardAction", "restoreCardAction", "chooseCardActionsDaemon", "chooseCardActionIcon", "cancelCardActionForm", "closeCardActionsEditor"]) {
+      const entry = registry[id];
+      expect(entry, `${id} is in the registry`).toBeDefined();
+      if (entry?.voice) {
+        const found = commandRows().filter((candidate) => candidate.invoke === id);
+        expect(found, `${id} has one row`).toHaveLength(1);
+        expect(found[0].screens, id).toEqual(["overview"]);
+      } else {
+        expect(typeof entry?.no_voice, `${id} says why it is not on voice`).toBe("string");
+        expect(entry!.no_voice!.length, `${id}'s reason is a reason, not a placeholder`).toBeGreaterThan(60);
+      }
+    }
+    // The presses that write a removal or the form's text stay the user's own.
+    expect(registry.confirmRemoveCardAction?.voice).not.toBe(true);
+    expect(registry.saveCardAction?.voice).not.toBe(true);
   });
 });

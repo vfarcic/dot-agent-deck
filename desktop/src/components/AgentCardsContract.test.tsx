@@ -625,13 +625,15 @@ describe("desktop/agent-cards — action icons on a card (PRD #2374, 2026-11-24)
     expect(within(screen.getByTestId("agent-card-confirm")).getByTestId("agent-card-confirm-prompt").textContent).toBe("Run tests; then upload the logs.");
   });
 
-  /// Scenario: read the card of a stopped agent whose prompt action the daemon disabled. Its icon is drawn disabled, its hover says why in the overlay's words, and pressing it sends nothing and opens nothing.
+  /// Scenario: read the card of a running agent whose prompt action the daemon disabled. Its icon reads as disabled yet stays reachable by keyboard, its hover names the action and says why in the overlay's words, and pressing it sends nothing and opens nothing.
   it("desktop/agent-cards/048: a disabled action's icon is disabled and says why on hover", () => {
     const live = runtime({}, [MIKE]);
     cardsView(live);
     const ship = within(cardOf(MIKE.key)).getByRole("button", { name: "Ship it" });
     expect(ship).toHaveAttribute("data-testid", "agent-card-action-icon");
-    expect(ship).toBeDisabled();
+    expect(ship).toHaveAttribute("aria-disabled", "true");
+    expect(ship, "a native disabled button cannot take keyboard focus").not.toBeDisabled();
+    expect(ship.title).toContain("Ship it");
     expect(ship.title).toContain("Release it.");
     expect(ship.title).toContain("the agent is not running");
     fireEvent.click(ship);
@@ -672,5 +674,75 @@ describe("desktop/agent-cards — action icons on a card (PRD #2374, 2026-11-24)
     fireEvent.click(more);
     for (const id of ["a1", "a2", "a3", "a4", "a5"]) expect(within(overlay()).getByTestId(`agent-card-action-${id}`)).toBeInTheDocument();
     expect(live.invokeCardAction).not.toHaveBeenCalled();
+  });
+  /// Scenario: move keyboard focus onto a card's action icons: an ordinary one, one that asks first and one the daemon disabled on a running agent. Each shows a tooltip, which the icon names as its description, with the action's label and the exact text it sends — the confirm-first one saying it asks first, the disabled one saying why — and moving focus away hides it. Hovering the confirm-first and the disabled icons names the label too.
+  it("desktop/agent-cards/063: keyboard focus on an action icon shows its label and exact text, disabled ones included", () => {
+    const card = entry("47", "focused", {
+      status: "thinking",
+      actions: [
+        action("explain", { label: "Explain", prompt: "Explain what you did.\nThen wait." }),
+        action("deploy", { label: "Deploy it", prompt: "Deploy it, then update your card.", confirm: true }),
+        action("ship", { label: "Ship it", prompt: "Release it.", enabled: false, disabled_reason: "agent_stopped" }),
+        ...deckActions(),
+      ],
+    });
+    cardsView(runtime({}, [card]));
+    const cases = [
+      { label: "Explain", prompt: "Explain what you did.\nThen wait.", note: undefined },
+      { label: "Deploy it", prompt: "Deploy it, then update your card.", note: /confirm/i },
+      { label: "Ship it", prompt: "Release it.", note: /the agent is not running/ },
+    ];
+    for (const { label, prompt, note } of cases) {
+      const icon = within(cardOf(card.key)).getByRole("button", { name: label });
+      expect(screen.queryByRole("tooltip")).toBeNull();
+      act(() => icon.focus());
+      expect(icon, `${label} takes keyboard focus`).toHaveFocus();
+      const tip = screen.getByRole("tooltip");
+      expect(tip).toHaveTextContent(label);
+      expect(tip.textContent).toContain(prompt);
+      if (note) expect(tip).toHaveTextContent(note);
+      expect(icon).toHaveAccessibleDescription(expect.stringContaining(label));
+      expect(icon.getAttribute("aria-describedby")).toBe(tip.id);
+      if (note) {
+        expect(icon.title).toContain(label);
+        expect(icon.title).toMatch(note);
+      }
+      act(() => icon.blur());
+      expect(screen.queryByRole("tooltip")).toBeNull();
+    }
+  });
+
+  /// Scenario: read cards offering exactly three and exactly four prompt actions: three draw three icons and no `+N`; four draw the first three and `+1`. Then the daemon sends the four-action card again with one action gone, a new token on the first, new text on the second and the third now disabled: the card redraws three icons with no `+N`, the new text and the disabled reason are in their hovers, and pressing the re-tokened icon sends the new token.
+  it("desktop/agent-cards/064: the icon limit's boundary, and a card whose offered actions change redraws its icons", async () => {
+    const three = entry("48", "three", { actions: [...["b1", "b2", "b3"].map((id) => action(id, { label: `Action ${id}` })), ...deckActions()] });
+    const four = entry("49", "four", { actions: [...["c1", "c2", "c3", "c4"].map((id) => action(id, { label: `Action ${id}` })), ...deckActions()] });
+    const live = runtime({}, [three, four]);
+    const view = cardsView(live);
+    expect(iconsOn(three.key).map((icon) => icon.getAttribute("data-action"))).toEqual(["b1", "b2", "b3"]);
+    expect(within(cardOf(three.key)).queryByTestId("agent-card-actions-more")).toBeNull();
+    expect(iconsOn(four.key).map((icon) => icon.getAttribute("data-action"))).toEqual(["c1", "c2", "c3"]);
+    expect(within(cardOf(four.key)).getByTestId("agent-card-actions-more")).toHaveTextContent("+1");
+
+    const changed = {
+      ...four,
+      revision: 2,
+      actions: [
+        action("c1", { label: "Action c1", prompt_source: "catalog", token: "tok-c1-new" }),
+        action("c2", { label: "Action c2", prompt: "Do c2, now differently." }),
+        action("c3", { label: "Action c3", enabled: false, disabled_reason: "agent_stopped" }),
+        ...deckActions(),
+      ],
+    };
+    const next = runtime({ invokeCardAction: live.invokeCardAction, agentCards: { [FIXTURE_DAEMON_ID]: snapshot([three, changed], 8) } }, [three, changed]);
+    view.rerender(<AgentOverview runtime={next} onNavigate={vi.fn()} />);
+    expect(iconsOn(four.key).map((icon) => icon.getAttribute("data-action"))).toEqual(["c1", "c2", "c3"]);
+    expect(within(cardOf(four.key)).queryByTestId("agent-card-actions-more")).toBeNull();
+    const c1 = within(cardOf(four.key)).getByRole("button", { name: "Action c1" });
+    expect(within(cardOf(four.key)).getByRole("button", { name: "Action c2" }).title).toContain("Do c2, now differently.");
+    const c3 = within(cardOf(four.key)).getByRole("button", { name: "Action c3" });
+    expect(c3).toHaveAttribute("aria-disabled", "true");
+    expect(c3.title).toContain("the agent is not running");
+    await act(async () => { fireEvent.click(c1); });
+    expect(next.invokeCardAction).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ paneId: four.pane_id }), "c1", expect.objectContaining({ actionToken: "tok-c1-new" }));
   });
 });
