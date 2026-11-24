@@ -991,29 +991,30 @@ export function docsAgentCards(): AgentCardsSnapshot {
 }
 
 /*
- * Issue #2399 — the `agent-cards-batch` and `agent-cards-batch-results` docs
- * scenes (`/?fixture=1&state=docs&cards=batch`): the `agent-cards` scene's
- * cards from a daemon that does batch actions, with a catalog action,
- * Status update, offered by the orchestration's three cards and not by the
- * standalone agent's, so a batch to all four previews three included agents
- * and one skipped. Its execution fails for one agent, as a daemon refuses a
- * press on an agent that stopped after the preview, so the results show a
- * partial failure. Served only for `cards=batch`, so neither the `agent-cards`
- * scene nor any other shows a Select button.
+ * Issue #2399 — the `agent-cards-select`, `agent-cards-tree-batch`,
+ * `agent-cards-batch` and `agent-cards-batch-results` docs scenes
+ * (`/?fixture=1&state=docs&cards=batch`): the `agent-cards` scene's cards from
+ * a daemon that does batch actions, with the deck's default Go ahead
+ * (`go-ahead`, `default_actions` in `src/card_catalog.rs`) offered by the
+ * orchestration's three cards and not by the standalone agent's, so a batch
+ * to all four previews three included agents and one skipped. Every card
+ * keeps the deck's Close, so the selection offers Go ahead and Close. Its
+ * execution fails for one agent, as a daemon refuses a press on an agent that
+ * stopped after the preview, so the results show a partial failure. Served
+ * only for `cards=batch`, so neither the `agent-cards` scene nor any other
+ * shows a Select button.
  */
-const DOCS_BATCH_ACTION = "status-update";
-const DOCS_BATCH_PROMPT = "Post a short status update on your card: what is done, what is next, and anything that blocks you.";
 const DOCS_BATCH_OFFERED = new Set(["1", "2", "3"]);
-/** The agent whose press the scene's daemon refuses at Send, and the sentence it refuses with. */
+/** The agent whose press the scene's daemon refuses at Send, and the sentence it refuses with (the daemon's `action_disabled` wording, `invoke_once` in `src/agent_cards.rs`). */
 const DOCS_BATCH_EXECUTE_FAILURES: Readonly<Record<string, { code: string; message: string }>> = {
-  "2": { code: "action_disabled", message: "Status update is disabled: the agent is not running" },
+  "2": { code: "action_disabled", message: "Go ahead is disabled: the agent is not running" },
 };
 
 /** Issue #2399 — the `cards=batch` scene's cards: `docsAgentCards()` from a daemon that does batches. */
 export function docsBatchAgentCards(): AgentCardsSnapshot {
   const snapshot = docsAgentCards();
-  const entries = snapshot.entries.map((entry) => DOCS_BATCH_OFFERED.has(entry.agent_id)
-    ? { ...entry, actions: [docsCardAction(DOCS_BATCH_ACTION, { label: "Status update", prompt: DOCS_BATCH_PROMPT, prompt_source: "catalog", placement: "detail", icon: "activity" }), ...entry.actions] }
+  const entries = snapshot.entries.map((entry) => DOCS_BATCH_OFFERED.has(entry.agent_id) && !entry.actions.some((action) => action.id === "go-ahead")
+    ? { ...entry, actions: [docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", prompt_source: "catalog", icon: "play" }), ...entry.actions] }
     : entry);
   return { ...snapshot, entries, batch: true };
 }

@@ -107,8 +107,18 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards-select",
+        description: "The desktop Cards view selecting agents for a batch: Select on, the orchestrator root (which selects its two roles) and a standalone agent ticked, and the selection bar's count with Go ahead and Close (issue #2399).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-tree-batch",
+        description: "An orchestrator's card opened from the desktop Cards view, at its section that sends one action to it and the two agents under it (issue #2399).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "agent-cards-batch",
-        description: "The desktop Cards view's batch confirmation for four selected agents: three included, each with the exact text it gets, and one skipped with its reason (issue #2399).",
+        description: "The desktop Cards view's batch confirmation of Go ahead for four selected agents: three included, each with the exact text it gets, and one skipped with its reason (issue #2399).",
         clients: &[Client::Desktop],
     },
     Scenario {

@@ -108,27 +108,70 @@ desktopScenario("agent-cards", async (page) => {
 
 // Issue #2399 — desktop-only: the TUI has no cards view. The `agent-cards`
 // scene's cards from a daemon that does batches (`docsBatchAgentCards`, served
-// only with `cards=batch`): Select, the closed orchestrator root (which
-// selects it and its two roles) and the standalone agent, then Status update,
-// which the three orchestration cards offer and the standalone one does not.
-async function openCardsBatch(page: Page): Promise<void> {
+// only with `cards=batch`), in the Cards view.
+async function openBatchCards(page: Page): Promise<void> {
   await page.goto("/?fixture=1&state=docs&cards=batch");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await page.getByTestId("overview-mode-cards").click();
   await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(2);
+}
+
+// Select, then the closed orchestrator root (which selects it and its two
+// roles) and the standalone agent: the selection bar offers Go ahead, which
+// the three orchestration cards offer, and Close, which every card offers.
+async function selectBatchCards(page: Page): Promise<void> {
+  await openBatchCards(page);
   await page.getByTestId("agent-cards-select").click();
   await page.getByRole("checkbox", { name: "Select Plan / architecture" }).check();
   await page.getByRole("checkbox", { name: "Select User-path verification" }).check();
   await expect(page.getByTestId("agent-cards-selection-count")).toHaveText("4 selected");
-  await page.getByTestId("agent-cards-batch-action-status-update").click();
 }
+
+// The selection, then Go ahead, which opens the batch's confirmation.
+async function openCardsBatch(page: Page): Promise<void> {
+  await selectBatchCards(page);
+  await page.getByTestId("agent-cards-batch-action-go-ahead").click();
+}
+
+// How cards are selected: Select pressed (it reads as on), each card's
+// checkbox, the two ticked, and the selection bar's count with a button per
+// action the selected cards offer. No dialog is open.
+desktopScenario("agent-cards-select", async (page) => {
+  await selectBatchCards(page);
+  await expect(page.getByTestId("agent-cards-select")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("agent-card-select")).toHaveCount(2);
+  await expect(page.getByRole("checkbox", { name: "Select Plan / architecture" })).toBeChecked();
+  await expect(page.getByRole("checkbox", { name: "Select User-path verification" })).toBeChecked();
+  const bar = page.getByTestId("agent-cards-selection");
+  await expect(bar.getByRole("button")).toHaveText(["Go ahead", "Close"]);
+  for (const button of await bar.getByRole("button").all()) {
+    await expect(button).toBeInViewport({ ratio: 1 });
+    expect(await button.evaluate((node) => node.scrollWidth <= node.clientWidth), "the action's label is drawn whole").toBe(true);
+  }
+  await expect(page.getByTestId("agent-cards-batch-confirm")).toHaveCount(0);
+});
+
+// The other way to start a batch: the orchestrator's own card, opened from
+// the Cards view, has a section named after it and the agents under it, with
+// a button per action that opens the same confirmation.
+desktopScenario("agent-cards-tree-batch", async (page) => {
+  await openBatchCards(page);
+  await page.getByRole("button", { name: /: show Plan \/ architecture's card$/ }).click();
+  const overlay = page.getByTestId("agent-card-overlay");
+  await expect(overlay.getByRole("heading", { name: "Plan / architecture", exact: true })).toBeVisible();
+  const batch = overlay.getByTestId("agent-card-batch");
+  await expect(batch.getByRole("heading")).toHaveText("Plan / architecture and the 2 agents under it");
+  await expect(batch.getByRole("button")).toHaveText(["Go ahead", "Close"]);
+  await batch.scrollIntoViewIfNeeded();
+  await expect(batch).toBeInViewport({ ratio: 1 });
+});
 
 desktopScenario("agent-cards-batch", async (page) => {
   await openCardsBatch(page);
   const dialog = page.getByTestId("agent-cards-batch-confirm");
   await expect(dialog.locator(".agent-cards-batch-entry.is-included")).toHaveCount(3);
-  await expect(dialog.getByTestId("agent-cards-batch-prompt").first()).toContainText("Post a short status update on your card");
+  await expect(dialog.getByTestId("agent-cards-batch-prompt")).toHaveText(["Go ahead.", "Go ahead.", "Go ahead."]);
   await expect(dialog.locator(".agent-cards-batch-entry.is-skipped")).toContainText("User-path verification's card does not offer this action");
   await expect(dialog.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
 });
@@ -141,7 +184,7 @@ desktopScenario("agent-cards-batch-results", async (page) => {
   await page.getByTestId("agent-cards-batch-confirm").getByRole("button", { name: "Send", exact: true }).click();
   const results = page.getByTestId("agent-cards-batch-results");
   await expect(results.getByTestId("agent-cards-batch-entry")).toHaveCount(3);
-  await expect(results.locator("[data-outcome='failed']")).toContainText("Status update is disabled: the agent is not running");
+  await expect(results.locator("[data-outcome='failed']")).toContainText("Go ahead is disabled: the agent is not running");
   await expect(results.getByRole("status")).toHaveText("2 queued for the agent of 3; 1 failed");
   await expect(results.getByRole("button", { name: "Close", exact: true })).toBeVisible();
 });
