@@ -780,10 +780,57 @@ fn probe_098_a_codex_home_inside_the_working_directory_is_held_without_a_check()
     let f = live::Fixture::with_codex_home("codex", ENV, "codex");
     f.hook_event("session_start");
     f.hook_event("idle");
-    let tui = attached(&f);
+    held_for_the_codex_home(&f);
+}
+
+/// Scenario: Start a Codex stand-in whose own `config.toml` adds its home, `~/.codex`, to the folders Codex's sandbox may write (`sandbox_workspace_write.writable_roots`, issue #2127), so a real Codex would hand its editor a file elsewhere, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G, and run no helper: the card and the attached TUI say `cannot_check`, the log names the `Keymap(CodexHome)` hold, and the mail waits.
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_a_codex_home_inside_a_root_its_config_adds_is_held_without_a_check() {
+    let f = with_home_files(
+        "codex",
+        &[(
+            ".codex/config.toml",
+            "\n[sandbox_workspace_write]\nwritable_roots = [\"~/.codex\"]\n",
+        )],
+    );
+    held_for_the_codex_home(&f);
+}
+
+/// Scenario: The control for the test above: the same stand-in with its `config.toml` adding a folder that doesn't hold its home (`~/elsewhere`) to the folders Codex's sandbox may write. Typing and deleting text then queueing mail brings the deck's check, and the notice is typed and its mail fetched once.
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_a_codex_whose_config_adds_another_root_is_checked_then_rung() {
+    let f = with_home_files(
+        "codex",
+        &[
+            (
+                ".codex/config.toml",
+                "\n[sandbox_workspace_write]\nwritable_roots = [\"~/elsewhere\"]\n",
+            ),
+            ("elsewhere/.keep", ""),
+        ],
+    );
     touched_empty(&f);
     let id = f.enqueue();
-    wait_hold(&f, "cannot_check");
+    let line = delivered(&f, &id);
+    f.expect(format!("x\x7f\x07{line}\r").as_bytes());
+    assert!(
+        !f.log_text().contains("Keymap(CodexHome)"),
+        "{}",
+        f.log_text()
+    );
+}
+
+/// What the Codex-home tests above assert once mail is queued behind a
+/// touched and cleared box: `cannot_check` on the card and in an attached
+/// TUI, a `Keymap(CodexHome)` hold in the log, nothing typed (not even a
+/// check's Ctrl+G), no helper run and the mail still waiting.
+fn held_for_the_codex_home(f: &Fixture) {
+    let tui = attached(f);
+    touched_empty(f);
+    let id = f.enqueue();
+    wait_hold(f, "cannot_check");
     let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
     let expected: String = words["wakeHolds"]["cannot_check"]
         .as_str()
@@ -808,7 +855,7 @@ fn probe_098_a_codex_home_inside_the_working_directory_is_held_without_a_check()
         f.input()
     );
     assert!(!f.path("helper-exited-1").exists(), "no helper ran");
-    assert!(mail_turns(&f, &id).is_empty());
+    assert!(mail_turns(f, &id).is_empty());
 }
 
 /// A stand-in of `kind` started with `files` written into its HOME (also its
@@ -902,6 +949,20 @@ fn probe_099_a_claude_whose_settings_env_sets_a_deck_variable_is_held_without_a_
         &[(
             ".claude/settings.json",
             r#"{"env": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+        )],
+    );
+    held_for_the_editor(&f, false);
+}
+
+/// Scenario: Start a Claude Code stand-in whose cached server-managed settings (`~/.claude/remote-settings.json`) name a policy helper, a program Claude Code runs as it starts and whose output's `env` it applies, so `VISUAL` can be set where no file shows it (issue #2131), then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card says `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_a_claude_whose_managed_settings_name_a_policy_helper_is_held_without_a_check() {
+    let f = with_home_files(
+        "claude",
+        &[(
+            ".claude/remote-settings.json",
+            r#"{"policyHelpers": {"linux": {"path": "/usr/local/bin/policy"}}}"#,
         )],
     );
     held_for_the_editor(&f, false);

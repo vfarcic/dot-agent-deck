@@ -73,3 +73,16 @@ export function statusWordLabel(word: StatusWord): string {
  * the desktop's own states.
  */
 export const STATUS_WORD_ORDER: readonly StatusWord[] = ["working", "thinking", "compacting", "running", "needs_input", "error", "blocked", "waiting", "idle", "queued", "passed", "stopped"];
+
+/**
+ * Issue #2418 — the word a card's status is shown as. A card carries the
+ * daemon's status (`waiting_for_input`, `unknown`, …) or `stopped`, which the
+ * daemon sets on a card whose agent exited; each reads as the table and the
+ * TUI read it. `undefined` for a status a newer daemon names that this build
+ * does not know, which is then shown as it came.
+ */
+export function cardStatusWord(status: string): StatusWord | undefined {
+  const daemon = status.toLowerCase();
+  if (daemon === "stopped") return "stopped";
+  return Object.prototype.hasOwnProperty.call(DAEMON_WORD, daemon) ? DAEMON_WORD[daemon as DaemonAgentStatus] : undefined;
+}

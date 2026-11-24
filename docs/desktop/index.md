@@ -27,7 +27,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Open an agent's live terminal and type into it | Click its row on the Dashboard | [Dashboard → The agent pane](dashboard.md#the-agent-pane) |
 | Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
 | Read an agent's pull request on GitHub, inside the app | The pull request badge on its row or in its pane | [Dashboard → Pull requests](dashboard.md#pull-requests) |
-| Have an agent write or update the project's `.dot-agent-deck.toml` | **Generate config** (**Update config** when the project has one) on its row or in its pane | [Dashboard → Generate a config with an agent](dashboard.md#generate-a-config-with-an-agent) |
+| Have an agent write or update the project's `.dot-agent-deck.toml` | **Generate config** (**Update config** when the project has one) in its pane, or by voice | [Dashboard → Generate a config with an agent](dashboard.md#generate-a-config-with-an-agent) |
 | Stop an agent, or every role of an orchestration | The stop control on a row, **Close** on an orchestration | [Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations) |
 | Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
 | Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
@@ -51,7 +51,7 @@ The desktop app has two things the TUI does not: one Dashboard over several daem
 
 ## Upgrade the app
 
-The app checks for a newer release when it starts and every 6 hours while it runs. When the app itself is behind, two things appear:
+The app checks for a newer release when it starts, every 6 hours while it runs, and when you come back to its window after an hour or more without a check, such as after the laptop slept. When the app itself is behind, two things appear:
 
 - an upgrade button, an arrow in a circle, at the bottom of the rail, on every screen. Hovering it shows, for example, `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)`.
 - a banner with the same text at the top of the Dashboard, with an **Upgrade…** button and a dismiss button. Dismissing it hides it until a newer release appears or the app restarts; the rail button stays.
@@ -90,6 +90,8 @@ A copy that cannot be upgraded from the app, such as an app in a folder you cann
 
 After a CLI is installed, its result goes on to say what your agents' hooks call now, for example `Claude Code and Codex hooks now run this copy (v<new>). Restart agents that were already running so they use them.` When the hooks still call another copy, or could not be checked, the result names the command to run, with a **Copy** button, and says to restart the affected agents; after a download you still have to install, it says `Agent hooks were not updated.` and gives the command to run once it is installed. [Installation → Your agents' hooks after an upgrade](../installation.md#your-agents-hooks-after-an-upgrade) lists each result; the TUI and `dot-agent-deck upgrade` show the same ones.
 
+On Linux, a CLI downloaded from a release takes the [resource collector](../telemetry.md#cpu-memory-and-disk-per-run) in its directory along: the CLI's plan says so before you press **Upgrade**, and the result says whether the collector was upgraded and whether its systemd user service was restarted, or why it was left alone, for example `Upgraded the resource collector at <path> from v<old> to v<new>, checked the same way.` When the CLI's directory is not yours to write, the collector is only downloaded and checked, even when the app installs the CLI behind the password prompt, and the result shows the `sudo` command, with a **Copy** button, that installs it. [Installation → The resource collector after an upgrade](../installation.md#the-resource-collector-after-an-upgrade) lists each result; the TUI and `dot-agent-deck upgrade` show the same ones.
+
 If **Relaunch** fails, the dialog shows why under its buttons; quit the app and open it again yourself. For any other failure, the copy's section shows the error and says whether anything changed; [Installation → When an upgrade fails](../installation.md#when-an-upgrade-fails) lists the messages and what to do.
 
 Upgrading does not stop the daemon or its agents. When the restarted app finds the daemon on this machine running the older release, it restarts the daemon onto its own version, asking first when agents are running ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)). If the Dashboard says **Incompatible daemon** after the app restarts, see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release). A remote daemon is not upgraded from this dialog; use its **Upgrade** button ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)).
@@ -117,7 +119,7 @@ When the app starts with something else to ask you first, such as an upgrade it 
 Some desktop surfaces are hidden unless the `experimental` flag is on, and these pages do not describe them. If you see one of these on someone else's screen and not on yours, that is why:
 
 - The **Daemons** entry in the rail and the Dashboard's **Open daemons** button, which lead to a multi-pane screen. That screen's own **Stop** and **Replace daemon** controls (the Dashboard has both too), renaming an agent, the command palette (`Ctrl+K` / `⌘K`), the shortcut sheet (`?`) and the output **Reader** are on that screen, so they are hidden with it.
-- The **Projects**, **Prompts**, **Orchestrations** and **Agent Profiles** entries in the rail.
+- The **Projects**, **Orchestrations** and **Agent Profiles** entries in the rail.
 
 **How the desktop app reads the flag.** From its own environment, once, when it starts: set `DOT_AGENT_DECK_EXPERIMENTAL=1` in the environment the app is launched from, or set `DOT_AGENT_DECK_FEATURES_CONFIG` to the path of a `.dot-agent-deck.toml` whose `[features]` table sets `experimental = true`. When both are set, `DOT_AGENT_DECK_EXPERIMENTAL` wins. Unlike the TUI and the daemon, the desktop app does not look for a `.dot-agent-deck.toml` in any directory, and it does not notice a change until it is restarted. An app launched from the macOS Dock or Finder, or from a Linux desktop menu, does not inherit variables exported in your shell profile; on Linux, start it from a terminal instead: `DOT_AGENT_DECK_EXPERIMENTAL=1 dot-agent-deck-desktop`.
 

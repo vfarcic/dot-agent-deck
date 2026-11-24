@@ -12,6 +12,8 @@ export type PullRequestBrowserSession = {
   agentLabel: string;
   number: number;
   url: string;
+  /** Issue #2418 — an issue a card's agent reported opens here too; absent for a pull request. */
+  kind?: "pull_request" | "issue";
 };
 
 /**
@@ -221,7 +223,7 @@ export function PullRequestBrowser<S extends PullRequestBrowserSession>({ sessio
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [covered]);
 
-  const title = `Pull request #${session.number}`;
+  const title = `${session.kind === "issue" ? "Issue" : "Pull request"} #${session.number}`;
   return (
     <div
       ref={overlayRef}

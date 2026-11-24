@@ -2413,7 +2413,7 @@ fn probe_097_an_agent_whose_helper_reads_another_generation_is_held() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Lay out Codex homes, working folders and temporary directories on disk and ask whether such a Codex can be checked at all (the user's ruling Q227b). A home outside the working folder, the working folder's own `.codex`, and a home reached through a symlink that lands outside are checkable; a home inside the working folder (or the folder itself), one whose symlink lands inside it, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
+/// Scenario: Lay out Codex homes, working folders, temporary directories and folders a launch adds to what Codex may write on disk, and ask whether such a Codex can be checked at all (the user's ruling Q227b, issue #2127). A home outside the working folder and every added folder, the working folder's own `.codex`, an added folder's own `.codex`, a home reached through a symlink that lands outside, and an added folder that doesn't exist are checkable; a home inside the working folder (or the folder itself), inside an added folder (or that folder itself, or reached through a symlinked one), one whose symlink lands inside either, one with an added folder inside its `editor`, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
 #[spec("inbox/probe/098")]
 #[test]
 fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
@@ -2455,9 +2455,73 @@ fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
         .tempdir_in("/tmp")
         .unwrap();
     let missing = root.join("missing");
+    let added = mk(&root.join("added"));
+    let in_added = mk(&added.join("codexhome"));
+    let added_own = mk(&added.join(".codex"));
+    let added_link = root.join("added-link");
+    std::os::unix::fs::symlink(&added, &added_link).unwrap();
+    let into_added = root.join("into-added");
+    std::os::unix::fs::symlink(&in_added, &into_added).unwrap();
+    let in_editor = mk(&outside.join("editor/sub"));
 
     let held = Err(Hold::CodexHome);
     let mut wrong = Vec::new();
+    for (row, home, roots, want) in [
+        (
+            "a home outside the added folder",
+            &outside,
+            vec![added.clone()],
+            Ok(()),
+        ),
+        (
+            "the added folder's own .codex",
+            &added_own,
+            vec![added.clone()],
+            Ok(()),
+        ),
+        (
+            "an added folder that doesn't exist",
+            &outside,
+            vec![missing.clone()],
+            Ok(()),
+        ),
+        (
+            "a home inside the added folder",
+            &in_added,
+            vec![added.clone()],
+            held,
+        ),
+        ("the added folder itself", &added, vec![added.clone()], held),
+        (
+            "a home inside a symlinked added folder",
+            &in_added,
+            vec![added_link.clone()],
+            held,
+        ),
+        (
+            "a symlinked home landing in the added folder",
+            &into_added,
+            vec![added.clone()],
+            held,
+        ),
+        (
+            "an added folder inside the home's editor",
+            &outside,
+            vec![in_editor.clone()],
+            held,
+        ),
+        (
+            "a home inside the second added folder",
+            &in_added,
+            vec![elsewhere.clone(), added.clone()],
+            held,
+        ),
+    ] {
+        let got = codex_home_checkable(home, &project, None, &roots);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
     for (row, home, cwd, tmpdir, want) in [
         (
             "a home outside the project",
@@ -2527,14 +2591,147 @@ fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
             held,
         ),
     ] {
-        let got = codex_home_checkable(home, cwd, tmpdir);
+        let got = codex_home_checkable(home, cwd, tmpdir, &[]);
         if got != want {
             wrong.push(format!("{row}: {got:?}, want {want:?}"));
         }
     }
-    let got = codex_home_checkable(in_slash_tmp.path(), &project, None);
+    let got = codex_home_checkable(in_slash_tmp.path(), &project, None, &[]);
     if got != held {
         wrong.push(format!("a home under /tmp: {got:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Read the folders a Codex launch adds to what its sandbox may write, as the deck does before it checks the box (issue #2127): `writable_roots` under `sandbox_workspace_write` in `config.toml`, a profile file, a project file and a `-c` (as a dotted key or as a table), and each `--add-dir` in its separate and `=` forms, a relative one under the working folder and, from a file, under that file's folder too, and `~` from `HOME`. A root set in one layer and replaced in a later one still counts, nothing after `--` does, and a `writable_roots` that isn't a list of strings, a `--add-dir` with no value, a `~` with no `HOME` and a file that can't be parsed hold.
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_the_roots_a_codex_launch_adds_are_read_from_every_source() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, codex_writable_roots};
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let codex_home = home.join(".codex");
+    let cwd = dir.path().join("repo");
+    for d in [&codex_home, &cwd.join(".codex")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "[sandbox_workspace_write]\nwritable_roots = [\"/from/config\", \"rel\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home.join("work.config.toml"),
+        "sandbox_workspace_write = { writable_roots = [\"~/from-profile\"] }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".codex/config.toml"),
+        "[sandbox_workspace_write]\nwritable_roots = [\"/from/project\"]\n",
+    )
+    .unwrap();
+    let launch = args(&[
+        "-p",
+        "work",
+        "-c",
+        "sandbox_workspace_write.writable_roots=[\"/from/c\"]",
+        "--config=sandbox_workspace_write={writable_roots=[\"/from/table\"]}",
+        "--add-dir",
+        "/from/add-dir",
+        "--add-dir=../sibling",
+        "--",
+        "--add-dir",
+        "/after/dashes",
+    ]);
+    let baseline = CodexBaseline::at_spawn(&codex_home, &launch, &cwd).unwrap();
+    let roots = codex_writable_roots(
+        &baseline.sources,
+        &baseline.read,
+        &launch,
+        &cwd,
+        Some(&home),
+    )
+    .unwrap();
+    let want: Vec<PathBuf> = vec![
+        "/from/config".into(),
+        cwd.join("rel"),
+        codex_home.join("rel"),
+        home.join("from-profile"),
+        "/from/project".into(),
+        "/from/c".into(),
+        "/from/table".into(),
+        "/from/add-dir".into(),
+        cwd.join("../sibling"),
+    ];
+    let mut got = roots.clone();
+    got.sort();
+    let mut sorted = want.clone();
+    sorted.sort();
+    assert_eq!(got, sorted, "every source's roots, and nothing after --");
+
+    std::fs::remove_file(cwd.join(".codex/config.toml")).unwrap();
+    let held = |launch: &[&str], config: &str, user_home: Option<&Path>| {
+        std::fs::write(codex_home.join("config.toml"), config).unwrap();
+        let launch = args(launch);
+        let baseline = CodexBaseline::at_spawn(&codex_home, &launch, &cwd).unwrap();
+        codex_writable_roots(&baseline.sources, &baseline.read, &launch, &cwd, user_home)
+    };
+    let mut wrong = Vec::new();
+    for (row, launch, config, user_home, want) in [
+        (
+            "a root replaced in a later layer still counts",
+            vec!["-c", "sandbox_workspace_write.writable_roots=[]"],
+            "[sandbox_workspace_write]\nwritable_roots = [\"/kept\"]\n",
+            Some(home.as_path()),
+            Ok(vec![PathBuf::from("/kept")]),
+        ),
+        (
+            "a writable_roots that is a string",
+            vec![],
+            "[sandbox_workspace_write]\nwritable_roots = \"/one\"\n",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a writable_roots holding a number",
+            vec![],
+            "[sandbox_workspace_write]\nwritable_roots = [1]\n",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a sandbox_workspace_write that isn't a table",
+            vec!["-c", "sandbox_workspace_write=1"],
+            "",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a --add-dir with no value",
+            vec!["--add-dir"],
+            "",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a ~ with no HOME",
+            vec!["--add-dir", "~/x"],
+            "",
+            None,
+            Err(Hold::CodexHome),
+        ),
+        (
+            "a config.toml that can't be parsed",
+            vec![],
+            "[sandbox_workspace_write\n",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+    ] {
+        let got = held(&launch, config, user_home);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -2721,7 +2918,7 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents whose `env` moves where Claude Code reads its configuration (the revcxfix2 review's LOW-1): `CLAUDE_CONFIG_DIR` (which, set there, moved where the pinned 2.1.318 read `keybindings.json` from, measured in a sandbox) and `HOME`, in any case, hold `Unmeasured`; names that only contain them, and a value naming a home folder, pass.
+/// Scenario: Judge Claude Code settings documents whose `env` moves where Claude Code reads its configuration (the revcxfix2 review's LOW-1): `CLAUDE_CONFIG_DIR` (which, set there, moved where the pinned 2.1.318 read `keybindings.json` from, measured in a sandbox), `HOME` and `CLAUDE_CODE_REMOTE_SETTINGS_PATH` (where an internal build caches server-managed settings, issue #2131), in any case, hold `Unmeasured`; names that only contain them, and a value naming a home folder, pass.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_env_moving_its_config_holds() {
@@ -2732,6 +2929,11 @@ fn probe_099_claude_settings_env_moving_its_config_holds() {
         (
             "CLAUDE_CONFIG_DIR",
             r#"{"env": {"CLAUDE_CONFIG_DIR": "/x"}}"#,
+            moved,
+        ),
+        (
+            "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+            r#"{"env": {"claude_code_remote_settings_path": "/x.json"}}"#,
             moved,
         ),
         ("HOME", r#"{"env": {"A": "1", "HOME": "/x"}}"#, moved),
@@ -2849,6 +3051,122 @@ fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Scenario: Judge Claude Code settings documents that configure a policy helper, an executable Claude Code runs as it starts whose output's `env` it applies (issue #2131: with one named by `/etc/claude-code/managed-settings.json`, 2.1.318 and 2.1.330 opened the editor its output named on Ctrl+G, measured in a sandbox). `policyHelper`, `policyHelpers` (a per-system map, or one holding only a static payload) in any case, at the top or nested, hold `Editor`, also beside an `env` with no editor; another helper (`apiKeyHelper`) and the name only in a value pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_naming_a_policy_helper_hold() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "policyHelper",
+            r#"{"policyHelper": {"path": "/usr/local/bin/policy"}}"#,
+            editor,
+        ),
+        (
+            "policyHelpers per system",
+            r#"{"policyHelpers": {"linux": {"path": "/usr/local/bin/policy"}}}"#,
+            editor,
+        ),
+        (
+            "a static payload only",
+            r#"{"policyHelpers": {"default": {"model": "x"}}}"#,
+            editor,
+        ),
+        (
+            "beside an env with no editor",
+            r#"{"env": {"A": "1"}, "policyHelper": {"path": "/p"}}"#,
+            editor,
+        ),
+        ("lower case", r#"{"policyhelper": {"path": "/p"}}"#, editor),
+        (
+            "nested",
+            r#"{"x": {"PolicyHelpers": {"linux": {"path": "/p"}}}}"#,
+            editor,
+        ),
+        (
+            "another helper",
+            r#"{"apiKeyHelper": "/bin/key", "env": {"A": "1"}}"#,
+            Ok(()),
+        ),
+        (
+            "only in a value",
+            r#"{"model": "policyHelper", "statusLine": {"command": "policyHelpers"}}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("managed-settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Judge the server-managed settings Claude Code 2.1.330 caches for an organisation sign-in in `~/.claude/state/hybrid-settings.json`, whose `settings` member is the settings document (issue #2131). An `env` there naming `VISUAL` or a policy helper there holds `Editor`, and an `env` naming `HOME` holds `Unmeasured`; a `settings` that isn't an object, or named twice, holds `Editor`; no `settings`, a `settings` with no `env`, an empty file and an `env` beside `settings` rather than in it (which Claude does not apply) pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_organisation_cached_settings_are_read() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_settings_member_env};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "VISUAL in settings' env",
+            r#"{"organizationUuid": "u", "settings": {"env": {"VISUAL": "nvim"}}, "fetchedAt": 1}"#,
+            editor,
+        ),
+        (
+            "a policy helper in settings",
+            r#"{"organizationUuid": "u", "settings": {"policyHelper": {"path": "/p"}}}"#,
+            editor,
+        ),
+        (
+            "HOME in settings' env",
+            r#"{"organizationUuid": "u", "settings": {"env": {"HOME": "/x"}}}"#,
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "settings not an object",
+            r#"{"organizationUuid": "u", "settings": 1}"#,
+            editor,
+        ),
+        (
+            "settings twice",
+            r#"{"settings": {}, "settings": {"env": {"HOME": "/x"}}}"#,
+            editor,
+        ),
+        ("not an object", r#"[1]"#, editor),
+        ("no settings", r#"{"organizationUuid": "u"}"#, Ok(())),
+        (
+            "settings with no env",
+            r#"{"organizationUuid": "u", "settings": {"model": "x", "env": {"A": "1"}}}"#,
+            Ok(()),
+        ),
+        ("empty", "", Ok(())),
+        (
+            "an env beside settings",
+            r#"{"env": {"HOME": "/x"}, "settings": {"model": "x"}}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("hybrid-settings.json"),
+            claude_settings_member_env(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A Claude Code HOME and working directory, each under the private test
 /// base, for [`claude_env_sources`].
 struct ClaudeHome {
@@ -2887,7 +3205,7 @@ impl ClaudeHome {
     }
 }
 
-/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, the cached server-managed `remote-settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`, and so do a file that can't be read, a directory where a file belongs, a file past the size bound and a symlink to a file naming `VISUAL`; with every file absent, or present with no `env` (server-managed settings as Claude Code caches them included), a dangling symlink included, the box can be checked.
+/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, the cached server-managed `remote-settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`; so does a policy helper named in `remote-settings.json`, and an `env` naming `HOME` in the `settings` of the organisation sign-in's cached `state/hybrid-settings.json`, under each endpoint's name, holds `Unmeasured` (issue #2131); and so do a file that can't be read, a directory where a file belongs, a file past the size bound and a symlink to a file naming `VISUAL`; with every file absent, or present with no `env` (server-managed settings as Claude Code caches them included), a dangling symlink included, the box can be checked.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_each_file_claude_takes_an_env_from_is_read() {
@@ -2922,6 +3240,40 @@ fn probe_099_each_file_claude_takes_an_env_from_is_read() {
         }
         std::fs::remove_file(&path).unwrap();
     }
+    // The organisation sign-in's cached settings, under each endpoint's name
+    // (issue #2131): the settings document is the file's `settings` member.
+    for suffix in ["", "-custom-oauth", "-staging-oauth", "-local-oauth"] {
+        let path = claude
+            .home
+            .join(format!(".claude/state/hybrid-settings{suffix}.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            r#"{"organizationUuid": "u", "settings": {"env": {"HOME": "/x"}}}"#,
+        );
+        if claude.judge() != Err(Hold::Unmeasured) {
+            wrong.push(format!("HOME in {} passed", path.display()));
+        }
+        write(
+            &path,
+            r#"{"organizationUuid": "u", "settings": {"env": {"DAD_UNRELATED": "1"}}}"#,
+        );
+        if claude.judge() != Ok(()) {
+            wrong.push(format!("no editor in {} held", path.display()));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+    // Server-managed settings naming a policy helper, whose output no file
+    // holds (issue #2131).
+    let remote = claude.home.join(".claude/remote-settings.json");
+    write(
+        &remote,
+        r#"{"policyHelpers": {"linux": {"path": "/usr/local/bin/policy"}}}"#,
+    );
+    if claude.judge() != Err(Hold::Editor) {
+        wrong.push("a policy helper in remote-settings.json passed".into());
+    }
+    std::fs::remove_file(&remote).unwrap();
     let settings = claude.home.join(".claude/settings.json");
     let mut held = |row: &str, judge: Result<(), Hold>| {
         if judge != Err(Hold::Editor) {
@@ -3007,7 +3359,7 @@ fn probe_099_claude_managed_drop_ins_are_read() {
     assert_eq!(judge(), Err(Hold::Editor), "more drop-ins than the bound");
 }
 
-/// Scenario: Ask where Claude Code takes `env` maps from for environments and launches the deck can't follow: a `CLAUDE_CONFIG_DIR`, no `HOME` and a relative working directory are `Unmeasured`; `--settings` and `--project-config-root`, separate or with `=`, are found on the launch's arguments, and other arguments are not.
+/// Scenario: Ask where Claude Code takes `env` maps from for environments and launches the deck can't follow: a `CLAUDE_CONFIG_DIR`, no `HOME`, a `CLAUDE_CODE_REMOTE_SETTINGS_PATH` (empty included) and a relative working directory are `Unmeasured`; `--settings` and `--project-config-root`, separate or with `=`, are found on the launch's arguments, and other arguments are not.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_env_sources_it_cannot_follow() {
@@ -3025,6 +3377,16 @@ fn probe_099_claude_env_sources_it_cannot_follow() {
     assert_eq!(
         claude_env_sources(|_: &str| None, Path::new("/w")).err(),
         Some(Hold::Unmeasured)
+    );
+    let remote_moved = |name: &str| match name {
+        "HOME" => Some(OsString::from("/home/u")),
+        "CLAUDE_CODE_REMOTE_SETTINGS_PATH" => Some(OsString::new()),
+        _ => None,
+    };
+    assert_eq!(
+        claude_env_sources(remote_moved, Path::new("/w")).err(),
+        Some(Hold::Unmeasured),
+        "CLAUDE_CODE_REMOTE_SETTINGS_PATH, empty included"
     );
     assert_eq!(
         claude_env_sources(home, Path::new("w")).err(),

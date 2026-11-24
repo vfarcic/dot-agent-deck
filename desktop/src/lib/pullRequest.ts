@@ -44,7 +44,7 @@ const KNOWN_REVIEWS: readonly PullRequestReview[] = ["approved", "changes_reques
 const KNOWN_CHECKS: readonly PullRequestChecksState[] = ["passing", "failing", "pending", "unknown"];
 
 /** `https://github.com/<owner>/<repo>/pull/<number>` and nothing else — the same rule as `pr_browser::is_pull_request_url`. */
-function isPullRequestUrl(value: string): boolean {
+export function isPullRequestUrl(value: string): boolean {
   let url: URL;
   try {
     url = new URL(value);

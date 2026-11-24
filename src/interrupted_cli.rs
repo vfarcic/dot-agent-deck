@@ -239,6 +239,24 @@ fn render_item_paged(item: &InterruptedItem, page: Option<(usize, Option<usize>)
             }
         }
     }
+    // PRD #1790 stage 3: each agent, the attempt a restore or start-over
+    // names, and whether it can come back.
+    for agent in &item.agents {
+        let name = agent.name.as_deref().map(shown).unwrap_or_default();
+        out.push_str(&format!(
+            "    {}: {name}  {}: {}\n        {}\n",
+            words::LABEL_AGENT,
+            words::LABEL_ATTEMPT,
+            agent.attempt,
+            words::restore_verdict_sentence(agent.restore)
+        ));
+    }
+    if item.agents_omitted > 0 {
+        out.push_str(&format!(
+            "    {}\n",
+            words::omitted_sentence(item.agents_omitted)
+        ));
+    }
     if item.cut {
         out.push_str(&format!("    {}\n", words::ITEM_CUT));
     }
@@ -607,6 +625,298 @@ pub fn render_dismiss(outcome: &DismissOutcome) -> CliOutput {
         } else {
             EXIT_REFUSED
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// restore and start-over (PRD #1790 stage 3)
+// ---------------------------------------------------------------------------
+
+/// `interrupted restore`'s arguments, as clap parsed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreArgs {
+    pub id: String,
+    pub agents: Vec<String>,
+    pub mode: words::RestoreMode,
+    pub dry_run: bool,
+    pub yes: bool,
+}
+
+/// `interrupted start-over`'s arguments, as clap parsed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartOverArgs {
+    pub id: String,
+    pub agent: String,
+    pub dry_run: bool,
+    pub yes: bool,
+}
+
+fn restore_unsupported() -> CliOutput {
+    failed(words::RESTORE_UNSUPPORTED, EXIT_DAEMON_TOO_OLD)
+}
+
+/// The refusal's sentence, from the shared wording, or the daemon's own for a
+/// code this build does not know.
+fn restore_refusal_text(refused: &words::RestoreRefused) -> String {
+    if refused.reason == words::RestoreRefusal::Unknown {
+        shown(&refused.message)
+    } else {
+        words::restore_refusal_sentence(refused.reason).to_string()
+    }
+}
+
+/// Whether the acting command may go on: it was confirmed (`--yes`, a dry
+/// run, or the person answered yes on a terminal). `None` to go on; otherwise
+/// the output that refuses.
+fn restore_gate(
+    dry_run: bool,
+    yes: bool,
+    needs_yes: &str,
+    question: &str,
+    confirm: Confirm<'_>,
+) -> Option<CliOutput> {
+    if dry_run || yes {
+        return None;
+    }
+    match confirm {
+        Confirm::NoTerminal => Some(failed(needs_yes, EXIT_REFUSED)),
+        Confirm::Ask(ask) => {
+            if ask(&format!("{question} [y/N] ")) {
+                None
+            } else {
+                Some(failed(words::NOTHING_RESTORED, EXIT_REFUSED))
+            }
+        }
+    }
+}
+
+/// Whether the acting command will ask on a terminal: it is not a dry run,
+/// `--yes` was not given, and there is a terminal.
+fn asks(dry_run: bool, yes: bool, confirm: &Confirm<'_>) -> bool {
+    !dry_run && !yes && matches!(confirm, Confirm::Ask(_))
+}
+
+/// `question` with a dry run's Git note ([`words::restore_git_note`]) in
+/// front, when there is one.
+fn with_git_note(question: String, git: Option<&words::GitFacts>) -> String {
+    match words::restore_git_note(git) {
+        Some(note) => format!("{note} {question}"),
+        None => question,
+    }
+}
+
+/// `interrupted restore <id> (--continue | --only) [--agent <attempt>]…
+/// [--dry-run] [--yes]`: bring the item's agents back with their
+/// conversations. Asks first on a terminal, unless `--yes` or `--dry-run`;
+/// refused without a terminal and without `--yes`.
+pub async fn run_restore(
+    client: &DaemonClient,
+    args: &RestoreArgs,
+    identity: &AmbientIdentity,
+    confirm: Confirm<'_>,
+) -> CliOutput {
+    let mut question = words::restore_question(&shown(&args.id));
+    // What the person confirms: the item, agents and daemon process its dry
+    // run resolved, so the action reaches exactly them (audit suggestion:
+    // CLI confirmation binding). `None` without a dry run that answered.
+    let mut bound: Option<Bound> = None;
+    // §4 item 10: ask with what a dry run says of an open pull request. Best
+    // effort: a dry run that cannot answer leaves the question as it is, and
+    // the request itself reports why.
+    if asks(args.dry_run, args.yes, &confirm)
+        && let Ok(PinnedQuery::Answered { value, instance }) = client
+            .restore_interrupted_pinned(
+                &args.id,
+                args.agents.clone(),
+                args.mode,
+                true,
+                identity.claim(),
+                None,
+            )
+            .await
+    {
+        question = with_git_note(question, value.git.as_ref());
+        bound = value.item.map(|item| Bound {
+            item,
+            instance,
+            // Only what the dry run said it would restore: an empty
+            // selection must not grow to agents nobody was asked about.
+            agents: if args.agents.is_empty() && !value.would_restore.is_empty() {
+                value
+                    .would_restore
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            } else {
+                args.agents.clone()
+            },
+        });
+    }
+    if let Some(refused) = restore_gate(
+        args.dry_run,
+        args.yes,
+        words::RESTORE_NEEDS_YES,
+        &question,
+        confirm,
+    ) {
+        return refused;
+    }
+    let (id, agents, pinned) = match &bound {
+        Some(bound) => (
+            bound.item.as_str(),
+            bound.agents.clone(),
+            bound.instance.as_deref(),
+        ),
+        None => (args.id.as_str(), args.agents.clone(), None),
+    };
+    match client
+        .restore_interrupted_pinned(
+            id,
+            agents,
+            args.mode,
+            args.dry_run,
+            identity.claim(),
+            pinned,
+        )
+        .await
+    {
+        Ok(PinnedQuery::Answered { value, .. }) => render_restore(&value),
+        Ok(PinnedQuery::Unsupported) => restore_unsupported(),
+        Ok(PinnedQuery::OtherInstance) => failed(words::RESTORE_DAEMON_REPLACED, EXIT_REFUSED),
+        Err(e) => client_error(e),
+    }
+}
+
+/// What a confirmed restore or start over acts on: the item its dry run
+/// resolved, the daemon process that answered it, and the agents.
+struct Bound {
+    item: String,
+    instance: Option<String>,
+    agents: Vec<String>,
+}
+
+/// [`run_restore`]'s text and exit code: 0 when something was (or, in a dry
+/// run, would be) restored and nothing was refused.
+pub fn render_restore(outcome: &words::RestoreOutcome) -> CliOutput {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    for attempt in &outcome.would_restore {
+        stdout.push_str(&format!("{} {attempt}\n", words::RESTORE_WOULD));
+    }
+    if let Some(note) = words::restore_git_note(outcome.git.as_ref()) {
+        stdout.push_str(&format!("{note}\n"));
+    }
+    for agent in &outcome.restored {
+        let name = agent.name.as_deref().map(shown).unwrap_or_default();
+        stdout.push_str(&format!(
+            "{}\n    {}: {}\n",
+            words::restored_sentence(&name),
+            words::LABEL_ATTEMPT,
+            agent.attempt
+        ));
+        if !agent.first_message_posted {
+            stderr.push_str(&format!("{}\n", words::RESTART_NOTE_NOT_SENT));
+        }
+        if !agent.recorded {
+            stderr.push_str(&format!("{}\n", words::RESTORE_NOT_RECORDED));
+        }
+    }
+    for refused in &outcome.refused {
+        match &refused.attempt {
+            Some(attempt) => {
+                stderr.push_str(&format!("{attempt}: {}\n", restore_refusal_text(refused)))
+            }
+            None => stderr.push_str(&format!("{}\n", restore_refusal_text(refused))),
+        }
+    }
+    let acted = !outcome.restored.is_empty() || !outcome.would_restore.is_empty();
+    if !acted && outcome.refused.is_empty() {
+        stderr.push_str(&format!("{}\n", words::NOTHING_RESTORED));
+    }
+    CliOutput {
+        stdout,
+        stderr,
+        code: if acted && outcome.refused.is_empty() {
+            EXIT_OK
+        } else {
+            EXIT_REFUSED
+        },
+    }
+}
+
+/// `interrupted start-over <id> --agent <attempt> [--dry-run] [--yes]`: start
+/// the agent again in its folder, without its conversation. Confirmed as
+/// [`run_restore`] is.
+pub async fn run_start_over(
+    client: &DaemonClient,
+    args: &StartOverArgs,
+    identity: &AmbientIdentity,
+    confirm: Confirm<'_>,
+) -> CliOutput {
+    let mut question = words::start_over_question(&shown(&args.agent));
+    let mut bound: Option<Bound> = None;
+    if asks(args.dry_run, args.yes, &confirm)
+        && let Ok(PinnedQuery::Answered { value, instance }) = client
+            .start_over_interrupted_pinned(&args.id, &args.agent, true, identity.claim(), None)
+            .await
+    {
+        question = with_git_note(question, value.git.as_ref());
+        bound = value.item.map(|item| Bound {
+            item,
+            instance,
+            agents: vec![args.agent.clone()],
+        });
+    }
+    if let Some(refused) = restore_gate(
+        args.dry_run,
+        args.yes,
+        words::START_OVER_NEEDS_YES,
+        &question,
+        confirm,
+    ) {
+        return refused;
+    }
+    let (id, pinned) = match &bound {
+        Some(bound) => (bound.item.as_str(), bound.instance.as_deref()),
+        None => (args.id.as_str(), None),
+    };
+    match client
+        .start_over_interrupted_pinned(id, &args.agent, args.dry_run, identity.claim(), pinned)
+        .await
+    {
+        Ok(PinnedQuery::Answered { value, .. }) => render_start_over(&value),
+        Ok(PinnedQuery::Unsupported) => restore_unsupported(),
+        Ok(PinnedQuery::OtherInstance) => failed(words::RESTORE_DAEMON_REPLACED, EXIT_REFUSED),
+        Err(e) => client_error(e),
+    }
+}
+
+/// [`run_start_over`]'s text and exit code.
+pub fn render_start_over(outcome: &words::StartOverOutcome) -> CliOutput {
+    if let Some(refused) = &outcome.refused {
+        return failed(restore_refusal_text(refused), EXIT_REFUSED);
+    }
+    if outcome.would_start {
+        let note = words::restore_git_note(outcome.git.as_ref())
+            .map(|note| format!("{note}\n"))
+            .unwrap_or_default();
+        return ok(format!("{}\n{note}", words::START_OVER_WOULD));
+    }
+    let Some(agent) = &outcome.started else {
+        return failed(words::NOTHING_RESTORED, EXIT_REFUSED);
+    };
+    let name = agent.name.as_deref().map(shown).unwrap_or_default();
+    let mut stderr = String::new();
+    if !agent.first_message_posted {
+        stderr.push_str(&format!("{}\n", words::SAVED_TASK_NOT_SENT));
+    }
+    if !agent.recorded {
+        stderr.push_str(&format!("{}\n", words::RESTORE_NOT_RECORDED));
+    }
+    CliOutput {
+        stdout: format!("{}\n", words::started_over_sentence(&name)),
+        stderr,
+        code: EXIT_OK,
     }
 }
 

@@ -488,6 +488,10 @@ export function useDeckRuntime(): DeckRuntimeState {
   const generateConfig = useMemo(() => (typeof bridge.generateConfig === "function"
     ? (deckId: string, agentId: string, paneId: string, incarnation?: string) => bridge.generateConfig!(deckId, agentId, paneId, incarnation)
     : undefined), [bridge]);
+  // Issue #2454: the user opened an agent. Best effort; nothing waits on it.
+  const agentOpened = useMemo(() => (typeof bridge.agentOpened === "function"
+    ? (deckId: string, agentId: string, paneId: string, incarnation?: string) => bridge.agentOpened!(deckId, agentId, paneId, incarnation)
+    : undefined), [bridge]);
   const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
     ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
@@ -680,6 +684,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),
     ...(generateConfig ? { generateConfig } : {}),
+    ...(agentOpened ? { agentOpened } : {}),
     ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
     ...(invokeCardAction ? { invokeCardAction } : {}),
     ...(interruptedWork ? { interruptedWork } : {}),

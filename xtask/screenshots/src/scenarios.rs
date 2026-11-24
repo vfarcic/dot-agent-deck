@@ -103,7 +103,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "agent-cards",
-        description: "The desktop Dashboard's Cards view: four agents' cards in an orchestration group and a standalone group, three needing you (PRD #2374).",
+        description: "The desktop Dashboard's Cards view as a tree: an orchestrator opened to show its two roles beside a standalone agent, three needing you (PRD #2374, issue #2418).",
         clients: &[Client::Desktop],
     },
     Scenario {
@@ -118,7 +118,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "generate-config",
-        description: "The Generate .dot-agent-deck.toml confirmation, Yes and No, opened on one agent: in the TUI with `g` on its card beside its pane, on the desktop from its Dashboard row's Generate config button.",
+        description: "The Generate .dot-agent-deck.toml confirmation, Yes and No, opened on one agent: in the TUI with `g` on its card beside its pane, on the desktop from the Generate config button in its pane's header.",
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {

@@ -343,3 +343,191 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
     );
     assert!(Path::new(&repo).join(SENTINEL).is_file());
 }
+
+/// Issue #2418: what `agent-report/live/002` has the agent report, a public
+/// pull request that is merged.
+const MERGED_PR: &str = "https://github.com/vfarcic/dot-agent-deck/pull/2378";
+const REFS_SENTINEL: &str = "AGENT_CARD_LIVE_REFS_7B2C40_SENTINEL.sentinel";
+const REFS_PANE_ID: &str = "agent-card-live-refs-pane";
+/// How long the deck's own lookup of the reported pull request may take once
+/// the card is published.
+const CHECKED: Duration = Duration::from_secs(60);
+
+/// The token the host's own `gh` is logged in with, which the deck's daemon
+/// needs to look a pull request up: the test's `HOME` is a sandbox, so the
+/// daemon's `gh` would otherwise be logged out.
+fn host_gh_token() -> Result<String, String> {
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("the host has no runnable gh ({e})"))?;
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || token.is_empty() {
+        return Err(
+            "the host's gh is not logged in (`gh auth token` printed none), so the deck \
+             cannot check a pull request"
+                .into(),
+        );
+    }
+    Ok(token)
+}
+
+/// Scenario: Start an interactive Haiku in a deck pane and tell it to create
+/// a uniquely named sentinel file and publish its card naming a real, merged
+/// public pull request. `card list` then shows the agent's claim beside the
+/// deck's own check of it, made on the daemon's host with the developer's
+/// `gh`: merged, with its canonical link.
+#[spec("agent-report/live/002")]
+#[test]
+fn live_002_a_real_agents_reported_pull_request_is_checked_by_the_deck() {
+    skip_unless!(common::check_claude_available());
+    let token = match host_gh_token() {
+        Ok(token) => token,
+        Err(reason) => {
+            skip_unless!(Err(reason));
+            unreachable!()
+        }
+    };
+    // The token is registered for redaction before anything launches, so the
+    // diagnostics and recordings the harness writes have it replaced. It is
+    // handed to the deck's launch environment: the TUI, the CLI children the
+    // harness runs at launch and the daemon all receive it, and the daemon's
+    // `gh` is the one that uses it. This Haiku pane overrides `GH_TOKEN` with an
+    // empty value below, so the token is not inherited into the agent's own
+    // environment — but the agent runs as the same OS user and can still read
+    // the daemon's or the TUI's environment through `/proc`. This is an
+    // isolated HOME and configuration, not an OS credential sandbox.
+    common::register_diagnostic_redactions([token.clone()]);
+
+    let scratch = common::harness_tempdir().expect("live checked-reference scratch");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let repo = repo.canonicalize().expect("canonical fixture dir");
+    let bin = common::contained_deck_binary().display().to_string();
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .with_imported_claude_credentials()
+        .with_claude_project_trust(repo.to_string_lossy())
+        .with_env("GH_TOKEN", token)
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    phase("starting Haiku");
+    let events = deck.subscribe_events();
+    let response = common::attach_request_on(
+        deck.attach_socket_path(),
+        &AttachRequest::StartAgent {
+            command: Some(
+                "claude --ax-screen-reader --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
+                    .into(),
+            ),
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            rows: 36,
+            cols: 156,
+            env: vec![
+                ("DOT_AGENT_DECK_PANE_ID".into(), REFS_PANE_ID.into()),
+                // Not inherited from the daemon into this pane; see the
+                // comment where the token is registered for what that does
+                // and does not keep from the agent.
+                ("GH_TOKEN".into(), String::new()),
+            ],
+            display_name: Some("refs Haiku".into()),
+            tab_membership: None,
+            agent_type: Some(AgentType::ClaudeCode),
+            seed: None,
+            authoring_kind: None,
+            client_seeded_kind: None,
+            remember_command: false,
+        },
+    )
+    .expect("start interactive Haiku");
+    assert!(response.ok, "StartAgent: {response:?}");
+    let agent_id = response.id.expect("started Haiku agent id");
+    let key = format!("{REFS_PANE_ID}/{agent_id}");
+    events.wait_for_session_start_on_pane(REFS_PANE_ID, &agent_id, START);
+    deck.wait_for_absence("No active agents");
+    deck.send_keys(b"1");
+    assert!(
+        common::wait_until_panes_settled(
+            deck.attach_socket_path(),
+            std::slice::from_ref(&agent_id),
+            Duration::from_millis(1500),
+            Duration::from_secs(8),
+            SETTLE,
+        ),
+        "interactive Claude startup must settle before typing:\n{}",
+        deck.snapshot_grid()
+    );
+    if deck
+        .snapshot_grid()
+        .lines()
+        .any(|line| line.starts_with(" COMMAND "))
+    {
+        deck.send_keys(b"\x04");
+    }
+    deck.wait_until_grid("interactive Haiku typing mode", |grid| {
+        grid.lines().any(|line| line.starts_with(" TYPING "))
+    });
+
+    phase("prompting the publish");
+    deck.submit_claude_prompt(
+        &events,
+        &agent_id,
+        &format!(
+            "AGENT_CARD_REFS. Use Bash to run exactly this one command, then stop and wait without doing anything else: touch {REFS_SENTINEL} && {bin} card publish --status working --summary 'Reported the pull request' --field pull-request={MERGED_PR}"
+        ),
+        "AGENT_CARD_REFS",
+    );
+
+    phase("waiting for the sentinel and the published card");
+    assert!(
+        common::wait_for_path(&repo.join(REFS_SENTINEL), TURN),
+        "the agent never created {REFS_SENTINEL} in {}\n{}",
+        repo.display(),
+        deck.snapshot_grid()
+    );
+    let published = wait_card(&deck, &key, "showed the agent's report", TURN, |e| {
+        e["report"]["summary"] == "Reported the pull request"
+    });
+    assert_eq!(published["report"]["source"], "agent");
+    let field = published["fields"]
+        .as_array()
+        .and_then(|f| f.iter().find(|f| f["name"] == "pull-request"))
+        .unwrap_or_else(|| panic!("the reported pull-request field: {published:#}"));
+    assert_eq!(
+        field["value"], MERGED_PR,
+        "the agent's claim, as it wrote it"
+    );
+
+    phase("waiting for the deck's check");
+    let reference = |e: &Value| -> Option<Value> {
+        e["checked_refs"]
+            .as_array()?
+            .iter()
+            .find(|r| r["field"] == "pull-request")
+            .cloned()
+    };
+    let checked = wait_card(
+        &deck,
+        &key,
+        "showed the deck's check of the pull request",
+        CHECKED,
+        |e| reference(e).is_some_and(|r| r["result"]["status"] != "pending"),
+    );
+    let pr = reference(&checked).unwrap();
+    if pr["result"]["reason"] == "no_github_access" {
+        skip_unless!(Err(format!(
+            "the deck's gh could not use the host's GitHub login: {pr}"
+        )));
+    }
+    assert_eq!(pr["claim"], MERGED_PR, "{pr:#}");
+    assert_eq!(pr["kind"], "pull_request", "{pr:#}");
+    assert_eq!(pr["repo"], "vfarcic/dot-agent-deck", "{pr:#}");
+    assert_eq!(pr["number"], 2378, "{pr:#}");
+    assert_eq!(pr["url"], MERGED_PR, "{pr:#}");
+    assert_eq!(pr["result"]["status"], "checked", "{pr:#}");
+    assert_eq!(pr["result"]["state"], "merged", "{pr:#}");
+    assert_eq!(pr["result"]["stale"], false, "{pr:#}");
+    assert!(pr["result"]["checked_at"].is_string(), "{pr:#}");
+}

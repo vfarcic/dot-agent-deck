@@ -1,7 +1,8 @@
-import type { DeckView } from "../types";
+import type { DeckView, InboxActionVerb } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 import type { CardStep, OverviewMode } from "./agentCards";
+import type { CardReferenceTarget } from "./prBrowser";
 import type { InterruptedDialogControls } from "./interruptedWork";
 
 /**
@@ -112,7 +113,7 @@ import type { InterruptedDialogControls } from "./interruptedWork";
  * that needed it would be a change to where the state lives rather than a
  * change to the table.
  */
-export type DeckOverlay = "projects" | "prompts" | "profiles" | "orchestration" | "settings";
+export type DeckOverlay = "projects" | "profiles" | "orchestration" | "settings";
 
 /** Issue #1492 — where a spoken scroll moves the agent dashboard: a screen down or up, or to either end. */
 export type DashboardScroll = "down" | "up" | "top" | "bottom";
@@ -588,6 +589,17 @@ export type VoiceActionContext = {
    */
   confirmGenerateConfig: (target: VoiceDispatchTarget) => string | undefined;
   /**
+   * Issue #2148 — Retry or Cancel the deck messages waiting on the user for
+   * the agent an `agent_ref` resolved to, as the Daemons screen's tile lists
+   * them: OPEN a confirmation listing every message the verb covers, by
+   * sender and subject. Like the stops it only asks; the confirmation's
+   * button sends each Retry or Cancel, bound to the message revisions shown.
+   * Served by the deck screen, whose tiles draw the messages. Answers
+   * `undefined` when it opened the confirmation, or the sentence saying why
+   * it did not.
+   */
+  confirmInboxAction: (verb: InboxActionVerb, target: VoiceDispatchTarget) => string | undefined;
+  /**
    * PRD #1401 — open GitHub's page for one agent's pull request in the app's
    * own browser, over the screen. Answers `undefined` when it opened, or the
    * sentence saying why not (the agent has no pull request, or none the app
@@ -597,6 +609,13 @@ export type VoiceActionContext = {
    * pane and the overview's alike.
    */
   openPullRequest: (target: { deckId: string; agentId: string }) => string | undefined;
+  /**
+   * Issue #2418 — open the in-app browser on a pull request or issue a card's
+   * agent reported, at the address the deck checked. Served by the shell,
+   * which owns the browser; the overview reaches it through
+   * `OpenCardReference`, behind `openCardReference`.
+   */
+  openCheckedReference: (target: CardReferenceTarget) => string | undefined;
   /**
    * PRD #1401 — hand the page the browser is showing to the system browser,
    * and close the in-app one once the system browser has it: the toolbar's
@@ -628,14 +647,25 @@ export type VoiceActionContext = {
    */
   /** Show the dashboard as its table or as cards (remembered per window). */
   setOverviewMode: (mode: OverviewMode) => string | undefined;
-  /** Open one agent's card in the card overlay. */
-  showAgentCard: (target: AgentCardRef) => string | undefined;
+  /**
+   * Open one agent's card in the card overlay; with `section`, at that part of
+   * it (issue #2418 review: a card's `+N` opens it at its checked references).
+   */
+  showAgentCard: (target: AgentCardRef, section?: CardOverlaySection) => string | undefined;
   /** Move the open card overlay one card on or back, or to the next card that needs the user. */
   stepAgentCard: (step: CardStep) => string | undefined;
   /** Show only the cards that need the user, or every card. */
   setNeedsYouFilter: (on: boolean) => string | undefined;
   /** Close the card overlay. Published only while it is open, so `closeTopmost` can read its presence. */
   closeAgentCard: () => string | undefined;
+  /** Issue #2418 — open or close the tree under one card: the cards the daemon hung under it. Shows the Cards view. */
+  setCardTree: (target: AgentCardRef, open: boolean) => string | undefined;
+  /**
+   * Issue #2418 — open a pull request or issue one card's agent reported, as
+   * the deck checked it, in the app's GitHub browser: the one at `url` when
+   * given (the badge pressed), else the card's first checked one of `kind`.
+   */
+  openCardReference: (target: AgentCardRef, kind: "pull_request" | "issue", url?: string) => string | undefined;
   /**
    * Press one action of one card: by id from a button, by its label from
    * voice. A prompt action is sent; one that asks for confirmation, a close,
@@ -657,6 +687,9 @@ export type VoiceActionContext = {
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
 export type AgentCardRef = { deckId: string; agentId: string; incarnation?: string };
+
+/** A part of the card overlay a control can open it at. */
+export type CardOverlaySection = "references";
 
 /**
  * One registry entry.
@@ -1128,13 +1161,6 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
   },
 
-  openPromptLibrary: {
-    label: "Open the prompt library",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4)",
-    needs: ["openOverlay"],
-    run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
-  },
-
   openAgentProfiles: {
     label: "Open agent profiles",
     no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
@@ -1386,6 +1412,42 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* PRD #1790 stage 3 — Restore. Voice never starts an agent (PRD #802 D5):
+     this asks the restore question about the item the words name, and the
+     agent starts on the person's own click or key on it. The Restore button
+     and `s` open the same question through this entry; for an item that
+     lists no agent the dialog asks nothing and says so. */
+  askRestoreInterrupted: {
+    label: "Ask to restore an interrupted agent",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.askRestore(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  restoreAndContinueInterrupted: {
+    label: "Restore the agent the question names, and let it continue",
+    no_voice: "Restore and continue starts an agent that spends credits and may push or send; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `c` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreAndContinue(); },
+  },
+
+  restoreOnlyInterrupted: {
+    label: "Restore the agent the question names, waiting",
+    no_voice: "Restore only starts an agent that spends credits and may push or send once told to continue; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `o` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreOnly(); },
+  },
+
+  startOverInterrupted: {
+    label: "Start the agent the question names over in its worktree",
+    no_voice: "Start over starts an agent that spends credits and may push or send, with its saved task; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `w` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.startOver(); },
+  },
+
   backInterruptedWork: {
     label: "Back to the interrupted work list",
     no_voice: "backs out of an item's details or a confirmation to the list; voice's `close` does the same while the dialog is the topmost overlay, which is what the dialog's Escape does",
@@ -1420,8 +1482,11 @@ export const VOICE_ACTIONS = {
     label: "Open one agent's card",
     voice: true,
     needs: ["showAgentCard"],
-    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
-      const refused = context.showAgentCard(cardRefOf(target));
+    /* A spoken "show <agent>'s card" opens the overlay at its top, and its
+       checked references are a section of it; the card's `+N` control names
+       that section so it opens there. */
+    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { cardSection?: CardOverlaySection }) => {
+      const refused = target.cardSection !== undefined ? context.showAgentCard(cardRefOf(target), target.cardSection) : context.showAgentCard(cardRefOf(target));
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1472,6 +1537,48 @@ export const VOICE_ACTIONS = {
     needs: ["closeAgentCard"],
     run: (context: Pick<VoiceActionContext, "closeAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
       const refused = context.closeAgentCard();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* Issue #2418 — the Cards tree: a card's toggle, and its checked pull
+     request and issue badges. */
+  openCardTree: {
+    label: "Open the tree of cards under one card",
+    voice: true,
+    needs: ["setCardTree"],
+    run: (context: Pick<VoiceActionContext, "setCardTree"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.setCardTree(cardRefOf(target), true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  closeCardTree: {
+    label: "Close the tree of cards under one card",
+    voice: true,
+    needs: ["setCardTree"],
+    run: (context: Pick<VoiceActionContext, "setCardTree"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.setCardTree(cardRefOf(target), false);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  openCardPullRequest: {
+    label: "Open the pull request a card's agent reported, as the deck checked it",
+    voice: true,
+    needs: ["openCardReference"],
+    run: (context: Pick<VoiceActionContext, "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { referenceUrl?: string }) => {
+      const refused = context.openCardReference(cardRefOf(target), "pull_request", target.referenceUrl);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  openCardIssue: {
+    label: "Open the issue a card's agent reported, as the deck checked it",
+    voice: true,
+    needs: ["openCardReference"],
+    run: (context: Pick<VoiceActionContext, "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { referenceUrl?: string }) => {
+      const refused = context.openCardReference(cardRefOf(target), "issue", target.referenceUrl);
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1777,6 +1884,29 @@ export const VOICE_ACTIONS = {
     needs: ["confirmGenerateConfig", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">, target: VoiceDispatchTarget) => {
       const refused = context.confirmGenerateConfig(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* Issue #2148 — Retry and Cancel on an agent's deck messages that wait on
+     the user, by voice. Each only OPENS the confirmation listing them; a
+     row's own Retry or Cancel button acts on its one message directly. */
+  confirmRetryInboxMessage: {
+    label: "Ask to retry the deck messages waiting on one agent",
+    voice: true,
+    needs: ["confirmInboxAction", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmInboxAction" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmInboxAction("retry", target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  confirmCancelInboxMessage: {
+    label: "Ask to cancel the deck messages waiting on one agent",
+    voice: true,
+    needs: ["confirmInboxAction", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmInboxAction" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmInboxAction("cancel", target);
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
@@ -2141,7 +2271,7 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "clos
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the
  * browser opens over the deck's pane and the overview's alike.
  */
-export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "openPullRequestInBrowser" | "closePullRequest" | "pullRequestBack">;
+export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "openPullRequestInBrowser" | "closePullRequest" | "pullRequestBack" | "openCheckedReference">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent
@@ -2154,7 +2284,7 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | "showInterruptedWork" | "hideInterruptedWork" | "interruptedDialog" | AgentCardMember>;
 
 /** PRD #2374 — the agent cards' members, served by the overview. */
-export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu";
+export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

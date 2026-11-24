@@ -543,6 +543,13 @@ pub trait PaneController: Send + Sync {
     fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
         self.focus_pane(&card.pane_id)
     }
+    /// Issue #2454: the user opened `card`'s pane (Enter or its number on the
+    /// dashboard), which the daemon counts as dealing with the reason the
+    /// agent's card report raised. `agent_id` is the generation the card
+    /// showed, when the card knows it, so the daemon does nothing if another
+    /// agent took the pane meanwhile. Fire and forget; the default does
+    /// nothing, for controllers with no daemon behind them.
+    fn note_card_opened(&self, _card: &BoundPane, _agent_id: Option<&str>) {}
     /// PRD #1666 part 2 (G-fix7c): whether the local pane under `card`'s pane
     /// id is the card's, so a focus on that pane may select the card: attached
     /// on the daemon process the card was learned from. The default is `true`,
