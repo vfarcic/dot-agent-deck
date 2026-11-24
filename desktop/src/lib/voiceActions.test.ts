@@ -726,7 +726,6 @@ describe("VOICE_ACTIONS", () => {
    */
   it.each([
     ["Projects", "projects-panel"],
-    ["Prompts", "prompt-library-panel"],
     ["Orchestrations", "orchestration-editor"],
     ["Agent Profiles", "agent-profiles-panel"],
     ["Settings", "settings-panel"],
@@ -794,7 +793,6 @@ describe("VOICE_ACTIONS", () => {
    */
   it.each([
     [/Manage projects/, "projects-panel"],
-    [/Open prompt library/, "prompt-library-panel"],
     [/Open agent profiles/, "agent-profiles-panel"],
     [/Edit orchestration order/, "orchestration-editor"],
     [/Open settings/, "settings-panel"],
@@ -1109,7 +1107,6 @@ describe("VOICE_ACTIONS", () => {
     fireEvent.click(screen.getByRole("button", { name: /deck/ }));
     await waitFor(() => expect(screen.getByTestId("selected-project")).toBeVisible());
     fireEvent.click(screen.getByRole("button", { name: "Configure orchestration" }));
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     registryDispatch.mockClear();
 

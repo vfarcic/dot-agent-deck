@@ -19,13 +19,12 @@ The app looks for the daemon at the same default address the TUI uses. If you ru
 
 ## What you can do in it
 
-The rail on the left has four entries, **Dashboard**, **Daemons**, **Prompts** and **Settings**, and the **Voice** button sits at the bottom of the window.
+The rail on the left has two entries, **Dashboard** and **Settings**, and the **Voice** button sits at the bottom of the window.
 
 | Task | Where | Page |
 | --- | --- | --- |
 | See every agent on one or more daemons, with its status | **Dashboard** | [Dashboard](dashboard.md) |
 | Open an agent's live terminal and type into it | Click its row on the Dashboard | [Dashboard → The agent pane](dashboard.md#the-agent-pane) |
-| See one daemon's agents as terminals side by side | **Daemons** | [The Daemons screen](#the-daemons-screen) |
 | Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
 | Read an agent's pull request on GitHub, inside the app | The pull request badge on its row or in its pane | [Dashboard → Pull requests](dashboard.md#pull-requests) |
 | Have an agent write or update the project's `.dot-agent-deck.toml` | **Generate config** (**Update config** when the project has one) in its pane, or by voice | [Dashboard → Generate a config with an agent](dashboard.md#generate-a-config-with-an-agent) |
@@ -35,7 +34,6 @@ The rail on the left has four entries, **Dashboard**, **Daemons**, **Prompts** a
 | Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
 | Upgrade the app to a newer release, and the `dot-agent-deck` CLI on this machine with it when that is behind too | The upgrade button at the bottom of the rail, or **Upgrade…** on the Dashboard's banner | [Upgrade the app](#upgrade-the-app) |
 | Upgrade the `dot-agent-deck` CLI and the daemon on this machine, leading with the app when that is behind too | **Upgrade** on the **Local daemon** section of the Dashboard | [Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine) |
-| Keep reusable prompts on a daemon | **Prompts** | [Saved prompts](#saved-prompts) |
 | Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
 | Sign out of GitHub in the app's pull request page | **Settings → GitHub** | [Settings → GitHub](settings.md#github) |
 | Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
@@ -45,11 +43,11 @@ The rail on the left has four entries, **Dashboard**, **Daemons**, **Prompts** a
 These are TUI-only:
 
 - The [Schedules manager](../scheduled-tasks.md). The desktop app can start a schedule-authoring agent from **New agent**, but cannot list, edit or run schedules. Use the TUI or the `dot-agent-deck schedule` CLI.
-- Filtering agents with `/`, and [customising keybindings](../keyboard-shortcuts.md).
+- Filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
 - Saving and restoring the workspace, and the quit dialog's **Detach** / **Stop**.
 - Installing the deck on a remote machine (`dot-agent-deck remote add`). Once it is installed, the desktop app can [start a daemon there](daemons.md#start-a-daemon-from-the-app) and [upgrade it](daemons.md#upgrade-a-remote-daemon) to the app's version.
 
-The desktop app has three things the TUI does not: one Dashboard over several daemons at once, voice control, and the [saved prompts](#saved-prompts) library.
+The desktop app has two things the TUI does not: one Dashboard over several daemons at once, and voice control.
 
 ## Upgrade the app
 
@@ -98,20 +96,6 @@ If **Relaunch** fails, the dialog shows why under its buttons; quit the app and 
 
 Upgrading does not stop the daemon or its agents. When the restarted app finds the daemon on this machine running the older release, it restarts the daemon onto its own version, asking first when agents are running ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)). If the Dashboard says **Incompatible daemon** after the app restarts, see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release). A remote daemon is not upgraded from this dialog; use its **Upgrade** button ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)).
 
-## The Daemons screen
-
-**Daemons** in the rail, or **Open daemons** on the Dashboard, shows the agents of the daemon chosen in the Dashboard's **Daemon** selector as terminal tiles side by side, each one live and ready to type into. With **All daemons** selected the screen asks you to choose one daemon, and **Open dashboard** takes you back.
-
-The bar at the top of the screen has **Command** (`Ctrl+K` / `⌘K`), a menu of what you can do from here, and a stop button: with an agent selected it reads **Close** and the agent's role, and with none selected it stops the daemon, after asking. When the daemon is not connected, the same bar offers what fixes it, such as **Start daemon**, **Upgrade**, **Replace daemon** or **Reconnect**, as the Dashboard does. Press `?`, or the button at the bottom of the rail, for the screen's keyboard shortcuts.
-
-## Saved prompts
-
-**Prompts** in the rail opens a library of reusable prompts over the Daemons screen. Press **Add prompt** to start one, then give it a name, the prompt text and an optional note. What you type is saved as you type, and a prompt is removed with **Remove prompt** followed by **Confirm remove**. Press `Escape` or the close button to close the library. The library is the desktop app's; the TUI has none.
-
-The app inserts saved prompts in one place for now: **Insert saved prompt** in the Orchestrations editor, which is behind the [`experimental` flag](#features-behind-the-experimental-flag). Without the flag you can still keep and edit prompts.
-
-**Where saved prompts are kept.** The library belongs to the daemon chosen in the Dashboard's **Daemon** selector, on the machine it runs on, so every desktop app connected to that daemon shows the same prompts, and each daemon has its own. With **All daemons** selected there is no library to show, and the library asks you to choose one daemon. If you saved prompts in an earlier version, which kept them on this computer, they move into the first daemon you select that keeps prompts, and the library says how many moved. A prompt longer than a daemon keeps stays on this computer, and the library names it. If that daemon refuses the move, the prompts stay on this computer and the move is tried again the next time the library loads. A daemon from an earlier release does not keep prompts: with one selected, the library is kept on this computer as before, and says so.
-
 ## The star reminder
 
 About once every 10 launches, the app asks when it starts whether you would like to star the dot-agent-deck repository on GitHub. The dialog, **Enjoying dot-agent-deck?**, offers three choices, with the same keys as the TUI's star prompt.
@@ -134,7 +118,8 @@ When the app starts with something else to ask you first, such as an upgrade it 
 
 Some desktop surfaces are hidden unless the `experimental` flag is on, and these pages do not describe them. If you see one of these on someone else's screen and not on yours, that is why:
 
-- The **Projects**, **Orchestrations** and **Agent Profiles** entries in the rail, and the Daemons screen's doors to two of them: **Edit loop** and **Configure agents**.
+- The **Daemons** entry in the rail and the Dashboard's **Open daemons** button, which lead to a multi-pane screen. That screen's own **Stop** and **Replace daemon** controls (the Dashboard has both too), renaming an agent, the command palette (`Ctrl+K` / `⌘K`), the shortcut sheet (`?`) and the output **Reader** are on that screen, so they are hidden with it.
+- The **Projects**, **Orchestrations** and **Agent Profiles** entries in the rail.
 
 **How the desktop app reads the flag.** From its own environment, once, when it starts: set `DOT_AGENT_DECK_EXPERIMENTAL=1` in the environment the app is launched from, or set `DOT_AGENT_DECK_FEATURES_CONFIG` to the path of a `.dot-agent-deck.toml` whose `[features]` table sets `experimental = true`. When both are set, `DOT_AGENT_DECK_EXPERIMENTAL` wins. Unlike the TUI and the daemon, the desktop app does not look for a `.dot-agent-deck.toml` in any directory, and it does not notice a change until it is restarted. An app launched from the macOS Dock or Finder, or from a Linux desktop menu, does not inherit variables exported in your shell profile; on Linux, start it from a terminal instead: `DOT_AGENT_DECK_EXPERIMENTAL=1 dot-agent-deck-desktop`.
 

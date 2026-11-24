@@ -113,7 +113,7 @@ import type { InterruptedDialogControls } from "./interruptedWork";
  * that needed it would be a change to where the state lives rather than a
  * change to the table.
  */
-export type DeckOverlay = "projects" | "prompts" | "profiles" | "orchestration" | "settings";
+export type DeckOverlay = "projects" | "profiles" | "orchestration" | "settings";
 
 /** Issue #1492 — where a spoken scroll moves the agent dashboard: a screen down or up, or to either end. */
 export type DashboardScroll = "down" | "up" | "top" | "bottom";
@@ -1006,6 +1006,12 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /**
+   * Voice-reachable, and the one row whose screen issue #1198 hides by
+   * default: while the flag is off the crate offers it `callable: false`
+   * (`voice::schema::hidden_by_flag`) and `DeckShell` refuses it at dispatch,
+   * so the row stays in the table and the door stays shut.
+   */
   openDeck: {
     label: "Go back to the Daemons screen",
     voice: true,
@@ -1102,9 +1108,12 @@ export const VOICE_ACTIONS = {
 
   /* Issue #1492 — scrolling the agent dashboard, which shows everything
      whether voice is on or off rather than a page at a time. A scroll changes
-     which part of the dashboard is showing and nothing else. */
+     which part of the dashboard is showing and nothing else. The shell routes
+     `scrollDashboard` to what is in front: a pull request open in the app,
+     else an open agent's pane (issue #1673, `lib/paneScroll.ts`), else the
+     dashboard. */
   scrollDown: {
-    label: "Scroll the agent dashboard down by about a screen",
+    label: "Scroll down by about a screen: the agent dashboard, an open agent's pane, or a pull request open in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1114,7 +1123,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollUp: {
-    label: "Scroll the agent dashboard up by about a screen",
+    label: "Scroll up by about a screen: the agent dashboard, an open agent's pane, or a pull request open in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1124,7 +1133,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToTop: {
-    label: "Scroll the agent dashboard to its top",
+    label: "Scroll to the top: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1134,7 +1143,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToBottom: {
-    label: "Scroll the agent dashboard to its bottom",
+    label: "Scroll to the bottom: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1152,23 +1161,16 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
   },
 
-  openPromptLibrary: {
-    label: "Open the prompt library",
-    no_voice: "a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4). It left the experimental flag in issue #1310, which removed only the other half of the old reason",
-    needs: ["openOverlay"],
-    run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
-  },
-
   openAgentProfiles: {
     label: "Open agent profiles",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no flag gate at all since `open_deck`'s went with the deck's flag (issue #1308) — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("profiles"),
   },
 
   openOrchestrationOrder: {
     label: "Edit orchestration order",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no flag gate at all since `open_deck`'s went with the deck's flag (issue #1308) — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the editor launches nothing, since only its own Activate orchestration starts one, so this gets a row on the same terms as `openAgentProfiles`; activating by voice would be a separate row, weighed against PRD #802 D5 (PRD #1195 M4, deferred D3)",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the editor launches nothing, since only its own Activate orchestration starts one, so this gets a row on the same terms as `openAgentProfiles`; activating by voice would be a separate row, weighed against PRD #802 D5 (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("orchestration"),
   },

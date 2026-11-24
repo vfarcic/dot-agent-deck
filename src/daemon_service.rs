@@ -201,6 +201,9 @@ fn systemd_quoted(value: &str) -> String {
 /// by walking up from the daemon's directory, which from `/` would miss
 /// `~/.dot-agent-deck.toml`. `RestartSec` spaces out a crash loop, which at
 /// systemd's 100 ms default would reach its start limit within a second.
+/// `Delegate=yes` hands the daemon its unit's cgroup subtree, where it starts
+/// each agent in a cgroup of its own (issue #1897, [`crate::run_cgroup`]);
+/// stopping the unit still kills everything in it, those cgroups included.
 pub fn render_systemd_unit(spec: &ServiceSpec) -> Result<String, String> {
     reject_control_chars("the binary path", &spec.binary)?;
     let mut unit = String::from(
@@ -225,7 +228,8 @@ pub fn render_systemd_unit(spec: &ServiceSpec) -> Result<String, String> {
         ));
     }
     unit.push_str(
-        "Restart=on-failure\n\
+        "Delegate=yes\n\
+         Restart=on-failure\n\
          RestartSec=2\n\
          \n\
          [Install]\n\
@@ -821,6 +825,8 @@ mod tests {
         );
         assert!(unit.contains("Restart=on-failure\n"));
         assert!(!unit.contains("Restart=always"));
+        // Issue #1897: the subtree agent cgroups are made in.
+        assert!(unit.contains("Delegate=yes\n"), "{unit}");
         assert!(unit.contains("WantedBy=default.target\n"));
         assert!(unit.contains("WorkingDirectory=~\n"));
     }

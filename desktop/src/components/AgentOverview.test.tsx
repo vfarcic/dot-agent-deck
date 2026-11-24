@@ -136,9 +136,9 @@ describe("disconnected daemon actions (issue #1490)", () => {
   const cases = (["local", "remote"] as const).flatMap((deckKind) =>
     (["not-running", "running-not-connected", "unknown"] as const).map((kind) => ({ deckKind, kind })));
 
-  /// Scenario: With experimental features off, a local or remote deck offers one remedy selected by its disconnected reason,
-  /// beside the way to the Daemons screen. An unreachable host explains why retrying is the available action.
-  it.each(cases)("offers one remedy for $deckKind / $kind with experimental off", ({ deckKind, kind }) => {
+  /// Scenario: With experimental features off, a local or remote deck offers one remedy selected by its disconnected reason.
+  /// An unreachable host explains why retrying is the available action.
+  it.each(cases)("offers one action for $deckKind / $kind with experimental off", ({ deckKind, kind }) => {
     window.history.replaceState({}, "", "/");
     const snapshot = createFixtureSnapshot("disconnected");
     const host = deckKind === "local" ? "this machine" : "deploy@build-box:2222";
@@ -152,9 +152,8 @@ describe("disconnected daemon actions (issue #1490)", () => {
     render(<AgentOverview runtime={runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures("") })} onNavigate={vi.fn()} />);
     const note = screen.getByTestId("overview-disconnected");
     const buttons = within(note).getAllByRole("button");
-    expect(buttons).toHaveLength(2);
-    expect(buttons[0]).toHaveAccessibleName("Open daemons");
-    expect(buttons[1]).toHaveAccessibleName(kind === "not-running" ? "Start daemon" : "Reconnect");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]).toHaveAccessibleName(kind === "not-running" ? "Start daemon" : "Reconnect");
     expect(note).toHaveTextContent(message);
     if (kind === "not-running") {
       expect(within(note).getByTestId("start-daemon")).toBeVisible();
@@ -2498,27 +2497,28 @@ describe("DeckShell", () => {
 
   /**
    * Scenario: launch the shipped desktop with the experimental flag absent.
-   * The dashboard is the landing screen, and the rail offers Dashboard, Daemons, Prompts and Settings.
+   * The dashboard is the landing screen and the only rail destinations are Dashboard and Settings.
    */
   it("hides every experimental destination from the shipped rail", async () => {
     window.history.replaceState({}, "", "/?fixture=1");
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Daemons", "Prompts", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
-    expect(screen.getByTestId("open-deck")).toBeInTheDocument();
+    expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
   });
 
   /**
    * Scenario: an older or incomplete desktop bridge returns no feature answer
-   * at startup. The visible app uses the shipped four-destination rail.
+   * at startup. The visible app uses the shipped two-destination rail.
    */
   it("keeps the shipped rail when the feature answer is missing", async () => {
     window.history.replaceState({}, "", "/?fixture=1&experimental=1");
     const state = runtime({ snapshot: createFixtureSnapshot("connected"), ...{ desktopFeatures: undefined } });
     render(<DeckShell runtime={state} />);
 
-    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Daemons", "Prompts", "Settings"]));
+    await waitFor(() => expect(railEntries()).toEqual(["Dashboard", "Settings"]));
     expect(screen.getByTestId("overview-table-region")).toBeVisible();
   });
 
@@ -2531,40 +2531,25 @@ describe("DeckShell", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
 
     await waitFor(() => expect(railEntries()).toEqual([
-      "Dashboard", "Daemons", "Projects", "Prompts", "Orchestrations", "Agent Profiles", "Settings",
+      "Dashboard", "Daemons", "Projects", "Orchestrations", "Agent Profiles", "Settings",
     ]));
   });
 
   /**
-   * Scenario: start on the deck with the shipped flag off. The Daemons screen
-   * is shown, and its command menu opens, since the deck left the flag (issue #1308).
+   * Scenario: ask to start on the deck while the shipped flag is off, then try
+   * the overview's remaining deck entry points. The app keeps the overview visible throughout.
    */
-  it("shows a requested deck view with the experimental flag off", async () => {
+  it("redirects a hidden deck view and leaves no overview shortcut into it", async () => {
     window.history.replaceState({}, "", "/?fixture=1");
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "deck" }} />);
 
-    await waitFor(() => expect(screen.getByTestId("agent-tile-planner")).toBeInTheDocument());
-    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
-    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    expect(screen.getByRole("dialog", { name: "Command menu" })).toBeInTheDocument();
-  });
-
-  /**
-   * Scenario: with the shipped flag off, press Prompts in the rail on the dashboard.
-   * The Daemons screen comes up with the prompt library open over it, and Escape closes the library.
-   */
-  it("opens the prompt library from the shipped dashboard", async () => {
-    window.history.replaceState({}, "", "/?fixture=1");
-    render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
     await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
-
-    fireEvent.click(screen.getByTestId("open-prompts"));
-    expect(screen.getByTestId("prompt-library-panel")).toBeVisible();
-    expect(screen.getByTestId("open-prompts")).toHaveAttribute("aria-current", "page");
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.queryByTestId("prompt-library-panel")).not.toBeInTheDocument();
-    expect(screen.getByTestId("agent-tile-planner")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-open-deck")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open daemons" })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(screen.queryByRole("dialog", { name: "Command menu" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
   });
 
   /**

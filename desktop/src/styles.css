@@ -959,7 +959,6 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .orchestration-editor-list { padding: 12px 16px; display: grid; gap: 7px; overflow: auto; }
 .orchestration-launch-form { padding: 13px 16px; display: grid; grid-template-columns: minmax(130px, .55fr) minmax(220px, 1.45fr); gap: 10px; border-bottom: 1px solid var(--line); background: var(--paper-sunken); }
 .orchestration-launch-form label { display: flex; flex-direction: column; gap: 5px; }
-.orchestration-launch-form .orchestration-task-prompt { grid-column: 1 / -1; }
 .orchestration-launch-form label span { color: var(--faint); font-size: var(--text-xs); font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .orchestration-launch-form input, .orchestration-launch-form textarea { padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: var(--paper-strong); font-family: "JetBrains Mono", monospace; font-size: var(--text-base); }
 .orchestration-launch-form input { height: 33px; }
@@ -1398,9 +1397,9 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 /* From 1240px down to the phone layout the dashboard's actions do not fit
    beside its title with room to spare (measured locally they fit to about
    990px; CI's wider fallback font overflowed at 961px; with the Table | Cards
-   switch, PRD #2374, to about 1135px; and 1180px became 1240px when the Open
-   daemons button joined the shipped actions, issue #1308), so they take a row
-   of their own under it. */
+   switch, PRD #2374, to about 1135px; and 1180px became 1240px for the Open
+   daemons button the experimental flag shows, issue #1308), so they take a
+   row of their own under it. */
 @media (max-width: 1240px) and (min-width: 681px) {
   .topbar.overview-topbar { grid-template-columns: minmax(0, 1fr); row-gap: 0; padding-bottom: 10px; }
   .overview-topbar .top-actions { justify-content: flex-start; flex-wrap: wrap; }

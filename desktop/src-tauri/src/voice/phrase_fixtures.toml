@@ -299,8 +299,10 @@ screen = "agent"
 action = "open_overview"
 outcome = "unavailable"
 
-# The Daemons screen left the experimental flag in issue #1308, so these
-# `open_deck` fixtures run it shown, as the shipped app does.
+# These first four `open_deck` fixtures run with the experimental deck shown.
+# The deck-hidden fixtures following them exercise the shipped overview: a
+# bare "go back" routes to `close`, while explicit deck requests resolve to
+# `open_deck` and are refused with the hidden-deck hint.
 [[fixtures]]
 name = "open-deck-back"
 utterance = "go back"
@@ -327,6 +329,30 @@ name = "open-deck-unavailable"
 utterance = "take me back to the terminals"
 # The agent screen, for `open-overview-unavailable`'s reason (#1197).
 screen = "agent"
+action = "open_deck"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "deck-hidden-go-back"
+utterance = "go back"
+screen = "overview"
+deck_hidden = true
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "deck-hidden-back-to-deck"
+utterance = "back to the deck"
+screen = "overview"
+deck_hidden = true
+action = "open_deck"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "deck-hidden-open-deck"
+utterance = "open the deck"
+screen = "overview"
+deck_hidden = true
 action = "open_deck"
 outcome = "unavailable"
 
@@ -2732,12 +2758,44 @@ screen = "overview"
 action = "scroll_to_bottom"
 outcome = "dispatch"
 
+# Issue #1673 — over an open agent's pane the four rows are callable and the
+# app scrolls the pane (PageUp / PageDown to an agent on the alternate screen),
+# or says why it did not. "scroll to the top" there is still `scroll_to_top`,
+# which the app answers, rather than a `scroll_up` that would move one screen.
 [[fixtures]]
-name = "scroll-negative-over-an-agent-pane"
+name = "scroll-down-over-an-agent-pane"
 utterance = "scroll down"
 screen = "agent"
 action = "scroll_down"
-outcome = "unavailable"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-over-an-agent-pane"
+utterance = "scroll up"
+screen = "agent"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-back-up-through-the-agents-output"
+utterance = "scroll back up through what it wrote"
+screen = "agent"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top-over-an-agent-pane"
+utterance = "scroll to the top"
+screen = "agent"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom-over-an-agent-pane"
+utterance = "scroll to the bottom"
+screen = "agent"
+action = "scroll_to_bottom"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "scroll-negative-under-the-new-agent-dialog"

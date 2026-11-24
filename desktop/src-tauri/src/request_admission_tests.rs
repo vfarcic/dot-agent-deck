@@ -684,14 +684,9 @@ async fn a_preparation_after_a_swap_sends_the_replacement_nothing() {
         let deck = ReplacedDeck::start("g3-prep", SwapAt::FirstConnection, replacement);
         let links = DaemonLinks::default();
         let daemon = held(&links, &deck.endpoint()).await;
-        let prepared = OrchestrationDaemon::prepare_orchestration(
-            &*daemon.client,
-            "/project",
-            "team",
-            "the task",
-            None,
-        )
-        .await;
+        let prepared =
+            OrchestrationDaemon::prepare_orchestration(&*daemon.client, "/project", "team", None)
+                .await;
         let outcome = deck.finish();
         assert_admitted(
             name,

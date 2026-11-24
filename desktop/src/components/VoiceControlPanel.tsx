@@ -1053,6 +1053,9 @@ export function newAnswerLease(): string {
   return String(lastAnswerLease);
 }
 
+/** The command table's row for the deck, whose screen issue #1198 hides by default. */
+const OPEN_DECK_COMMAND = "open_deck";
+
 /**
  * Whose prompt has words in it that nobody has sent yet (PRD #802 D6, rebuilt).
  *
@@ -1278,10 +1281,11 @@ const INTERRUPTED_DIALOG_INVOKES: ReadonlySet<string> = new Set(Object.entries(V
 
 /**
  * The invokes that, said on the agent screen without an `agent_ref`, act on
- * the pane on screen: issue #1402's whole "stop", and PRD #2119's nameless
- * "generate config". {@link dispatchLost} holds each to the pane it was said in.
+ * the pane on screen: issue #1402's whole "stop", PRD #2119's nameless
+ * "generate config", and issue #1673's four scrolls, which move the open
+ * pane. {@link dispatchLost} holds each to the pane it was said in.
  */
-const IMPLICIT_PANE_INVOKES: ReadonlySet<string> = new Set(["confirmStopAgent", "confirmGenerateConfig"]);
+const IMPLICIT_PANE_INVOKES: ReadonlySet<string> = new Set(["confirmStopAgent", "confirmGenerateConfig", "scrollUp", "scrollDown", "scrollToTop", "scrollToBottom"]);
 
 /**
  * The gate for dispatching a resolved outcome: {@link contextLost}'s `answer`
@@ -1840,6 +1844,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const overlappedRef = useRef(false);
   /** PRD #1497 — reading and the app's speech, as declared with an utterance. */
   const declaredReading = (): VoiceReadingStateDto => ({ reading: reader.reader.on, speaking: overlappedRef.current });
+  /* Issue #1198 — the list of what can be said leaves out the deck while the
+     deck is hidden, even from its "elsewhere" half: it is not somewhere else,
+     it is not there. The crate withholds the row from the model as well
+     (`voice::schema::annotate_for`); this covers the overlay's own render,
+     including against an older crate that still lists it as callable. */
+  const showDeck = desktopFeaturesOf(runtime).showDeck;
 
   const [on, setOnState] = useState(false);
   const [phase, setPhaseState] = useState<VoicePhase>("idle");
@@ -4176,10 +4186,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        promise continuation, and the prop captured when the callback was built
        may be a screen the user has already left. */
     void voiceCommands(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.()).then(
-      (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands }); },
+      (commands) => { if (vocabularyRequest.current === mine) setVocabulary({ commands: showDeck ? commands : commands.filter((command) => command.id !== OPEN_DECK_COMMAND) }); },
       (cause) => { if (vocabularyRequest.current === mine) setVocabulary({ problem: sentenceOf(cause) }); },
     );
-  }, [voiceCommands]);
+  }, [showDeck, voiceCommands]);
 
   /*
     Escape closes it. The overlay is the one thing this surface puts over the

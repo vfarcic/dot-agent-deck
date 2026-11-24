@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   ArrowRight,
   Blocks,
-  BookMarked,
   Bot,
   Check,
   CheckCircle2,
@@ -47,7 +46,7 @@ import { AddDaemonDialog, AddDaemonOpener } from "./components/AddDaemonDialog";
 import { HandoffRail } from "./components/HandoffRail";
 import { DeckAttention } from "./components/DeckAttention";
 import { SelectDeckNote } from "./components/SelectDeckNote";
-import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
+import { ProfilesPanel, ProjectsPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
@@ -70,7 +69,6 @@ import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { stopDaemonConfirmCopy, stopDaemonOffer } from "./lib/stopDaemon";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
-import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useQuestionNotifications } from "./hooks/useQuestionNotifications";
 import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
@@ -113,6 +111,8 @@ import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bri
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
+import { PAGE_UP, PANE_AGENT_GONE, PANE_COVERED, PANE_SCROLLING_DOWN, PANE_SCROLLING_UP, PANE_TERMINAL_HIDDEN, paneScrollFailed, scrollAgentPane } from "./lib/paneScroll";
+import { getTerminal } from "./lib/terminalRegistry";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 /** Issue #2454: how many times one open of an agent is reported before giving up. */
@@ -234,12 +234,13 @@ function evidenceOpenOnFirstLoad(): boolean {
  * rather than an overlay the Deck button and `Escape` silently leave open —
  * the property the `Record<DeckOverlay, …>` of setters this replaced carried.
  */
-const DECK_OVERLAYS = Object.keys({ projects: true, prompts: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
+const DECK_OVERLAYS = Object.keys({ projects: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
 
 /**
  * The registry entry voice's `open_deck` row invokes — typed against the
  * registry, so renaming the entry breaks this rather than the gate below.
  */
+const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
 
 /**
  * The registry entry voice's `switch_deck` row invokes (PRD #1195 M3), whose
@@ -253,6 +254,17 @@ const RUN_CARD_ACTION_INVOKE: keyof typeof VOICE_ACTIONS = "runCardAction";
 const REPLY_TO_AGENT_CARD_INVOKE: keyof typeof VOICE_ACTIONS = "replyToAgentCard";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
+
+/**
+ * Issue #1198 — what a view that names the deck is shown as while the deck is
+ * hidden: the overview, and a pane opened over the deck opens over the
+ * overview instead. Views that do not name the deck come back unchanged.
+ */
+function overviewInsteadOfDeck(view: DeckView): DeckView {
+  if (view.kind === "deck") return { kind: "overview" };
+  if (view.kind === "agent" && view.from === "deck") return { ...view, from: "overview" };
+  return view;
+}
 
 export default function App() {
   return <DeckShell runtime={useDeckRuntime()} />;
@@ -312,10 +324,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   }, []);
   /**
    * Issue #1198 — the app's experimental surfaces, read once at startup. The
-   * deck left the flag in issue #1308, so every view is shown as requested.
+   * deck is one of them, so while it is hidden a view that names it — an
+   * `initialView`, a deep link, a pane opened over it — is SHOWN as the
+   * overview instead. Derived rather than written back, so nothing about the
+   * request is lost and no effect races the first render; every navigation
+   * control that could ask for the deck is itself withheld below (the rail,
+   * the overview's Open deck buttons, voice's `open_deck`).
    */
   const features = desktopFeaturesOf(runtime);
-  const view = requestedView;
+  const view = useMemo(() => (features.showDeck ? requestedView : overviewInsteadOfDeck(requestedView)), [features.showDeck, requestedView]);
   /**
    * Issue #1635 — a newer release of this app (or of the CLI beside it): asked
    * at start and every `UPDATE_RECHECK_INTERVAL`, shown in the rail on every
@@ -1460,13 +1477,46 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          PRD #1401 — while the pull request browser is open it is what is in
          front, so the four scrolls move its PAGE instead, from outside it (a
          fixed script per direction, and nothing read back), unless one of the
-         app's own dialogs is over the browser. */
+         app's own dialogs is over the browser.
+
+         Issue #1673 — with an agent's pane open and no pull request over it,
+         the pane is what is in front, so the four scrolls move the pane
+         (`scrollAgentPane`: the PageUp / PageDown the agent scrolls itself by,
+         or the terminal's own history), never the dashboard behind it. */
       ...(prBrowser
         ? { scrollDashboard: (move: DashboardScroll) => {
           if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
           void onPrBrowserPage(prBrowser.opened, prBrowserHost.scroll(move));
           return undefined;
         } }
+        : agentView
+          ? { scrollDashboard: (move: DashboardScroll) => {
+            /* The pane is itself an `aria-modal` overlay, so `modalOpen()` is
+               always true here; what matters is whether anything is drawn
+               OVER it — a raised sheet, a dialog, a confirmation, the Daemon
+               menu. Settings beneath the pane leaves the pane in front. */
+            if (dialogLayerUp() || confirmationOpen || overlayAbove(document.querySelector(".agent-pane-overlay"))) return PANE_COVERED;
+            if (!voicePane) return PANE_AGENT_GONE;
+            if (voicePane.terminalHidden) return PANE_TERMINAL_HIDDEN;
+            const target = { deckId: voicePane.deckId, agentId: voicePane.agentId, incarnation: voicePane.incarnation };
+            /* Straight to the agent, not through the terminal's `onData`:
+               voice's own scroll is not a hand edit of the prompt (Qodo on
+               PR #2476). `dispatchLost` already held this to the pane the
+               utterance was said over. */
+            /* The write settles after the dispatch returns, so its sentence
+               goes through `reportPending`, called here inside the row's
+               `run`: the resolver's "Scrolling up." is not shown, and the
+               row then says the scroll happened or why it did not, unless a
+               newer utterance has reported since (Qodo on PR #2476). */
+            const sendKey = (key: string) => {
+              const work = runtime.sendTerminalInput(target, key).then(() => undefined, (cause: unknown) => paneScrollFailed(cause));
+              const sentence = key === PAGE_UP ? PANE_SCROLLING_UP : PANE_SCROLLING_DOWN;
+              const reportPending = panelVoiceContext.current?.reportPending;
+              if (reportPending) reportPending(sentence, work, sentence);
+              else void work;
+            };
+            return scrollAgentPane(getTerminal(voicePane.deckId, voicePane.agentId, voicePane.incarnation), move, sendKey, voicePane.inputBlocked);
+          } }
         : overviewVoiceContext.current?.scrollDashboard
           ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
           : {}),
@@ -1495,6 +1545,12 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       navigate: (next) => { moved = true; setView(next); },
       closeAgentView: () => { moved = true; closeAgent(); },
     };
+    /* Issue #1198 — the deck is hidden, so voice does not go there even when a
+       resolver names it. The crate already withholds `open_deck` from what the
+       model is offered (`voice::schema::annotate_for`); this is the same gate at
+       the dispatch seam, for an answer that arrives anyway. Refused like any
+       dispatch the host cannot serve, so the report says nothing ran. */
+    if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     /* PR #1451 round 3, change 4 — voice acts only on what is on screen. An
        answer naming an item a paged list shows on another page (an agent
        tile on the Daemons screen's page 2, resolved by Rust against the whole
@@ -1509,7 +1565,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view, voicePane, runtime.sendTerminalInput]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -2073,8 +2129,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const projectsOpen = overlays.open.projects ?? false;
   const profilesOpen = overlays.open.profiles ?? false;
-  const promptsOpen = overlays.open.prompts ?? false;
-  const [selectedPromptId, setSelectedPromptId] = useState(""); // voice-registry-exempt: which stored prompt the library panel is editing — a selection within that panel
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
   const orchestrationOpen = overlays.open.orchestration ?? false;
   const [paletteOpen, setPaletteOpen] = useState(false); // voice-registry-exempt: the command palette is the registry's own surface: it lists entries and runs them, and opening it runs none
@@ -2198,22 +2252,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   // sit open while another run takes the title (PR #1333 review).
   const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
   orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
-  // Issue #824 — the prompt library is the selected daemon's, so it follows
-  // the deck: none under All Decks or while no deck is connected.
-  const promptDeckId = !allDecks && snapshot.connection.status === "connected" ? orchestrationDeckId : undefined;
-  const { prompts, source: promptSource, notice: promptNotice, addPrompt, updatePrompt, removePrompt, flushPending: flushPromptSaves } = usePromptLibrary({
-    deckId: promptDeckId,
-    listPrompts: runtime.listPrompts,
-    savePrompt: runtime.savePrompt,
-    deletePrompt: runtime.deletePrompt,
-    seedPrompts: runtime.seedPrompts,
-  });
-  // Issue #824 — however the Prompts panel closes (its button, Escape, a voice
-  // action that dismisses every overlay), a pending edit is saved now rather
-  // than on its timer.
-  useEffect(() => {
-    if (!promptsOpen) flushPromptSaves();
-  }, [promptsOpen, flushPromptSaves]);
   const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
@@ -2245,12 +2283,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       setSelectedEvidenceId(snapshot.evidence[0]?.id ?? "");
     }
   }, [selectedEvidenceId, snapshot.evidence]);
-
-  useEffect(() => {
-    if (!selectedPromptId || !prompts.some((prompt) => prompt.id === selectedPromptId)) {
-      setSelectedPromptId(prompts[0]?.id ?? "");
-    }
-  }, [prompts, selectedPromptId]);
 
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
@@ -2715,9 +2747,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       : "";
     setConfirm({
       title: `Activate ${config.displayName}?`,
-      // Issue #1044: the task is optional. Without one the orchestrator is still
-      // briefed — the daemon's context names its role and team — and then waits.
-      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and ${config.taskPrompt ? "sends your task prompt to the orchestrator" : "briefs the orchestrator with no task, so it waits for you to type one into its pane"}.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
+      // The orchestrator is briefed — the daemon's context names its role and
+      // team — and then waits for the user to type the task into its pane.
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and briefs the orchestrator, which then waits for you to type the task into its pane.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
       label: "Activate orchestration",
       busyLabel: "Activating…",
       action: async () => {
@@ -2896,15 +2928,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const commandItems = [
     ...(coordinator ? [{ label: "Message orchestrator…", hint: `Focus ${coordinator.displayName}'s terminal`, icon: Send, run: () => VOICE_ACTIONS.messageCoordinator.run(voiceContext, { agentId: coordinator.id }) }] : []),
     /* Issue #1198 — each experimental panel's entry follows its own field, as
-       its rail entry does. The deck and the prompt library left the flag
-       (issues #1308 and #1310), so their entries are always offered. The
-       deck's own doors into gated panels follow those panels' fields too: the
-       run graph's Edit loop (`showOrchestrations`) and the empty deck's
-       Configure agents (`showAgentProfiles`). NOT gated, and named so the
-       residual is known: the Projects ↔ Orchestrations cross-links, which sit
-       inside panels that are themselves hidden with the flag off. */
+       its rail entry does. The palette itself is the deck's (it is bound here,
+       and the deck is unmounted while `showDeck` is off), so it needs no gate
+       of its own. NOT gated, and named so the residual is known: the panels'
+       in-deck doors — the run graph's Edit loop, the empty deck's Configure
+       agents, and the Projects ↔ Orchestrations cross-links inside those panels.
+       Each sits inside a surface that is itself hidden with the flag off, and
+       all five fields follow the one flag today; if they ever diverge, those
+       doors need gates of their own. */
     ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose projects & orchestrations", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
-    { label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) },
     ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
     ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
@@ -3020,7 +3052,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         )}
 
         {!allDecks && <section className="workflow-strip" aria-labelledby="workflow-title">
-          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div>{features.showOrchestrations && <button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}><SlidersHorizontal size={13} /> Edit loop</button>}</header>
+          <header><div><span className="section-kicker">RUN GRAPH</span><h1 id="workflow-title">Visible deterministic loop</h1></div><button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}><SlidersHorizontal size={13} /> Edit loop</button></header>
           <div className="workflow-track">
             {orderedStages.length ? orderedStages.map((stage, index) => (
               <div className={`workflow-node node-${stage.status} ${stage.enabled ? "" : "is-disabled"}`} key={stage.id} data-testid={`workflow-node-${stage.id}`}>
@@ -3028,7 +3060,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                 <div><strong>{stage.label}</strong><small>{stage.enabled ? (stage.attempt === undefined ? stage.status : `${stage.status} · att ${stage.attempt}`) : "skipped"}</small></div>
                 {index < orderedStages.length - 1 && <i className="workflow-link" aria-hidden="true" />}
               </div>
-            )) : <div className="workflow-empty">No workflow nodes reported.{features.showOrchestrations && <> Open <button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}>Edit loop</button> to inspect configuration.</>}</div>}
+            )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext)}>Edit loop</button> to inspect configuration.</div>}
           </div>
         </section>}
 
@@ -3095,7 +3127,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                 />
               ))}
             </div>
-          ) : <EmptyDeck onReconnect={() => void runtime.reconnect(snapshot.connection.deckId)} onProfiles={features.showAgentProfiles ? () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) : undefined} />}
+          ) : <EmptyDeck onReconnect={() => void runtime.reconnect(snapshot.connection.deckId)} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
         </section>}
       </main>
 
@@ -3108,20 +3140,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         onConfigureOrchestration={() => { setOverlay("projects", false); VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext); }}
         allDecks={allDecks}
       />
-      <PromptLibraryPanel
-        open={promptsOpen}
-        prompts={prompts}
-        selectedId={selectedPromptId}
-        onSelect={setSelectedPromptId}
-        onClose={() => setOverlay("prompts", false)}
-        source={promptSource}
-        notice={promptNotice}
-        onAdd={() => { const id = addPrompt(); if (id) setSelectedPromptId(id); }}
-        onUpdate={updatePrompt}
-        onRemove={(id) => { removePrompt(id); setNotice(promptSource.kind === "deck" ? "Prompt removed from this daemon's library." : "Prompt removed from this device's library."); }}
-      />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setOverlay("profiles", false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
@@ -3352,9 +3372,8 @@ function LoadingDeck() {
   return <div className="loading-grid" aria-label="Loading agents">{[0, 1, 2, 3].map((item) => <div key={item}><span /><i /><i /><b /></div>)}</div>;
 }
 
-/** `onProfiles` is absent while the Agent Profiles form is behind the experimental flag (issue #1198), which removes its door here. */
-function EmptyDeck({ onReconnect, onProfiles }: { onReconnect: () => void; onProfiles?: () => void }) {
-  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>{onProfiles ? "Connect to a running daemon or prepare agent profiles before activating an orchestration." : "Connect to a running daemon."}</p><div>{onProfiles && <button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button>}<button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
+function EmptyDeck({ onReconnect, onProfiles }: { onReconnect: () => void; onProfiles: () => void }) {
+  return <div className="empty-deck"><Blocks size={28} /><h3>No active agent surfaces</h3><p>Connect to a running daemon or prepare agent profiles before activating an orchestration.</p><div><button className="button secondary" onClick={onProfiles}><Bot size={14} /> Configure agents</button><button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button></div></div>;
 }
 
 function CommandPalette({ commands, onClose }: { commands: { label: string; hint: string; icon: typeof Bot; run: () => void }[]; onClose: () => void }) {

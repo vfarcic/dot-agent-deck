@@ -17,8 +17,9 @@ test.describe("desktop navigation rail", () => {
     await page.goto("/?fixture=1&state=connected");
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
-    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Daemons", "Prompts", "Settings"]);
+    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Settings"]);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Dashboard");
+    await expect(page.getByTestId("overview-open-deck")).toHaveCount(0);
   });
 
   /**
@@ -32,7 +33,7 @@ test.describe("desktop navigation rail", () => {
     await expect(page.getByTestId("agent-tile-planner")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
     const entries = await rail(page).locator("nav button").allTextContents();
-    expect(entries).toEqual(["Dashboard", "Daemons", "Projects", "Prompts", "Orchestrations", "Agent Profiles", "Settings"]);
+    expect(entries).toEqual(["Dashboard", "Daemons", "Projects", "Orchestrations", "Agent Profiles", "Settings"]);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Daemons");
 
     await page.getByTestId("open-overview").click();
@@ -45,22 +46,6 @@ test.describe("desktop navigation rail", () => {
     await expect(rail(page)).toHaveCount(1);
     await expect(rail(page).locator("nav button")).toHaveText(entries);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Dashboard");
-  });
-
-  /**
-   * Scenario: on the shipped overview, click the Prompts entry in the rail.
-   * The Daemons screen comes up with the prompt library open over it, and
-   * Escape closes the library.
-   */
-  test("opens the prompt library from the shipped overview", async ({ page }) => {
-    await page.goto("/?fixture=1&state=connected");
-    await expect(page.getByTestId("overview-table-region")).toBeVisible();
-    await rail(page).getByRole("button", { name: "Prompts" }).click();
-    await expect(page.getByTestId("prompt-library-panel")).toBeVisible();
-    await expect(rail(page).locator("[aria-current='page']")).toHaveText("Prompts");
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("prompt-library-panel")).toHaveCount(0);
-    await expect(page.getByTestId("agent-tile-planner")).toBeVisible();
   });
 
   /**
@@ -88,6 +73,6 @@ test.describe("desktop navigation rail", () => {
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
-    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Daemons", "Prompts", "Settings"]);
+    await expect(rail(page).locator("nav button")).toHaveText(["Dashboard", "Settings"]);
   });
 });
