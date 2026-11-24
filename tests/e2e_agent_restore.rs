@@ -243,6 +243,17 @@ impl Decks {
         started
     }
 
+    /// The one agent a dispatch started, once it reported SessionStart. The
+    /// dispatch's reply can reach its caller before the stand-in has written
+    /// its start record, so this waits for the record rather than reading
+    /// [`Self::starts`] at the reply.
+    fn wait_dispatched_start(&self) -> Value {
+        common::wait_until(common::child_boot_budget(), || !self.starts().is_empty());
+        let starts = self.starts();
+        assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
+        self.wait_start(&string(&starts[0], "pane"))
+    }
+
     fn wait_start(&self, pane: &str) -> Value {
         let file = self.root.join(format!("restore-argv-{pane}.json"));
         assert!(
@@ -827,9 +838,7 @@ fn journal_restore_014_start_over_replays_only_a_safely_saved_dispatch_task() {
         ),
         "dispatch must finish before restart"
     );
-    let starts = decks.starts();
-    assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
-    let unit = decks.wait_start(&string(&starts[0], "pane"));
+    let unit = decks.wait_dispatched_start();
     let old_attempt = decks.attempt(&string(&unit, "agent"));
     let attempt = string(&old_attempt, "attempt");
     let work = string(&old_attempt, "work");
@@ -1759,7 +1768,7 @@ fn journal_restore_029_start_over_reads_github_again_under_its_claims() {
         }),
         "dispatch must finish before restart"
     );
-    let unit = decks.wait_start(&string(&decks.starts()[0], "pane"));
+    let unit = decks.wait_dispatched_start();
     let attempt = string(&decks.attempt(&string(&unit, "agent")), "attempt");
     let barrier = decks.root.join("start-over-barrier");
     let reached = barrier.with_extension("reached");
@@ -2612,9 +2621,7 @@ fn dispatched_unit(decks: &Decks, name: &str) -> String {
         ),
         "dispatch must finish before restart"
     );
-    let starts = decks.starts();
-    assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
-    let unit = decks.wait_start(&string(&starts[0], "pane"));
+    let unit = decks.wait_dispatched_start();
     string(&decks.attempt(&string(&unit, "agent")), "attempt")
 }
 
