@@ -241,6 +241,7 @@ describe("ControlDeck", () => {
       const selected = createFixtureSnapshot("connected");
       const live = runtime({ mode: "live", snapshot: selected, fleet: [selected, target], desktopFeatures: fixtureDesktopFeatures("") });
       render(<DeckShell runtime={live} />);
+      expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
       const card = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === target.connection.deckId)!;
       const start = within(card).getByTestId("start-daemon");
       fireEvent.click(start);
@@ -771,10 +772,9 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build the project switcher polish." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("All 6 commands are generated from the current provider, CLI, model, effort, and permission fields.");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("sends your task prompt to the orchestrator");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("briefs the orchestrator, which then waits for you to type the task into its pane");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Among generated commands, 1 role runs unrestricted");
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
@@ -782,7 +782,7 @@ describe("ControlDeck", () => {
       const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
       expect(launch).toMatchObject({ type: "activate_orchestration" });
       if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
-      expect(launch.taskPrompt).toBe("Build the project switcher polish.");
+      expect(launch).not.toHaveProperty("taskPrompt");
       expect(launch.roles.find((role) => role.role === "coder")?.command).toBe("'/Applications/Codex Nightly/bin/codex' --model gpt-5.6-sol-fast --sandbox danger-full-access --ask-for-approval on-request -c model_reasoning_effort=high");
     });
   });
@@ -802,7 +802,6 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close agent profiles" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Use the custom coder to fix failing tests." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("1 explicit custom command override bypasses those fields");
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Custom commands may carry arbitrary permissions and are not covered by structured permission claims.");
@@ -821,7 +820,6 @@ describe("ControlDeck", () => {
     const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Wire the launch prompt into the orchestration." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(live.runAction).not.toHaveBeenCalled();
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
@@ -834,7 +832,6 @@ describe("ControlDeck", () => {
       name: "dot-agent-deck",
       cwd: "/home/dev/code/deck",
       configRevision: "revision-1",
-      taskPrompt: "Wire the launch prompt into the orchestration.",
       roles: expect.arrayContaining([expect.objectContaining({ role: "orchestrator", start: true }), expect.objectContaining({ role: "coder", start: false })]),
     })));
   });
@@ -983,11 +980,10 @@ describe("ControlDeck", () => {
   });
 
   /**
-   * Issue #1044. Scenario: choose the project and press Activate without typing
-   * a task. The button is enabled — neither the daemon nor the TUI requires a
-   * task — the sheet says the orchestrator will wait, the confirmation says so
-   * too instead of promising to send a prompt, and the activation goes out with an
-   * empty task for the daemon to compose around.
+   * Scenario: choose the project and press Activate. The editor has no task
+   * field: the sheet says the orchestrator will wait for the task in its pane,
+   * the confirmation says so too, and the activation carries no task, so the
+   * daemon composes the context without one, as under the TUI.
    */
   it("activates with no task, saying the orchestrator will wait for one", async () => {
     const live = liveWithProject();
@@ -998,14 +994,13 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     const dialog = screen.getByRole("alertdialog");
-    expect(dialog).toHaveTextContent("briefs the orchestrator with no task, so it waits for you to type one into its pane");
-    expect(dialog).not.toHaveTextContent("sends your task prompt");
+    expect(dialog).toHaveTextContent("briefs the orchestrator, which then waits for you to type the task into its pane");
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
     await waitFor(() => {
       const launch = vi.mocked(live.runAction).mock.calls[0]?.[0];
       if (launch?.type !== "activate_orchestration") throw new Error("expected orchestration activation");
-      expect(launch.taskPrompt).toBe("");
+      expect(launch).not.toHaveProperty("taskPrompt");
     });
   });
 
@@ -1194,11 +1189,10 @@ describe("ControlDeck", () => {
     expect(screen.getByLabelText("Orchestration name")).toHaveTextContent("dot-agent-deck (default)");
     expect(document.body.textContent).not.toContain("\u0001");
 
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     // The confirmation dialog names both values, and it is a text node too.
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Activate dot-agent-deck?");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("in /home/dev/code/deck and sends");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("in /home/dev/code/deck and briefs");
     expect(document.body.textContent).not.toContain("\u0001");
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
@@ -1243,7 +1237,6 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
     const resolvesAfterPick = vi.mocked(live.resolveProject).mock.calls.length;
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
@@ -1357,7 +1350,6 @@ describe("ControlDeck", () => {
     });
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
@@ -1386,7 +1378,6 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
     const resolvesAfterPick = vi.mocked(live.resolveProject).mock.calls.length;
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
 
@@ -1413,7 +1404,6 @@ describe("ControlDeck", () => {
     });
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Anything." } });
 
     expect(screen.getByTestId("orchestration-role-mismatch")).toHaveTextContent("pair defines orchestrator, coder");
     expect(screen.getByTestId("orchestration-role-mismatch")).toHaveTextContent("Not in this orchestration: reviewer");
@@ -1455,7 +1445,6 @@ describe("ControlDeck", () => {
     expect(startBadges).toHaveLength(1);
     expect(startBadges[0].parentElement?.textContent).toContain("Coder");
 
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
     expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
@@ -1490,7 +1479,6 @@ describe("ControlDeck", () => {
     });
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
 
     expect(screen.getByTestId("orchestration-no-start-role")).toHaveTextContent("marks no role as its start role");
     expect(document.querySelectorAll(".start-role")).toHaveLength(0);
@@ -1625,7 +1613,6 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live" });
     render(<ControlDeck runtime={live} orchestrationPlatformIssue={WINDOWS_ORCHESTRATION_BLOCK_REASON} />);
     fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Try to launch on Windows." } });
 
     expect(screen.getByTestId("orchestration-platform-issue")).toHaveTextContent("unavailable in this Windows preview");
     expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
@@ -1658,7 +1645,6 @@ describe("ControlDeck", () => {
     };
     render(<ControlDeck runtime={withheld} />);
     fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Try to launch against an older deck." } });
 
     expect(screen.getByTestId("orchestration-capability-issue")).toHaveTextContent("cannot offer projects or activate orchestrations");
     expect(screen.getByTestId("orchestration-capability-issue")).not.toHaveTextContent("prepare-orchestration");
@@ -3137,7 +3123,6 @@ describe("ControlDeck", () => {
     const live = liveWithProject();
     render(<ControlDeck runtime={live} />);
     await chooseTheOnlyProject();
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "List the files." } });
     expect(screen.getByTestId("activate-orchestration")).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Close orchestration editor" }));
 
@@ -3148,7 +3133,7 @@ describe("ControlDeck", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Orchestrations" }));
     expect(screen.getByTestId("orchestration-select-deck")).toHaveTextContent("Select a daemon to activate an orchestration");
-    expect(screen.queryByLabelText("Task prompt")).toBeNull();
+    expect(screen.queryByLabelText("Run name")).toBeNull();
     expect(screen.getByTestId("activate-orchestration")).toBeDisabled();
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     expect(screen.queryByRole("alertdialog")).toBeNull();

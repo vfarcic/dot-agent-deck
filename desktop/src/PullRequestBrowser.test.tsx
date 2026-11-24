@@ -996,7 +996,6 @@ describe("PRD #1401 — what close closes with the pull request browser open", (
   it.each([
     ["Settings", "Open settings", "settings-panel"],
     ["the agent profiles sheet", "Open agent profiles", "agent-profiles-panel"],
-    ["the prompt library", "Open prompt library", "prompt-library-panel"],
     ["the projects sheet", "Manage projects", "projects-panel"],
   ])("closes %s opened over the page, and keeps the page and the pane", async (_what, command, testId) => {
     const { host } = fakeHost();

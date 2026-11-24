@@ -197,8 +197,6 @@ pub mod project_config;
 pub mod project_resolve;
 // PRD #1885: remembered approvals of a project's orchestration commands and prompts.
 pub mod project_trust;
-// Issue #824: the deck's prompt library, kept by the daemon.
-pub mod prompt_library;
 // Issue #1884: the bounded macOS retry of PTY allocation.
 pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.

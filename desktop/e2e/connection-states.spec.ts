@@ -59,6 +59,7 @@ test.describe("start a daemon with experimental off (issue #1490)", () => {
         Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", { value: { unregisterListener: (_event: string, id: number) => callbacks.delete(id) } });
       }, { initial, host });
       await page.goto("/?live=1");
+      await expect(page.getByTestId("open-deck")).toHaveCount(0);
       const card = page.getByTestId("daemon-group");
       await expect(card).toHaveCount(1);
       await expect(card.getByTestId("overview-disconnected")).toBeVisible();

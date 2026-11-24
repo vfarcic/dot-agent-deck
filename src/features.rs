@@ -120,15 +120,25 @@ pub fn show_command_entry_lock() -> bool {
     experimental_enabled()
 }
 
-/// Production wrapper for the desktop app's **Projects** surface (issue
-/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
-/// show_desktop_projects` finds every gate at graduation — see the
-/// `graduate-desktop-projects` issue.
+/// Production wrapper for the desktop app's **deck** screen — the multi-pane
+/// terminal workspace (issue #1198). One wrapper per surface (CLAUDE.md #9) so
+/// `grep show_desktop_deck` finds every gate at graduation — see the
+/// `graduate-desktop-deck` issue.
 ///
 /// A *presentation* switch read in the desktop process and handed to the
 /// webview through the desktop crate's `desktop_features` command; the webview
-/// gates its render and navigation seams on it. Nothing in the daemon, the
-/// protocol or the TUI reads it.
+/// gates its render and navigation seams on it. With the flag OFF the agent
+/// overview is the landing screen and the full-screen agent overlay is how a
+/// terminal is seen. Nothing in the daemon, the protocol or the TUI reads it.
+pub fn show_desktop_deck() -> bool {
+    experimental_enabled()
+}
+
+/// Production wrapper for the desktop app's **Projects** surface (issue
+/// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
+/// show_desktop_projects` finds every gate at graduation — see the
+/// `graduate-desktop-projects` issue. A presentation switch, carried to the
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
 pub fn show_desktop_projects() -> bool {
     experimental_enabled()
 }
@@ -137,7 +147,7 @@ pub fn show_desktop_projects() -> bool {
 /// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
 /// show_desktop_orchestrations` finds every gate at graduation — see the
 /// `graduate-desktop-workflows` issue. A presentation switch, carried to the
-/// webview by `desktop_features`, exactly like [`show_desktop_projects`].
+/// webview by `desktop_features`, exactly like [`show_desktop_deck`].
 pub fn show_desktop_orchestrations() -> bool {
     experimental_enabled()
 }
@@ -146,7 +156,7 @@ pub fn show_desktop_orchestrations() -> bool {
 /// #1198). One wrapper per surface (CLAUDE.md #9) so `grep
 /// show_desktop_agent_profiles` finds every gate at graduation — see the
 /// `graduate-desktop-agent-profiles` issue. A presentation switch, carried to
-/// the webview by `desktop_features`, exactly like [`show_desktop_projects`].
+/// the webview by `desktop_features`, exactly like [`show_desktop_deck`].
 pub fn show_desktop_agent_profiles() -> bool {
     experimental_enabled()
 }
@@ -158,7 +168,7 @@ pub fn show_desktop_agent_profiles() -> bool {
 /// show_desktop_agent_details` finds every gate — see PRD #1399, which decides
 /// per tab and field whether each is kept, fixed or removed. A presentation
 /// switch, carried to the webview by `desktop_features`, exactly like
-/// [`show_desktop_projects`].
+/// [`show_desktop_deck`].
 pub fn show_desktop_agent_details() -> bool {
     experimental_enabled()
 }
