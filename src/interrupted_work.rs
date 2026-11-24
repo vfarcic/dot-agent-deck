@@ -140,6 +140,120 @@ pub struct InterruptedItem {
     /// otherwise, so the plain list's shape does not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitFacts>,
+    /// PRD #1790 stage 3: the agents that served the item, one per distinct
+    /// attempt, at most [`MAX_ITEM_AGENTS`], each with whether it can be
+    /// restored. Empty from a daemon before stage 3.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<ItemAgent>,
+    /// The item's agents left out of [`Self::agents`] past
+    /// [`MAX_ITEM_AGENTS`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub agents_omitted: usize,
+}
+
+/// PRD #1790 stage 3: the most agents one item lists.
+pub const MAX_ITEM_AGENTS: usize = 16;
+
+/// PRD #1790 stage 3: one agent of an interrupted item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemAgent {
+    /// The attempt (`<run>/<agent id>`): what a restore or start-over names.
+    pub attempt: AttemptId,
+    /// Its pane's display name, from its launch record.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The agent it ran, from its launch record or the session it reported.
+    #[serde(default)]
+    pub agent_type: Option<crate::event::AgentType>,
+    /// Its role, for an orchestration's agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The folder it ran in, from its launch record; not checked to exist.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Whether it can be restored, from the journal and the launch records
+    /// alone: the folder, the old process and the saved task are checked
+    /// when a restore or start-over is asked for.
+    pub restore: RestoreVerdict,
+}
+
+/// PRD #1790 stage 3: whether an agent can be restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RestoreVerdict {
+    /// The deck holds a conversation id the agent can be resumed into.
+    Resume,
+    /// It cannot be resumed, but its command and folder can start it again
+    /// without its conversation.
+    StartOver { reason: RestoreReason },
+    /// Neither.
+    #[serde(rename = "none")]
+    NotRestorable { reason: RestoreReason },
+    /// A verdict of a newer daemon's.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RestoreVerdict {
+    /// Why it cannot be resumed; `None` for [`RestoreVerdict::Resume`].
+    pub fn reason(self) -> Option<RestoreReason> {
+        match self {
+            RestoreVerdict::Resume => None,
+            RestoreVerdict::StartOver { reason } | RestoreVerdict::NotRestorable { reason } => {
+                Some(reason)
+            }
+            RestoreVerdict::Unknown => Some(RestoreReason::Unknown),
+        }
+    }
+}
+
+/// PRD #1790 stage 3: why an agent cannot be resumed. The wire codes are
+/// kebab-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreReason {
+    /// The agent is one the deck cannot resume by id yet, or an
+    /// unrecognised command.
+    AgentCannotResume,
+    /// The agent never reported a conversation id the deck kept.
+    NoSessionId,
+    /// The conversation id the deck holds is not of the agent's own syntax.
+    SessionIdInvalid,
+    /// No launch record says how the agent was started.
+    NoLaunchRecord,
+    /// More than one launch record could be the agent's, or the journal
+    /// holds its attempt under more than one piece of work, or two of the
+    /// item's agents were in one conversation.
+    AmbiguousRecord,
+    /// The folder it started in had been moved away.
+    FolderMoved,
+    /// Its launch record names no folder it started in.
+    FolderUnknown,
+    /// It served an orchestration, or a unit run by more than one agent,
+    /// which a later stage restores.
+    OrchestrationLater,
+    /// An orchestration's worker that starts fresh for each task.
+    ClearWorker,
+    /// The pane ran the default shell, not an agent.
+    DefaultShell,
+    /// The journal or launch-record read was incomplete.
+    IncompleteRead,
+    /// A restart did not stop it: it ended on its own, or is still running.
+    NotInterrupted,
+    /// A restore with its conversation was tried and did not take, so it
+    /// can only be started over.
+    NotResumed,
+    /// Review R#2: its launch record does not say which process it was (a
+    /// build before stage 3 wrote it), so the deck cannot tell the old agent
+    /// is gone and will not resume its conversation; it can be started over.
+    OldProcessUnknown,
+    /// Review (Qodo #5): the deck already brought this agent back (a
+    /// restore or a start over recorded its successor), while another agent
+    /// of the same item is still interrupted, so the item stays listed.
+    Restored,
+    /// A reason of a newer daemon's.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How far an item's work got, from its journal lines alone: how many
@@ -1108,14 +1222,511 @@ pub fn still_interrupted(
         && !works.iter().any(|w| index.has_live_attempt(w))
 }
 
+/// PRD #1790 stage 3, review (Qodo #5): whether every interrupted attempt
+/// of the item rooted at `root` was brought back (an `attempt_restored`
+/// names it as `from`), so a restore or start over may close the item. An
+/// item with no interrupted attempt, or one `read` does not hold, is not.
+pub fn every_interrupted_attempt_restored(
+    read: &JournalRead,
+    root: &WorkId,
+    is_live: impl Fn(&str) -> bool,
+) -> bool {
+    let no_records = LaunchRead::default();
+    let index = Index::build(read, &no_records, is_live);
+    let roots = index.roots();
+    let Some(works) = roots.under.get(root) else {
+        return false;
+    };
+    let mut interrupted = works
+        .iter()
+        .flat_map(|work| index.attempts(work))
+        .filter(|attempt| {
+            matches!(
+                index.attempt_state.get(attempt),
+                Some(
+                    AttemptState::Ended { interrupted: true } | AttemptState::Open { live: false }
+                )
+            )
+        })
+        .peekable();
+    interrupted.peek().is_some() && interrupted.all(|attempt| index.restored.contains(attempt))
+}
+
+/// PRD #1790 stage 3: the action that opens the restore question.
+pub const RESTORE_ACTION: &str = "Restore";
+/// The question's choice that restores the agent and lets it carry on.
+pub const RESTORE_AND_CONTINUE: &str = "Restore and continue";
+/// The question's choice that restores the agent and lets it wait.
+pub const RESTORE_ONLY: &str = "Restore only";
+/// The question's choice for an agent that cannot be resumed.
+pub const START_OVER: &str = "Start over in this worktree";
+/// What [`RESTORE_AND_CONTINUE`] does, under the question.
+pub const RESTORE_AND_CONTINUE_EXPLANATION: &str =
+    "It checks what already happened and carries on where it stopped.";
+/// What [`RESTORE_ONLY`] does, under the question.
+pub const RESTORE_ONLY_EXPLANATION: &str = "It comes back and waits until you tell it to continue.";
+
+/// The restore question for the agent or item called `name`.
+pub fn restore_question(name: &str) -> String {
+    format!("Restore {name} with its conversation?")
+}
+
+/// The note a restored agent receives first after [`RESTORE_AND_CONTINUE`].
+pub const RESTART_NOTE_CONTINUE: &str = "The deck restarted and resumed this session. If your previous turn was cut off before it finished, first check the current state — `git status`, `git log`, whether anything was already pushed, opened or sent — then continue from where you stopped without repeating what already happened. If your previous turn had finished, do nothing and wait for the next message.";
+/// The note a restored agent receives first after [`RESTORE_ONLY`].
+pub const RESTART_NOTE_ONLY: &str = "The deck restarted and resumed this session. Your previous turn may have been cut off before it finished. Do nothing until you are told to continue; when you are, first check the current state — `git status`, `git log`, whether anything was already pushed, opened or sent — and do not repeat what already happened.";
+
+/// Why an agent is not offered a resume, in the words every client shows.
+pub fn restore_reason_sentence(reason: RestoreReason) -> &'static str {
+    match reason {
+        RestoreReason::AgentCannotResume => {
+            "The agent cannot be restored with its conversation yet."
+        }
+        RestoreReason::NoSessionId => "The deck does not know which conversation the agent was in.",
+        RestoreReason::SessionIdInvalid => {
+            "The conversation id the deck holds for the agent is not one it can resume."
+        }
+        RestoreReason::NoLaunchRecord => "The deck has no record of how the agent was started.",
+        RestoreReason::AmbiguousRecord => {
+            "The deck's records do not say for certain how the agent was started."
+        }
+        RestoreReason::FolderMoved => {
+            "The agent's folder was moved, is gone, or others can write to it."
+        }
+        RestoreReason::FolderUnknown => "The deck does not know which folder the agent ran in.",
+        RestoreReason::OrchestrationLater => "Orchestrations come back in a later version.",
+        RestoreReason::ClearWorker => {
+            "This worker starts fresh for each task and comes back with its orchestration."
+        }
+        RestoreReason::DefaultShell => {
+            "The pane ran a shell, not an agent, so there is no conversation to restore."
+        }
+        RestoreReason::IncompleteRead => {
+            "The deck could not read its whole work journal or all its records of how agents were started."
+        }
+        RestoreReason::NotInterrupted => "The restart did not stop this agent.",
+        RestoreReason::NotResumed => {
+            "The deck tried to restore the agent's conversation and could not."
+        }
+        RestoreReason::OldProcessUnknown => {
+            "An older version of the deck started this agent, so the deck cannot tell whether its old process is gone."
+        }
+        RestoreReason::Restored => "The deck already brought this agent back.",
+        RestoreReason::Unknown => "The agent cannot be restored.",
+    }
+}
+
+/// PRD #1790 stage 3: what every client says of an agent that can be
+/// restored with its conversation.
+pub const RESTORE_VERDICT_RESUME: &str = "Can be restored with its conversation.";
+/// The label of one of an item's agents, where a client lists them.
+pub const LABEL_AGENT: &str = "Agent";
+/// The label of the attempt id a restore or start-over names.
+pub const LABEL_ATTEMPT: &str = "Attempt";
+
+/// What every client says of an agent's verdict: [`RESTORE_VERDICT_RESUME`],
+/// or why it cannot be resumed and, when it can be started again, that
+/// [`START_OVER`] is offered.
+pub fn restore_verdict_sentence(verdict: RestoreVerdict) -> String {
+    match verdict {
+        RestoreVerdict::Resume => RESTORE_VERDICT_RESUME.to_string(),
+        RestoreVerdict::StartOver { reason } => format!(
+            "{} It can be started again without it: {START_OVER}.",
+            restore_reason_sentence(reason)
+        ),
+        RestoreVerdict::NotRestorable { reason } => restore_reason_sentence(reason).to_string(),
+        RestoreVerdict::Unknown => restore_reason_sentence(RestoreReason::Unknown).to_string(),
+    }
+}
+
+/// The question a client asks before it starts an agent over.
+pub fn start_over_question(name: &str) -> String {
+    format!("Start {name} over in this worktree, without its conversation?")
+}
+
+/// A restore's answer for one agent brought back.
+pub fn restored_sentence(name: &str) -> String {
+    format!("Restored {name} with its conversation.")
+}
+
+/// A start-over's answer for the agent started again.
+pub fn started_over_sentence(name: &str) -> String {
+    format!("Started {name} over in this worktree.")
+}
+
+/// A dry run's answer for an agent a restore would bring back.
+pub const RESTORE_WOULD: &str = "Restore would bring the agent back with its conversation.";
+/// PRD #1790 stage 3 (§4 item 10): what a dry run and the question say when
+/// the item's branch has an open pull request.
+pub const RESTORE_PR_OPEN: &str =
+    "Its branch has an open pull request, which the agent may change.";
+
+/// The note a dry run's Git facts add to the answer and the question:
+/// [`RESTORE_PR_OPEN`] for an open pull request, else none.
+pub fn restore_git_note(git: Option<&GitFacts>) -> Option<&'static str> {
+    git.filter(|git| git.pr == PrFact::Open)
+        .map(|_| RESTORE_PR_OPEN)
+}
+
+/// A dry run's answer for an agent a start-over would start again.
+pub const START_OVER_WOULD: &str =
+    "Start over would start the agent again in this worktree, without its conversation.";
+/// A restored agent the deck could not give its restart note.
+pub const RESTART_NOTE_NOT_SENT: &str = "The deck could not give the restored agent its restart note, so it does not know the deck restarted. Tell it before it continues.";
+/// A started-over agent the deck could not give its saved task.
+pub const SAVED_TASK_NOT_SENT: &str =
+    "The deck could not give the new agent its saved task. Give it the task yourself.";
+/// The item's close could not be recorded, so it may be listed again.
+pub const RESTORE_NOT_RECORDED: &str =
+    "The deck could not record this, so the item may be listed again. Dismiss it if it is.";
+/// Nothing was restored.
+pub const NOTHING_RESTORED: &str = "Nothing was restored.";
+/// A restore asked for with no terminal to confirm on and no `--yes`.
+pub const RESTORE_NEEDS_YES: &str =
+    "Refused: there is no terminal to confirm on, so nothing was restored. Add --yes to restore.";
+/// A start-over asked for with no terminal to confirm on and no `--yes`.
+pub const START_OVER_NEEDS_YES: &str =
+    "Refused: there is no terminal to confirm on, so nothing was started. Add --yes to start over.";
+/// Audit suggestion (CLI confirmation binding): the daemon that answered the
+/// question was replaced before the confirmed action reached it.
+pub const RESTORE_DAEMON_REPLACED: &str = "Refused: the deck daemon was restarted or replaced while you were answering, so nothing was started. Ask again.";
+/// The running daemon does not advertise the restore verbs.
+pub const RESTORE_UNSUPPORTED: &str = "The running deck daemon does not support restoring agents. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
+/// PR #2497 review: restore asked for an item that lists no agent. The TUI
+/// offers neither `s` nor its hint for such an item; the desktop's voice
+/// command answers with this.
+pub const NO_AGENT_TO_RESTORE: &str = "This item lists no agent to restore.";
+
+/// PRD #1790 stage 3: which note a restored agent receives first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreMode {
+    /// [`RESTORE_AND_CONTINUE`]: [`RESTART_NOTE_CONTINUE`].
+    Continue,
+    /// [`RESTORE_ONLY`]: [`RESTART_NOTE_ONLY`].
+    Only,
+}
+
+impl RestoreMode {
+    /// The restart note this mode posts.
+    pub fn note(self) -> &'static str {
+        match self {
+            RestoreMode::Continue => RESTART_NOTE_CONTINUE,
+            RestoreMode::Only => RESTART_NOTE_ONLY,
+        }
+    }
+}
+
+/// PRD #1790 stage 3: why a restore or start-over did not act. The wire
+/// codes are kebab-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreRefusal {
+    /// The request came from an agent in a deck pane.
+    AgentCaller,
+    /// The request named nothing it could act on.
+    BadRequest,
+    /// This platform has no way to restore an agent.
+    Unsupported,
+    /// The work journal could not be read.
+    Unreadable,
+    /// The journal or launch-record read was incomplete.
+    IncompleteRead,
+    /// No interrupted item matches, or it is no longer interrupted.
+    NotListed,
+    /// More than one interrupted item matches.
+    Ambiguous,
+    /// The attempt named is not one of the item's agents.
+    NotAnAgent,
+    /// The agent's verdict does not offer what was asked.
+    NotRestorable,
+    /// The records do not say for certain how the agent was started.
+    AmbiguousRecord,
+    /// No launch record says how the agent was started.
+    NoLaunchRecord,
+    /// The folder it started in was moved away.
+    FolderMoved,
+    /// Its record names no folder.
+    FolderUnknown,
+    /// The folder is not on disk.
+    FolderMissing,
+    /// The folder, or its path, is one another account can change.
+    FolderUnsafe,
+    /// The deck holds no conversation id for it.
+    NoSessionId,
+    /// The conversation id is not of the agent's own syntax.
+    SessionIdInvalid,
+    /// The agent's old process, or a process it left in its session, is
+    /// still running.
+    StillRunning,
+    /// The record does not say which process the agent was, so the deck
+    /// cannot tell it is gone.
+    OldProcessUnknown,
+    /// A restore or start-over of the same agent is already running.
+    AlreadyRestoring,
+    /// The deck is shutting down or restarting.
+    ShuttingDown,
+    /// The agent could not be started.
+    SpawnFailed,
+    /// The agent started but did not come back into its conversation, so it
+    /// was stopped before anything was sent to it.
+    NotResumed,
+    /// The saved task cannot be trusted: a symlink, not a regular file,
+    /// another account's, readable or writable by others, or too large.
+    TaskUnsafe,
+    /// A dispatched unit's saved task is not there.
+    NoSavedTask,
+    /// Another agent the deck runs now is in the same conversation, or is
+    /// being restored into it (audit "later slices" 3).
+    SessionInUse,
+    /// Too many restores are running or waiting for their agents to confirm.
+    TooManyPending,
+    /// Audit F5: the request named an agent twice, more agents than an item
+    /// lists, or an id longer than any the deck makes.
+    BadSelection,
+    /// Audit F3: the agent's recorded command reopens an earlier
+    /// conversation, so starting it over would not start fresh.
+    CommandReopens,
+    /// Audit F3: the started-over agent reported its old conversation, or
+    /// no conversation in time, so it was stopped before anything was sent.
+    NotFresh,
+    /// Audit F4: the deck stopped the agent it had just started, and could
+    /// not confirm that every process of it is gone.
+    NotStopped,
+    /// Review R#3: the item's branch has an open pull request, which a
+    /// start over would replay its task beside.
+    PrOpen,
+    /// Review R#3: newer work is running in the agent's folder now.
+    DirectoryInUse,
+    /// Review R#4: the deck's inbox cannot take the restart note now, so
+    /// nothing was started.
+    NoteRefused,
+    /// Review R#4: the agent came back into its conversation, but its
+    /// restart note could not be posted, so it was stopped again and the
+    /// item stays listed.
+    NoteNotDelivered,
+    /// Review (Qodo #2): a dispatched unit was started over, but its saved
+    /// task could not be posted to it, so it was stopped again and the item
+    /// stays listed.
+    TaskNotDelivered,
+    /// Audit B1: the agent started, but the deck could not record it as the
+    /// one that took the old one's place, so it stopped the agent again
+    /// and the item stays listed.
+    NotRecorded,
+    /// Round 5: another restore or start over is acting now, in this deck or
+    /// in another one on the same state folder; one acts at a time.
+    RestoreBusy,
+    /// A refusal of a newer daemon's.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The sentence every client shows for a restore or start-over refusal.
+pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
+    match reason {
+        RestoreRefusal::AgentCaller => {
+            "Refused: this request came from an agent in a deck pane, and restoring agents is left to the person. Do it from the deck or from a terminal."
+        }
+        RestoreRefusal::BadRequest => "Refused: name the agent to start over.",
+        RestoreRefusal::Unsupported => "Refused: the deck cannot restore agents on this system.",
+        RestoreRefusal::Unreadable => REFUSED_UNREADABLE,
+        RestoreRefusal::IncompleteRead => {
+            "Refused: the deck could not read its whole work journal or all its records of how agents were started, so it cannot be sure how the agent was started."
+        }
+        RestoreRefusal::NotListed => REFUSED_NOT_LISTED,
+        RestoreRefusal::Ambiguous => REFUSED_AMBIGUOUS,
+        RestoreRefusal::NotAnAgent => "Refused: that agent is not one of this item's.",
+        RestoreRefusal::NotRestorable => {
+            "Refused: this agent cannot be brought back that way. Show the item to see what it offers."
+        }
+        RestoreRefusal::AmbiguousRecord => {
+            "Refused: the deck's records do not say for certain how the agent was started."
+        }
+        RestoreRefusal::NoLaunchRecord => {
+            "Refused: the deck has no record of how the agent was started."
+        }
+        RestoreRefusal::FolderMoved => "Refused: the agent's folder was moved away.",
+        RestoreRefusal::FolderUnknown => {
+            "Refused: the deck does not know which folder the agent ran in."
+        }
+        RestoreRefusal::FolderMissing => "Refused: the agent's folder is not on disk.",
+        RestoreRefusal::FolderUnsafe => {
+            "Refused: another account could change the agent's folder, or the path to it."
+        }
+        RestoreRefusal::NoSessionId => {
+            "Refused: the deck does not know which conversation the agent was in."
+        }
+        RestoreRefusal::SessionIdInvalid => {
+            "Refused: the conversation id the deck holds for the agent is not one it can resume."
+        }
+        RestoreRefusal::StillRunning => {
+            "Refused: the agent's old process, or a process it started, is still running. Stop it first, so two agents do not write to one conversation."
+        }
+        RestoreRefusal::OldProcessUnknown => {
+            "Refused: the deck cannot tell whether the agent's old process is gone: an older version of the deck started it, or the system did not let the deck look. Start it over instead."
+        }
+        RestoreRefusal::AlreadyRestoring => {
+            "Refused: this agent is already being restored or started over."
+        }
+        RestoreRefusal::ShuttingDown => "Refused: the deck is shutting down or restarting.",
+        RestoreRefusal::SpawnFailed => "Refused: the deck could not start the agent.",
+        RestoreRefusal::NotResumed => {
+            "The agent started but did not come back into its conversation, so the deck stopped it before sending it anything. You can start it over in this worktree instead."
+        }
+        RestoreRefusal::TaskUnsafe => {
+            "Refused: the saved task file cannot be trusted (it is a link, not a plain file, another account's, open to other accounts, or too large)."
+        }
+        RestoreRefusal::NoSavedTask => "Refused: the unit's saved task is not there.",
+        RestoreRefusal::SessionInUse => {
+            "Refused: another agent the deck runs is in this conversation now, or is being restored into it, or an agent the deck could not confirm it stopped may be in it, so two agents would write to one conversation."
+        }
+        RestoreRefusal::TooManyPending => {
+            "Refused: too many restores are waiting for their agents to start. Try again in a minute."
+        }
+        RestoreRefusal::BadSelection => {
+            "Refused: the request named an agent twice, named too many agents, or used an id that is too long."
+        }
+        RestoreRefusal::CommandReopens => {
+            "Refused: the agent's command reopens an earlier conversation, so starting it over would not start fresh. Start it yourself without that option."
+        }
+        RestoreRefusal::NotFresh => {
+            "The deck could not confirm that the agent started a new conversation rather than its old one, so it stopped the agent before sending it anything."
+        }
+        RestoreRefusal::NotStopped => {
+            "The deck stopped the agent it had just started, but could not confirm that all of it stopped. Make sure it is not running before you try again."
+        }
+        RestoreRefusal::PrOpen => {
+            "Refused: its branch has an open pull request, and starting the agent over would repeat its task beside it. Restore it with its conversation instead, or close the pull request first."
+        }
+        RestoreRefusal::DirectoryInUse => {
+            "Refused: newer work is running in this agent's folder now. Stop it first, so two agents do not work in one folder."
+        }
+        RestoreRefusal::NoteRefused => {
+            "Refused: the deck's inbox cannot take the restart note now, so nothing was started. Try again in a minute."
+        }
+        RestoreRefusal::NoteNotDelivered => {
+            "The agent came back into its conversation, but the deck could not give it its restart note, so it stopped the agent again. The item is still listed; try again."
+        }
+        RestoreRefusal::TaskNotDelivered => {
+            "The agent started over, but the deck could not give it its saved task, so it stopped the agent again. The item is still listed; try again."
+        }
+        RestoreRefusal::NotRecorded => {
+            "The agent started, but the deck could not record it in its work journal, so it stopped the agent again. The item is still listed; try again."
+        }
+        RestoreRefusal::RestoreBusy => {
+            "Refused: another restore or start over is in progress. Try again in a moment."
+        }
+        RestoreRefusal::Unknown => REFUSED_UNKNOWN,
+    }
+}
+
+/// PRD #1790 stage 3: one agent a restore or start-over started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredAgent {
+    /// The interrupted attempt it brings back.
+    pub attempt: AttemptId,
+    /// The new agent's registry id.
+    pub agent_id: String,
+    /// The new agent's pane.
+    pub pane_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Its first message (the restart note, or the saved task) was posted.
+    #[serde(default)]
+    pub first_message_posted: bool,
+    /// What the start had to record was recorded: its successor link and,
+    /// once every interrupted agent of the item is back, the item's close,
+    /// so it leaves the list (review Qodo #5: an item with an agent still
+    /// interrupted stays listed, this one reading as brought back). `false`:
+    /// the item may be listed again.
+    #[serde(default)]
+    pub recorded: bool,
+}
+
+/// PRD #1790 stage 3: one refusal of a restore or start-over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRefused {
+    /// The attempt refused; `null` for a refusal of the whole request.
+    #[serde(default)]
+    pub attempt: Option<AttemptId>,
+    pub reason: RestoreRefusal,
+    /// [`restore_refusal_sentence`], for a client that does not know the code.
+    pub message: String,
+}
+
+impl RestoreRefused {
+    pub fn new(attempt: Option<AttemptId>, reason: RestoreRefusal) -> Self {
+        Self {
+            attempt,
+            reason,
+            message: restore_refusal_sentence(reason).to_string(),
+        }
+    }
+}
+
+/// PRD #1790 stage 3: the answer to a restore
+/// ([`crate::daemon_protocol::AttachRequest::RestoreInterrupted`]): final,
+/// after each agent confirmed its conversation or was stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreOutcome {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub restored: Vec<RestoredAgent>,
+    #[serde(default)]
+    pub refused: Vec<RestoreRefused>,
+    /// With `dry_run`: the attempts a restore would bring back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub would_restore: Vec<AttemptId>,
+    /// With `dry_run`: what Git and GitHub say of the item's worktree and
+    /// branch now (§4 item 10), so a client can show an open pull request
+    /// in its question. Absent for a restore that acted (it reads them again
+    /// with its claims held, and does not carry them), and from a daemon
+    /// before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitFacts>,
+    /// The full id of the item the request's `id` resolved to, so a client
+    /// that asked with a short name can act on exactly the item it asked
+    /// about (audit suggestion: CLI confirmation binding). Absent when the
+    /// request was refused before resolving, and from a daemon before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+}
+
+/// PRD #1790 stage 3: the answer to a start-over
+/// ([`crate::daemon_protocol::AttachRequest::StartOverInterrupted`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartOverOutcome {
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The agent started; `null` when refused, and on a dry run.
+    #[serde(default)]
+    pub started: Option<RestoredAgent>,
+    #[serde(default)]
+    pub refused: Option<RestoreRefused>,
+    /// With `dry_run`: a start-over would start the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub would_start: bool,
+    /// With `dry_run`: what Git and GitHub say of the item's worktree and
+    /// branch now, as [`RestoreOutcome::git`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitFacts>,
+    /// As [`RestoreOutcome::item`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+}
+
 /// The list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptedList {
     /// Most recent last entry first.
     pub items: Vec<InterruptedItem>,
-    /// The journal read or the launch-record read stopped at its budget, so
-    /// an item may be missing, or listed although an end or close that would
-    /// hide it was not read.
+    /// The journal read or the launch-record read stopped at its budget, or
+    /// skipped what may hold an item's work (a launch record it could not
+    /// read; a journal line of a newer version or an unknown kind), so an
+    /// item may be missing, or listed although an end or close that would
+    /// hide it was not read. Every agent's restore verdict is then
+    /// `incomplete-read`.
     #[serde(default)]
     pub incomplete: bool,
     /// Items left out past [`MAX_LISTED_ITEMS`], the oldest ones.
@@ -1189,6 +1800,14 @@ pub fn derive_with_home(
         }
     }
 
+    // A launch-record read that skipped a record may have skipped the one
+    // that would make an agent's record ambiguous; a journal line of a newer
+    // version or an unknown kind may close, restore or relate the work in a
+    // way this build cannot read (review R2 / audit S5). The same test as
+    // pruning's ([`crate::work_tracking::launch_read_incomplete`]).
+    let incomplete = crate::work_tracking::launch_read_incomplete(&read.stats)
+        || launches.truncated
+        || launches.skipped > 0;
     let mut items = Vec::new();
     for (root, works) in &roots.under {
         if index.closed_by_person(root) {
@@ -1200,7 +1819,14 @@ pub fn derive_with_home(
         if !interrupted && reports.is_empty() {
             continue;
         }
-        items.push(index.item(root, works, roots.launcher.get(root), reports, home));
+        items.push(index.item(
+            root,
+            works,
+            roots.launcher.get(root),
+            reports,
+            home,
+            incomplete,
+        ));
     }
     items.sort_by(|a, b| {
         b.last_entry
@@ -1210,7 +1836,7 @@ pub fn derive_with_home(
     });
     InterruptedList {
         items,
-        incomplete: read.stats.truncated || launches.truncated,
+        incomplete,
         omitted: 0,
     }
 }
@@ -1297,6 +1923,14 @@ fn cut_fields(item: &mut InterruptedItem) {
     cut |= cut_to(&mut item.last_entry.kind, MAX_FIELD_BYTES);
     for role in &mut item.progress.roles {
         cut |= cut_to(role, MAX_FIELD_BYTES);
+    }
+    for agent in &mut item.agents {
+        for field in [&mut agent.name, &mut agent.role, &mut agent.folder]
+            .into_iter()
+            .flatten()
+        {
+            cut |= cut_to(field, MAX_FIELD_BYTES);
+        }
     }
     for report in &mut item.reports {
         for field in [&mut report.task_id, &mut report.unit_id]
@@ -1498,6 +2132,22 @@ struct Index<'a> {
     lines: &'a JournalRead,
     /// Launch records joined to the journal, by attempt.
     records: HashMap<&'a AttemptId, &'a LaunchRecord>,
+    /// Attempts with a launch record that could not be joined: more than one
+    /// record, or a record whose work the journal does not hold the attempt
+    /// under alone.
+    ambiguous: HashSet<&'a AttemptId>,
+    /// The role each attempt's first `attempt_started` names.
+    role_of: HashMap<&'a AttemptId, &'a String>,
+    /// PRD #1790 stage 3: attempts a resume was tried for and did not take
+    /// (`restore_failed`).
+    restore_failed: HashSet<&'a AttemptId>,
+    /// Review (Qodo #5): attempts a restore or start over brought back
+    /// (`attempt_restored`'s `from`).
+    restored: HashSet<&'a AttemptId>,
+    /// Each attempt's latest session, as
+    /// [`crate::work_journal::latest_session_of`] answers it, indexed in the
+    /// one pass (review R5).
+    sessions: HashMap<&'a AttemptId, crate::work_journal::SessionReport<'a>>,
 }
 
 /// Each work's root, each root's works and each root's launcher work.
@@ -1524,6 +2174,11 @@ impl<'a> Index<'a> {
             last_line: HashMap::new(),
             lines: read,
             records: HashMap::new(),
+            ambiguous: HashSet::new(),
+            role_of: HashMap::new(),
+            restore_failed: HashSet::new(),
+            restored: HashSet::new(),
+            sessions: HashMap::new(),
         };
         let mut seen: HashSet<&WorkId> = HashSet::new();
         let mut ends: HashMap<&AttemptId, bool> = HashMap::new();
@@ -1558,6 +2213,7 @@ impl<'a> Index<'a> {
                     }
                     works_of.entry(attempt).or_default().insert(work);
                     if let Some(role) = role {
+                        index.role_of.entry(attempt).or_insert(role);
                         let roles = index.roles_of.entry(work).or_default();
                         if !roles.iter().any(|(_, seen)| *seen == role) {
                             roles.push((at, role));
@@ -1582,7 +2238,18 @@ impl<'a> Index<'a> {
                     destination: *destination,
                 }),
                 Event::Closed { how, .. } => index.closes.entry(work).or_default().push(*how),
-                Event::AttemptSession { .. } | Event::Linked { .. } => {}
+                Event::RestoreFailed { attempt, .. } => {
+                    index.restore_failed.insert(attempt);
+                }
+                Event::AttemptSession { .. } => {
+                    if let Some(report) = crate::work_journal::own_session_report(line) {
+                        crate::work_journal::keep_latest(&mut index.sessions, report);
+                    }
+                }
+                Event::AttemptRestored { from, .. } => {
+                    index.restored.insert(from);
+                }
+                Event::Linked { .. } => {}
             }
         }
         let mut live_runs: HashMap<&str, bool> = HashMap::new();
@@ -1620,10 +2287,11 @@ impl<'a> Index<'a> {
             by_attempt.entry(&record.attempt).or_default().push(record);
         }
         for (attempt, records) in by_attempt {
-            let [record] = records.as_slice() else {
+            let Some((journal_attempt, works)) = works_of.get_key_value(attempt) else {
                 continue;
             };
-            let Some((journal_attempt, works)) = works_of.get_key_value(attempt) else {
+            let [record] = records.as_slice() else {
+                self.ambiguous.insert(*journal_attempt);
                 continue;
             };
             let holds = works.contains(&&record.work);
@@ -1636,6 +2304,8 @@ impl<'a> Index<'a> {
             });
             if holds && others_are_delegations {
                 self.records.insert(*journal_attempt, *record);
+            } else {
+                self.ambiguous.insert(*journal_attempt);
             }
         }
     }
@@ -1687,8 +2357,15 @@ impl<'a> Index<'a> {
 
     fn closed_by_person(&self, work: &WorkId) -> bool {
         self.closes.get(work).is_some_and(|hows| {
-            hows.iter()
-                .any(|how| matches!(how, CloseHow::Dismissed | CloseHow::Reclaimed))
+            hows.iter().any(|how| {
+                matches!(
+                    how,
+                    CloseHow::Dismissed
+                        | CloseHow::Reclaimed
+                        | CloseHow::Restored
+                        | CloseHow::StartedOver
+                )
+            })
         })
     }
 
@@ -1803,6 +2480,7 @@ impl<'a> Index<'a> {
         launcher: Option<&&'a WorkId>,
         reports: Vec<ItemReport>,
         home: &Path,
+        incomplete: bool,
     ) -> InterruptedItem {
         let opened = self.opened.get(root);
         let kind = match opened.map(|o| o.launch) {
@@ -1867,6 +2545,7 @@ impl<'a> Index<'a> {
             ts_ms: last.map_or(0, |line| line.ts_ms),
         };
         let progress = self.progress(&ordered);
+        let (agents, agents_omitted) = self.agents(kind, &ordered, incomplete);
         InterruptedItem {
             id: root.clone(),
             kind,
@@ -1882,7 +2561,159 @@ impl<'a> Index<'a> {
             cut: false,
             progress,
             git: None,
+            agents,
+            agents_omitted,
         }
+    }
+
+    /// PRD #1790 stage 3: the item's agents, one per distinct attempt in the
+    /// order its works (`ordered`, root first) name them, at most
+    /// [`MAX_ITEM_AGENTS`], and how many were left out. Each verdict comes
+    /// from the journal and the launch records alone.
+    fn agents(
+        &self,
+        kind: ItemKind,
+        ordered: &[&'a WorkId],
+        incomplete: bool,
+    ) -> (Vec<ItemAgent>, usize) {
+        let mut attempts: Vec<&'a AttemptId> = Vec::new();
+        let mut seen: HashSet<&'a AttemptId> = HashSet::new();
+        for work in ordered {
+            for attempt in self.attempts(work) {
+                if seen.insert(attempt) {
+                    attempts.push(attempt);
+                }
+            }
+        }
+        // Stage 3 restores a single agent: a plain agent, or a unit or issue
+        // dispatch one agent ran with nothing delegated and no orchestration.
+        let team = ordered.iter().any(|w| {
+            self.opened
+                .get(*w)
+                .is_some_and(|o| matches!(o.launch, Launch::Orchestration | Launch::Delegation))
+        });
+        let single = !team
+            && match kind {
+                ItemKind::Agent => true,
+                ItemKind::Unit | ItemKind::IssueDispatch => attempts.len() == 1,
+                ItemKind::Orchestration => false,
+            };
+        let omitted = attempts.len().saturating_sub(MAX_ITEM_AGENTS);
+        // Review (Qodo #6): the duplicate check runs over every attempt of
+        // the item, the ones left out of the list included, so an omitted
+        // agent in the same conversation still makes a listed one ambiguous.
+        let mut agents: Vec<ItemAgent> = Vec::with_capacity(attempts.len().min(MAX_ITEM_AGENTS));
+        let mut sessions: Vec<Option<&str>> = Vec::with_capacity(attempts.len());
+        for (at, attempt) in attempts.iter().enumerate() {
+            let (agent, session) = self.agent(attempt, single, incomplete);
+            sessions.push(session);
+            if at < MAX_ITEM_AGENTS {
+                agents.push(agent);
+            }
+        }
+        // Two agents resumed into one conversation would both write to it.
+        let mut resumers: HashMap<&str, usize> = HashMap::new();
+        for session in sessions.iter().flatten() {
+            *resumers.entry(session).or_default() += 1;
+        }
+        for (agent, session) in agents.iter_mut().zip(&sessions) {
+            if session.is_some_and(|session| resumers.get(session).is_some_and(|n| *n > 1)) {
+                agent.restore = RestoreVerdict::NotRestorable {
+                    reason: RestoreReason::AmbiguousRecord,
+                };
+            }
+        }
+        (agents, omitted)
+    }
+
+    /// One agent of an item, and the session it would be resumed into when
+    /// its verdict is [`RestoreVerdict::Resume`].
+    fn agent(
+        &self,
+        attempt: &'a AttemptId,
+        single: bool,
+        incomplete: bool,
+    ) -> (ItemAgent, Option<&'a str>) {
+        let record = self.records.get(attempt).copied();
+        let session = self
+            .sessions
+            .get(attempt)
+            .map(|report| (report.session, report.agent));
+        let agent_type = record
+            .and_then(|r| r.agent_type.clone())
+            .or_else(|| session.map(|(_, agent)| agent.clone()))
+            .or_else(|| {
+                record.and_then(|r| crate::event::AgentType::from_command(r.command.as_deref()))
+            });
+        let none = |reason| RestoreVerdict::NotRestorable { reason };
+        let start_over = |reason| RestoreVerdict::StartOver { reason };
+        let interrupted = matches!(
+            self.attempt_state.get(attempt),
+            Some(AttemptState::Ended { interrupted: true } | AttemptState::Open { live: false })
+        );
+        let mut resumed = None;
+        let restore = if incomplete {
+            none(RestoreReason::IncompleteRead)
+        } else if !single {
+            none(RestoreReason::OrchestrationLater)
+        } else if !interrupted {
+            none(RestoreReason::NotInterrupted)
+        } else if self.restored.contains(attempt) {
+            // Review (Qodo #5): brought back by a request that left another
+            // agent of the item interrupted; not offered again.
+            none(RestoreReason::Restored)
+        } else if self.ambiguous.contains(attempt) {
+            none(RestoreReason::AmbiguousRecord)
+        } else if let Some(record) = record {
+            let resume = agent_type
+                .as_ref()
+                .and_then(|agent| crate::agent_registry::spec(agent).resume);
+            if record.cwd.is_none() {
+                none(if record.cwd_moved_from.is_some() {
+                    RestoreReason::FolderMoved
+                } else {
+                    RestoreReason::FolderUnknown
+                })
+            } else if record.command.is_none()
+                && matches!(agent_type, None | Some(crate::event::AgentType::None))
+            {
+                start_over(RestoreReason::DefaultShell)
+            } else if let Some(resume) = resume {
+                match session {
+                    None => start_over(RestoreReason::NoSessionId),
+                    Some((id, _)) if !resume.valid_session_id(id) => {
+                        start_over(RestoreReason::SessionIdInvalid)
+                    }
+                    Some(_) if self.restore_failed.contains(attempt) => {
+                        start_over(RestoreReason::NotResumed)
+                    }
+                    // Review R#2: a record a build before stage 3 wrote,
+                    // without the process identity a restore checks first.
+                    Some(_) if record.pid.is_none() || record.pid_start.is_none() => {
+                        start_over(RestoreReason::OldProcessUnknown)
+                    }
+                    Some((id, _)) => {
+                        resumed = Some(id);
+                        RestoreVerdict::Resume
+                    }
+                }
+            } else {
+                start_over(RestoreReason::AgentCannotResume)
+            }
+        } else {
+            none(RestoreReason::NoLaunchRecord)
+        };
+        let agent = ItemAgent {
+            attempt: attempt.clone(),
+            name: record.and_then(|r| r.name.clone()),
+            agent_type,
+            role: record
+                .and_then(|r| r.role.clone())
+                .or_else(|| self.role_of.get(attempt).map(|role| (*role).clone())),
+            folder: record.and_then(|r| r.cwd.clone()),
+            restore,
+        };
+        (agent, resumed)
     }
 }
 

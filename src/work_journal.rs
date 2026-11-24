@@ -151,7 +151,7 @@ const MAX_LISTED: usize = 65_536;
 
 const MAINTENANCE_LOCK: &str = "maintenance.lock";
 
-const KNOWN_KINDS: [&str; 7] = [
+const KNOWN_KINDS: [&str; 9] = [
     "opened",
     "attempt_started",
     "attempt_session",
@@ -159,6 +159,8 @@ const KNOWN_KINDS: [&str; 7] = [
     "linked",
     "reported",
     "closed",
+    "attempt_restored",
+    "restore_failed",
 ];
 
 // ---------------------------------------------------------------------------
@@ -500,6 +502,79 @@ pub enum CloseHow {
     /// removed, its branch kept). Written as [`CloseHow::Dismissed`] is, and
     /// read by an older daemon the same way.
     Reclaimed,
+    /// PRD #1790 stage 3: a person restored the work's agent with its
+    /// conversation, and the restored agent confirmed it is back in it.
+    /// Written as [`CloseHow::Dismissed`] is, after the confirmation, and
+    /// read by an older daemon the same way.
+    Restored,
+    /// PRD #1790 stage 3: a person started the work's agent over, without its
+    /// conversation, in the folder it ran in. Written as
+    /// [`CloseHow::Dismissed`] is, once the new agent started, and read by an
+    /// older daemon the same way.
+    StartedOver,
+}
+
+/// PRD #1790 stage 3: how an [`Event::AttemptRestored`] brought an attempt
+/// back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoredHow {
+    /// Resumed into its conversation.
+    Resumed,
+    /// Started over without its conversation.
+    StartedOver,
+}
+
+/// PRD #1790 stage 3: why an [`Event::RestoreFailed`] resume did not take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreFailure {
+    /// The restored agent reported a conversation other than the one asked
+    /// for.
+    SessionMismatch,
+    /// The launch refused the resume (its command chooses another
+    /// conversation or command, or the id is not of the agent's syntax).
+    Refused,
+    /// The agent exited before it confirmed its conversation.
+    Exited,
+    /// The launch never reached the deck's resume step (the command calls
+    /// the agent by an absolute path, replaces `PATH`, or a wrapper dropped
+    /// the arguments), and no confirmation came.
+    ShimNotReached,
+    /// The resume was applied but no confirmation came in time.
+    TimedOut,
+    /// A failure of a newer daemon's.
+    #[serde(other)]
+    Unknown,
+}
+
+/// PRD #1790 stage 3: what the launch shim had done with a restore's
+/// one-shot resume request when the restore gave up
+/// ([`Event::RestoreFailed`]'s `shim`), so a failure can be told apart
+/// after the fact: a refusal names its reason, as the shim wrote it
+/// (`crate::telemetry::shim`'s `REFUSED_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShimOutcome {
+    /// No call of the program reached the shim with the request.
+    NotReached,
+    /// A call claimed the request and published no outcome: it is still
+    /// deciding, or failed after claiming. Never a resume.
+    Pending,
+    /// The shim gave the agent its resume arguments.
+    Resumed,
+    /// Refused: the program's own arguments choose another conversation or
+    /// a command a resume cannot be combined with.
+    ResumeArgsConflict,
+    /// Refused: the id is not of the agent's own syntax.
+    SessionIdInvalid,
+    /// Refused: the program has no resume by id.
+    AgentCannotResume,
+    /// Refused, with a reason the deck could not read.
+    Refused,
+    /// An outcome of a newer daemon's.
+    #[serde(other)]
+    Unknown,
 }
 
 /// External references of a work. Every field is optional.
@@ -614,6 +689,65 @@ pub enum Event {
         work: WorkId,
         how: CloseHow,
     },
+    /// PRD #1790 stage 3: the attempt `from` was brought back as the new
+    /// attempt `to` (the minimal successor link a later stage builds on;
+    /// never a reuse of the old ids). `work` is `from`'s work. Written once
+    /// the restore is confirmed or the start-over started, beside the
+    /// [`CloseHow::Restored`] or [`CloseHow::StartedOver`] closes. Additive
+    /// under `v:1`: a reader that predates it skips the kind.
+    AttemptRestored {
+        work: WorkId,
+        from: AttemptId,
+        to: AttemptId,
+        how: RestoredHow,
+        /// Audit B1: the conversation `to` was confirmed in: the resumed one
+        /// for a restore, the new one a start over's agent reported. Written
+        /// synchronously before the restore releases its claims, so every
+        /// later check finds `to` in that conversation without waiting for
+        /// `to`'s own `attempt_session`, which the session quota may hold
+        /// back. Absent when no conversation was confirmed, and from a build
+        /// before it was recorded. Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
+    /// PRD #1790 stage 3: a resume of `attempt` was tried and did not take,
+    /// so the agent it started was stopped before anything was sent to it.
+    /// The interrupted work list offers that attempt Start over from then on.
+    /// Additive under `v:1`.
+    RestoreFailed {
+        work: WorkId,
+        attempt: AttemptId,
+        failure: RestoreFailure,
+        /// What the launch shim had done with the resume request when the
+        /// restore gave up; absent for a restore with no request, and from
+        /// a build before it was recorded. Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shim: Option<ShimOutcome>,
+        /// Audit F4: the attempt the failed restore started, which it then
+        /// stopped. A later restore or start over of `attempt` checks that
+        /// no process of it is left before starting another. Absent when
+        /// nothing was started, and from a build before it was recorded.
+        /// Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<AttemptId>,
+        /// Audit B2: the conversations the agent `to` may be writing to (the
+        /// one asked for, and one it reported instead), when the stop of it
+        /// could not be proven. Until `to`'s launch is proven gone, no
+        /// restore of any item into one of these is started, from any
+        /// daemon; `to` ending in the journal does not lift that. Empty when
+        /// the stop was proven, and from a build before it was recorded.
+        /// Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sessions: Vec<String>,
+        /// Round-4 B2: the stop of `to` could not be proven and the deck
+        /// does not know which conversation `to` ended up in, for an agent
+        /// whose kind a restore exists for. Until `to`'s launch is proven
+        /// gone, no restore of an agent of the same kind starts, into any
+        /// conversation. `false` otherwise, and from a build before it was
+        /// recorded. Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unknown_session: bool,
+    },
 }
 
 impl Event {
@@ -626,7 +760,9 @@ impl Event {
             | Event::AttemptEnded { work, .. }
             | Event::Linked { work, .. }
             | Event::Reported { work, .. }
-            | Event::Closed { work, .. } => work,
+            | Event::Closed { work, .. }
+            | Event::AttemptRestored { work, .. }
+            | Event::RestoreFailed { work, .. } => work,
         }
     }
 
@@ -640,6 +776,8 @@ impl Event {
             Event::Linked { .. } => "linked",
             Event::Reported { .. } => "reported",
             Event::Closed { .. } => "closed",
+            Event::AttemptRestored { .. } => "attempt_restored",
+            Event::RestoreFailed { .. } => "restore_failed",
         }
     }
 }
@@ -678,18 +816,70 @@ pub fn latest_session_of<'a>(
 ) -> Option<(&'a str, &'a crate::event::AgentType)> {
     lines
         .iter()
-        .filter(|line| line.run == attempt.run())
-        .filter_map(|line| match &line.event {
-            Event::AttemptSession {
-                attempt: a,
-                session,
-                agent,
-                ..
-            } if a == attempt => Some((line.seq, session.as_str(), agent)),
-            _ => None,
-        })
-        .max_by_key(|(seq, _, _)| *seq)
-        .map(|(_, session, agent)| (session, agent))
+        .filter_map(own_session_report)
+        .filter(|report| report.attempt == attempt)
+        .max_by_key(|report| report.seq)
+        .map(|report| (report.session, report.agent))
+}
+
+/// One `attempt_session` line, read the way [`latest_session_of`] reads
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionReport<'a> {
+    pub attempt: &'a AttemptId,
+    pub seq: u64,
+    pub session: &'a str,
+    pub agent: &'a crate::event::AgentType,
+}
+
+/// `line` as a session report of an attempt of its own run, the only lines
+/// [`latest_session_of`] counts; `None` for any other line. An index built in
+/// one pass keeps, per attempt, the report with the highest `seq`
+/// ([`latest_sessions`]).
+pub fn own_session_report(line: &Line) -> Option<SessionReport<'_>> {
+    match &line.event {
+        Event::AttemptSession {
+            attempt,
+            session,
+            agent,
+            ..
+        } if line.run == attempt.run() => Some(SessionReport {
+            attempt,
+            seq: line.seq,
+            session: session.as_str(),
+            agent,
+        }),
+        _ => None,
+    }
+}
+
+/// Every attempt's latest session in `lines`, as [`latest_session_of`]
+/// answers it for each, in one pass.
+pub fn latest_sessions(lines: &[Line]) -> HashMap<&AttemptId, SessionReport<'_>> {
+    let mut latest: HashMap<&AttemptId, SessionReport<'_>> = HashMap::new();
+    for report in lines.iter().filter_map(own_session_report) {
+        keep_latest(&mut latest, report);
+    }
+    latest
+}
+
+/// Keep `report` in `latest` when it is the highest `seq` of its attempt so
+/// far.
+pub fn keep_latest<'a>(
+    latest: &mut HashMap<&'a AttemptId, SessionReport<'a>>,
+    report: SessionReport<'a>,
+) {
+    match latest.entry(report.attempt) {
+        std::collections::hash_map::Entry::Occupied(mut held) => {
+            // `>=`: the later of equal ones, as `max_by_key` keeps.
+            if report.seq >= held.get().seq {
+                held.insert(report);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(free) => {
+            free.insert(report);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +1030,16 @@ fn validate(line: &Line, homes: &HomeSpellings) -> Result<(), Refusal> {
             }
             if let Some(unit_id) = unit_id {
                 plain("unit_id", unit_id)?;
+            }
+        }
+        Event::AttemptRestored { session, .. } => {
+            if let Some(session) = session {
+                plain("session", session)?;
+            }
+        }
+        Event::RestoreFailed { sessions, .. } => {
+            for session in sessions {
+                plain("session", session)?;
             }
         }
         Event::Closed { .. } => {}
@@ -2370,6 +2570,14 @@ impl WorkJournal {
         let Some(store) = &self.shared.store else {
             return false;
         };
+        // In an e2e build only: `DOT_AGENT_DECK_TEST_WITHHOLD_SESSIONS=1`
+        // admits no session event, as a full session quota would, so lane 1
+        // can hold a restored agent's own report back (audit B1).
+        #[cfg(feature = "e2e")]
+        if std::env::var("DOT_AGENT_DECK_TEST_WITHHOLD_SESSIONS").as_deref() == Ok("1") {
+            store.note_drop();
+            return false;
+        }
         let mut queued = store.queued_sessions.load(Ordering::Acquire);
         let taken = loop {
             if queued >= store.session_quota {
@@ -2939,7 +3147,11 @@ impl WorkJournal {
     /// Compact with the default retention, now. Never fails: an error is
     /// logged. Blocking; the daemon runs it off the startup path.
     pub fn compact(&self) -> CompactReport {
-        match self.compact_with(now_ms(), Retention::default()) {
+        let successor_gone = self
+            .state_dir()
+            .map(crate::agent_restore::successor_gone_check);
+        let gone = |attempt: &AttemptId| successor_gone.as_ref().is_some_and(|gone| gone(attempt));
+        match self.compact_guarded(now_ms(), Retention::default(), &gone) {
             Ok(report) => {
                 if report.consumed_files > 0 {
                     info!(?report, "work journal: compacted");
@@ -2977,7 +3189,8 @@ impl WorkJournal {
     ///    compaction budget's `files` and `bytes`: first the files of the
     ///    oldest works retention drops (a work is dropped only in a round that
     ///    rewrites every file holding a line of it, and never while it is an
-    ///    ancestor of a kept work or holds the end of a kept work's attempt),
+    ///    ancestor of a kept work, holds the end of a kept work's attempt, or
+    ///    started a successor a kept work's restore evidence names),
     ///    then segments and compacted chunks under half the chunk size. Each
     ///    picked file is streamed into new chunks of at most about the chunk
     ///    size; what a round does not pick waits for a later one. A full chunk
@@ -2991,6 +3204,20 @@ impl WorkJournal {
     /// `entries` keys and `carried_unreadable` lines; past them a line is
     /// written as it is, or an unreadable one discarded).
     pub fn compact_with(&self, now_ms: u64, retention: Retention) -> io::Result<CompactReport> {
+        self.compact_guarded(now_ms, retention, &|_| false)
+    }
+
+    /// [`Self::compact_with`], with `successor_gone` answering whether the
+    /// successor a restore's safety evidence names is proven gone, so that
+    /// evidence may go with its work ([`Index::eligible`], PRD #1790 round-4
+    /// F1). [`Self::compact_with`] answers no for every one: such evidence is
+    /// kept.
+    pub fn compact_guarded(
+        &self,
+        now_ms: u64,
+        retention: Retention,
+        successor_gone: &dyn Fn(&AttemptId) -> bool,
+    ) -> io::Result<CompactReport> {
         let store = self.store()?;
         let dir = &store.dir;
         let mut report = CompactReport::default();
@@ -3079,7 +3306,7 @@ impl WorkJournal {
         // Pass 2: pick the files, decide the drops, rewrite.
         let chunk = self.shared.compacted_chunk_bytes;
         let eligible = if retain {
-            index.eligible(now_ms, retention)
+            index.eligible(now_ms, retention, successor_gone)
         } else {
             Vec::new()
         };
@@ -3308,6 +3535,9 @@ struct WorkFacts {
     closed: bool,
     /// Its `opened` names it a delegation, which never gets a new attempt.
     delegation: bool,
+    /// PRD #1790 round-4 F1: the successors its restore safety evidence
+    /// names ([`Index::guards`]).
+    guards: Vec<u32>,
     /// A live run started an attempt of it: that run may still serve it (an
     /// exited pane keeps its work until it closes, and a restart of it is a
     /// new attempt of the same work).
@@ -3324,6 +3554,10 @@ struct Index<'a> {
     attempts: HashMap<AttemptId, u32>,
     /// Attempt -> the work whose `attempt_ended` line ended it.
     ender: Vec<Option<u32>>,
+    /// Attempt -> its id.
+    attempt_ids: Vec<AttemptId>,
+    /// Attempt -> the work whose `attempt_started` line started it.
+    starter: Vec<Option<u32>>,
     entries: usize,
     limit: usize,
     /// Over `limit`: the index is incomplete and drives no retention.
@@ -3338,6 +3572,8 @@ impl<'a> Index<'a> {
             by_id: HashMap::new(),
             attempts: HashMap::new(),
             ender: Vec::new(),
+            attempt_ids: Vec::new(),
+            starter: Vec::new(),
             entries: 0,
             limit,
             full: false,
@@ -3372,6 +3608,7 @@ impl<'a> Index<'a> {
             closed: false,
             delegation: false,
             live_attempt: false,
+            guards: Vec::new(),
         });
         self.by_id.insert(id.clone(), w);
         Some(w)
@@ -3386,6 +3623,8 @@ impl<'a> Index<'a> {
         }
         let a = u32::try_from(self.ender.len()).ok()?;
         self.ender.push(None);
+        self.attempt_ids.push(id.clone());
+        self.starter.push(None);
         self.attempts.insert(id.clone(), a);
         Some(a)
     }
@@ -3426,11 +3665,28 @@ impl<'a> Index<'a> {
                 if self.live.contains(&line.run) {
                     self.works[w as usize].live_attempt = true;
                 }
-                if let Some(a) = self.attempt(attempt)
-                    && !self.works[w as usize].started.contains(&a)
+                if let Some(a) = self.attempt(attempt) {
+                    self.starter[a as usize].get_or_insert(w);
+                    if !self.works[w as usize].started.contains(&a) && self.room(1) {
+                        self.works[w as usize].started.push(a);
+                    }
+                }
+            }
+            // PRD #1790 round-4 F1: a restore's evidence that its successor
+            // owns a conversation, or may still be writing to one.
+            Event::AttemptRestored {
+                to,
+                session: Some(_),
+                ..
+            }
+            | Event::RestoreFailed { to: Some(to), .. }
+                if Self::guards(&line.event) =>
+            {
+                if let Some(a) = self.attempt(to)
+                    && !self.works[w as usize].guards.contains(&a)
                     && self.room(1)
                 {
-                    self.works[w as usize].started.push(a);
+                    self.works[w as usize].guards.push(a);
                 }
             }
             Event::AttemptEnded { attempt, .. } => {
@@ -3453,8 +3709,17 @@ impl<'a> Index<'a> {
     /// live run started an attempt of and has not closed is not finished,
     /// unless it is a delegation: the run may still serve it (an exited
     /// pane can be restarted into its work), and it becomes finished once
-    /// that run closes it or is gone.
-    fn eligible(&self, now_ms: u64, retention: Retention) -> Vec<u32> {
+    /// that run closes it or is gone. A work holding restore safety evidence
+    /// is not finished while a successor it names is not proven gone
+    /// (`successor_gone`, PRD #1790 round-4 F1): that evidence is what keeps
+    /// a second agent out of the conversation the successor may be in, and
+    /// it is kept however old it is.
+    fn eligible(
+        &self,
+        now_ms: u64,
+        retention: Retention,
+        successor_gone: &dyn Fn(&AttemptId) -> bool,
+    ) -> Vec<u32> {
         let max_age_ms = u64::try_from(retention.max_age.as_millis()).unwrap_or(u64::MAX);
         let cutoff = now_ms.saturating_sub(max_age_ms);
         let mut finished: Vec<u32> = (0..self.works.len())
@@ -3465,6 +3730,9 @@ impl<'a> Index<'a> {
                     && !f.files.is_empty()
                     && f.started.iter().all(|a| self.ender[*a as usize].is_some())
                     && (f.closed || f.delegation || !f.live_attempt)
+                    && f.guards
+                        .iter()
+                        .all(|a| successor_gone(&self.attempt_ids[*a as usize]))
             })
             .collect();
         // Newest first, to rank them.
@@ -3490,15 +3758,41 @@ impl<'a> Index<'a> {
         eligible
     }
 
-    /// What a work needs kept while it is kept: its parent, and every work
-    /// whose line ends an attempt it started (dropping that line would leave
-    /// it unfinished for good).
+    /// Whether `event` is restore safety evidence a work keeps while the
+    /// successor it names may run (PRD #1790 round-4 F1): an
+    /// `attempt_restored` that names the conversation its successor was
+    /// confirmed in, or a `restore_failed` that fences conversations.
+    fn guards(event: &Event) -> bool {
+        match event {
+            Event::AttemptRestored { session, .. } => session.is_some(),
+            Event::RestoreFailed {
+                to,
+                sessions,
+                unknown_session,
+                ..
+            } => to.is_some() && (!sessions.is_empty() || *unknown_session),
+            _ => false,
+        }
+    }
+
+    /// What a work needs kept while it is kept: its parent, every work whose
+    /// line ends an attempt it started (dropping that line would leave it
+    /// unfinished for good), and the work that started each successor its
+    /// restore safety evidence names (PRD #1790 round-4 F1), so that
+    /// successor's launch record, which the evidence is checked against, is
+    /// kept with it.
     fn needs(&self, w: u32) -> impl Iterator<Item = u32> + '_ {
         let facts = &self.works[w as usize];
         facts
             .parent
             .into_iter()
             .chain(facts.started.iter().filter_map(|a| self.ender[*a as usize]))
+            .chain(
+                facts
+                    .guards
+                    .iter()
+                    .filter_map(|a| self.starter[*a as usize]),
+            )
     }
 
     /// Clear `drop` for everything a kept work needs, transitively.

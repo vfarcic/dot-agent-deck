@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DeckBridge } from "../lib/bridge";
-import { isInterruptedList, listedCount, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "../lib/interruptedWork";
+import { isInterruptedList, listedCount, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreOutcome, type StartOverOutcome } from "../lib/interruptedWork";
 import type { DeckFleet } from "../types";
 
 /** PRD #1790 stage 2 — what the app holds of one deck's interrupted work. */
@@ -13,6 +13,12 @@ export interface InterruptedDeck {
   failed?: string;
   /** The process answered that it does not support interrupted work. */
   unsupported?: true;
+  /**
+   * PRD #1790 stage 3 — the process answered a restore or start-over that it
+   * does not restore agents: Restore then says so without asking again, as
+   * the TUI's does for its daemon.
+   */
+  restoreUnsupported?: true;
 }
 
 /**
@@ -58,7 +64,16 @@ export interface InterruptedWorkRuntime {
    */
   reclaim: (target: InterruptedTarget, id: string, dryRun: boolean) => Promise<InterruptedReply<ReclaimOutcome>>;
   dismiss: (target: InterruptedTarget, ids: string[]) => Promise<InterruptedReply<DismissOutcome>>;
-  /** Whether a real reclaim or a dismissal sent to `target`'s daemon process is still waiting for its answer. */
+  /**
+   * PRD #1790 stage 3 — restore attempt `attempt` of item `id` with its
+   * conversation, or start it over without it. Held here like a dismissal:
+   * pending ({@link busy}) until the daemon answers — once the agent
+   * confirmed its conversation, or was stopped — then the list again. The
+   * daemon starts the agent; the app starts nothing itself.
+   */
+  restore: (target: InterruptedTarget, id: string, attempt: string, mode: RestoreMode) => Promise<InterruptedReply<RestoreOutcome>>;
+  startOver: (target: InterruptedTarget, id: string, attempt: string) => Promise<InterruptedReply<StartOverOutcome>>;
+  /** Whether a real reclaim, a dismissal, a restore or a start-over sent to `target`'s daemon process is still waiting for its answer. */
   busy: (target: InterruptedTarget) => boolean;
   /** The open "Interrupted work" dialog, when one is. */
   dialog?: InterruptedDialog;
@@ -119,7 +134,7 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
         if (reply.outcome !== "answered" || !isInterruptedList(reply.answer)) return { ...held, [deckId]: reply.outcome === "unsupported" ? { instance, unsupported: true } : { instance } };
         /* A refresh without Git facts keeps the ones a list with them read, for the items still listed. */
         const items = reply.answer.items.map((item) => (item.git ? item : { ...item, git: before.list?.items.find((old) => old.id === item.id)?.git ?? item.git }));
-        return { ...held, [deckId]: { instance, list: { ...reply.answer, items } } };
+        return { ...held, [deckId]: { instance, list: { ...reply.answer, items }, ...(before.restoreUnsupported ? { restoreUnsupported: true as const } : {}) } };
       });
       if (listed) {
         const list = reply.answer as InterruptedList;
@@ -223,5 +238,19 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
     bridge.interruptedWorkDismiss ? bridge.interruptedWorkDismiss(target, ids) : Promise.resolve<InterruptedReply<DismissOutcome>>({ outcome: "unsupported" })
   )), [bridge, mutate]);
 
-  return useMemo(() => (offered ? { decks, hidden, hide, reveal, refresh, show, reclaim, dismiss, busy, ...(dialog ? { dialog } : {}), openDialog, closeDialog } : undefined), [busy, closeDialog, decks, dialog, dismiss, hidden, hide, offered, openDialog, reclaim, refresh, reveal, show]);
+  /* A restore or start-over answered `unsupported`: that process does not restore agents. */
+  const learnUnsupported = useCallback(<T,>(target: InterruptedTarget, reply: InterruptedReply<T>): InterruptedReply<T> => {
+    if (reply.outcome === "unsupported") {
+      setDecks((held) => (held[target.deckId]?.instance === target.instance ? { ...held, [target.deckId]: { ...held[target.deckId], restoreUnsupported: true } } : held));
+    }
+    return reply;
+  }, []);
+  const restore = useCallback((target: InterruptedTarget, id: string, attempt: string, mode: RestoreMode) => mutate(target, () => (
+    bridge.interruptedWorkRestore ? bridge.interruptedWorkRestore(target, id, [attempt], mode, false) : Promise.resolve<InterruptedReply<RestoreOutcome>>({ outcome: "unsupported" })
+  )).then((reply) => learnUnsupported(target, reply)), [bridge, learnUnsupported, mutate]);
+  const startOver = useCallback((target: InterruptedTarget, id: string, attempt: string) => mutate(target, () => (
+    bridge.interruptedWorkStartOver ? bridge.interruptedWorkStartOver(target, id, attempt, false) : Promise.resolve<InterruptedReply<StartOverOutcome>>({ outcome: "unsupported" })
+  )).then((reply) => learnUnsupported(target, reply)), [bridge, learnUnsupported, mutate]);
+
+  return useMemo(() => (offered ? { decks, hidden, hide, reveal, refresh, show, reclaim, dismiss, restore, startOver, busy, ...(dialog ? { dialog } : {}), openDialog, closeDialog } : undefined), [busy, closeDialog, decks, dialog, dismiss, hidden, hide, offered, openDialog, reclaim, refresh, restore, reveal, show, startOver]);
 }

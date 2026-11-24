@@ -1601,6 +1601,9 @@ enum InterruptedAnswer {
     Answered {
         response: Box<AttachResponse>,
         instance: Option<String>,
+        /// PRD #1790 stage 3: whether the same `Hello` advertised
+        /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`].
+        restore_agents: bool,
     },
     Unsupported,
     OtherInstance,
@@ -3842,6 +3845,19 @@ impl DaemonClient {
         request: &AttachRequest,
         pinned_instance: Option<&str>,
     ) -> Result<InterruptedAnswer, ClientError> {
+        self.interrupted_work_needing(request, pinned_instance, None)
+            .await
+    }
+
+    /// [`Self::interrupted_work_on`], also withholding the request unless the
+    /// same `Hello` advertises `also` (PRD #1790 stage 3's
+    /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`]).
+    async fn interrupted_work_needing(
+        &self,
+        request: &AttachRequest,
+        pinned_instance: Option<&str>,
+        also: Option<&str>,
+    ) -> Result<InterruptedAnswer, ClientError> {
         // PR #2431 round 4 (Qodo): on a gated handle (the TUI's, the
         // desktop's) the `Hello` this request follows is the gate's own, so a
         // daemon on another protocol, one the handle's admission refuses, or
@@ -3881,6 +3897,7 @@ impl DaemonClient {
         };
         if !capabilities.supports(crate::daemon_protocol::CAP_INTERRUPTED_WORK)
             || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+            || also.is_some_and(|cap| !capabilities.supports(cap))
         {
             return Ok(InterruptedAnswer::Unsupported);
         }
@@ -3889,8 +3906,13 @@ impl DaemonClient {
         {
             return Ok(InterruptedAnswer::OtherInstance);
         }
+        let restore_agents = capabilities.supports(crate::daemon_protocol::CAP_RESTORE_AGENTS);
         let response = Box::new(issue_command(&mut rd, &mut wr, request).await?);
-        Ok(InterruptedAnswer::Answered { response, instance })
+        Ok(InterruptedAnswer::Answered {
+            response,
+            instance,
+            restore_agents,
+        })
     }
 
     /// PRD #1790 stage 2 (verification finding A): [`Self::list_interrupted_work`],
@@ -3904,7 +3926,9 @@ impl DaemonClient {
         let request = AttachRequest::ListInterruptedWork { git };
         let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
         {
-            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
             InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
             InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
         };
@@ -3934,7 +3958,9 @@ impl DaemonClient {
         let request = AttachRequest::DismissInterrupted { ids, all, caller };
         let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
         {
-            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
             InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
             InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
         };
@@ -3945,6 +3971,35 @@ impl DaemonClient {
             }),
             None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
                 "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 3: [`Self::list_interrupted_work`], also answering
+    /// whether the daemon that listed it advertised
+    /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`] on the same `Hello`, so
+    /// the TUI can say a daemon cannot restore agents before it asks one to.
+    pub async fn list_interrupted_work_restorable(
+        &self,
+        git: bool,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<(crate::interrupted_work::InterruptedList, bool)>, ClientError> {
+        let request = AttachRequest::ListInterruptedWork { git };
+        let (response, restore_agents) =
+            match self.interrupted_work_on(&request, pinned_instance).await? {
+                InterruptedAnswer::Answered {
+                    response,
+                    restore_agents,
+                    ..
+                } => (response, restore_agents),
+                InterruptedAnswer::Unsupported | InterruptedAnswer::OtherInstance => {
+                    return Ok(GatedQuery::Unsupported);
+                }
+            };
+        match response.interrupted_work {
+            Some(list) => Ok(GatedQuery::Answered((list, restore_agents))),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered ListInterruptedWork with no list".into()
             }))),
         }
     }
@@ -4073,6 +4128,140 @@ impl DaemonClient {
             Some(outcome) => Ok(GatedQuery::Answered(outcome)),
             None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
                 "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 3: restore an interrupted item's agents `agents`
+    /// (empty: every one a restore is offered for) with their conversations,
+    /// each posted `mode`'s restart note, or with `dry_run` run every check
+    /// and start nothing ([`AttachRequest::RestoreInterrupted`]). Answers
+    /// once each agent confirmed or was stopped, which can take the daemon's
+    /// confirmation bound. `caller` as for [`Self::reclaim_interrupted`].
+    /// [`GatedQuery::Unsupported`], with nothing sent, from a daemon that
+    /// does not advertise [`crate::daemon_protocol::CAP_RESTORE_AGENTS`] and
+    /// [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`] on a fresh `Hello`,
+    /// or that is not `pinned_instance`.
+    pub async fn restore_interrupted(
+        &self,
+        id: &str,
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::RestoreOutcome>, ClientError> {
+        Ok(
+            match self
+                .restore_interrupted_pinned(id, agents, mode, dry_run, caller, pinned_instance)
+                .await?
+            {
+                PinnedQuery::Answered { value, .. } => GatedQuery::Answered(value),
+                PinnedQuery::Unsupported | PinnedQuery::OtherInstance => GatedQuery::Unsupported,
+            },
+        )
+    }
+
+    /// [`Self::restore_interrupted`], telling a daemon that is not
+    /// `pinned_instance` from one that does not support the request, and
+    /// answering the daemon process that answered, so a confirmed action can
+    /// be pinned to the process its dry run asked (audit suggestion: CLI
+    /// confirmation binding).
+    pub async fn restore_interrupted_pinned(
+        &self,
+        id: &str,
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::RestoreOutcome>, ClientError> {
+        let request = AttachRequest::RestoreInterrupted {
+            id: id.to_string(),
+            agents,
+            mode,
+            dry_run,
+            caller,
+        };
+        let (response, instance) = match self
+            .interrupted_work_needing(
+                &request,
+                pinned_instance,
+                Some(crate::daemon_protocol::CAP_RESTORE_AGENTS),
+            )
+            .await?
+        {
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_restore {
+            Some(value) => Ok(PinnedQuery::Answered { value, instance }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered RestoreInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 3: start an interrupted item's agent `agent` (its
+    /// attempt) over, without its conversation, or with `dry_run` run every
+    /// check and start nothing ([`AttachRequest::StartOverInterrupted`]).
+    /// Gated as [`Self::restore_interrupted`] is.
+    pub async fn start_over_interrupted(
+        &self,
+        id: &str,
+        agent: &str,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::StartOverOutcome>, ClientError> {
+        Ok(
+            match self
+                .start_over_interrupted_pinned(id, agent, dry_run, caller, pinned_instance)
+                .await?
+            {
+                PinnedQuery::Answered { value, .. } => GatedQuery::Answered(value),
+                PinnedQuery::Unsupported | PinnedQuery::OtherInstance => GatedQuery::Unsupported,
+            },
+        )
+    }
+
+    /// [`Self::start_over_interrupted`], answering as
+    /// [`Self::restore_interrupted_pinned`] does.
+    pub async fn start_over_interrupted_pinned(
+        &self,
+        id: &str,
+        agent: &str,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::StartOverOutcome>, ClientError> {
+        let request = AttachRequest::StartOverInterrupted {
+            id: id.to_string(),
+            agent: agent.to_string(),
+            dry_run,
+            caller,
+        };
+        let (response, instance) = match self
+            .interrupted_work_needing(
+                &request,
+                pinned_instance,
+                Some(crate::daemon_protocol::CAP_RESTORE_AGENTS),
+            )
+            .await?
+        {
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_start_over {
+            Some(value) => Ok(PinnedQuery::Answered { value, instance }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered StartOverInterrupted with no outcome".into()
             }))),
         }
     }
@@ -8615,6 +8804,8 @@ mod tests {
                                 cut: false,
                                 progress: Default::default(),
                                 git: None,
+                                agents: Vec::new(),
+                                agents_omitted: 0,
                             };
                             let response = match op.as_str() {
                                 "hello" => AttachResponse {
