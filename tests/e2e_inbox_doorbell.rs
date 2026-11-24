@@ -132,6 +132,45 @@ fn doorbell_003_armed_waiter_suppresses_ring_until_eof() {
     ring(&daemon, &pane, &id);
 }
 
+/// Scenario: Register a Claude Code once-waiter for an Idle pane with its hand-over paused, so the waiter stays armed and never takes the queued task, with the re-wake bound shortened to 1.5 s. Nothing is typed while the bound runs; once it passes, the doorbell types its token-led line for that task with the waiter still armed, the agent's record shows the wake as stalled, and the task body is never typed.
+#[spec("inbox/doorbell/066")]
+#[test]
+fn doorbell_066_an_armed_waiter_that_never_takes_the_mail_is_rung_past() {
+    let daemon = daemon_unbound(&[
+        ("DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY", "1"),
+        ("DOT_AGENT_DECK_INBOX_REWAKE_AFTER_MS", "1500"),
+    ]);
+    let pane = pane(&daemon, "rewake");
+    status(&daemon, &pane, "idle", "claude_code");
+    let _wait = waiter(&daemon, &pane);
+    armed(&daemon, &pane, 1);
+    let id = enqueue(&daemon, &pane, BODY);
+    state(&daemon, &pane, &id, "queued");
+    unchanged(&pane, Duration::from_millis(900));
+    assert!(
+        bytes(&pane).is_empty(),
+        "an armed waiter holds the ring until the re-wake bound passes"
+    );
+    ring(&daemon, &pane, &id);
+    armed(&daemon, &pane, 1);
+    assert!(
+        common::wait_until(WAIT, || agent_inbox(&daemon, &pane)["wake_stalled"] == true),
+        "mail queued past the re-wake bound beside an armed waiter shows as stalled: {}",
+        agent_inbox(&daemon, &pane)
+    );
+}
+
+/// The agent's `inbox` summary, as the daemon's agent records show it.
+fn agent_inbox(daemon: &impl Endpoint, pane: &inbox::Pane) -> serde_json::Value {
+    attach(daemon, json!({"op":"list-agents"}))["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == pane.agent)
+        .map(|record| record["inbox"].clone())
+        .unwrap_or_default()
+}
+
 /// Scenario: Announce a Native component without arming a waiter and queue a task for an Idle pane. The token-led line must remain absent during arm_grace, then ring if the component has still not armed; a TurnEnd announce gets no native grace.
 #[spec("inbox/doorbell/004")]
 #[test]

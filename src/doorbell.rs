@@ -109,6 +109,18 @@ pub const ENV_BUSY_STALL_AFTER_MS: &str = "DOT_AGENT_DECK_INBOX_BUSY_STALL_AFTER
 /// shorter than the shortest stall issue #2385 reported (16 minutes).
 pub const DEFAULT_BUSY_STALL_AFTER: Duration = Duration::from_secs(15 * 60);
 
+/// Issue #2385: how long, in milliseconds, the oldest message queued for an
+/// agent may wait before the doorbell rings for it even though a native
+/// component is registered to take it ([`RewakeClock`]).
+pub const ENV_REWAKE_AFTER_MS: &str = "DOT_AGENT_DECK_INBOX_REWAKE_AFTER_MS";
+
+/// See [`ENV_REWAKE_AFTER_MS`]. A registered component hands a message over
+/// within seconds, or within one ack-wait (60 s) when a turn has just started
+/// (issue #2133), so mail still queued beside one after five minutes is not
+/// on its way. Long enough that a slow hand-over never meets a ring, short
+/// enough that an orchestrator waits minutes, not hours, for its report.
+pub const DEFAULT_REWAKE_AFTER: Duration = Duration::from_secs(5 * 60);
+
 /// The fixed line, before its id.
 pub const LINE_PREFIX: &str = " dot-agent-deck: message ";
 
@@ -171,6 +183,8 @@ pub struct DoorbellConfig {
     pub wake_stall_after: Duration,
     /// See [`ENV_BUSY_STALL_AFTER_MS`].
     pub busy_stall_after: Duration,
+    /// See [`ENV_REWAKE_AFTER_MS`].
+    pub rewake_after: Duration,
 }
 
 impl Default for DoorbellConfig {
@@ -181,6 +195,7 @@ impl Default for DoorbellConfig {
             arm_grace: DEFAULT_ARM_GRACE,
             wake_stall_after: DEFAULT_WAKE_STALL_AFTER,
             busy_stall_after: DEFAULT_BUSY_STALL_AFTER,
+            rewake_after: DEFAULT_REWAKE_AFTER,
         }
     }
 }
@@ -229,6 +244,12 @@ impl DoorbellConfig {
                 _ => ignored(ENV_BUSY_STALL_AFTER_MS),
             }
         }
+        if let Some(raw) = lookup(ENV_REWAKE_AFTER_MS) {
+            match parse_ms(&raw) {
+                Some(ms) if !ms.is_zero() => config.rewake_after = ms,
+                _ => ignored(ENV_REWAKE_AFTER_MS),
+            }
+        }
         config
     }
 
@@ -263,6 +284,10 @@ pub struct Facts {
     /// suspended, or the agent did not take the deck's last Enter in this
     /// episode.
     pub held: bool,
+    /// Issue #2385: the oldest queued message has waited past
+    /// [`DoorbellConfig::rewake_after`] ([`RewakeClock`]), so a registered
+    /// native component no longer holds the ring ([`ring_admitted`]).
+    pub rewake: bool,
 }
 
 /// The doorbell's memory of one agent generation.
@@ -324,11 +349,34 @@ pub fn decide(bell: &Bell, facts: &Facts, config: &DoorbellConfig, now: Instant)
         .last_ring
         .is_none_or(|last| now >= last + config.delay_after(bell.rings));
     match facts.inbox.queued.first() {
-        Some(id) if due && ring_still_admitted(&facts.inbox, config, now) => {
+        Some(id) if due && ring_admitted(&facts.inbox, config, now, facts.rewake) => {
             Action::Ring { id: id.clone() }
         }
         _ => Action::Nothing,
     }
+}
+
+/// [`ring_still_admitted`], or, with `rewake` (issue #2385: the oldest queued
+/// message has waited past [`DoorbellConfig::rewake_after`]), the same with a
+/// registered native component no longer counted. A component that keeps mail
+/// queued that long is not taking it, whatever it is: its hand-over failed,
+/// or what it handed never started a turn. An incompatible integration still
+/// gets no ring, and an announcement or a batch handed to a once-waiter
+/// within the arm grace still holds it, so a wake that is on its way is never
+/// typed over (issue #2133).
+pub fn ring_admitted(
+    inbox: &DoorbellFacts,
+    config: &DoorbellConfig,
+    now: Instant,
+    rewake: bool,
+) -> bool {
+    if !rewake {
+        return ring_still_admitted(inbox, config, now);
+    }
+    !inbox.blocked
+        && inbox
+            .native_announced_at
+            .is_none_or(|at| now >= at + config.arm_grace)
 }
 
 /// Whether a native component leaves the doorbell to ring for this agent at
@@ -353,7 +401,8 @@ pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: 
 /// and, for a ring, still no native component armed or inside the arm grace
 /// of an announcement. Part 2 (`inbox/doorbell/031`): and the message the
 /// ring names (`selected`) still queued for this generation, from a fresh
-/// query each time.
+/// query each time. Issue #2385: a ring the tick decided as a re-wake
+/// (`rewake`) is re-asked by the same rule ([`ring_admitted`]).
 ///
 /// Part 3, round 5-wake (plan §2.3): the check never waits on the hub's lock.
 /// The ring holds the writer, and the hub's holders can themselves wait on
@@ -363,6 +412,7 @@ pub fn ring_still_admitted(inbox: &DoorbellFacts, config: &DoorbellConfig, now: 
 /// contended the check sleeps and asks again, the app state included, until
 /// it answers or the ring's own deadline gives up on it. No guard is held
 /// across an await.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ring_admission_check(
     state: SharedState,
     registry: Arc<AgentPtyRegistry>,
@@ -371,6 +421,7 @@ pub(crate) fn ring_admission_check(
     config: &DoorbellConfig,
     selected: &str,
     admission: Option<crate::state::DoorbellAdmission>,
+    rewake: bool,
 ) -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync + use<>
 {
     let (pane, agent, selected) = (pane.to_string(), agent.to_string(), selected.to_string());
@@ -399,7 +450,7 @@ pub(crate) fn ring_admission_check(
                 }
                 if let Some(facts) = registry.inbox().try_doorbell_facts(&pane, &agent) {
                     let queued = facts.queued.contains(&selected);
-                    let still = ring_still_admitted(&facts, &config, Instant::now());
+                    let still = ring_admitted(&facts, &config, Instant::now(), rewake);
                     if !(queued && still) {
                         debug!(
                         target: "doorbell",
@@ -537,6 +588,46 @@ impl QuietClock {
         if self.oldest.as_deref() != Some(oldest) || self.activity != activity {
             self.oldest = Some(oldest.to_string());
             self.activity = activity;
+            self.since = Some(now);
+        }
+        self.since.is_some_and(|since| now >= since + after)
+    }
+}
+
+/// Issue #2385: whether the oldest message queued for an agent generation has
+/// been its oldest for [`DoorbellConfig::rewake_after`].
+///
+/// The recovery for a wake that never came, whatever its cause. The clock
+/// reads only the queue, not the agent's status or what is registered to take
+/// the mail: it starts when a message becomes the oldest queued one and starts
+/// again when that changes (something took it), so an agent that keeps taking
+/// its mail never trips it. What tripping it allows is narrow:
+/// [`ring_admitted`] stops counting a registered native component, so the
+/// doorbell may ring, and the wake shows as stalled. Every other condition of
+/// a ring still applies: the agent reads Idle, nothing holds it, and the
+/// transaction proves an empty composer before it types and re-asks that the
+/// message is still queued under the writer, so a re-wake types only into an
+/// agent the deck reads as idle and only for mail nothing took meanwhile. The
+/// line carries no content: it names a message and asks the agent to fetch,
+/// and the fetch is handed what the receipt engine still holds for the agent,
+/// by the same rules as any other fetch, so a component that takes the mail
+/// first leaves the fetch nothing of it to hand over again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RewakeClock {
+    oldest: Option<String>,
+    since: Option<Instant>,
+}
+
+impl RewakeClock {
+    /// One tick: `oldest` is the oldest message queued for the agent. Returns
+    /// whether it has been the oldest for `after`.
+    pub fn observe(&mut self, oldest: Option<&str>, now: Instant, after: Duration) -> bool {
+        let Some(oldest) = oldest else {
+            *self = Self::default();
+            return false;
+        };
+        if self.oldest.as_deref() != Some(oldest) {
+            self.oldest = Some(oldest.to_string());
             self.since = Some(now);
         }
         self.since.is_some_and(|since| now >= since + after)
@@ -890,6 +981,8 @@ struct Slot {
     stall: StallClock,
     /// Issue #2389.
     quiet: QuietClock,
+    /// Issue #2385.
+    rewake: RewakeClock,
     /// PRD #1666 part 3, round 5-wake.
     hold: HoldEpisode,
     /// The last ring found no screen it could type into, and none has written
@@ -1046,7 +1139,23 @@ async fn run_tick(
         let explained = status_explains_waiting(status.as_ref());
         let input = registry.pane_input_hold(&pane, &agent);
         let inbox = hub.doorbell_facts(&pane, &agent);
-        let receiver = !ring_still_admitted(&inbox, config, now);
+        // Issue #2385: mail queued past the re-wake bound is no longer left to
+        // a registered native component.
+        let rewake = slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((pane.clone(), agent.clone()))
+            .or_default()
+            .rewake
+            .observe(
+                inbox.queued.first().map(String::as_str),
+                now,
+                config.rewake_after,
+            );
+        let receiver = !ring_admitted(&inbox, config, now, rewake);
+        // A registered component the re-wake no longer counts: the mail is
+        // queued beside it, so the wake has stalled, and the card says so.
+        let passed_over = rewake && inbox.armed > 0 && !receiver;
         let queued = !inbox.queued.is_empty();
         // Only asked while mail waits and nothing else takes it: each reads
         // the generation's activation and evidence.
@@ -1083,11 +1192,11 @@ async fn run_tick(
                 now,
                 config.busy_stall_after,
             );
-            let waiting = inbox.armed == 0 && (!explained || silent);
+            let waiting = (inbox.armed == 0 || passed_over) && (!explained || silent);
             match slot.stall.observe(
                 inbox.queued.first().map(String::as_str),
                 waiting,
-                silent,
+                silent || passed_over,
                 now,
                 config.wake_stall_after,
             ) {
@@ -1172,6 +1281,7 @@ async fn run_tick(
                     || settling
                     || suspended
                     || slot.not_taken.is_some(),
+                rewake,
             };
             slot.bell.observe(&facts);
             // Plan §2.2's evidence-refresh nudge: once per episode, between
@@ -1182,6 +1292,15 @@ async fn run_tick(
                 slot.nudged = Some(input.turns);
             }
             let action = decide(&slot.bell, &facts, config, now);
+            if rewake && action != Action::Nothing {
+                info!(
+                    pane_id = %pane,
+                    agent_id = %agent,
+                    armed = facts.inbox.armed,
+                    rings = slot.bell.rings,
+                    "doorbell re-wake: the oldest message waited past the re-wake bound"
+                );
+            }
             if action == Action::Nothing {
                 if slot.bell.is_idle() && facts.inbox.queued.is_empty() {
                     slots.remove(&(pane.clone(), agent.clone()));
@@ -1243,6 +1362,7 @@ async fn run_tick(
                 &config,
                 &id,
                 admission,
+                rewake,
             );
             let Some(message) = crate::inbox::MessageId::parse(&id) else {
                 warn!(pane_id = %pane, agent_id = %agent, message_id = %id, "doorbell: a queued id that does not parse");
@@ -1935,6 +2055,7 @@ mod tests {
             },
             idle: true,
             held: false,
+            rewake: false,
         }
     }
 
@@ -2138,8 +2259,10 @@ mod tests {
             (ENV_TICK_MS, "25"),
             (ENV_SCHEDULE_MS, "300, 500,700"),
             (ENV_ARM_GRACE_MS, "0"),
+            (ENV_REWAKE_AFTER_MS, "90000"),
         ]));
         assert_eq!(config.tick, Duration::from_millis(25));
+        assert_eq!(config.rewake_after, Duration::from_secs(90));
         assert_eq!(config.delay_after(1), Duration::from_millis(300));
         assert_eq!(config.delay_after(3), Duration::from_millis(700));
         assert_eq!(config.delay_after(9), Duration::from_millis(700));
@@ -2148,6 +2271,7 @@ mod tests {
             (ENV_TICK_MS, "0"),
             (ENV_SCHEDULE_MS, "300,,x"),
             (ENV_ARM_GRACE_MS, "soon"),
+            (ENV_REWAKE_AFTER_MS, "0"),
         ]));
         assert_eq!(bad, DoorbellConfig::default());
         assert_eq!(
@@ -2163,5 +2287,104 @@ mod tests {
             doorbell_line("m-k3xzq2ab-0f3c9a71d2e4b850"),
             doorbell_line_naming("m-k3xzq2ab-0f3c9a71d2e4b850", &bin)
         );
+    }
+
+    /// Scenario: Step the re-wake clock (issue #2385) over one queued message
+    /// and the policy over an agent whose registered native waiter keeps that
+    /// message queued. Before the bound the waiter holds the ring as before;
+    /// once the oldest message has been the oldest for the bound, the policy
+    /// rings for it, while an incompatible integration, a fresh announcement
+    /// or hand-over inside the arm grace, a busy agent and a held generation
+    /// still hold it. A new oldest message, or an empty queue, starts the
+    /// clock again.
+    #[spec("inbox/doorbell/065")]
+    #[test]
+    fn doorbell_065_mail_left_queued_past_the_bound_rings_past_a_registered_waiter() {
+        let after = Duration::from_secs(300);
+        let config = DoorbellConfig {
+            rewake_after: after,
+            ..DoorbellConfig::default()
+        };
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+
+        let mut clock = RewakeClock::default();
+        assert!(!clock.observe(Some("m1"), at(0), after));
+        assert!(!clock.observe(Some("m1"), at(299), after));
+        assert!(
+            clock.observe(Some("m1"), at(300), after),
+            "the bound passed"
+        );
+        assert!(
+            clock.observe(Some("m1"), at(900), after),
+            "and stays passed"
+        );
+        assert!(
+            !clock.observe(Some("m2"), at(901), after),
+            "something took the oldest message: the next one waits the bound itself"
+        );
+        assert!(clock.observe(Some("m2"), at(1201), after));
+        assert!(!clock.observe(None, at(1202), after), "an empty queue");
+        assert!(
+            !clock.observe(Some("m2"), at(1203), after),
+            "mail queued again after an empty queue starts again"
+        );
+
+        // A registered waiter holds the ring until the bound passes.
+        let bell = Bell::default();
+        let mut armed = facts(&["m1"]);
+        armed.inbox.armed = 1;
+        assert_eq!(decide(&bell, &armed, &config, at(0)), Action::Nothing);
+        armed.rewake = true;
+        assert_eq!(decide(&bell, &armed, &config, at(300)), ring("m1"));
+        assert!(!ring_still_admitted(&armed.inbox, &config, at(300)));
+        assert!(ring_admitted(&armed.inbox, &config, at(300), true));
+
+        // What still holds a re-wake.
+        let mut blocked = armed.clone();
+        blocked.inbox.blocked = true;
+        assert_eq!(
+            decide(&bell, &blocked, &config, at(300)),
+            Action::Nothing,
+            "an incompatible integration gets no ring"
+        );
+        let mut handing = armed.clone();
+        handing.inbox.native_announced_at = Some(at(299));
+        assert_eq!(
+            decide(&bell, &handing, &config, at(300)),
+            Action::Nothing,
+            "a hand-over or announcement inside the arm grace is on its way"
+        );
+        assert_eq!(
+            decide(&bell, &handing, &config, at(299) + config.arm_grace),
+            ring("m1")
+        );
+        let mut busy = armed.clone();
+        busy.idle = false;
+        assert_eq!(
+            decide(&bell, &busy, &config, at(300)),
+            Action::Nothing,
+            "a busy agent is never rung"
+        );
+        let mut held = armed.clone();
+        held.held = true;
+        assert_eq!(decide(&bell, &held, &config, at(300)), Action::Nothing);
+        assert_eq!(
+            decide(&bell, &armed.clone(), &config, at(300)),
+            ring("m1"),
+            "the re-wake rings on the doorbell's own schedule"
+        );
+        let mut rung = Bell::default();
+        rung.rang(at(300), vec!["m1".to_string()]);
+        assert_eq!(
+            decide(&rung, &armed, &config, at(301)),
+            Action::Nothing,
+            "and waits the schedule's delay before ringing again"
+        );
+        assert_eq!(
+            decide(&rung, &armed, &config, at(300) + config.delay_after(1)),
+            ring("m1")
+        );
+        assert_eq!(DEFAULT_REWAKE_AFTER, Duration::from_secs(300));
     }
 }

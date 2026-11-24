@@ -659,6 +659,37 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     );
 }
 
+/// Scenario: Run interactive Haiku idle in its deck pane with Claude Code's own waiter armed but handed nothing (the deck's waiter hand-over paused) and the re-wake bound shortened to five seconds, then post a directive task naming a sentinel without typing into the pane (SKIP when the deck's Claude Code facts are not Go). The waiter stays armed and never takes the task; once the bound passes the deck's re-wake rings the doorbell anyway, Haiku takes the task through its prompt hook, writes the sentinel once, and the task is acknowledged with one delivery.
+#[spec("inbox/claude/057")]
+#[test]
+#[cfg(target_os = "linux")]
+fn claude_057_live_an_armed_waiter_that_never_takes_the_mail_is_rung_past() {
+    skip_unless!(common::check_claude_available());
+    skip_unless!(claude_facts_admit_installed_release());
+    let claude = Claude::launch_with(
+        &common::capability_export_command(&format!("exec {}", claude_command())),
+        &[
+            ("DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY", "1"),
+            ("DOT_AGENT_DECK_INBOX_REWAKE_AFTER_MS", "5000"),
+        ],
+    );
+    let name = "rewake-armed-3d91c7.txt";
+    let id = claude.post(&claude.directive(name));
+    assert_eq!(
+        claude.listing()["armed"],
+        1,
+        "Claude Code's own waiter is armed beside the task; {}",
+        claude.evidence()
+    );
+    claude.done(&id, name, false);
+    claude.assert_witnessed(&id, false);
+    assert!(
+        claude.log().contains("doorbell re-wake"),
+        "the doorbell rang as a re-wake; {}",
+        claude.evidence()
+    );
+}
+
 /// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's waiter, and post a directive task naming a sentinel (SKIP when the deck's Claude Code facts are not Go). The doorbell rings and that prompt is blocked, so Claude runs no turn and puts the line back in its input box; the card must read Idle again with the doorbell held as awaiting a prompt. Pressing Enter in the pane sends the line, Haiku writes the sentinel once, and the task is acknowledged with two deliveries.
 #[spec("inbox/claude/053")]
 #[test]

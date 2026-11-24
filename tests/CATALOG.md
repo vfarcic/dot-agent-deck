@@ -12234,6 +12234,22 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
+##### inbox/doorbell/065 — Mail left queued past the re-wake bound is rung for past a registered native waiter (issue #2385).
+- **Layer:** L1 unit (`src/doorbell.rs`, pure `RewakeClock`, `ring_admitted` and `decide` with injected time).
+- **Agent:** none.
+- **Asserts:** the re-wake clock trips once the oldest queued message has been the oldest for the bound, stays tripped, and starts again when the oldest message changes or the queue empties; before the bound an armed waiter holds the ring, after it the policy rings for the oldest message on the doorbell's own schedule; an incompatible integration, an announcement or hand-over inside the arm grace, a busy agent and a held generation still hold it; the default bound is five minutes and `DOT_AGENT_DECK_INBOX_REWAKE_AFTER_MS` overrides it (zero is ignored, `inbox/doorbell/016`).
+- **Test:** `doorbell_065_mail_left_queued_past_the_bound_rings_past_a_registered_waiter` in `src/doorbell.rs`.
+- **Does not assert:** the daemon wiring, the bytes typed or the stall shown (`inbox/doorbell/066`), or a real agent (`inbox/claude/057`).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/doorbell/066 — An armed waiter that never takes the mail is rung past, and the wake shows as stalled (issue #2385).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay; the armed waiter is a Claude once-waiter opened from the test process at the one-shot integration.
+- **Agent:** none (the e2e stand-in profile's Python editor; no agent executable or credential).
+- **Asserts:** with `DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY=1` and `DOT_AGENT_DECK_INBOX_REWAKE_AFTER_MS=1500`, an Idle Claude Code pane's task stays queued beside the armed waiter and nothing is typed for 0.9 s; after the bound the token-led line is typed and submitted, the body never, with the waiter still armed, and the agent record's `inbox.wake_stalled` reads true. Red when `ring_admitted` ignores the re-wake (measured: no line within the wait).
+- **Test:** `doorbell_066_an_armed_waiter_that_never_takes_the_mail_is_rung_past` in `tests/e2e_inbox_doorbell.rs`.
+- **Does not assert:** a real agent (`inbox/claude/057`), the default bound, or a busy pane (the doorbell's own guards, `inbox/doorbell/002`).
+- **Platform coverage:** mac+linux.
+
 #### inbox/probe
 
 The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an agent's input box through the agent's own Ctrl+G, and holding what a user types while a check runs. It is built a commit at a time: the daemon feeds the output hook every byte an agent writes (inbox/probe/004), moves the input epoch at the PTY writer's enqueue and notes the output's queries into it (inbox/probe/001, 045, 060), and nothing in the daemon reads what the probe computes or calls the rest of it yet.
@@ -14207,6 +14223,15 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** which wake reached the resumed conversation (its waiter or the doorbell); a brand-new session started from the overview, a nested agent a tool starts, or a host of another executable, which keep the pin where it is (`a_background_session_takes_the_pin_from_its_own_foreground`, `a_claude_background_session_is_placed_by_its_ancestry_only`); a conversation returned to the foreground process; macOS; or the `/resume` command.
 - **Platform coverage:** linux.
 - **Cost:** two cheap model turns.
+
+##### inbox/claude/057 — Live: a Claude Code whose armed waiter never takes its mail is rung past it once the re-wake bound passes (issue #2385).
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, its lazy-spawned daemon with `DOT_AGENT_DECK_INBOX_TEST_PAUSE_WAITER_DELIVERY=1` and `DOT_AGENT_DECK_INBOX_REWAKE_AFTER_MS=5000`, and the deck's log.
+- **Agent:** Claude Code (Haiku).
+- **Asserts:** Claude Code's own `SessionStart` waiter is armed beside a posted sentinel-writing task and is handed nothing; once the re-wake bound passes the doorbell rings anyway (the log names `doorbell re-wake`), Haiku takes the task through its prompt hook (the transcript shows delivery 1.1 as a `hook_additional_context` attachment), writes the sentinel once, and the task is acknowledged after one hand-over and kept out of the user's prompt history.
+- **Test:** `claude_057_live_an_armed_waiter_that_never_takes_the_mail_is_rung_past` in `tests/e2e_inbox_claude_live.rs`.
+- **Does not assert:** why a real waiter would keep mail queued (the pause knob stands in for that, since the cause in #2385 is not known); a busy or Error-status agent, which the re-wake does not ring; the stall shown on the card (`inbox/doorbell/066`); macOS.
+- **Platform coverage:** linux.
+- **Cost:** one cheap model turn.
 
 ##### inbox/claude/046 — Claude Code outside the deck's recorded process tree still takes and acknowledges its messages.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).

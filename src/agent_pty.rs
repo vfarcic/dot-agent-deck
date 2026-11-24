@@ -30405,6 +30405,7 @@ mod spawn_tests {
             &tick_config(Duration::from_secs(60)),
             &selected,
             admission,
+            false,
         );
         (check, crate::inbox::MessageId::parse(&selected).unwrap())
     }
