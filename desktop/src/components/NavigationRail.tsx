@@ -28,11 +28,12 @@ export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | 
  * there, since those panels exist only on the deck; Settings opens over
  * whichever screen is up.
  *
- * Issue #1198 — the deck and its four panels are experimental surfaces, so
- * each entry renders only while its own `features` field says so. With the
- * flag off — the shipped default — the rail is Dashboard and Settings. Nothing
- * else here reads the flag: the entries that remain dispatch exactly as they
- * did.
+ * Issue #1198 — three of the deck's panels are experimental surfaces, so
+ * each of those entries renders only while its own `features` field says so.
+ * The deck (issue #1308) and Prompts (issue #1310) left the flag and always
+ * render. With the flag off — the shipped default — the rail is Dashboard,
+ * Daemons, Prompts and Settings. Nothing else here reads the flag: the
+ * entries that remain dispatch exactly as they did.
  */
 export function NavigationRail({ screen, overlays, context, connection, features, onShowShortcuts, update }: { screen: RailScreen; overlays: ShellOverlayState; context: RailContext; connection: ConnectionView; features: DesktopFeatures; onShowShortcuts?: () => void; /** Issue #1635: the newer-release notice, which renders nothing while there is none. */ update?: ReactNode }) {
   const overlayOpen = Boolean(overlays.projects || overlays.prompts || overlays.profiles || overlays.orchestration || overlays.settings);
@@ -46,9 +47,9 @@ export function NavigationRail({ screen, overlays, context, connection, features
       <img className="brand-mark" src={logoUrl} alt="Agent Deck" width={36} height={36} />
       <nav>
         <RailButton icon={LayoutList} label="Dashboard" active={screen === "overview" && !overlayOpen} onClick={() => VOICE_ACTIONS.openOverview.run(context)} testId="open-overview" />
-        {features.showDeck && <RailButton icon={SquareTerminal} label="Daemons" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />}
+        <RailButton icon={SquareTerminal} label="Daemons" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />
         {features.showProjects && <RailButton icon={FolderGit2} label="Projects" active={overlays.projects} onClick={() => VOICE_ACTIONS.openProjects.run(context)} testId="open-projects" />}
-        {features.showPrompts && <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />}
+        <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />
         {features.showOrchestrations && <RailButton icon={Network} label="Orchestrations" active={overlays.orchestration} onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(context)} />}
         {features.showAgentProfiles && <RailButton icon={Bot} label="Agent Profiles" active={overlays.profiles} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(context)} testId="open-agent-profiles" />}
         <RailButton icon={Settings2} label="Settings" active={overlays.settings} onClick={() => VOICE_ACTIONS.openSettings.run(context)} testId="open-settings" />

@@ -2151,6 +2151,10 @@ pub struct AppState {
     /// unit tests that do not install one, where the daemon dispatch records
     /// nothing and answers no `last_command`.
     last_command_store: Option<Arc<crate::last_command::LastCommandStore>>,
+    /// Issue #824: the deck's prompt library, installed once at daemon start
+    /// ([`Self::set_prompt_library`]). `None` in the TUI and in unit tests that
+    /// do not install one, where the prompt verbs answer an error.
+    prompt_library: Option<Arc<crate::prompt_library::PromptLibraryStore>>,
     /// Panes whose CURRENT [`SessionState::status`] was last written by an
     /// event carrying no `agent_id` — i.e. by a producer that named no
     /// generation (issue #398, Greptile PR #443 finding #2).
@@ -9308,6 +9312,18 @@ impl AppState {
     /// Issue #1540: the daemon's last-command store, if one is installed.
     pub fn last_command_store(&self) -> Option<Arc<crate::last_command::LastCommandStore>> {
         self.last_command_store.clone()
+    }
+
+    /// Issue #824: install the daemon's prompt library. Called once, by
+    /// [`crate::daemon::run_daemon_with`] after loading it from the daemon's
+    /// state directory; a test installs one over a temp directory.
+    pub fn set_prompt_library(&mut self, store: Arc<crate::prompt_library::PromptLibraryStore>) {
+        self.prompt_library = Some(store);
+    }
+
+    /// Issue #824: the daemon's prompt library, if one is installed.
+    pub fn prompt_library(&self) -> Option<Arc<crate::prompt_library::PromptLibraryStore>> {
+        self.prompt_library.clone()
     }
 
     /// Issue #454: may an event naming `(pane_id, agent_id)` drive this state?

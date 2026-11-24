@@ -8,6 +8,407 @@ use super::*;
 use crate::launch_records::{LaunchRecord, SCHEMA_VERSION};
 use crate::retained_store::{AdoptedState, KeptReport, OwnState};
 use crate::work_journal::{Line, ReadStats};
+use spec::spec;
+
+const RESTORE_SESSION: &str = "01234567-89ab-4cde-8fab-0123456789ab";
+
+/// A launch record as this build writes it: with the process identity a
+/// restore checks first (review R#2 makes a record without one Start over).
+fn restore_record(w: &WorkId, a: &AttemptId, agent: crate::event::AgentType) -> LaunchRecord {
+    let mut r = record(w, a, "saved agent", Some("/home/someone/code/p"));
+    r.agent_type = Some(agent);
+    r.pid = Some(4242);
+    r.pid_start = Some(7);
+    r
+}
+
+fn restore_session(
+    j: &mut Journal,
+    w: &WorkId,
+    a: &AttemptId,
+    agent: crate::event::AgentType,
+    id: &str,
+) {
+    j.push(
+        a.run(),
+        Event::AttemptSession {
+            work: w.clone(),
+            attempt: a.clone(),
+            session: id.into(),
+            agent,
+        },
+    );
+}
+
+fn restore_verdict(agent: &ItemAgent) -> serde_json::Value {
+    let verdict: &RestoreVerdict = &agent.restore;
+    serde_json::to_value(verdict).unwrap()
+}
+
+/// Scenario: List an interrupted Claude pane, or a dispatched single Claude agent, with a recorded conversation. The list names that agent and offers resume using its latest session, without checking whether its folder exists.
+#[spec("journal/restore/001")]
+#[test]
+fn journal_restore_001_single_agents_offer_resume_from_the_latest_session() {
+    use crate::event::AgentType;
+    for (launch, kind) in [
+        (Launch::Pane, ItemKind::Agent),
+        (Launch::Dispatch, ItemKind::Unit),
+        (Launch::IssueDispatch, ItemKind::IssueDispatch),
+    ] {
+        // PRD #1790 stage 3 (#2492): Codex is a documented gap, listed with
+        // the other gaps in `journal/restore/002`.
+        {
+            let agent_type = AgentType::ClaudeCode;
+            let mut j = Journal::default();
+            let (w, a) = (work(1), attempt(OLD, 1));
+            j.opened(
+                &w,
+                launch,
+                None,
+                Refs::default(),
+                Some("/home/someone/code/p"),
+            )
+            .started(&w, &a);
+            restore_session(&mut j, &w, &a, agent_type.clone(), "old-invalid-id");
+            restore_session(&mut j, &w, &a, agent_type.clone(), RESTORE_SESSION);
+            j.ended(&w, &a, EndHow::Interrupted);
+            // Reader order is not session order: the higher seq wins.
+            j.lines.swap(2, 3);
+            let list = derive_in(&j, vec![restore_record(&w, &a, agent_type.clone())], &[]);
+            assert_eq!(list.items.len(), 1);
+            let item = &list.items[0];
+            assert_eq!(item.kind, kind);
+            assert_eq!(item.agents.len(), 1);
+            assert_eq!(item.agents_omitted, 0);
+            let agent: &ItemAgent = &item.agents[0];
+            assert_eq!(agent.attempt.to_string(), a.to_string());
+            assert_eq!(agent.name.as_deref(), Some("saved agent"));
+            assert_eq!(agent.agent_type, Some(agent_type));
+            assert_eq!(agent.role, None);
+            assert_eq!(agent.folder.as_deref(), Some("/home/someone/code/p"));
+            assert_eq!(
+                restore_verdict(agent),
+                serde_json::json!({"kind": "resume"})
+            );
+            let mut old_reply = serde_json::to_value(item).unwrap();
+            old_reply.as_object_mut().unwrap().remove("agents");
+            old_reply.as_object_mut().unwrap().remove("agents_omitted");
+            let old_item: InterruptedItem = serde_json::from_value(old_reply).unwrap();
+            assert!(
+                old_item.agents.is_empty(),
+                "older daemons omit the additive fields"
+            );
+            assert_eq!(old_item.agents_omitted, 0);
+        }
+    }
+}
+
+/// Scenario: List an interrupted team with twenty distinct agent attempts. The item carries at most sixteen agents and reports how many were omitted, so the restored-agent list remains bounded.
+#[spec("journal/restore/001")]
+#[test]
+fn journal_restore_001_agent_lists_are_bounded_with_an_omitted_count() {
+    use crate::event::AgentType;
+    let mut j = Journal::default();
+    let w = work(1);
+    j.opened(&w, Launch::Orchestration, None, Refs::default(), None);
+    let mut records = Vec::new();
+    for n in 1..=20 {
+        let a = attempt(OLD, n);
+        j.started(&w, &a).ended(&w, &a, EndHow::Interrupted);
+        records.push(restore_record(&w, &a, AgentType::ClaudeCode));
+    }
+    let list = derive_in(&j, records, &[]);
+    let item = &list.items[0];
+    assert_eq!(item.agents.len(), 16);
+    assert_eq!(item.agents_omitted, 4);
+    let attempts: std::collections::HashSet<_> = item
+        .agents
+        .iter()
+        .map(|agent| agent.attempt.to_string())
+        .collect();
+    assert_eq!(attempts.len(), 16, "distinct attempts, not duplicate rows");
+}
+
+/// Scenario: List an interrupted plain agent whose pane ran seventeen attempts, each in a conversation of its own except the seventeenth, which is in the first one's conversation. Only sixteen agents are listed, and the first is not offered a resume, because the agent left out of the list shares its conversation.
+#[spec("journal/restore/037")]
+#[test]
+fn journal_restore_037_an_agent_left_out_of_the_list_still_makes_a_shared_conversation_ambiguous() {
+    use crate::event::AgentType;
+    let session = |n: u64| format!("{n:08x}-0000-4cde-8fab-0123456789ab");
+    let mut j = Journal::default();
+    let w = work(1);
+    j.opened(
+        &w,
+        Launch::Pane,
+        None,
+        pane_refs("pane-1"),
+        Some("/home/someone/code/p"),
+    );
+    let mut records = Vec::new();
+    let count = MAX_ITEM_AGENTS as u64 + 1;
+    for n in 1..=count {
+        let a = attempt(OLD, n);
+        j.started(&w, &a);
+        // The last attempt, the one the list leaves out, is in the first's
+        // conversation.
+        let id = if n == count { session(1) } else { session(n) };
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, &id);
+        j.ended(&w, &a, EndHow::Interrupted);
+        records.push(restore_record(&w, &a, AgentType::ClaudeCode));
+    }
+    let list = derive_in(&j, records, &[]);
+    let item = &list.items[0];
+    assert_eq!(item.agents.len(), MAX_ITEM_AGENTS);
+    assert_eq!(item.agents_omitted, 1);
+    assert_eq!(
+        item.agents[0].attempt.to_string(),
+        attempt(OLD, 1).to_string()
+    );
+    assert_eq!(
+        item.agents[0].restore,
+        RestoreVerdict::NotRestorable {
+            reason: RestoreReason::AmbiguousRecord
+        },
+        "the omitted agent shares its conversation"
+    );
+    for agent in &item.agents[1..] {
+        assert_eq!(agent.restore, RestoreVerdict::Resume, "{}", agent.attempt);
+    }
+}
+
+/// Scenario: List interrupted agents that cannot resume, Codex and a default shell among them, and list a team's roles and multi-attempt units. Fresh starts are offered for the unsupported single agents; team roles and units outside the single-agent scope say orchestration-later.
+#[spec("journal/restore/002")]
+#[test]
+fn journal_restore_002_gaps_start_over_and_teams_wait_for_orchestration_restore() {
+    use crate::event::AgentType;
+    for agent_type in [
+        AgentType::Codex,
+        AgentType::Pi,
+        AgentType::OpenCode,
+        AgentType::Devin,
+        AgentType::Antigravity,
+        AgentType::None,
+    ] {
+        let mut j = Journal::default();
+        let (w, a) = pane(&mut j, 1);
+        restore_session(&mut j, &w, &a, agent_type.clone(), RESTORE_SESSION);
+        j.ended(&w, &a, EndHow::Interrupted);
+        let mut r = restore_record(&w, &a, agent_type.clone());
+        r.command = crate::agent_registry::spec(&agent_type)
+            .default_command
+            .map(str::to_string);
+        if agent_type == AgentType::None {
+            r.agent_type = None;
+        }
+        let list = derive_in(&j, vec![r], &[]);
+        let reason = if agent_type == AgentType::None {
+            "default-shell"
+        } else {
+            "agent-cannot-resume"
+        };
+        assert_eq!(
+            restore_verdict(&list.items[0].agents[0]),
+            serde_json::json!({"kind": "start_over", "reason": reason})
+        );
+    }
+
+    for launch in [
+        Launch::Orchestration,
+        Launch::Dispatch,
+        Launch::IssueDispatch,
+    ] {
+        let mut j = Journal::default();
+        let w = work(1);
+        j.opened(&w, launch, None, Refs::default(), None);
+        let mut records = Vec::new();
+        for (n, role) in [(1, "orchestrator"), (2, "coder")] {
+            let a = attempt(OLD, n);
+            j.push(
+                OLD,
+                Event::AttemptStarted {
+                    work: w.clone(),
+                    attempt: a.clone(),
+                    pane: role.into(),
+                    agent: n,
+                    role: Some(role.into()),
+                },
+            );
+            restore_session(&mut j, &w, &a, AgentType::ClaudeCode, RESTORE_SESSION);
+            j.ended(&w, &a, EndHow::Interrupted);
+            let mut r = restore_record(&w, &a, AgentType::ClaudeCode);
+            r.role = Some(role.into());
+            records.push(r);
+        }
+        let list = derive_in(&j, records, &[]);
+        assert_eq!(list.items[0].agents.len(), 2);
+        for agent in &list.items[0].agents {
+            assert!(matches!(
+                agent.role.as_deref(),
+                Some("orchestrator" | "coder")
+            ));
+            assert_eq!(
+                restore_verdict(agent),
+                serde_json::json!({"kind": "none", "reason": "orchestration-later"})
+            );
+        }
+    }
+
+    // Even one distinct attempt is outside Stage 3 once it has a delegation.
+    let mut j = Journal::default();
+    let (w, a) = (work(1), attempt(OLD, 1));
+    j.opened(&w, Launch::Dispatch, None, Refs::default(), None)
+        .started(&w, &a);
+    let delegated = work(2);
+    j.opened(
+        &delegated,
+        Launch::Delegation,
+        Some(&w),
+        Refs::default(),
+        None,
+    )
+    .started(&delegated, &a);
+    restore_session(&mut j, &w, &a, AgentType::ClaudeCode, RESTORE_SESSION);
+    j.ended(&w, &a, EndHow::Interrupted);
+    let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
+    assert_eq!(
+        list.items[0].agents.len(),
+        1,
+        "a delegated generation is listed once"
+    );
+    assert_eq!(
+        restore_verdict(&list.items[0].agents[0]),
+        serde_json::json!({"kind": "none", "reason": "orchestration-later"})
+    );
+}
+
+/// Scenario: List interrupted panes with ambiguous, absent or moved launch records, a record an older deck wrote without the old process's identity, an invalid or absent conversation id, and incomplete reads. Each agent remains visible with a specific refusal or fresh-start reason instead of being offered resume.
+#[spec("journal/restore/003")]
+#[test]
+fn journal_restore_003_bad_evidence_never_offers_resume() {
+    use crate::event::AgentType;
+    for (case, kind, reason) in [
+        ("duplicate", "none", "ambiguous-record"),
+        ("wrong-work", "none", "ambiguous-record"),
+        ("shared-attempt", "none", "ambiguous-record"),
+        ("moved", "none", "folder-moved"),
+        ("missing", "none", "no-launch-record"),
+        ("invalid", "start_over", "session-id-invalid"),
+        ("no-session", "start_over", "no-session-id"),
+        ("legacy", "start_over", "old-process-unknown"),
+        ("legacy-no-start", "start_over", "old-process-unknown"),
+        ("journal-incomplete", "none", "incomplete-read"),
+        ("launch-incomplete", "none", "incomplete-read"),
+        ("launch-skipped", "none", "incomplete-read"),
+        ("journal-newer", "none", "incomplete-read"),
+        ("journal-unknown-kind", "none", "incomplete-read"),
+    ] {
+        let mut j = Journal::default();
+        let (w, a) = pane(&mut j, 1);
+        if case != "no-session" {
+            restore_session(
+                &mut j,
+                &w,
+                &a,
+                AgentType::ClaudeCode,
+                if case == "invalid" {
+                    "--continue"
+                } else {
+                    RESTORE_SESSION
+                },
+            );
+        }
+        j.ended(&w, &a, EndHow::Interrupted);
+        let mut r = restore_record(&w, &a, AgentType::ClaudeCode);
+        if case == "legacy" {
+            r.pid = None;
+            r.pid_start = None;
+        }
+        if case == "legacy-no-start" {
+            r.pid_start = None;
+        }
+        if case == "moved" {
+            r.cwd = None;
+            r.cwd_moved_from = Some("/home/someone/code/p".into());
+        }
+        if case == "wrong-work" {
+            r.work = work(99);
+        }
+        if case == "shared-attempt" {
+            let other = work(2);
+            j.opened(&other, Launch::Pane, None, Refs::default(), None)
+                .started(&other, &a)
+                .ended(&other, &a, EndHow::Interrupted);
+        }
+        let mut records = launches(match case {
+            "duplicate" => vec![r.clone(), r],
+            "missing" => Vec::new(),
+            _ => vec![r],
+        });
+        j.truncated = case == "journal-incomplete";
+        records.truncated = case == "launch-incomplete";
+        records.skipped = usize::from(case == "launch-skipped");
+        let mut read = j.read();
+        read.stats.newer_version = usize::from(case == "journal-newer");
+        read.stats.unknown_kind = usize::from(case == "journal-unknown-kind");
+        let list = derive_with_home(&read, &records, live_only, &[], &home());
+        let item = list.items.iter().find(|item| item.id == w).unwrap();
+        assert_eq!(
+            item.agents.len(),
+            1,
+            "{case}: the refused agent stays visible"
+        );
+        assert_eq!(
+            restore_verdict(&item.agents[0]),
+            serde_json::json!({"kind": kind, "reason": reason}),
+            "{case}"
+        );
+        if case.ends_with("incomplete") || case == "launch-skipped" || case.starts_with("journal-")
+        {
+            assert!(list.incomplete, "{case}");
+        }
+    }
+}
+
+/// PRD #1790 stage 3 (review R5): with many interrupted agents, each still
+/// gets the latest session of its own attempt, now read from the index built
+/// in one pass rather than from a scan of the whole journal per agent.
+#[test]
+fn many_interrupted_agents_each_resume_their_own_latest_session() {
+    use crate::event::AgentType;
+    const AGENTS: u64 = 600;
+    let session =
+        |n: u64, generation: u64| format!("{n:08x}-{generation:04x}-4cde-8fab-0123456789ab");
+    let mut j = Journal::default();
+    let mut records = Vec::new();
+    for n in 1..=AGENTS {
+        let (w, a) = pane(&mut j, n);
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, &session(n, 1));
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, &session(n, 2));
+        j.ended(&w, &a, EndHow::Interrupted);
+        records.push(restore_record(&w, &a, AgentType::ClaudeCode));
+    }
+    let read = j.read();
+    let list = derive_with_home(&read, &launches(records), live_only, &[], &home());
+    assert_eq!(list.items.len(), AGENTS as usize);
+    for n in 1..=AGENTS {
+        let item = list.items.iter().find(|item| item.id == work(n)).unwrap();
+        assert_eq!(item.agents.len(), 1);
+        assert_eq!(item.agents[0].restore, RestoreVerdict::Resume, "agent {n}");
+        assert_eq!(
+            crate::work_journal::latest_session_of(&read.lines, &item.agents[0].attempt)
+                .map(|(id, _)| id.to_string()),
+            Some(session(n, 2)),
+        );
+    }
+    let indexed = crate::work_journal::latest_sessions(&read.lines);
+    assert_eq!(indexed.len(), AGENTS as usize);
+    for (attempt, report) in indexed {
+        assert_eq!(
+            crate::work_journal::latest_session_of(&read.lines, attempt).map(|(id, _)| id),
+            Some(report.session)
+        );
+    }
+}
 
 const DECK: &str = "abcdefgh";
 const OLD: &str = "runold";
@@ -153,6 +554,9 @@ fn record(w: &WorkId, a: &AttemptId, name: &str, cwd: Option<&str>) -> LaunchRec
         orchestration: None,
         orchestration_id: None,
         ts_ms: 5,
+        pid: None,
+        pid_start: None,
+        launch_nonce: None,
     }
 }
 
@@ -554,6 +958,7 @@ fn the_list_serialises_with_the_agreed_field_names() {
     assert_eq!(
         keys,
         [
+            "agents",
             "branch",
             "id",
             "issue",
@@ -977,6 +1382,8 @@ fn heavy_item(n: u64, reports: usize) -> InterruptedItem {
         cut: false,
         progress: Progress::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     }
 }
 
@@ -1332,4 +1739,128 @@ fn dismiss_batches_fit_the_daemons_count_and_byte_limits() {
         assert!(batch.iter().map(String::len).sum::<usize>() <= MAX_SELECTOR_BYTES);
     }
     assert_eq!(batches.concat(), long);
+}
+
+/// PRD #1790 stage 3: a resume that did not take (`restore_failed`) leaves
+/// the agent listed with Start over offered; a restored or started-over item
+/// (`closed how=restored|started_over`) is no longer listed.
+#[test]
+fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list() {
+    use crate::event::AgentType;
+    use crate::work_journal::{RestoreFailure, RestoredHow};
+    let build = || {
+        let mut j = Journal::default();
+        let (w, a) = (work(1), attempt(OLD, 1));
+        j.opened(
+            &w,
+            Launch::Pane,
+            None,
+            Refs::default(),
+            Some("/home/someone/code/p"),
+        )
+        .started(&w, &a);
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, RESTORE_SESSION);
+        j.ended(&w, &a, EndHow::Interrupted);
+        (j, w, a)
+    };
+    let (mut j, w, a) = build();
+    j.push(
+        LIVE,
+        Event::RestoreFailed {
+            work: w.clone(),
+            attempt: a.clone(),
+            failure: RestoreFailure::SessionMismatch,
+            shim: None,
+            to: None,
+            sessions: Vec::new(),
+            unknown_session: false,
+        },
+    );
+    let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(
+        restore_verdict(&list.items[0].agents[0]),
+        serde_json::json!({"kind": "start_over", "reason": "not-resumed"})
+    );
+    for (how, restored) in [
+        (CloseHow::Restored, RestoredHow::Resumed),
+        (CloseHow::StartedOver, RestoredHow::StartedOver),
+    ] {
+        let (mut j, w, a) = build();
+        j.closed(&w, how).push(
+            LIVE,
+            Event::AttemptRestored {
+                work: w.clone(),
+                from: a.clone(),
+                to: attempt(LIVE, 1),
+                how: restored,
+                session: None,
+            },
+        );
+        let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
+        assert!(list.items.is_empty(), "{how:?}: {list:?}");
+    }
+}
+
+/// Review (Qodo #5): of a plain pane's two interrupted attempts, the one an
+/// `attempt_restored` names reads `none` / `restored` while the other keeps
+/// its verdict, and the item may be closed only once both are named.
+#[test]
+fn an_attempt_brought_back_reads_restored_and_the_item_closes_once_all_are_back() {
+    use crate::event::AgentType;
+    use crate::work_journal::RestoredHow;
+    let mut j = Journal::default();
+    let w = work(1);
+    j.opened(
+        &w,
+        Launch::Pane,
+        None,
+        pane_refs("pane-1"),
+        Some("/home/someone/code/p"),
+    );
+    let (first, second) = (attempt(OLD, 1), attempt(OLD, 2));
+    let mut records = Vec::new();
+    for (n, a) in [&first, &second].into_iter().enumerate() {
+        j.started(&w, a);
+        let id = format!("{:08x}-0000-4cde-8fab-0123456789ab", n + 1);
+        restore_session(&mut j, &w, a, AgentType::ClaudeCode, &id);
+        j.ended(&w, a, EndHow::Interrupted);
+        records.push(restore_record(&w, a, AgentType::ClaudeCode));
+    }
+    assert!(!every_interrupted_attempt_restored(
+        &j.read(),
+        &w,
+        live_only
+    ));
+    let brought_back = |j: &mut Journal, from: &AttemptId, n: u64| {
+        j.push(
+            LIVE,
+            Event::AttemptRestored {
+                work: w.clone(),
+                from: from.clone(),
+                to: attempt(LIVE, n),
+                how: RestoredHow::Resumed,
+                session: None,
+            },
+        );
+    };
+    brought_back(&mut j, &first, 1);
+    let list = derive_in(&j, records.clone(), &[]);
+    assert_eq!(list.items.len(), 1, "still listed: {list:?}");
+    let agents = &list.items[0].agents;
+    assert_eq!(
+        restore_verdict(&agents[0]),
+        serde_json::json!({"kind": "none", "reason": "restored"})
+    );
+    assert_eq!(agents[1].restore, RestoreVerdict::Resume);
+    assert!(
+        !every_interrupted_attempt_restored(&j.read(), &w, live_only),
+        "the second is still interrupted"
+    );
+    brought_back(&mut j, &second, 2);
+    assert!(every_interrupted_attempt_restored(&j.read(), &w, live_only));
+    assert!(
+        !every_interrupted_attempt_restored(&j.read(), &work(9), live_only),
+        "an item the read does not hold"
+    );
 }

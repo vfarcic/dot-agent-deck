@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: question
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+     ┌ Interrupted work ────────────────────────────────────────────────────────────────────────────────┐     
+     │                                                                                                  │     
+     │  Restore restore-scratch · Agent                                                                 │     
+     │                                                                                                  │     
+     │  Start restore-scratch over in this worktree, without its conversation?                          │     
+     │  The agent cannot be restored with its conversation yet.                                         │     
+     │                                                                                                  │     
+     │  w  Start over in this worktree                                                                  │     
+     │                                                                                                  │     
+     │  w start over in this worktree · n back                                                          │     
+     └──────────────────────────────────────────────────────────────────────────────────────────────────┘     
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+1 interrupted item from before the restart                                                   [Show I] [Hide X]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r]
+[Generate g] [Schedules s]

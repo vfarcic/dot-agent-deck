@@ -47,3 +47,203 @@ fn restore_005_daemon_hydration_wins_over_snapshot() {
         "PRD #89 M2.2: multiple hydrated managed panes must still skip the snapshot"
     );
 }
+
+use dot_agent_deck::config::SavedPane;
+use dot_agent_deck::features::{self, Features};
+use dot_agent_deck::interrupted_work::{InterruptedList, ItemAgent, RestoreReason, RestoreVerdict};
+use dot_agent_deck::launch_records::LaunchRecord;
+use dot_agent_deck::ui::should_defer_saved_agent_restore;
+use dot_agent_deck::work_journal::{AttemptId, WorkId};
+use serde_json::json;
+
+static SAVED_AGENT_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct SavedAgentFlag(Features);
+impl Drop for SavedAgentFlag {
+    fn drop(&mut self) {
+        features::set_for_test(self.0);
+    }
+}
+
+/// Scenario: On a fresh TUI startup with no hydrated panes, a saved pane matching a resumable agent's recorded directory and exact command is left for the restore question instead of starting blank, with the experimental flag pinned off. Changing either match field, or having only a Start-over verdict keeps the ordinary saved-pane start, and an unrelated launch record cannot suppress it.
+#[spec("journal/restore/018")]
+#[test]
+fn journal_restore_018_saved_panes_defer_only_an_exact_restorable_launch() {
+    let _lock = SAVED_AGENT_FLAG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _flag = SavedAgentFlag(features::current());
+    let dir = "/home/me/code/restore-app";
+    let command = "exec ./start-agent.sh --model small";
+    let work = "w-abcdefgh-0000000000000018";
+    let attempt = "restore-saved/18";
+    let saved = SavedPane {
+        dir: dir.into(),
+        name: "saved-name-can-change".into(),
+        command: command.into(),
+        mode: None,
+        orchestration: None,
+    };
+    let launch = LaunchRecord {
+        v: dot_agent_deck::launch_records::SCHEMA_VERSION,
+        work: WorkId::parse(work).unwrap(),
+        attempt: AttemptId::parse(attempt).unwrap(),
+        command: Some(command.into()),
+        shell: None,
+        agent_type: Some(dot_agent_deck::event::AgentType::ClaudeCode),
+        cwd: Some(dir.into()),
+        cwd_moved_from: None,
+        name: Some("original-name".into()),
+        role: None,
+        orchestration: None,
+        orchestration_id: None,
+        ts_ms: 1795400000000,
+        pid: Some(u32::MAX),
+        pid_start: Some(1),
+        launch_nonce: None,
+    };
+    let mut interrupted: InterruptedList = serde_json::from_value(json!({
+        "items":[{
+            "id":work, "kind":"agent", "name":"original-name", "worktree":dir,
+            "last_entry":{"kind":"attempt_ended", "ts_ms":1795400000000_u64},
+            "agents":[]
+        }],
+        "incomplete":false, "omitted":0
+    }))
+    .unwrap();
+    interrupted.items[0].agents = vec![ItemAgent {
+        attempt: launch.attempt.clone(),
+        name: launch.name.clone(),
+        agent_type: launch.agent_type.clone(),
+        role: None,
+        folder: launch.cwd.clone(),
+        restore: RestoreVerdict::Resume,
+    }];
+
+    // Exercise the same startup branch as SavedSession::load on a fresh daemon.
+    assert!(should_apply_snapshot(&AppState::default()));
+    features::set_for_test(Features::test_with(false));
+    assert!(
+        should_defer_saved_agent_restore(&saved, &interrupted, std::slice::from_ref(&launch)),
+        "the matching command must not start blank before the user answers Restore, \
+         with the experimental flag off"
+    );
+    for verdict in [
+        RestoreVerdict::StartOver {
+            reason: RestoreReason::AgentCannotResume,
+        },
+        RestoreVerdict::StartOver {
+            reason: RestoreReason::NotResumed,
+        },
+        RestoreVerdict::NotRestorable {
+            reason: RestoreReason::OrchestrationLater,
+        },
+        RestoreVerdict::Unknown,
+    ] {
+        let mut unavailable = interrupted.clone();
+        unavailable.items[0].agents[0].restore = verdict;
+        assert!(
+            !should_defer_saved_agent_restore(&saved, &unavailable, std::slice::from_ref(&launch)),
+            "only a Resume verdict defers saved-workspace startup: {verdict:?}"
+        );
+    }
+    for changed in [
+        SavedPane {
+            dir: format!("{dir}-other"),
+            ..saved.clone()
+        },
+        SavedPane {
+            command: format!("{command} --verbose"),
+            ..saved.clone()
+        },
+    ] {
+        assert!(
+            !should_defer_saved_agent_restore(
+                &changed,
+                &interrupted,
+                std::slice::from_ref(&launch)
+            ),
+            "both directory and verbatim original command must match: {changed:?}"
+        );
+    }
+    assert!(!should_defer_saved_agent_restore(
+        &saved,
+        &InterruptedList::default(),
+        std::slice::from_ref(&launch)
+    ));
+    assert!(!should_defer_saved_agent_restore(&saved, &interrupted, &[]));
+    let mut unrelated = launch.clone();
+    unrelated.attempt = AttemptId::parse("restore-saved/19").unwrap();
+    assert!(
+        !should_defer_saved_agent_restore(&saved, &interrupted, &[unrelated]),
+        "a same-command launch must belong to the listed resume attempt"
+    );
+    let mut wrong_work = launch;
+    wrong_work.work = WorkId::parse("w-abcdefgh-0000000000000019").unwrap();
+    assert!(
+        !should_defer_saved_agent_restore(&saved, &interrupted, &[wrong_work]),
+        "matching an attempt under the wrong work must not hide a saved pane"
+    );
+}
+
+/// Scenario: On a daemon-empty TUI startup, the interrupted work list the saved-workspace restore asks for does not answer within its bound, fails, or answers while the launch records cannot be read. No saved pane is deferred and each case names its reason, so every saved pane starts fresh as before; a daemon that does not list interrupted work, or offers no resume, defers nothing without a reason, and a readable answer offering a resume defers by it.
+#[spec("journal/restore/045")]
+#[test]
+fn journal_restore_045_an_unread_interrupted_list_defers_no_saved_pane() {
+    use dot_agent_deck::daemon_client::{ClientError, GatedQuery};
+    use dot_agent_deck::ui::saved_restore_deferral_from;
+
+    let resumable: InterruptedList = serde_json::from_value(json!({
+        "items":[{
+            "id":"w-abcdefgh-0000000000000045", "kind":"agent", "name":"saved-agent",
+            "worktree":"/home/me/code/restore-app",
+            "last_entry":{"kind":"attempt_ended", "ts_ms":1795400000000_u64},
+            "agents":[{"attempt":"restore-saved/45", "restore":{"kind":"resume"}}]
+        }],
+        "incomplete":false, "omitted":0
+    }))
+    .unwrap();
+    assert_eq!(resumable.items[0].agents[0].restore, RestoreVerdict::Resume);
+    let unread = || -> std::io::Result<Vec<LaunchRecord>> {
+        panic!("the launch records are read only once the list offers a resume")
+    };
+
+    let timed_out = saved_restore_deferral_from(None, unread)
+        .expect_err("no answer within the bound is a reason, not a deferral");
+    assert!(timed_out.contains("did not answer"), "{timed_out}");
+
+    let failed =
+        saved_restore_deferral_from(Some(Err(ClientError::Server("list failed".into()))), unread)
+            .expect_err("a failed request defers nothing");
+    assert!(failed.contains("list failed"), "{failed}");
+
+    let records_unreadable =
+        saved_restore_deferral_from(Some(Ok(GatedQuery::Answered(resumable.clone()))), || {
+            Err(std::io::Error::other("records unreadable"))
+        })
+        .expect_err("unreadable launch records defer nothing");
+    assert!(
+        records_unreadable.contains("records unreadable"),
+        "{records_unreadable}"
+    );
+
+    assert_eq!(
+        saved_restore_deferral_from(Some(Ok(GatedQuery::Unsupported)), unread),
+        Ok(None),
+        "a daemon without interrupted work has nothing to defer"
+    );
+    assert_eq!(
+        saved_restore_deferral_from(
+            Some(Ok(GatedQuery::Answered(InterruptedList::default()))),
+            unread
+        ),
+        Ok(None),
+        "no resume offered: nothing to defer"
+    );
+    let deferral =
+        saved_restore_deferral_from(Some(Ok(GatedQuery::Answered(resumable.clone()))), || {
+            Ok(Vec::new())
+        })
+        .expect("a readable answer offering a resume");
+    assert_eq!(deferral, Some((resumable, Vec::new())));
+}

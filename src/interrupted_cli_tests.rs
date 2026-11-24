@@ -23,6 +23,8 @@ fn item(id: &str, kind: ItemKind, name: &str) -> InterruptedItem {
         cut: false,
         progress: Default::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     }
 }
 
@@ -860,5 +862,288 @@ fn a_dismissal_refused_on_an_incomplete_read_says_so() {
         out.stderr.contains(words::REFUSED_INCOMPLETE_READ),
         "{}",
         out.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD #1790 stage 3: restore and start-over
+// ---------------------------------------------------------------------------
+
+const ATTEMPT: &str = "r-restorecli/7";
+
+fn restored(first_message_posted: bool, recorded: bool) -> words::RestoredAgent {
+    words::RestoredAgent {
+        attempt: crate::work_journal::AttemptId::parse(ATTEMPT).unwrap(),
+        agent_id: "3".into(),
+        pane_id: "sched-restored-fix-login-abcdef-0".into(),
+        name: Some("fix-login".into()),
+        first_message_posted,
+        recorded,
+    }
+}
+
+fn refused_attempt(reason: words::RestoreRefusal) -> words::RestoreRefused {
+    words::RestoreRefused::new(crate::work_journal::AttemptId::parse(ATTEMPT), reason)
+}
+
+#[test]
+fn show_prints_each_agent_its_attempt_and_its_verdict() {
+    let mut unit = item(UNIT_ID, ItemKind::Unit, "fix-login");
+    unit.agents.push(words::ItemAgent {
+        attempt: crate::work_journal::AttemptId::parse(ATTEMPT).unwrap(),
+        name: Some("fix-login".into()),
+        agent_type: Some(crate::event::AgentType::ClaudeCode),
+        role: None,
+        folder: Some("/work/fix-login".into()),
+        restore: words::RestoreVerdict::Resume,
+    });
+    unit.agents.push(words::ItemAgent {
+        attempt: crate::work_journal::AttemptId::parse("r-restorecli/8").unwrap(),
+        name: Some("other".into()),
+        agent_type: Some(crate::event::AgentType::Pi),
+        role: None,
+        folder: Some("/work/fix-login".into()),
+        restore: words::RestoreVerdict::StartOver {
+            reason: words::RestoreReason::NotResumed,
+        },
+    });
+    let text = render_item(&unit);
+    assert!(text.contains(ATTEMPT), "{text}");
+    assert!(text.contains(words::RESTORE_VERDICT_RESUME), "{text}");
+    assert!(text.contains(words::START_OVER), "{text}");
+}
+
+#[test]
+fn restore_and_start_over_are_refused_before_anything_is_sent_when_unconfirmed() {
+    let (_dir, client) = no_daemon();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let restore = |dry_run: bool, yes: bool| RestoreArgs {
+        id: UNIT_ID.into(),
+        agents: Vec::new(),
+        mode: words::RestoreMode::Continue,
+        dry_run,
+        yes,
+    };
+    // No terminal and no --yes refuses and names --yes; a person who says
+    // no restores nothing. Neither reaches the (absent) daemon, which would
+    // be exit 3.
+    let out = rt.block_on(run_restore(
+        &client,
+        &restore(false, false),
+        &AmbientIdentity::Person,
+        Confirm::NoTerminal,
+    ));
+    assert_eq!(out.code, EXIT_REFUSED);
+    assert!(out.stderr.contains("--yes"), "{}", out.stderr);
+    let out = rt.block_on(run_start_over(
+        &client,
+        &StartOverArgs {
+            id: UNIT_ID.into(),
+            agent: ATTEMPT.into(),
+            dry_run: false,
+            yes: false,
+        },
+        &AmbientIdentity::Person,
+        Confirm::NoTerminal,
+    ));
+    assert_eq!(out.code, EXIT_REFUSED);
+    assert_eq!(
+        out.stderr.trim_end(),
+        words::START_OVER_NEEDS_YES,
+        "{}",
+        out.stderr
+    );
+    let mut asked = Vec::new();
+    let mut no = |question: &str| {
+        asked.push(question.to_string());
+        false
+    };
+    let out = rt.block_on(run_restore(
+        &client,
+        &restore(false, false),
+        &AmbientIdentity::Person,
+        Confirm::Ask(&mut no),
+    ));
+    assert_eq!(out.code, EXIT_REFUSED);
+    assert!(
+        out.stderr.contains(words::NOTHING_RESTORED),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].starts_with(&words::restore_question(UNIT_ID)));
+    // A dry run needs no confirmation and is sent: no daemon is exit 3.
+    let out = rt.block_on(run_restore(
+        &client,
+        &restore(true, false),
+        &AmbientIdentity::Person,
+        Confirm::NoTerminal,
+    ));
+    assert_eq!(out.code, EXIT_UNREACHABLE, "{}", out.stderr);
+}
+
+#[test]
+fn a_restore_exits_zero_only_when_something_came_back_and_nothing_was_refused() {
+    let done = words::RestoreOutcome {
+        restored: vec![restored(true, true)],
+        ..Default::default()
+    };
+    let out = render_restore(&done);
+    assert_eq!(out.code, EXIT_OK);
+    assert!(
+        out.stdout.contains(&words::restored_sentence("fix-login")),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stderr.is_empty(), "{}", out.stderr);
+
+    let quiet = words::RestoreOutcome {
+        restored: vec![restored(false, false)],
+        ..Default::default()
+    };
+    let out = render_restore(&quiet);
+    assert_eq!(out.code, EXIT_OK);
+    assert!(out.stderr.contains(words::RESTART_NOTE_NOT_SENT));
+    assert!(out.stderr.contains(words::RESTORE_NOT_RECORDED));
+
+    let refused = words::RestoreOutcome {
+        refused: vec![refused_attempt(words::RestoreRefusal::NotResumed)],
+        ..Default::default()
+    };
+    let out = render_restore(&refused);
+    assert_eq!(out.code, EXIT_REFUSED);
+    assert!(out.stderr.contains(ATTEMPT), "{}", out.stderr);
+    assert!(
+        out.stderr.contains(words::restore_refusal_sentence(
+            words::RestoreRefusal::NotResumed
+        )),
+        "{}",
+        out.stderr
+    );
+
+    let would = words::RestoreOutcome {
+        dry_run: true,
+        would_restore: vec![crate::work_journal::AttemptId::parse(ATTEMPT).unwrap()],
+        ..Default::default()
+    };
+    assert_eq!(render_restore(&would).code, EXIT_OK);
+    assert_eq!(
+        render_restore(&words::RestoreOutcome::default()).code,
+        EXIT_REFUSED
+    );
+
+    // A newer daemon's refusal shows its own sentence, escaped.
+    let mut unknown = refused_attempt(words::RestoreRefusal::Unknown);
+    unknown.message = "newer\x1b[2Jreason".into();
+    let out = render_restore(&words::RestoreOutcome {
+        refused: vec![unknown],
+        ..Default::default()
+    });
+    assert!(!out.stderr.contains('\x1b'), "{:?}", out.stderr);
+    assert!(out.stderr.contains("newer"), "{}", out.stderr);
+}
+
+#[test]
+fn a_start_over_says_what_it_started_or_why_it_did_not() {
+    let out = render_start_over(&words::StartOverOutcome {
+        started: Some(restored(true, true)),
+        ..Default::default()
+    });
+    assert_eq!(out.code, EXIT_OK);
+    assert!(
+        out.stdout
+            .contains(&words::started_over_sentence("fix-login"))
+    );
+
+    let out = render_start_over(&words::StartOverOutcome {
+        started: Some(restored(false, true)),
+        ..Default::default()
+    });
+    assert_eq!(out.code, EXIT_OK);
+    assert!(out.stderr.contains(words::SAVED_TASK_NOT_SENT));
+
+    let out = render_start_over(&words::StartOverOutcome {
+        refused: Some(refused_attempt(words::RestoreRefusal::TaskUnsafe)),
+        ..Default::default()
+    });
+    assert_eq!(out.code, EXIT_REFUSED);
+    assert!(out.stderr.contains(words::restore_refusal_sentence(
+        words::RestoreRefusal::TaskUnsafe
+    )));
+
+    let out = render_start_over(&words::StartOverOutcome {
+        dry_run: true,
+        would_start: true,
+        ..Default::default()
+    });
+    assert_eq!(out.code, EXIT_OK);
+    assert!(out.stdout.contains(words::START_OVER_WOULD));
+}
+
+/// PRD #1790 stage 3 (§4 item 10): a dry run whose Git facts show an open
+/// pull request says so, for a restore and for a start over; one without
+/// says nothing about it.
+#[test]
+fn a_dry_run_names_an_open_pull_request_on_the_items_branch() {
+    let open = Some(words::GitFacts {
+        worktree_exists: Some(true),
+        pr: words::PrFact::Open,
+        ..Default::default()
+    });
+    let restore = words::RestoreOutcome {
+        dry_run: true,
+        would_restore: vec![crate::work_journal::AttemptId::parse(ATTEMPT).unwrap()],
+        git: open.clone(),
+        ..Default::default()
+    };
+    let out = render_restore(&restore);
+    assert_eq!(out.code, EXIT_OK);
+    assert!(
+        out.stdout.contains(words::RESTORE_PR_OPEN),
+        "{}",
+        out.stdout
+    );
+    let start_over = words::StartOverOutcome {
+        dry_run: true,
+        would_start: true,
+        git: open,
+        ..Default::default()
+    };
+    let out = render_start_over(&start_over);
+    assert!(
+        out.stdout.contains(words::START_OVER_WOULD),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains(words::RESTORE_PR_OPEN),
+        "{}",
+        out.stdout
+    );
+    let merged = words::RestoreOutcome {
+        git: Some(words::GitFacts {
+            pr: words::PrFact::Merged,
+            ..Default::default()
+        }),
+        ..restore
+    };
+    assert!(
+        !render_restore(&merged)
+            .stdout
+            .contains(words::RESTORE_PR_OPEN)
+    );
+    assert_eq!(
+        with_git_note("Restore?".into(), merged.git.as_ref()),
+        "Restore?"
+    );
+    assert_eq!(
+        with_git_note(
+            "Restore?".into(),
+            Some(&words::GitFacts {
+                pr: words::PrFact::Open,
+                ..Default::default()
+            })
+        ),
+        format!("{} Restore?", words::RESTORE_PR_OPEN)
     );
 }

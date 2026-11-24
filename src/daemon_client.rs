@@ -1601,6 +1601,9 @@ enum InterruptedAnswer {
     Answered {
         response: Box<AttachResponse>,
         instance: Option<String>,
+        /// PRD #1790 stage 3: whether the same `Hello` advertised
+        /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`].
+        restore_agents: bool,
     },
     Unsupported,
     OtherInstance,
@@ -2431,6 +2434,84 @@ impl DaemonClient {
             ));
         }
         Ok(GatedQuery::Answered(()))
+    }
+
+    /// Issue #824 — this deck's prompt library, in order.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_PROMPT_LIBRARY`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything, so the caller keeps
+    /// its own copy of the library.
+    pub async fn list_prompts(
+        &self,
+    ) -> Result<GatedQuery<Vec<crate::prompt_library::Prompt>>, ClientError> {
+        self.prompt_library_request(AttachRequest::ListPrompts {}, "list-prompts")
+            .await
+    }
+
+    /// Issue #824 — add `prompt` to this deck's library, or replace the prompt
+    /// with its id, answering the library as it stands afterwards. A prompt or
+    /// library over the daemon's limits is a [`ClientError::Server`] naming the
+    /// limit. Withheld like [`Self::list_prompts`].
+    pub async fn save_prompt(
+        &self,
+        prompt: crate::prompt_library::Prompt,
+    ) -> Result<GatedQuery<Vec<crate::prompt_library::Prompt>>, ClientError> {
+        self.prompt_library_request(AttachRequest::SavePrompt { prompt }, "save-prompt")
+            .await
+    }
+
+    /// Issue #824 — remove the prompt with `id` from this deck's library,
+    /// answering the library afterwards. An unknown id is not an error.
+    /// Withheld like [`Self::list_prompts`].
+    pub async fn delete_prompt(
+        &self,
+        id: &str,
+    ) -> Result<GatedQuery<Vec<crate::prompt_library::Prompt>>, ClientError> {
+        self.prompt_library_request(
+            AttachRequest::DeletePrompt { id: id.to_string() },
+            "delete-prompt",
+        )
+        .await
+    }
+
+    /// Issue #824 — hand over a library the caller kept before the daemon owned
+    /// one: the daemon adds each prompt whose id it does not hold and replaces
+    /// none, all or nothing. Answers the library afterwards; a refusal is a
+    /// [`ClientError::Server`] and added nothing, so the caller keeps its copy.
+    /// Withheld like [`Self::list_prompts`].
+    pub async fn seed_prompts(
+        &self,
+        prompts: Vec<crate::prompt_library::Prompt>,
+    ) -> Result<GatedQuery<Vec<crate::prompt_library::Prompt>>, ClientError> {
+        self.prompt_library_request(AttachRequest::SeedPrompts { prompts }, "seed-prompts")
+            .await
+    }
+
+    /// The shared half of the four prompt-library verbs: the capability gate,
+    /// one round trip, and the library off [`AttachResponse::prompts`].
+    async fn prompt_library_request(
+        &self,
+        request: AttachRequest,
+        verb: &'static str,
+    ) -> Result<GatedQuery<Vec<crate::prompt_library::Prompt>>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_PROMPT_LIBRARY)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(&mut rd, &mut wr, &request).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| format!("{verb} failed")),
+            ));
+        }
+        resp.prompts.map(GatedQuery::Answered).ok_or_else(|| {
+            ClientError::Server(format!("the daemon answered {verb} with no prompt library"))
+        })
     }
 
     /// PRD #1666 S3 — post a deck-generated message (a seed, an orchestrator's
@@ -3842,6 +3923,19 @@ impl DaemonClient {
         request: &AttachRequest,
         pinned_instance: Option<&str>,
     ) -> Result<InterruptedAnswer, ClientError> {
+        self.interrupted_work_needing(request, pinned_instance, None)
+            .await
+    }
+
+    /// [`Self::interrupted_work_on`], also withholding the request unless the
+    /// same `Hello` advertises `also` (PRD #1790 stage 3's
+    /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`]).
+    async fn interrupted_work_needing(
+        &self,
+        request: &AttachRequest,
+        pinned_instance: Option<&str>,
+        also: Option<&str>,
+    ) -> Result<InterruptedAnswer, ClientError> {
         // PR #2431 round 4 (Qodo): on a gated handle (the TUI's, the
         // desktop's) the `Hello` this request follows is the gate's own, so a
         // daemon on another protocol, one the handle's admission refuses, or
@@ -3881,6 +3975,7 @@ impl DaemonClient {
         };
         if !capabilities.supports(crate::daemon_protocol::CAP_INTERRUPTED_WORK)
             || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+            || also.is_some_and(|cap| !capabilities.supports(cap))
         {
             return Ok(InterruptedAnswer::Unsupported);
         }
@@ -3889,8 +3984,13 @@ impl DaemonClient {
         {
             return Ok(InterruptedAnswer::OtherInstance);
         }
+        let restore_agents = capabilities.supports(crate::daemon_protocol::CAP_RESTORE_AGENTS);
         let response = Box::new(issue_command(&mut rd, &mut wr, request).await?);
-        Ok(InterruptedAnswer::Answered { response, instance })
+        Ok(InterruptedAnswer::Answered {
+            response,
+            instance,
+            restore_agents,
+        })
     }
 
     /// PRD #1790 stage 2 (verification finding A): [`Self::list_interrupted_work`],
@@ -3904,7 +4004,9 @@ impl DaemonClient {
         let request = AttachRequest::ListInterruptedWork { git };
         let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
         {
-            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
             InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
             InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
         };
@@ -3934,7 +4036,9 @@ impl DaemonClient {
         let request = AttachRequest::DismissInterrupted { ids, all, caller };
         let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
         {
-            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
             InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
             InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
         };
@@ -3945,6 +4049,35 @@ impl DaemonClient {
             }),
             None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
                 "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 3: [`Self::list_interrupted_work`], also answering
+    /// whether the daemon that listed it advertised
+    /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`] on the same `Hello`, so
+    /// the TUI can say a daemon cannot restore agents before it asks one to.
+    pub async fn list_interrupted_work_restorable(
+        &self,
+        git: bool,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<(crate::interrupted_work::InterruptedList, bool)>, ClientError> {
+        let request = AttachRequest::ListInterruptedWork { git };
+        let (response, restore_agents) =
+            match self.interrupted_work_on(&request, pinned_instance).await? {
+                InterruptedAnswer::Answered {
+                    response,
+                    restore_agents,
+                    ..
+                } => (response, restore_agents),
+                InterruptedAnswer::Unsupported | InterruptedAnswer::OtherInstance => {
+                    return Ok(GatedQuery::Unsupported);
+                }
+            };
+        match response.interrupted_work {
+            Some(list) => Ok(GatedQuery::Answered((list, restore_agents))),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered ListInterruptedWork with no list".into()
             }))),
         }
     }
@@ -4073,6 +4206,140 @@ impl DaemonClient {
             Some(outcome) => Ok(GatedQuery::Answered(outcome)),
             None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
                 "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 3: restore an interrupted item's agents `agents`
+    /// (empty: every one a restore is offered for) with their conversations,
+    /// each posted `mode`'s restart note, or with `dry_run` run every check
+    /// and start nothing ([`AttachRequest::RestoreInterrupted`]). Answers
+    /// once each agent confirmed or was stopped, which can take the daemon's
+    /// confirmation bound. `caller` as for [`Self::reclaim_interrupted`].
+    /// [`GatedQuery::Unsupported`], with nothing sent, from a daemon that
+    /// does not advertise [`crate::daemon_protocol::CAP_RESTORE_AGENTS`] and
+    /// [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`] on a fresh `Hello`,
+    /// or that is not `pinned_instance`.
+    pub async fn restore_interrupted(
+        &self,
+        id: &str,
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::RestoreOutcome>, ClientError> {
+        Ok(
+            match self
+                .restore_interrupted_pinned(id, agents, mode, dry_run, caller, pinned_instance)
+                .await?
+            {
+                PinnedQuery::Answered { value, .. } => GatedQuery::Answered(value),
+                PinnedQuery::Unsupported | PinnedQuery::OtherInstance => GatedQuery::Unsupported,
+            },
+        )
+    }
+
+    /// [`Self::restore_interrupted`], telling a daemon that is not
+    /// `pinned_instance` from one that does not support the request, and
+    /// answering the daemon process that answered, so a confirmed action can
+    /// be pinned to the process its dry run asked (audit suggestion: CLI
+    /// confirmation binding).
+    pub async fn restore_interrupted_pinned(
+        &self,
+        id: &str,
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::RestoreOutcome>, ClientError> {
+        let request = AttachRequest::RestoreInterrupted {
+            id: id.to_string(),
+            agents,
+            mode,
+            dry_run,
+            caller,
+        };
+        let (response, instance) = match self
+            .interrupted_work_needing(
+                &request,
+                pinned_instance,
+                Some(crate::daemon_protocol::CAP_RESTORE_AGENTS),
+            )
+            .await?
+        {
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_restore {
+            Some(value) => Ok(PinnedQuery::Answered { value, instance }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered RestoreInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 3: start an interrupted item's agent `agent` (its
+    /// attempt) over, without its conversation, or with `dry_run` run every
+    /// check and start nothing ([`AttachRequest::StartOverInterrupted`]).
+    /// Gated as [`Self::restore_interrupted`] is.
+    pub async fn start_over_interrupted(
+        &self,
+        id: &str,
+        agent: &str,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::StartOverOutcome>, ClientError> {
+        Ok(
+            match self
+                .start_over_interrupted_pinned(id, agent, dry_run, caller, pinned_instance)
+                .await?
+            {
+                PinnedQuery::Answered { value, .. } => GatedQuery::Answered(value),
+                PinnedQuery::Unsupported | PinnedQuery::OtherInstance => GatedQuery::Unsupported,
+            },
+        )
+    }
+
+    /// [`Self::start_over_interrupted`], answering as
+    /// [`Self::restore_interrupted_pinned`] does.
+    pub async fn start_over_interrupted_pinned(
+        &self,
+        id: &str,
+        agent: &str,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::StartOverOutcome>, ClientError> {
+        let request = AttachRequest::StartOverInterrupted {
+            id: id.to_string(),
+            agent: agent.to_string(),
+            dry_run,
+            caller,
+        };
+        let (response, instance) = match self
+            .interrupted_work_needing(
+                &request,
+                pinned_instance,
+                Some(crate::daemon_protocol::CAP_RESTORE_AGENTS),
+            )
+            .await?
+        {
+            InterruptedAnswer::Answered {
+                response, instance, ..
+            } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_start_over {
+            Some(value) => Ok(PinnedQuery::Answered { value, instance }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered StartOverInterrupted with no outcome".into()
             }))),
         }
     }
@@ -8255,6 +8522,126 @@ mod tests {
         drop(dir);
     }
 
+    /// Issue #824 — the four prompt-library verbs are withheld from a daemon
+    /// that does not advertise `prompt-library` (one advertising nothing, and
+    /// one advertising everything else this build knows), answered
+    /// `Unsupported` with nothing sent, so the caller keeps its own copy.
+    /// Against a daemon that advertises it, each verb is sent under its own
+    /// `op` and answered with the library.
+    #[cfg(unix)]
+    #[test]
+    fn the_prompt_library_is_withheld_by_a_daemon_that_does_not_advertise_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            let older: &'static [&'static str] = Box::leak(
+                crate::daemon_protocol::DAEMON_CAPABILITIES
+                    .iter()
+                    .copied()
+                    .filter(|cap| *cap != crate::daemon_protocol::CAP_PROMPT_LIBRARY)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            prompt_library_gate_inner(None, false).await;
+            prompt_library_gate_inner(Some(older), false).await;
+            prompt_library_gate_inner(Some(crate::daemon_protocol::DAEMON_CAPABILITIES), true)
+                .await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn prompt_library_gate_inner(advertised: Option<&'static [&'static str]>, keeps: bool) {
+        use crate::prompt_library::Prompt;
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("scripted-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind scripted daemon");
+            (dir, path, listener)
+        };
+        let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_ops = ops.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read scripted-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode scripted-daemon request");
+                let op = request
+                    .get("op")
+                    .and_then(|op| op.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let response = if op == "hello" {
+                    AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    }
+                } else {
+                    server_ops.lock().unwrap().push(op);
+                    AttachResponse {
+                        prompts: Some(Vec::new()),
+                        ..AttachResponse::ok()
+                    }
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write scripted-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path);
+        let prompt = Prompt {
+            id: "p".into(),
+            name: "n".into(),
+            body: "b".into(),
+            note: None,
+        };
+        let replies = [
+            client.list_prompts().await.unwrap(),
+            client.save_prompt(prompt.clone()).await.unwrap(),
+            client.delete_prompt("p").await.unwrap(),
+            client.seed_prompts(vec![prompt]).await.unwrap(),
+        ];
+        for reply in replies {
+            assert_eq!(
+                reply,
+                if keeps {
+                    GatedQuery::Answered(Vec::new())
+                } else {
+                    GatedQuery::Unsupported
+                },
+                "advertised {advertised:?}"
+            );
+        }
+        let sent = ops.lock().unwrap().clone();
+        let expected: Vec<String> = if keeps {
+            [
+                "list-prompts",
+                "save-prompt",
+                "delete-prompt",
+                "seed-prompts",
+            ]
+            .map(String::from)
+            .to_vec()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(sent, expected, "advertised {advertised:?}");
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
+    }
+
     /// Issue #1540 — the last-command marker and the seed verb are withheld
     /// from the two older daemons a client will meet: one advertising nothing
     /// (pre-PRD #819), and one advertising everything up to M7 but not
@@ -8615,6 +9002,8 @@ mod tests {
                                 cut: false,
                                 progress: Default::default(),
                                 git: None,
+                                agents: Vec::new(),
+                                agents_omitted: 0,
                             };
                             let response = match op.as_str() {
                                 "hello" => AttachResponse {
