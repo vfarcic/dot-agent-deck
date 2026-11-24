@@ -188,14 +188,17 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          corrected summary in a new file. When this orchestration was dispatched, that is \
          delivered to whoever dispatched it as an update to your summary: the first summary \
          still stands and is not replaced, so say what changed. At most {max_updates} updates \
-         are delivered.\n\n\
+         are delivered, and from update {first_flagged} on each one tells whoever dispatched \
+         this orchestration that it has sent more updates than usual and may be looping, so \
+         send one only when the outcome really changed.\n\n\
          **Shell safety and context length are two different problems.** Writing long context to \
          `.dot-agent-deck/<task-slug>.md` and *referencing that path inside* `--task \"…\"` keeps the \
          task description short, but the description itself still goes through your shell. Passing \
          the file with `--task-file` is what keeps the shell out of the text. One file solves both \
          at once: write the full task to `.dot-agent-deck/<task-slug>.md` and hand it over with \
          `--task-file`.\n",
-        max_updates = crate::report_recovery::MAX_REPORT_UPDATES
+        max_updates = crate::report_recovery::MAX_REPORT_UPDATES,
+        first_flagged = crate::report_recovery::USUAL_REPORT_UPDATES + 1
     ));
 
     // 4. Important guidelines.
