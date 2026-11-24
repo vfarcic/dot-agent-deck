@@ -220,16 +220,22 @@ impl Decks {
         assert_eq!(reply["ok"], true, "fixture launch: {reply}");
         let agent = string(&reply, "id");
         let started = self.wait_start(name);
+        self.wait_journaled(&agent, &started);
+        started
+    }
+
+    /// Waits until the daemon journalled agent `agent`'s attempt and the
+    /// conversation its start record `started` names. The stand-in's ready
+    /// file says its hook was sent, not that the daemon journalled the
+    /// conversation it named: a restart before that leaves the attempt with
+    /// no conversation to resume (seen as a `not-restorable` under load in
+    /// `journal/restore/013`). Agent ids restart in each daemon, so the line
+    /// is matched by the agent's number and the conversation it reported,
+    /// not by an earlier run's attempt of the same number.
+    fn wait_journaled(&self, agent: &str, started: &Value) {
         journal::wait_for(&self.state, "the fixture attempt", |lines| {
-            journal::attempt_of(lines, &agent).cloned()
+            journal::attempt_of(lines, agent).cloned()
         });
-        // The stand-in's ready file says its hook was sent, not that the
-        // daemon journalled the conversation it named: a restart before
-        // that leaves the attempt with no conversation to resume (seen as a
-        // `not-restorable` under load in `journal/restore/013`). Agent ids
-        // restart in each daemon, so the line is matched by the agent's
-        // number and the conversation it reported, not by an earlier run's
-        // attempt of the same number.
         let suffix = format!("/{agent}");
         journal::wait_for(&self.state, "the fixture's conversation", |lines| {
             journal::find(lines, "attempt_session", |line| {
@@ -240,6 +246,19 @@ impl Decks {
             })
             .cloned()
         });
+    }
+
+    /// The one agent a dispatch started, once it reported SessionStart and
+    /// the daemon journalled its conversation. The dispatch's reply can reach
+    /// its caller before the stand-in has written its start record, so this
+    /// waits for the record rather than reading [`Self::starts`] at the
+    /// reply.
+    fn wait_dispatched_start(&self) -> Value {
+        common::wait_until(common::child_boot_budget(), || !self.starts().is_empty());
+        let starts = self.starts();
+        assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
+        let started = self.wait_start(&string(&starts[0], "pane"));
+        self.wait_journaled(&string(&started, "agent"), &started);
         started
     }
 
@@ -827,9 +846,7 @@ fn journal_restore_014_start_over_replays_only_a_safely_saved_dispatch_task() {
         ),
         "dispatch must finish before restart"
     );
-    let starts = decks.starts();
-    assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
-    let unit = decks.wait_start(&string(&starts[0], "pane"));
+    let unit = decks.wait_dispatched_start();
     let old_attempt = decks.attempt(&string(&unit, "agent"));
     let attempt = string(&old_attempt, "attempt");
     let work = string(&old_attempt, "work");
@@ -1759,7 +1776,7 @@ fn journal_restore_029_start_over_reads_github_again_under_its_claims() {
         }),
         "dispatch must finish before restart"
     );
-    let unit = decks.wait_start(&string(&decks.starts()[0], "pane"));
+    let unit = decks.wait_dispatched_start();
     let attempt = string(&decks.attempt(&string(&unit, "agent")), "attempt");
     let barrier = decks.root.join("start-over-barrier");
     let reached = barrier.with_extension("reached");
@@ -2612,9 +2629,7 @@ fn dispatched_unit(decks: &Decks, name: &str) -> String {
         ),
         "dispatch must finish before restart"
     );
-    let starts = decks.starts();
-    assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
-    let unit = decks.wait_start(&string(&starts[0], "pane"));
+    let unit = decks.wait_dispatched_start();
     string(&decks.attempt(&string(&unit, "agent")), "attempt")
 }
 
