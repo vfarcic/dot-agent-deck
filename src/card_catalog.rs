@@ -1578,6 +1578,22 @@ fn still_as_read(path: &std::path::Path, read: &ConfigRead) -> Result<(), String
 /// writer, and a writer that takes no lock by [`still_as_read`].
 static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// [`EDIT_LOCK`], tried until `deadline` (issue #2399 final audit, section
+/// 2): a request that cannot have its turn by then is answered busy rather
+/// than queued behind the one waiting for the config lock. `None`: busy.
+fn edit_turn_by(deadline: std::time::Instant) -> Option<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        match EDIT_LOCK.try_lock() {
+            Ok(turn) => return Some(turn),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(crate::config::CONFIG_LOCK_POLL);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
 /// Read the user config at `path` and, with `edit`, apply it
 /// ([`apply_action_edit`]) and replace the file by rename
 /// ([`crate::config::write_config_strictly`]); answer the editable catalog
@@ -1591,13 +1607,19 @@ static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///   (a read with no edit still answers, with the problem in `errors`);
 /// - an edit whose `base` is not the action as the file has it now
 ///   ([`apply_action_edit`]);
-/// - the lock, held by another writer for
-///   [`crate::config::CONFIG_LOCK_WAIT`], or not available at all;
+/// - the lock, held by another writer until the request's deadline, unsafe
+///   ([`crate::config::ConfigLockProblem::Unsafe`]), or not available at all;
 /// - a file that changed between the read and the save, as far as the last
 ///   check sees ([`still_as_read`]), or whose links now lead elsewhere;
 /// - a file that cannot be replaced by a rename (another hard link, an owner
 ///   the swap would change, a folder that takes no new file, a folder on its
 ///   path other users can change): there is no in-place fallback.
+///
+/// One deadline, [`crate::config::CONFIG_LOCK_WAIT`] from when the request
+/// starts, bounds both waits a request can make: for its turn among this
+/// process's requests ([`edit_turn_by`]) and for the config lock. A request,
+/// read or edit, that has not had its turn by then is answered busy, to try
+/// again. Reading and writing the files has no deadline of its own.
 ///
 /// A missing file, and its folder, are created by an edit. The daemon passes
 /// its own user config's path; no path comes from a client. Every `Err` means
@@ -1617,17 +1639,24 @@ fn edit_user_catalog_at_with(
     edit: Option<&CatalogActionEdit>,
     between: impl FnOnce(),
 ) -> Result<EditableCardCatalog, String> {
-    let _one_at_a_time = EDIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let deadline = std::time::Instant::now() + crate::config::CONFIG_LOCK_WAIT;
     let display = path.display().to_string();
+    let Some(_one_at_a_time) = edit_turn_by(deadline) else {
+        return Err(format!(
+            "the user config {display} is busy: another change to it is still waiting to be \
+             saved; nothing was read or saved, try again"
+        ));
+    };
     let named = |mut catalog: EditableCardCatalog| {
         catalog.user_config = Some(display.clone());
         catalog
     };
     let not_saved = |reason: String| format!("the user config {display} was not saved: {reason}");
     let lock = || {
-        crate::config::lock_config_edit(path, crate::config::CONFIG_LOCK_WAIT).map_err(|problem| {
+        crate::config::lock_config_edit_by(path, deadline).map_err(|problem| {
             not_saved(match problem {
                 crate::config::ConfigLockProblem::Busy(why)
+                | crate::config::ConfigLockProblem::Unsafe(why)
                 | crate::config::ConfigLockProblem::Unavailable(why) => why,
             })
         })
@@ -1680,9 +1709,13 @@ fn edit_user_catalog_at_with(
         if locked.is_none() {
             locked = Some(lock()?);
         }
-        crate::config::write_config_strictly(&read.target, saved.as_bytes(), read.file, || {
-            still_as_read(path, &read)
-        })
+        crate::config::write_config_strictly(
+            path,
+            &read.target,
+            saved.as_bytes(),
+            read.file,
+            || still_as_read(path, &read),
+        )
         .map_err(not_saved)?;
     }
     drop(locked);
@@ -3600,24 +3633,34 @@ placement = \"card\" # on the card, on purpose
         std::fs::write(&path, EDITED_CONFIG).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let read = read_user_config(&path).unwrap();
-        let refused =
-            crate::config::write_config_strictly(&read.target, b"new = 1\n", read.file, || {
+        let refused = crate::config::write_config_strictly(
+            &path,
+            &read.target,
+            b"new = 1\n",
+            read.file,
+            || {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
                 still_as_read(&path, &read)
-            })
-            .expect_err("a chmod since the read is refused");
+            },
+        )
+        .expect_err("a chmod since the read is refused");
         assert!(refused.contains("changed since"), "{refused}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
 
         let read = read_user_config(&path).unwrap();
         let twin = dir.path().join("twin.toml");
-        let refused =
-            crate::config::write_config_strictly(&read.target, b"new = 1\n", read.file, || {
+        let refused = crate::config::write_config_strictly(
+            &path,
+            &read.target,
+            b"new = 1\n",
+            read.file,
+            || {
                 std::fs::hard_link(&path, &twin).unwrap();
                 still_as_read(&path, &read)
-            })
-            .expect_err("a hard link made since the read is refused");
+            },
+        )
+        .expect_err("a hard link made since the read is refused");
         assert!(refused.contains("changed since"), "{refused}");
         assert_eq!(std::fs::read_to_string(&twin).unwrap(), EDITED_CONFIG);
         assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
@@ -3728,8 +3771,9 @@ placement = \"card\" # on the card, on purpose
     }
 
     /// Issue #2399 re-audit 2: while another deck writer holds the config
-    /// lock past the bounded wait, an edit is refused with that reason — the
-    /// daemon's request never waits longer — and the file is left as it was.
+    /// lock past the bounded wait, an edit is refused with that reason, its
+    /// wait for the lock bounded by the request's deadline, and the file is
+    /// left as it was.
     #[test]
     fn an_edit_refuses_when_the_config_stays_locked() {
         let dir = crate::test_temp::tempdir().unwrap();
@@ -3759,5 +3803,272 @@ placement = \"card\" # on the card, on purpose
             }),
         )
         .expect("saved once the lock is free");
+    }
+
+    /// The lock file beside `path`'s config: where both deck writers lock.
+    fn lock_beside(path: &std::path::Path) -> std::path::PathBuf {
+        path.parent().unwrap().join(crate::config::CONFIG_LOCK_NAME)
+    }
+
+    /// Issue #2399 final review F2 / audit A3: a lock file beside the config
+    /// that the deck did not make for this user alone — a link, a FIFO, a file
+    /// others can read or write, one with a second hard link — is unsafe:
+    /// another user could replace it under a writer, or hold it. The catalog
+    /// editor and `config set` each refuse, naming the lock file, and leave
+    /// the config and the lock entry exactly as they were (nothing is
+    /// `chmod`ed or replaced).
+    #[cfg(unix)]
+    #[test]
+    fn an_unsafe_lock_file_beside_the_config_refuses_both_writers() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        type Make = fn(&std::path::Path, &std::path::Path);
+        let cases: [(&str, Make); 5] = [
+            ("a symlink", |dir, lock| {
+                let elsewhere = dir.join("elsewhere.lock");
+                std::fs::write(&elsewhere, "").unwrap();
+                std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                std::os::unix::fs::symlink(&elsewhere, lock).unwrap();
+            }),
+            ("a FIFO", |_, lock| {
+                let c = std::ffi::CString::new(lock.to_string_lossy().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            }),
+            ("mode 0644", |_, lock| {
+                std::fs::write(lock, "").unwrap();
+                std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }),
+            ("mode 0666", |_, lock| {
+                std::fs::write(lock, "").unwrap();
+                std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+            }),
+            ("a second hard link", |dir, lock| {
+                std::fs::write(lock, "").unwrap();
+                std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::hard_link(lock, dir.join("twin.lock")).unwrap();
+            }),
+        ];
+        for (what, make) in cases {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, EDITED_CONFIG).unwrap();
+            let lock = lock_beside(&path);
+            make(dir.path(), &lock);
+            let before = std::fs::symlink_metadata(&lock).unwrap();
+
+            let refused = edit_user_catalog_at(
+                &path,
+                Some(&CatalogActionEdit::Add {
+                    action: input("deploy"),
+                }),
+            )
+            .expect_err(&format!("{what}: the editor refuses"));
+            assert!(
+                refused.contains(crate::config::CONFIG_LOCK_NAME),
+                "{what}: {refused}"
+            );
+            assert!(refused.contains("not safe"), "{what}: {refused}");
+
+            let config = crate::config::DashboardConfig {
+                default_command: "zsh".into(),
+                ..Default::default()
+            };
+            let refused = config
+                .save_to(&path)
+                .expect_err(&format!("{what}: config set refuses"));
+            assert!(
+                refused.contains(crate::config::CONFIG_LOCK_NAME),
+                "{what}: {refused}"
+            );
+            assert!(refused.contains("not safe"), "{what}: {refused}");
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                EDITED_CONFIG,
+                "{what}"
+            );
+            let after = std::fs::symlink_metadata(&lock).unwrap();
+            assert_eq!(
+                (after.ino(), after.mode(), after.uid(), after.nlink()),
+                (before.ino(), before.mode(), before.uid(), before.nlink()),
+                "{what}: the lock entry is left as it was"
+            );
+        }
+    }
+
+    /// Issue #2399 final review F2: a lock file the writers make themselves
+    /// is a private regular file of this user's with one link, and both
+    /// writers use it again.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_file_the_writers_make_is_private_and_used_again() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect("the editor saves");
+        let meta = std::fs::symlink_metadata(lock_beside(&path)).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o077, 0, "{:o}", meta.mode());
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        assert_eq!(meta.nlink(), 1);
+        crate::config::DashboardConfig {
+            default_command: "zsh".into(),
+            ..Default::default()
+        }
+        .save_to(&path)
+        .expect("config set saves with the same lock");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(resolve(Some(&saved)).action("deploy").is_some(), "{saved}");
+        assert!(saved.contains("default_command = \"zsh\""), "{saved}");
+    }
+
+    /// Issue #2399 final review section 4: while another deck writer holds
+    /// the config lock, `config set`'s save waits the bounded time and then
+    /// refuses with the reason, saving nothing; once the lock is free it
+    /// saves.
+    #[test]
+    fn config_set_refuses_when_the_config_stays_locked() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let held = crate::config::lock_config_edit(&path, std::time::Duration::ZERO)
+            .expect("the test takes the lock");
+        let config = crate::config::DashboardConfig {
+            default_command: "zsh".into(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let refused = config.save_to(&path).expect_err("a held lock refuses");
+        let waited = started.elapsed();
+        assert!(
+            waited >= crate::config::CONFIG_LOCK_WAIT - std::time::Duration::from_millis(100),
+            "config set waited for the other writer ({waited:?})"
+        );
+        assert!(
+            waited < crate::config::CONFIG_LOCK_WAIT + std::time::Duration::from_secs(1),
+            "the wait is bounded ({waited:?})"
+        );
+        assert!(refused.contains("try again"), "{refused}");
+        assert!(
+            refused.contains(crate::config::CONFIG_LOCK_NAME),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+        drop(held);
+        config.save_to(&path).expect("saved once the lock is free");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_command = \"zsh\"")
+        );
+    }
+
+    /// Issue #2399 final audit, section 2: the editor's bound covers the
+    /// whole request, not each wait in turn. While another writer holds the
+    /// config lock, an edit arrives and waits for it; another edit and a read
+    /// arrive meanwhile and wait for their turn against their own request's
+    /// deadline rather than queueing behind the first, so each answers within
+    /// the bound plus a small margin, the edits refused, saying to try again.
+    /// The read answers either way (it takes no file lock once it has its
+    /// turn). A read that cannot have its turn in time is answered busy.
+    #[test]
+    fn a_held_lock_bounds_every_editor_request_that_arrives_meanwhile() {
+        use std::time::{Duration, Instant};
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let held = crate::config::lock_config_edit(&path, Duration::ZERO)
+            .expect("the test takes the lock");
+        let request = |name: Option<&'static str>| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let edit = name.map(|name| CatalogActionEdit::Add {
+                    action: input(name),
+                });
+                let began = Instant::now();
+                let answer = edit_user_catalog_at(&path, edit.as_ref());
+                (name, answer, began.elapsed())
+            })
+        };
+        let first = request(Some("deploy"));
+        std::thread::sleep(Duration::from_millis(300));
+        let others = [request(Some("release")), request(None)];
+        let bound = crate::config::CONFIG_LOCK_WAIT + Duration::from_secs(1);
+        for handle in std::iter::once(first).chain(others) {
+            let (name, answer, took) = handle.join().unwrap();
+            let what = name.unwrap_or("the read");
+            assert!(took < bound, "{what} answered after {took:?}");
+            match (name, answer) {
+                (Some(_), Ok(_)) => panic!("{what} saved while the lock was held"),
+                (_, Err(refused)) => assert!(refused.contains("try again"), "{what}: {refused}"),
+                (None, Ok(_)) => {}
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+        drop(held);
+
+        let turn = EDIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let began = Instant::now();
+        let busy = edit_user_catalog_at(&path, None).expect_err("a read with no turn is busy");
+        let took = began.elapsed();
+        drop(turn);
+        assert!(took < bound, "the read answered after {took:?}");
+        assert!(
+            busy.contains("busy") && busy.contains("try again"),
+            "{busy}"
+        );
+    }
+
+    /// Issue #2399 final audit A2: the folder check walks the config's path
+    /// as configured as well as where it leads. `shared/alias/config.toml`,
+    /// with `shared` group-writable and `alias` a link to a private folder,
+    /// is refused, naming `shared` — whoever can change `shared` can point
+    /// `alias` elsewhere — and the file is left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_is_refused_where_a_folder_holding_a_link_on_the_path_is_shared() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let private = home.join("private");
+        let shared = home.join("shared");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&private, shared.join("alias")).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        std::fs::write(private.join("config.toml"), EDITED_CONFIG).unwrap();
+        let path = shared.join("alias").join("config.toml");
+
+        let refused = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect_err("a shared folder holding a link on the path is refused");
+        assert!(refused.contains("other users"), "{refused}");
+        assert!(refused.contains("shared"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(private.join("config.toml")).unwrap(),
+            EDITED_CONFIG
+        );
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect("saved once the folder is private");
     }
 }
