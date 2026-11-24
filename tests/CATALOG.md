@@ -7176,8 +7176,8 @@ without depending on the config struct API.
 ##### dispatch/return/029 — A unit's updates to its report are bounded.
 - **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
 - **Agent:** none.
-- **Asserts:** after its first report a unit's next `MAX_REPORT_UPDATES` different reports are accepted as updates 1 to 3; one more different report is refused `report_updates_exhausted` with an exit-1 CLI line saying it was not delivered, and posts and saves nothing; an identical repeat of an earlier update still answers `already_accepted` with that update's id.
-- **Why it exists:** issue #2260: a unit that loops on `work-done` must not flood the conversation that dispatched it.
+- **Asserts:** after its first report a unit's next `MAX_REPORT_UPDATES` (20) different reports are accepted as updates 1 to 20, each delivered once; updates 1 to `USUAL_REPORT_UPDATES` (3) are delivered without the loop note and updates 4 to 20 each carry it; one more different report is refused `report_updates_exhausted` with an exit-1 CLI line naming 20 updates and saying it was not delivered, and posts and saves nothing; identical repeats of an update within the usual count and of one past it still answer `already_accepted` with that update's id and number, and deliver nothing.
+- **Why it exists:** issue #2260: a unit that loops on `work-done` must not flood the conversation that dispatched it; issue #2485: a healthy unit whose work keeps moving is not silenced at its fourth correction, and the dispatcher is told of a likely loop instead.
 - **Does not assert:** a real agent; the desktop app.
 - **Platform coverage:** mac+linux.
 
@@ -7204,6 +7204,14 @@ without depending on the config struct API.
 - **Why it exists:** issue #2260 (PR #2275 review): a repeat of an update used to answer with the first report's destination and no number.
 - **Does not assert:** a real agent; the desktop app.
 - **Platform coverage:** mac+linux.
+
+##### dispatch/return/034 — A unit's fourth update reaches the dispatcher flagged as a possible loop.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_dispatch_report_updates.rs`); the dispatcher is opened from the TUI's New Agent dialog with dispatcher mode chosen, its dispatcher seed is in its inbox, and it runs a real `dispatch --single`.
+- **Agent:** none — identity-recording probes that emit a synthetic `SessionStart` and exec `cat`, using their own minted pane capabilities.
+- **Asserts:** after the unit's first report, its next `USUAL_REPORT_UPDATES + 1` (4) different `work-done --done` reports each exit 0 saying which update they sent, and each reaches the dispatcher's inbox once, opening with the update wording and naming its number of at most `MAX_REPORT_UPDATES`; updates 1 to 3 carry no loop note and update 4 carries `LOOPING_NOTE`; an identical repeat of update 4 exits 0 and delivers nothing new.
+- **Why it exists:** issue #2485: the dispatcher-visible note on an update past the usual count, through the spawned binary.
+- **Does not assert:** the hard limit's refusal (`dispatch/return/029`); a real agent; the desktop app.
+- **Platform coverage:** mac+linux (Unix PTY/socket harness).
 
 ##### dispatch/return/030 — A real dispatched single unit, told its report is out of date, sends an update, and the dispatcher receives it as a separate turn beside the first report.
 - **Layer:** L2 PTY-attached, lane 2 (`TuiDeck` on `minimal`, `tests/e2e_dispatcher_mode.rs`) driving the real new-pane dispatcher flow and two real interactive Claude Code panes through the branch binary; the dispatcher runs `dot-agent-deck dispatch --single` itself, and no test process runs `dispatch` or `work-done`.
