@@ -944,6 +944,15 @@ slow-timeout = { period = "60s", terminate-after = 30 }
 filter = 'test(/^probe_043_live_/) | test(codex_001_touched_box_checked_then_delegate_delivered_once)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Issue #2435, `orchestration/remit/015`: a real Codex orchestrator's startup
+# turn, a `/compact` and the turn after it, in one deck inside its daemon's
+# 300 s cap. The test shares one 260 s deadline (`TOTAL`) across its preflight
+# and every wait, so a slow step fails with its evidence inside this window.
+# The filter tracks the TEST FUNCTION name.
+[[profile.default.overrides]]
+filter = 'test(orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summary)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # The five `inbox/doorbell/010` live cases re-oracled to the installed pane's
 # checks (`tests/e2e_inbox_claude_live.rs`): each waits for a check before its
 # five-second hold, and the kept-draft case runs three decks in turn.

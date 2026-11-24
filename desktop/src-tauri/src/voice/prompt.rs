@@ -791,6 +791,8 @@ pub(crate) mod tests {
                 "stop_agent".to_string(),
                 "generate_config".to_string(),
                 "close_orchestration".to_string(),
+                "retry_inbox_message".to_string(),
+                "cancel_inbox_message".to_string(),
                 "set_overview_mode".to_string(),
                 "show_agent_card".to_string(),
                 "next_agent_card".to_string(),

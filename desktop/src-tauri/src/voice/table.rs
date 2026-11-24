@@ -1505,6 +1505,18 @@ mod tests {
                     "close_orchestration",
                     "confirmCloseOrchestration",
                     vec!["overview"]
+                ),
+                // Issue #2148: Retry and Cancel on a deck message, on the
+                // Daemons screen. Each only opens a confirmation.
+                (
+                    "retry_inbox_message",
+                    "confirmRetryInboxMessage",
+                    vec!["deck"]
+                ),
+                (
+                    "cancel_inbox_message",
+                    "confirmCancelInboxMessage",
+                    vec!["deck"]
                 ), // PRD #2374: the agent cards, on the dashboard only.
                 ("set_overview_mode", "setOverviewMode", vec!["overview"]),
                 ("show_agent_card", "showAgentCard", vec!["overview"]),
@@ -2452,7 +2464,11 @@ mod tests {
                 "remind_star_later",
                 "dismiss_star_prompt",
                 "open_antigravity_issues",
-                "dismiss_antigravity_notice"
+                "dismiss_antigravity_notice",
+                // Issue #2148: Retry and Cancel on a deck message, where the
+                // tiles list the messages. Each only opens a confirmation.
+                "retry_inbox_message",
+                "cancel_inbox_message"
             ]
         );
         assert_eq!(
@@ -2991,6 +3007,8 @@ mod tests {
                 ("stop_agent", "confirmStopAgent"),
                 ("generate_config", "confirmGenerateConfig"),
                 ("close_orchestration", "confirmCloseOrchestration"),
+                ("retry_inbox_message", "confirmRetryInboxMessage"),
+                ("cancel_inbox_message", "confirmCancelInboxMessage"),
             ]
         );
         for (id, _) in &asking {
@@ -3009,6 +3027,8 @@ mod tests {
                 row.screens,
                 if matches!(*id, "stop_agent" | "generate_config") {
                     vec![Screen::Overview, Screen::Agent]
+                } else if matches!(*id, "retry_inbox_message" | "cancel_inbox_message") {
+                    vec![Screen::Deck]
                 } else {
                     vec![Screen::Overview]
                 },
@@ -3214,7 +3234,8 @@ mod tests {
     /// `close_orchestration`, the row that stops several agents at once, whose
     /// verbs are also the words a user closes a view with, and PRD #1885's
     /// `approve_project_commands`, which approves project commands only when
-    /// the user said "approve".
+    /// the user said "approve", and issue #2148's `cancel_inbox_message`,
+    /// which cancels a deck message only when the user said "message".
     #[test]
     fn voice_table_conjunctive_rows_are_the_deliberate_set() {
         let conjunctive: Vec<(&str, Vec<&str>)> = super::table()
@@ -3244,7 +3265,10 @@ mod tests {
                         "all roles",
                         "all the roles"
                     ]
-                )
+                ),
+                // Issue #2148: "cancel" alone is `close`'s, which closes what
+                // is on top; cancelling a deck message names the message.
+                ("cancel_inbox_message", vec!["message", "messages"])
             ]
         );
     }
