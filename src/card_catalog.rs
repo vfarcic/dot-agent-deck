@@ -1380,17 +1380,9 @@ pub fn apply_action_edit(
         ));
     }
     let after = resolve(Some(&saved));
-    let added: Vec<&String> = after
-        .errors
-        .iter()
-        .filter(|e| !before.errors.contains(e))
-        .collect();
+    let added = problems_added(&before.errors, &after.errors);
     if !added.is_empty() {
-        return Err(added
-            .into_iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("; "));
+        return Err(added.join("; "));
     }
     if let Some(expected) = expect
         && after.action(&expected.name) != Some(&expected)
@@ -1401,6 +1393,54 @@ pub fn apply_action_edit(
         ));
     }
     Ok(saved)
+}
+
+/// The problems in `after` that `before` did not have, compared without the
+/// position an entry with no usable name is reported by (`catalog.actions[2]`):
+/// an edit that adds or removes an entry before it moves that position, and
+/// the problem is still the one the file already had (PR #2491 review). Each
+/// problem in `before` accounts for one in `after`, so a second entry with the
+/// same problem is new. The problems returned are worded as `after` has them.
+fn problems_added<'a>(before: &[String], after: &'a [String]) -> Vec<&'a str> {
+    let mut had: Vec<String> = before.iter().map(|e| without_positions(e)).collect();
+    after
+        .iter()
+        .filter(|e| {
+            let problem = without_positions(e);
+            match had.iter().position(|h| *h == problem) {
+                Some(at) => {
+                    had.swap_remove(at);
+                    false
+                }
+                None => true,
+            }
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+/// `problem` with the index taken out of every `catalog.fields[N]` and
+/// `catalog.actions[N]` in it, as [`entry_label`] writes an unnamed entry.
+fn without_positions(problem: &str) -> String {
+    let mut out = String::with_capacity(problem.len());
+    let mut rest = problem;
+    while let Some(open) = [Kind::Fields, Kind::Actions]
+        .iter()
+        .filter_map(|kind| {
+            let prefix = format!("{}[", kind.table());
+            rest.find(&prefix).map(|at| at + prefix.len())
+        })
+        .min()
+    {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 && rest[digits..].starts_with(']') {
+            rest = &rest[digits..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Replace the first user entry named `action.name` with `action`, in place.
@@ -4249,6 +4289,87 @@ placement = \"card\" # on the card, on purpose
         assert!(
             resolve(Some(&created)).action("deploy").is_some(),
             "{created}"
+        );
+    }
+
+    /// PR #2491 review (Qodo 2): a problem the catalog already had is not a
+    /// problem the edit added, even when the edit moves the entry it is
+    /// reported against. An unnamed malformed entry is reported by its
+    /// position, so removing an action before it changes that position; the
+    /// removal is still saved and the old problem is still reported, while an
+    /// edit that adds a genuinely new problem is still refused.
+    #[test]
+    fn a_problem_the_catalog_already_had_does_not_block_an_edit_that_moves_it() {
+        let original = "\
+[[catalog.actions]]
+name = \"deploy\"
+description = \"Offer when the change can be deployed.\"
+prompt = \"Deploy it.\"
+
+[[catalog.actions]]
+description = \"An entry the user never named.\"
+prompt = \"Do the unnamed thing.\"
+";
+        let before = resolve(Some(original));
+        assert_eq!(before.errors.len(), 1, "{:?}", before.errors);
+        assert!(
+            before.errors[0].starts_with("catalog.actions[1]"),
+            "{:?}",
+            before.errors
+        );
+
+        let saved = apply_action_edit(
+            Some(original),
+            &CatalogActionEdit::Remove {
+                base: None,
+                name: "deploy".into(),
+            },
+        )
+        .expect("removing an action before an existing problem is saved");
+        let after = resolve(Some(&saved));
+        assert!(after.action("deploy").is_none(), "{saved}");
+        assert_eq!(after.errors.len(), 1, "{:?}", after.errors);
+        assert!(
+            after.errors[0].starts_with("catalog.actions[0]"),
+            "the existing problem is still reported: {:?}",
+            after.errors
+        );
+        assert!(
+            saved.contains("Do the unnamed thing."),
+            "the malformed entry is kept for its owner to fix:\n{saved}"
+        );
+
+        // A problem the edit genuinely adds is still found: the comparison
+        // ignores where an unnamed entry sits, not how many problems there
+        // are, so a second unnamed entry with the same problem is new, as is
+        // a problem of another kind.
+        let had = vec!["catalog.actions[1]: missing name".to_string()];
+        let moved = vec!["catalog.actions[0]: missing name".to_string()];
+        assert!(problems_added(&had, &moved).is_empty());
+        let doubled = vec![
+            "catalog.actions[0]: missing name".to_string(),
+            "catalog.actions[3]: missing name".to_string(),
+        ];
+        assert_eq!(
+            problems_added(&had, &doubled),
+            ["catalog.actions[3]: missing name"]
+        );
+        let other = vec![
+            "catalog.actions[0]: missing name".to_string(),
+            "catalog.actions \"ship\": bad icon".to_string(),
+        ];
+        assert_eq!(
+            problems_added(&had, &other),
+            ["catalog.actions \"ship\": bad icon"]
+        );
+        assert_eq!(
+            problems_added(&[], &moved),
+            ["catalog.actions[0]: missing name"]
+        );
+        // A fields problem keeps its kind: an actions problem does not hide it.
+        assert_eq!(
+            problems_added(&had, &["catalog.fields[1]: missing name".to_string()]),
+            ["catalog.fields[1]: missing name"]
         );
     }
 }
