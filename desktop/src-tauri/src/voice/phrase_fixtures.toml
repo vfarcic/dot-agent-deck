@@ -97,6 +97,62 @@ action = "remove_card_action"
 outcome = "dispatch"
 resolved_card_action = "deploy it"
 
+# Issue #2399 review 12: the editor's choices that write nothing — which
+# daemon's actions it lists (by the daemon's name), reading the list again, the
+# form's icon (by the icon's name, held to the transcript like the directory
+# filter) and its two checkboxes, one row per state, so each state is its own
+# fixture and a spoken "send without asking" can never land on the tick.
+[[fixtures]]
+name = "card-actions-editor-daemon-by-name"
+utterance = "show the build box daemon's card actions"
+screen = "overview"
+action = "choose_card_actions_daemon"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "card-actions-editor-refresh"
+utterance = "refresh the card actions"
+screen = "overview"
+action = "refresh_card_actions"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-icon-by-name"
+utterance = "set the icon to rocket"
+screen = "overview"
+action = "choose_card_action_icon"
+outcome = "dispatch"
+resolved_filter = "rocket"
+
+[[fixtures]]
+name = "card-actions-editor-ask-before-sending"
+utterance = "ask me before sending it"
+screen = "overview"
+action = "ask_before_sending_card_action"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-send-without-asking"
+utterance = "send it without asking"
+screen = "overview"
+action = "send_card_action_without_asking"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-on-every-card"
+utterance = "offer it on every card"
+screen = "overview"
+action = "offer_card_action_on_every_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-when-agents-suggest"
+utterance = "only offer it when agents suggest it"
+screen = "overview"
+action = "offer_card_action_when_agents_choose"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-agent-zoom"
 utterance = "zoom the tester"

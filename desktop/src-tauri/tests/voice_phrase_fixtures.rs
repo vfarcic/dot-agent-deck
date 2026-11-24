@@ -1710,8 +1710,13 @@ fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
             );
         }
         if let Some(expected) = fixture.resolved_filter.as_deref() {
+            // Issue #2399 review 12: the Card actions form's icon is a
+            // `filter_text` too, held to the transcript the same way, and is
+            // chosen with no directory browser on screen.
             assert!(
-                fixture.listing || fixture.hostile_listing,
+                fixture.listing
+                    || fixture.hostile_listing
+                    || fixture.action == "choose_card_action_icon",
                 "{}: a `resolved_filter` needs `listing = true` or `hostile_listing = true`, \
                  since the Filter box is the directory browser's",
                 fixture.name
