@@ -1284,6 +1284,19 @@ handler = "onChange"
 code = "(event) => onSave({ ...settings, zoom: { level: clampZoom(Number(event.target.value)) } })"
 reason = "Settings → Zoom level select; a preference edit inside the Settings sheet (opened by `open_settings`) — no row sets the zoom."
 
+# --- desktop/src/components/ActionTipButton.tsx ---
+#
+# Issue #2399 review (finding 7) — the icon button the cards, the selection
+# toolbar and the overlay's batch section draw their actions with. Its press
+# forwards the caller's own `onClick`, which is a control site of its own where
+# it is written (each one a single `VOICE_ACTIONS.<id>.run(…)`).
+
+[[site]]
+file = "desktop/src/components/ActionTipButton.tsx"
+handler = "onClick"
+code = "press"
+reason = "The action icon button's own press: it hides the button's keyboard tooltip and forwards the caller's `onClick`, which is checked where each caller writes it (the card's `runCardAction`, the toolbar's `runSelectionBatch`, the overlay's `runCardActionBatch`); for an action the daemon disabled it does nothing. It is no capability of its own."
+
 # --- desktop/src/components/AgentCardActionsEditor.tsx ---
 #
 # PRD #2374 decision 2026-11-24 — the Card actions editor's form. Voice opens

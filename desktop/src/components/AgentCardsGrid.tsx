@@ -9,6 +9,7 @@ import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "..
 import type { CardSelection } from "../hooks/useAgentCardsView";
 import type { EndedRole } from "../types";
 import { CardActionIcon, cardIconName } from "../lib/cardIcons";
+import { ActionTipButton } from "./ActionTipButton";
 import { AgentCard, batchChoiceHover, type CardControls, type CardPlace } from "./AgentCard";
 
 /**
@@ -81,16 +82,15 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection, ed
           <span className="agent-cards-selection-count" data-testid="agent-cards-selection-count">{count} selected</span>
           {count > 0 && selection.choices.length === 0 && <span className="agent-cards-selection-hint">No action is offered by the selected cards.</span>}
           {count > 0 && selection.choices.map((choice) => (
-            <button
+            <ActionTipButton
               key={choice.id}
-              type="button"
               className="icon-button agent-cards-batch-icon"
               data-testid={`agent-cards-batch-action-${domIdentity(choice.id)}`}
               data-icon={batchIconName(choice)}
               aria-label={displayText(choice.label, DISPLAY_LIMITS.name)}
-              title={batchChoiceHover(choice, `the ${count} selected ${count === 1 ? "agent" : "agents"}`)}
+              tip={batchChoiceHover(choice, `the ${count} selected ${count === 1 ? "agent" : "agents"}`)}
               onClick={() => VOICE_ACTIONS.runSelectionBatch.run(controls, { cardActionId: choice.id })}
-            ><BatchChoiceIcon choice={choice} /></button>
+            ><BatchChoiceIcon choice={choice} /></ActionTipButton>
           ))}
         </div>
       )}

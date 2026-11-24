@@ -9,6 +9,7 @@ import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "..
 import { CardActionIcon, cardActionHover, cardIconName } from "../lib/cardIcons";
 import { endedRoleLine } from "../lib/endedRoles";
 import type { AgentCardAction, AgentCardCheckedRef, AgentCardEntry, AgentCardRollup, EndedRole } from "../types";
+import { ActionTipButton } from "./ActionTipButton";
 import { PullRequestBadge } from "./PullRequestBadge";
 
 /**
@@ -415,18 +416,17 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
           <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
             <span className="agent-card-action-icons">
               {icons.map((action) => (
-                <button
+                <ActionTipButton
                   key={action.id}
-                  type="button"
                   className="icon-button agent-card-action-icon"
                   data-testid="agent-card-action-icon"
                   data-action={action.id}
                   data-icon={cardIconName(action.icon)}
                   aria-label={displayText(action.label, DISPLAY_LIMITS.name)}
-                  title={actionHover(action)}
-                  disabled={!action.enabled}
+                  tip={actionHover(action)}
+                  unavailable={!action.enabled}
                   onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token })}
-                ><CardActionIcon name={action.icon} /></button>
+                ><CardActionIcon name={action.icon} /></ActionTipButton>
               ))}
               {moreActions > 0 && (
                 <button

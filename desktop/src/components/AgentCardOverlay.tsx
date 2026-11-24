@@ -10,6 +10,7 @@ import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
 import type { AgentCardAction, AgentCardCheckedRef, EndedRole } from "../types";
 import { batchChoiceHover, CardReference, cardRef, ExactText, ExactTextNote, IssueLabelChip, SourceBadge, type ReferenceControls } from "./AgentCard";
 import { BatchChoiceIcon, batchIconName } from "./AgentCardsGrid";
+import { ActionTipButton } from "./ActionTipButton";
 
 /** The members the overlay's controls dispatch through. */
 export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused" | "runCardActionBatch">>;
@@ -315,16 +316,15 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                 <p className="agent-card-hint">Sends one action to all of them. You see who gets what, and who is skipped and why, before anything is sent.</p>
                 <div className="agent-card-actions">
                   {batch.choices.map((choice) => (
-                    <button
+                    <ActionTipButton
                       key={choice.id}
-                      type="button"
                       className="icon-button agent-cards-batch-icon"
                       data-testid={`agent-card-batch-action-${domIdentity(choice.id)}`}
                       data-icon={batchIconName(choice)}
                       aria-label={displayText(choice.label, DISPLAY_LIMITS.name)}
-                      title={batchChoiceHover(choice, `${name} and every agent under it`)}
+                      tip={batchChoiceHover(choice, `${name} and every agent under it`)}
                       onClick={() => VOICE_ACTIONS.runCardActionBatch.run(controls as Pick<VoiceActionContext, "runCardActionBatch">, { ...cardRef(card), cardActionId: choice.id })}
-                    ><BatchChoiceIcon choice={choice} /></button>
+                    ><BatchChoiceIcon choice={choice} /></ActionTipButton>
                   ))}
                 </div>
               </section>
