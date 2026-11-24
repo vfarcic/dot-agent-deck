@@ -4482,6 +4482,14 @@ export function terminalAttachFailure(cause: unknown): string {
   return text === AGENT_GONE_AFTER_RESTART || text === AGENT_IDENTITY_UNKNOWN ? text : TERMINAL_ATTACH_FAILED;
 }
 
+/**
+ * Issue #2399 review 8 — the words the desktop backend's
+ * `agent_card_catalog_edit` puts in its reason when an edit's answer was lost
+ * after the edit was sent (`CARD_CATALOG_EDIT_MAY_HAVE_SAVED` in
+ * `desktop/src-tauri/src/lib.rs`; a test holds the two to one text).
+ */
+export const CARD_CATALOG_EDIT_MAY_HAVE_SAVED = "it may have been saved";
+
 export class TauriDeckBridge implements DeckBridge {
   readonly mode = "live" as const;
   /*
@@ -6310,13 +6318,22 @@ export class TauriDeckBridge implements DeckBridge {
     return this.cardCatalogEdit(deckId, edit);
   }
 
-  /** `agent_card_catalog_edit`, its refusal an Error carrying the daemon's reason. */
+  /**
+   * `agent_card_catalog_edit`, its failure an Error carrying the backend's
+   * reason. An edit whose answer was lost after it was sent — the backend's
+   * reason then says {@link CARD_CATALOG_EDIT_MAY_HAVE_SAVED} — is marked
+   * `outcome: "unknown"`, so the editor says it may have been saved instead of
+   * that it was not (issue #2399 review 8); every other failure is a refusal,
+   * with nothing written.
+   */
   private async cardCatalogEdit(deckId: string, edit: CardCatalogEdit | null): Promise<EditableCardCatalog> {
     const invoke = await this.getInvoke();
     try {
       return await invoke<EditableCardCatalog>("agent_card_catalog_edit", { deckId, edit });
     } catch (error) {
-      throw error instanceof Error ? error : new Error(String(error));
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (edit !== null && failure.message.includes(CARD_CATALOG_EDIT_MAY_HAVE_SAVED)) Object.assign(failure, { outcome: "unknown" });
+      throw failure;
     }
   }
 

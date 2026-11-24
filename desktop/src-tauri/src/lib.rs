@@ -2210,13 +2210,21 @@ async fn agent_card_catalog_edit(
 /// What the editor says for a deck whose daemon cannot edit card actions.
 pub(crate) const CARD_CATALOG_EDIT_UNSUPPORTED: &str = "this deck's daemon is from a release whose card actions cannot be edited from the app; upgrade it, or edit its user config file";
 
+/// The words in an edit's failure that say it may have been saved: its answer
+/// was lost after it was sent. The webview's bridge looks for them
+/// (`CARD_CATALOG_EDIT_MAY_HAVE_SAVED` in `desktop/src/lib/bridge.ts`) to tell
+/// such a failure from a refusal (issue #2399 review 8).
+pub(crate) const CARD_CATALOG_EDIT_MAY_HAVE_SAVED: &str = "it may have been saved";
+
 /// [`agent_card_catalog_edit`] minus the webview. Reaching and trusting the
 /// deck and the exchange run against one deadline,
 /// [`crate::daemon_bridge::DECK_REPLY_TIMEOUT`] from when it starts, so a deck
 /// that never answers holds the editor no longer than any round trip. A
-/// refusal is the daemon's reason as it gave it. An edit whose answer was lost
-/// after it was sent says it may have been saved, so the editor reads the
-/// catalog again rather than repeat it.
+/// refusal is the daemon's reason as it gave it, and nothing was written. An
+/// edit whose answer was lost after it was sent, or that failed in a way that
+/// cannot say whether the daemon got it, says it may have been saved
+/// ([`CARD_CATALOG_EDIT_MAY_HAVE_SAVED`]); the editor then reads the catalog
+/// once more instead of repeating the edit.
 pub(crate) async fn agent_card_catalog_edit_on(
     state: &DesktopState,
     deck_id: &str,
@@ -2239,9 +2247,9 @@ pub(crate) async fn agent_card_catalog_edit_on(
     };
     daemon.require_compatible()?;
     let unknown = if edits {
-        "; it may have been saved, so check the list before saving again"
+        format!("; {CARD_CATALOG_EDIT_MAY_HAVE_SAVED}, so check the list before saving again")
     } else {
-        ""
+        String::new()
     };
     match tokio::time::timeout_at(until, daemon.client.card_catalog_edit(edit)).await {
         Ok(Ok(GatedQuery::Answered(catalog))) => Ok(catalog),
@@ -2250,7 +2258,7 @@ pub(crate) async fn agent_card_catalog_edit_on(
         Ok(Err(ClientError::Unanswered(detail))) => Err(safe_message(format!(
             "the deck's answer was lost or could not be read ({detail}){unknown}"
         ))),
-        Ok(Err(error)) => Err(safe_message(error.to_string())),
+        Ok(Err(error)) => Err(safe_message(format!("{error}{unknown}"))),
         Err(_) => Err(format!(
             "the deck did not answer within {}s{unknown}",
             deadline.as_secs()

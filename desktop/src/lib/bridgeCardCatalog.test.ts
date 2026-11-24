@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /*
@@ -61,5 +63,27 @@ describe("desktop/agent-cards/062: the Card actions editor's production bridge",
     expect(normalizeAgentCards({ ...base, catalogEdit: false })?.catalogEdit).toBe(false);
     expect(normalizeAgentCards(base)?.catalogEdit).toBe(false);
     expect(normalizeAgentCards({ ...base, catalogEdit: "yes" })?.catalogEdit).toBe(false);
+  });
+
+  /** Scenario: the backend fails an edit saying its answer was lost and it may have been saved, then refuses another with the daemon's reason, then fails a read the same uncertain way. Only the uncertain edit is marked `outcome: "unknown"`; the refusal and the read are not, and the words the bridge looks for are the ones the backend writes (issue #2399 review 8). */
+  it("desktop/agent-cards/071: marks an edit whose answer was lost as of unknown outcome, and a refusal as not", async () => {
+    const { TauriDeckBridge, CARD_CATALOG_EDIT_MAY_HAVE_SAVED } = await import("./bridge");
+    const backend = readFileSync(resolve("src-tauri/src/lib.rs"), "utf8");
+    expect(backend).toContain(`const CARD_CATALOG_EDIT_MAY_HAVE_SAVED: &str = "${CARD_CATALOG_EDIT_MAY_HAVE_SAVED}";`);
+    const lost = `the deck did not answer within 15s; ${CARD_CATALOG_EDIT_MAY_HAVE_SAVED}, so check the list before saving again`;
+    const failures = [lost, "an action named \"ship\" already exists; edit it instead", lost];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "agent_card_catalog_edit") throw failures.shift();
+      return undefined;
+    });
+    const bridge = new TauriDeckBridge();
+    const caught = (promise: Promise<unknown>) => promise.then(() => undefined, (error: unknown) => error as Error & { outcome?: string });
+    const unsure = await caught(bridge.editCardCatalog(DECK, { kind: "hide", name: "merge" }));
+    expect(unsure?.message).toBe(lost);
+    expect(unsure?.outcome).toBe("unknown");
+    const refused = await caught(bridge.editCardCatalog(DECK, { kind: "add", action: { name: "ship", description: "d", prompt: "p", confirm: false, always: false } }));
+    expect(refused?.outcome).toBeUndefined();
+    const read = await caught(bridge.readCardCatalog(DECK));
+    expect(read?.outcome, "a read writes nothing, so it is never of unknown outcome").toBeUndefined();
   });
 });
