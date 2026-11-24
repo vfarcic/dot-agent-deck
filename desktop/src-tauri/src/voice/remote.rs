@@ -923,6 +923,8 @@ mod tests {
                 "send_card_action_without_asking",
                 "offer_card_action_on_every_card",
                 "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_overlay",
                 "none"
             ]
         );

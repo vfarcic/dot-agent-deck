@@ -1599,6 +1599,16 @@ mod tests {
                     "offerCardActionWhenAgentsChoose",
                     vec!["overview"]
                 ),
+                (
+                    "show_card_action_on_the_card",
+                    "showCardActionOnCard",
+                    vec!["overview"]
+                ),
+                (
+                    "show_card_action_only_in_the_overlay",
+                    "showCardActionOnlyInOverlay",
+                    vec!["overview"]
+                ),
             ]
         );
     }
@@ -2611,7 +2621,9 @@ mod tests {
                 "ask_before_sending_card_action",
                 "send_card_action_without_asking",
                 "offer_card_action_on_every_card",
-                "offer_card_action_when_agents_choose"
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_overlay"
             ]
         );
         assert_eq!(

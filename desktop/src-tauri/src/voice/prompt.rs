@@ -821,6 +821,8 @@ pub(crate) mod tests {
                 "send_card_action_without_asking".to_string(),
                 "offer_card_action_on_every_card".to_string(),
                 "offer_card_action_when_agents_choose".to_string(),
+                "show_card_action_on_the_card".to_string(),
+                "show_card_action_only_in_the_overlay".to_string(),
                 "none".to_string(),
             ]
         );

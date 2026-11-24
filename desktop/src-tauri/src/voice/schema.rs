@@ -505,6 +505,8 @@ mod tests {
                 "send_card_action_without_asking".to_string(),
                 "offer_card_action_on_every_card".to_string(),
                 "offer_card_action_when_agents_choose".to_string(),
+                "show_card_action_on_the_card".to_string(),
+                "show_card_action_only_in_the_overlay".to_string(),
                 "none".to_string(),
             ]
         );
@@ -647,6 +649,8 @@ mod tests {
                 "send_card_action_without_asking",
                 "offer_card_action_on_every_card",
                 "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_overlay",
                 "none"
             ]
         );
@@ -911,6 +915,8 @@ mod tests {
                 ("send_card_action_without_asking".to_string(), false),
                 ("offer_card_action_on_every_card".to_string(), false),
                 ("offer_card_action_when_agents_choose".to_string(), false),
+                ("show_card_action_on_the_card".to_string(), false),
+                ("show_card_action_only_in_the_overlay".to_string(), false),
             ]
         );
         assert_eq!(
@@ -1023,6 +1029,8 @@ mod tests {
                 ("send_card_action_without_asking".to_string(), true),
                 ("offer_card_action_on_every_card".to_string(), true),
                 ("offer_card_action_when_agents_choose".to_string(), true),
+                ("show_card_action_on_the_card".to_string(), true),
+                ("show_card_action_only_in_the_overlay".to_string(), true),
             ]
         );
         assert_eq!(
@@ -1128,6 +1136,8 @@ mod tests {
                 ("send_card_action_without_asking".to_string(), false),
                 ("offer_card_action_on_every_card".to_string(), false),
                 ("offer_card_action_when_agents_choose".to_string(), false),
+                ("show_card_action_on_the_card".to_string(), false),
+                ("show_card_action_only_in_the_overlay".to_string(), false),
             ]
         );
     }
