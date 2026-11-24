@@ -1981,40 +1981,41 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   },
   {
     // Issue #1492 — scrolling the agent dashboard, which no longer pages. Like
-    // the live rows, only while the New agent dialog is closed.
+    // the live rows, only while the New agent dialog is closed. Issue #1673:
+    // and over an open agent's pane.
     phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
     action: "scroll_down",
     invoke: "scrollDown",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolling down.",
   },
   {
     phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
     action: "scroll_up",
     invoke: "scrollUp",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolling up.",
   },
   {
     phrases: ["scroll to the top", "go to the top", "back to the top"],
     action: "scroll_to_top",
     invoke: "scrollToTop",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolled to the top.",
   },
   {
     phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
     action: "scroll_to_bottom",
     invoke: "scrollToBottom",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolled to the bottom.",
   },
   {

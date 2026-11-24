@@ -10011,6 +10011,41 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the 1 MiB eviction route or the mouse-mode half of the preamble (both covered by the `AgentBus` replay unit tests in `src/agent_pty.rs`); that the wheel reaches the agent in typing mode; the notice's render tiers or TTL (covered by `mode/scroll/005`); or real-agent behavior.
 - **Platform coverage:** mac+linux.
 
+##### mode/scroll/009 — A REAL full-screen Claude Code scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--settings` naming a file in its working directory that sets `"tui": "fullscreen"`, with `CLAUDE_CODE_NO_FLICKER=1`, `--allowedTools Bash Read`, no `-p`), started with `StartAgent`, credentials imported and the work directory's trust seeded.
+- **Asserts:** after the agent types the integers 1 to 150 and the screen settles, a written `ESC[5~` takes 150 off the screen while earlier numbers show; repeated `ESC[6~` brings 150 back; the agent is still registered and not `crashed`. This is the route the desktop's voice "scroll up" / "scroll down" take over a pane on the alternate screen.
+- **Does not assert:** the desktop app itself (its routing is `desktop/src/lib/paneScroll.test.ts` and `PullRequestBrowser.test.tsx`'s issue #1673 block); how many lines one PageUp moves; the wheel; mid-turn scrolling (measured by hand for the issue, not pinned).
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/010 — A REAL Claude Code on its default renderer leaves its output in the history the deck scrolls (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the prompt is written on an attach stream, PageUp is pressed in the TUI's command mode; asserted on the rendered vt100 grid).
+- **Agent:** REAL interactive Claude Code on Haiku with `--settings` naming a file that sets `"tui": "default"` (inline renderer; the harness copies the host's `settings.json`, so the renderer is pinned), `--allowedTools Bash Read`, started with `StartAgent`.
+- **Asserts:** after the agent types 1 to 150 and the screen settles, Ctrl+D then PageUp in command mode (pressed until the view moves, because the first press after Ctrl+D can be lost, #2477) takes 150 off the screen while earlier numbers show, with no `Nothing to scroll` notice, and the agent is still running. This is the TUI's half of the route the desktop takes for a pane on the main screen with history (it scrolls its own terminal history).
+- **Does not assert:** that the desktop's xterm.js keeps the same history (it is fed the same bytes; not driven here); that PageUp written to the agent does nothing (measured for the issue, not pinned).
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/011 — A REAL OpenCode scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive OpenCode on its cheap test model (`common::opencode_interactive_command`), started from the New agent dialog, credentials imported.
+- **Asserts:** as `mode/scroll/009`: after 1 to 150 is typed and the screen settles, a written `ESC[5~` takes 150 off the screen while earlier numbers show, repeated `ESC[6~` brings it back, and the agent is still running.
+- **Does not assert:** as `mode/scroll/009`.
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/012 — A REAL Codex scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive Codex on `common::codex_test_model()`, `--sandbox workspace-write --ask-for-approval never`, low reasoning effort, started from the New agent dialog with the `codex-live` fixture, credentials imported.
+- **Asserts:** as `mode/scroll/009`. Codex 0.147.0 kept no transcript of its own and ignored PageUp (PRD #611); this pins that the version under test does scroll by it.
+- **Does not assert:** as `mode/scroll/009`; which Codex versions changed this.
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/013 — A REAL Pi scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive Pi on `common::pi_test_model()` with `--approve --no-builtin-tools --thinking off` (so the list is typed rather than collapsed behind a `seq` call), restored from a saved session with the bundled extension, credentials imported.
+- **Asserts:** as `mode/scroll/009`.
+- **Does not assert:** as `mode/scroll/009`.
+- **Platform coverage:** mac+linux.
+
 #### mode/live
 
 ##### mode/live/001 — A real PTY-attached deck keeps the persistent mode chip after the command banner collapses.

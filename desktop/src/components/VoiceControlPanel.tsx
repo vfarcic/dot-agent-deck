@@ -1281,10 +1281,11 @@ const INTERRUPTED_DIALOG_INVOKES: ReadonlySet<string> = new Set(Object.entries(V
 
 /**
  * The invokes that, said on the agent screen without an `agent_ref`, act on
- * the pane on screen: issue #1402's whole "stop", and PRD #2119's nameless
- * "generate config". {@link dispatchLost} holds each to the pane it was said in.
+ * the pane on screen: issue #1402's whole "stop", PRD #2119's nameless
+ * "generate config", and issue #1673's four scrolls, which move the open
+ * pane. {@link dispatchLost} holds each to the pane it was said in.
  */
-const IMPLICIT_PANE_INVOKES: ReadonlySet<string> = new Set(["confirmStopAgent", "confirmGenerateConfig"]);
+const IMPLICIT_PANE_INVOKES: ReadonlySet<string> = new Set(["confirmStopAgent", "confirmGenerateConfig", "scrollUp", "scrollDown", "scrollToTop", "scrollToBottom"]);
 
 /**
  * The gate for dispatching a resolved outcome: {@link contextLost}'s `answer`
