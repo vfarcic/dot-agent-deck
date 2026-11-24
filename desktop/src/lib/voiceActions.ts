@@ -714,6 +714,34 @@ export type VoiceActionContext = {
    * with the sentence returned, while the batch is being sent.
    */
   closeCardBatch: () => string | undefined;
+  /*
+   * PRD #2374 decision 2026-11-24 — the card actions editor. Each answers the
+   * sentence saying why it did nothing, or `undefined`. Opening the editor and
+   * its forms is voice's; every press that writes a daemon's config (Save, a
+   * removal's confirmation, Hide, Restore) is the user's own, by hand.
+   */
+  /** Open the Card actions editor on the local daemon's card actions. */
+  openCardActionsEditor: () => string | undefined;
+  /** Close the editor, or the removal it is asking to confirm. */
+  closeCardActionsEditor: () => string | undefined;
+  /** Show the card actions of the daemon `deckId` in the editor. */
+  chooseCardActionsDaemon: (deckId: string) => string | undefined;
+  /** Open the editor's form for a new action. */
+  addCardAction: () => string | undefined;
+  /** Open the editor's form for one listed action, by name (a button) or by label as spoken. */
+  editCardAction: (action: { name?: string; label?: string }) => string | undefined;
+  /** Ask to remove one of the user's own actions: opens the editor's confirmation. Writes nothing. */
+  removeCardAction: (action: { name?: string; label?: string }) => string | undefined;
+  /** The removal confirmation's Remove: write the removal. */
+  confirmRemoveCardAction: () => string | undefined;
+  /** Hide a deck default from every card, by name. Writes the daemon's config. */
+  hideCardAction: (name: string) => string | undefined;
+  /** Bring a deck default back as the deck ships it, by name. Writes the daemon's config. */
+  restoreCardAction: (name: string) => string | undefined;
+  /** The form's Save: write the action as the form holds it. */
+  saveCardAction: () => string | undefined;
+  /** The form's Cancel: close it, writing nothing. */
+  cancelCardActionForm: () => string | undefined;
 };
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
@@ -777,6 +805,8 @@ export const CARD_FILTER_UNHEARD = "Say whether you want only the cards that nee
 export const CARD_ACTION_UNHEARD = "Say which of the card's actions to press, by the label on its button.";
 export const CARD_REPLY_UNHEARD = "Say what to reply.";
 export const CARD_BATCH_UNHEARD = "Say which action to send to the card and every card under it, by the label on its button.";
+/** What the editor's voice members say when no action name was heard. */
+export const CARD_ACTION_EDIT_UNHEARD = "Say which card action, by its label in the Card actions editor.";
 export const CARD_SELECTION_BATCH_UNHEARD = "Say which action to send to the selected cards, by the label on its button.";
 
 /** The card a target names: its deck, agent and, where known, the daemon process that listed it. */
@@ -1738,6 +1768,123 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "closeCardBatch">) => context.closeCardBatch(),
   },
 
+  /* PRD #2374 decision 2026-11-24 — the card actions editor. Voice opens
+     the editor, its form for a new action, an action's form and a removal's
+     confirmation; nothing it says writes the daemon's config. Every write —
+     Save, the removal's Remove, Hide and Restore — is a press by hand, so a
+     misheard word can neither change what an agent is sent nor take an
+     action away. */
+  openCardActionsEditor: {
+    label: "Open the Card actions editor",
+    voice: true,
+    needs: ["openCardActionsEditor"],
+    run: (context: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.openCardActionsEditor();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  closeCardActionsEditor: {
+    label: "Close the Card actions editor, or the removal it is asking to confirm",
+    no_voice: "the editor's Close and `Escape`; the editor is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\") closes it, or the removal it is asking to confirm, as the thing on top through `closeTopmost` — a row of its own would be a second reading of words `close` already answers",
+    needs: ["closeCardActionsEditor"],
+    run: (context: Pick<VoiceActionContext, "closeCardActionsEditor">) => { context.closeCardActionsEditor(); },
+  },
+
+  chooseCardActionsDaemon: {
+    label: "Show another daemon's card actions in the editor",
+    no_voice: "the editor's Daemon picker, shown only with several daemons connected; the editor opens on the local daemon, and an action's spoken name says nothing about which daemon's catalog it is in, so choosing another daemon is a pick by hand from the list it shows",
+    needs: ["chooseCardActionsDaemon"],
+    run: (context: Pick<VoiceActionContext, "chooseCardActionsDaemon">, deckId: string) => { context.chooseCardActionsDaemon(deckId); },
+  },
+
+  addCardAction: {
+    label: "Open the Card actions editor's form for a new action",
+    voice: true,
+    needs: ["addCardAction"],
+    run: (context: Pick<VoiceActionContext, "addCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.addCardAction();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  editCardAction: {
+    label: "Open one card action's form in the Card actions editor",
+    voice: true,
+    needs: ["editCardAction"],
+    run: (context: Pick<VoiceActionContext, "editCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_ACTION_EDIT_UNHEARD
+        : context.editCardAction({
+          ...(target.cardActionId !== undefined ? { name: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+        });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  removeCardAction: {
+    label: "Ask to remove one of your own card actions",
+    voice: true,
+    needs: ["removeCardAction"],
+    run: (context: Pick<VoiceActionContext, "removeCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_ACTION_EDIT_UNHEARD
+        : context.removeCardAction({
+          ...(target.cardActionId !== undefined ? { name: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+        });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  confirmRemoveCardAction: {
+    label: "Remove the card action the editor is asking to confirm",
+    no_voice: "the removal confirmation's Remove, which deletes the action from the daemon's config; voice has no confirm-before-acting step yet (PRD #802 D5), so `remove_card_action` opens this confirmation on screen and stops — the press that removes it is the user's own, by hand",
+    needs: ["confirmRemoveCardAction"],
+    run: (context: Pick<VoiceActionContext, "confirmRemoveCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.confirmRemoveCardAction();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  hideCardAction: {
+    label: "Hide a deck default card action",
+    no_voice: "Hide writes the daemon's config at once, with no step to read first, and takes the action off every card; voice opens the editor and an action's form, and every write in the editor is a press by hand, so a misheard name cannot take an action off the agents' cards",
+    needs: ["hideCardAction"],
+    run: (context: Pick<VoiceActionContext, "hideCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, name: string) => {
+      const refused = context.hideCardAction(name);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  restoreCardAction: {
+    label: "Restore a deck default card action",
+    no_voice: "Restore writes the daemon's config at once and throws away the user's own version of that default; voice opens the editor and an action's form, and every write in the editor is a press by hand",
+    needs: ["restoreCardAction"],
+    run: (context: Pick<VoiceActionContext, "restoreCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, name: string) => {
+      const refused = context.restoreCardAction(name);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  saveCardAction: {
+    label: "Save the card action the editor's form holds",
+    no_voice: "the form's Save writes the action — the exact text agents are sent — to the daemon's config; voice opens the form (`add_card_action`, `edit_card_action`), the fields are typed by hand, and the press that writes them is the user's own, so a misheard word never becomes text an agent is sent",
+    needs: ["saveCardAction"],
+    run: (context: Pick<VoiceActionContext, "saveCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.saveCardAction();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  cancelCardActionForm: {
+    label: "Close the Card actions editor's form without saving",
+    no_voice: "the form's Cancel, which only closes the form; voice's `close` closes the editor it is in, and saying another action's name (`edit_card_action`, `add_card_action`) replaces the form",
+    needs: ["cancelCardActionForm"],
+    run: (context: Pick<VoiceActionContext, "cancelCardActionForm">) => { context.cancelCardActionForm(); },
+  },
+
   toggleOverviewRowMenu: {
     label: "Open or close a dashboard row's menu",
     no_voice: "each item it holds is reachable by its own voice command — `show_agent_card` and `run_card_action` — so a spoken door to the menu itself would open a list the user then has to point at",
@@ -2405,7 +2552,10 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | "showInterruptedWork" | "hideInterruptedWork" | "interruptedDialog" | AgentCardMember>;
 
 /** PRD #2374 — the agent cards' members, served by the overview. */
-export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch";
+export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
+
+/** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
+export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

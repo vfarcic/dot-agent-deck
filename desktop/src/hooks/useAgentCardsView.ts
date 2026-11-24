@@ -56,10 +56,20 @@ export const ANOTHER_BATCH_SENDING = "A batch is still being sent; wait for its 
 /** The card members the overview serves, every one of them. */
 type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch">;
 
-/** Issue #2399 — an action a batch can send: its id and the label its first card shows. */
+/**
+ * Issue #2399 — an action a batch can send: its id and the label and icon its
+ * first card shows, and (decision 2026-11-24) the exact text it sends when
+ * every card offering it sends the same one, or `differs` when they do not.
+ * The text is for the button's hover only: what each agent gets is the
+ * daemon's preview, in the confirmation.
+ */
 export interface CardBatchChoice {
   id: string;
   label: string;
+  icon?: string | null;
+  kind?: string;
+  text?: string;
+  differs?: boolean;
 }
 
 /** Issue #2399 — one daemon's part of a batch: its preview's or its execution's answer per card. */
@@ -106,15 +116,20 @@ export interface CardSelection {
  * card gets it is the daemon's call, in the preview.
  */
 export function batchChoices(cards: readonly PlacedCard[]): CardBatchChoice[] {
-  const choices = new Map<string, string>();
+  const choices = new Map<string, CardBatchChoice & { texts: Set<string> }>();
   for (const card of cards) {
     const options = new Set(card.entry.questions.flatMap((question) => question.options.map((option) => option.action_id)));
     for (const action of card.entry.actions) {
-      if (action.kind === "open" || action.text_input || options.has(action.id) || choices.has(action.id)) continue;
-      choices.set(action.id, action.label);
+      if (action.kind === "open" || action.text_input || options.has(action.id)) continue;
+      const choice = choices.get(action.id) ?? { id: action.id, label: action.label, icon: action.icon, kind: action.kind, texts: new Set<string>() };
+      if (action.prompt) choice.texts.add(action.prompt);
+      choices.set(action.id, choice);
     }
   }
-  return [...choices].map(([id, label]) => ({ id, label }));
+  return [...choices.values()].map(({ texts, ...choice }) => ({
+    ...choice,
+    ...(texts.size === 1 ? { text: [...texts][0] } : texts.size > 1 ? { differs: true } : {}),
+  }));
 }
 
 /**

@@ -93,10 +93,35 @@ function rowName(row: BatchRow, names: ReadonlyMap<string, string>): string {
 }
 
 /**
+ * Decision 2026-11-24 — the included rows grouped by what each agent gets:
+ * the same exact text (from the same source) or, with no text, the same kind
+ * of action. Groups keep the order of their first agent, and agents keep the
+ * preview's order within a group.
+ */
+function sameText(rows: readonly BatchRow[]): BatchRow[][] {
+  const groups = new Map<string, BatchRow[]>();
+  for (const row of rows) {
+    const key = row.entry.prompt !== undefined && row.entry.prompt !== null
+      ? `text\u0000${row.entry.prompt_source ?? ""}\u0000${row.entry.prompt}`
+      : `kind\u0000${row.entry.kind ?? ""}`;
+    groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+  return [...groups.values()];
+}
+
+/** What an action with no text does to the agents of one group. */
+function closeWords(kind: string | undefined, label: string, several: boolean): string {
+  if (kind === "close_keep_worktree") return several ? "Closes each of these agents and keeps its worktree." : "Closes this agent and keeps its worktree.";
+  if (kind === "close") return several ? "Closes each of these agents." : "Closes this agent.";
+  return several ? `Runs ${label} on each of these agents.` : `Runs ${label} on this agent.`;
+}
+
+/**
  * Issue #2399 — the batch confirmation, then its result per agent. It lists
  * exactly what the daemons' preview answered: each included agent with the
- * exact text it gets (quoted, never an input), and each skipped agent with
- * the reason. Every batch stops here, whatever the action's own `confirm`
+ * exact text it gets (quoted, never an input) — a text several agents get is
+ * quoted once, above the agents that get it (decision 2026-11-24) — and each
+ * skipped agent with the reason. Every batch stops here, whatever the action's own `confirm`
  * says, and only Send sends; voice opens this and never presses it (PRD #802
  * D5). After Send it says, for each agent, whether its text was queued for it
  * (the most a press can say when it answers: the card's delivery history
@@ -170,14 +195,38 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
               <h3>{included.length === 0 ? "No agent gets this action" : `Sends to ${included.length} ${included.length === 1 ? "agent" : "agents"}`}</h3>
               {included.length > 0 && (
                 <ul className="agent-cards-batch-list">
-                  {included.map((row) => { const { entry } = row; return (
-                    <li key={rowKey(row)} className="agent-cards-batch-entry is-included" data-testid="agent-cards-batch-entry">
-                      {who(row, entry.prompt_source === "agent" && <SourceBadge source="agent" />)}
-                      {entry.prompt
-                        ? <><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt"><ExactText text={entry.prompt} /></blockquote><ExactTextNote text={entry.prompt} /></>
-                        : <p className="agent-cards-batch-what">{entry.kind === "close_keep_worktree" ? "Closes this agent and keeps its worktree." : entry.kind === "close" ? "Closes this agent." : `Runs ${label} on this agent.`}</p>}
-                    </li>
-                  ); })}
+                  {sameText(included).map((group) => {
+                    const [first] = group;
+                    const what = (several: boolean) => (first.entry.prompt
+                      ? <><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt"><ExactText text={first.entry.prompt} /></blockquote><ExactTextNote text={first.entry.prompt} /></>
+                      : <p className="agent-cards-batch-what">{closeWords(first.entry.kind, label, several)}</p>);
+                    const badge = (row: BatchRow) => row.entry.prompt_source === "agent" && <SourceBadge source="agent" />;
+                    /* One agent: its row holds the text, as it always did. */
+                    if (group.length === 1) {
+                      return (
+                        <li key={rowKey(first)} className="agent-cards-batch-group" data-testid="agent-cards-batch-group">
+                          <div className="agent-cards-batch-entry is-included" data-testid="agent-cards-batch-entry">
+                            {who(first, badge(first))}
+                            {what(false)}
+                          </div>
+                        </li>
+                      );
+                    }
+                    /* Several agents get the same text: it is quoted once, then the agents that get it. */
+                    return (
+                      <li key={rowKey(first)} className="agent-cards-batch-group is-shared" data-testid="agent-cards-batch-group">
+                        {what(true)}
+                        <p className="agent-cards-batch-gets">{first.entry.prompt ? `Each of these ${group.length} agents gets exactly this text:` : `For each of these ${group.length} agents:`}</p>
+                        <ul className="agent-cards-batch-list">
+                          {group.map((row) => (
+                            <li key={rowKey(row)} className="agent-cards-batch-entry is-included" data-testid="agent-cards-batch-entry">
+                              {who(row, badge(row))}
+                            </li>
+                          ))}
+                        </ul>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
               {skipped.length > 0 && (

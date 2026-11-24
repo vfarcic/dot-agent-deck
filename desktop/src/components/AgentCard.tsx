@@ -6,8 +6,9 @@ import { cardStatusClass, cardStatusLabel, disabledReasonSentence, exactTextSegm
 import { cardTone, issueLabels, referenceUrl, referenceView, rollupSegments, rollupSentence, type CardKind, type IssueLabelView } from "../lib/agentCardsTree";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "../lib/voiceActions";
+import { CardActionIcon, cardActionHover, cardIconName } from "../lib/cardIcons";
 import { endedRoleLine } from "../lib/endedRoles";
-import type { AgentCardCheckedRef, AgentCardRollup, EndedRole } from "../types";
+import type { AgentCardAction, AgentCardCheckedRef, AgentCardEntry, AgentCardRollup, EndedRole } from "../types";
 import { PullRequestBadge } from "./PullRequestBadge";
 
 /**
@@ -220,6 +221,46 @@ function CardRollup({ rollup }: { rollup: AgentCardRollup }) {
   );
 }
 
+/**
+ * PRD #2374 decision 2026-11-24 — the most action icons a card draws beside
+ * Close; past it, one `+N` control opens the card's overlay, which lists every
+ * action. Three keeps the card's name readable on a 224-pixel card.
+ */
+export const CARD_ICON_LIMIT = 3;
+
+/**
+ * The actions a card draws as icons: every prompt action its agent offers now,
+ * in the daemon's order — never a reply (or any action that takes the user's
+ * own words), Open, an answer to the agent's own question, or a close, which
+ * keeps its own control. They are the overlay's actions, pressed the same way.
+ */
+export function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
+  const options = new Set(entry.questions.flatMap((question) => question.options.map((option) => option.action_id)));
+  return entry.actions.filter((action) => action.kind === "prompt" && !action.text_input && !options.has(action.id));
+}
+
+/** A card action's hover, in the overlay's words: its label, the exact text, whether it asks first, why it is disabled. */
+export function actionHover(action: AgentCardAction): string {
+  return cardActionHover(action.label, action.prompt, [
+    action.source === "agent" && "Suggested by the agent, not in the catalog",
+    action.confirm && action.enabled && "Asks you to confirm first.",
+    !action.enabled && `Disabled: ${disabledReasonSentence(action.disabled_reason)}`,
+  ]);
+}
+
+/**
+ * Issue #2399, decision 2026-11-24 — a batch button's hover: the action's
+ * label, the exact text when every agent it can reach offers the same one (or
+ * that the text differs per agent), and who it is for. The confirmation shows
+ * what each agent gets before anything is sent.
+ */
+export function batchChoiceHover(choice: { label: string; text?: string; differs?: boolean }, forWhom: string): string {
+  return cardActionHover(choice.label, choice.text, [
+    choice.differs && "The text differs per agent: the confirmation shows what each one gets.",
+    `Review it for ${forWhom} before anything is sent.`,
+  ]);
+}
+
 /** How a card sits in the tree: its depth, what is under it, whether its tree is open, and whether Needs you only fades it. */
 export interface CardPlace {
   depth: number;
@@ -239,7 +280,8 @@ export interface CardPlace {
  * and kind), its status in the daemon's words, whether it needs the user, the
  * pull requests and issues its agent reported as the deck checked them, the
  * first checked issue's labels, what is under it (closed, with its roll-up),
- * and one action, Close. Everything comes from the daemon's entry as received;
+ * an icon for each prompt action its agent offers (up to
+ * {@link CARD_ICON_LIMIT}, then a `+N`), and Close. Everything comes from the daemon's entry as received;
  * nothing here decides status, needs-you, roll-ups or references.
  *
  * Round 2 (D11, D12): the name opens the agent, as a table row does; a click
@@ -287,6 +329,13 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
      never resizes a card or moves a root (issue #2418 review). A cut line's
      text is in its tooltip. References and labels that do not fit are not
      cut: a `+N` counts them, and the overlay lists them all. */
+  /* The prompt actions the agent offers now, as icons beside Close (PRD
+     #2374 decision 2026-11-24): each is pressed exactly as its overlay button
+     is, so one that asks first, or whose text the agent wrote, opens the
+     overlay at its review instead of sending. The text is only in the hover. */
+  const iconActions = cardIconActions(entry);
+  const icons = iconActions.slice(0, CARD_ICON_LIMIT);
+  const moreActions = iconActions.length - icons.length;
   const endedText = ended ? endedRoleLine(ended) : undefined;
   const metaTitle = `${place.kind} · ${statusText}${endedText ? ` · ${endedText}` : ""} — show ${name}'s card`;
   return (
@@ -336,6 +385,36 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
               title={place.open ? "Hide the agents under it" : "Show the agents under it"}
               onClick={() => VOICE_ACTIONS[place.open ? "closeCardTree" : "openCardTree"].run(controls, ref)}
             >{place.open ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}</button>
+          </span>
+        )}
+        {icons.length > 0 && (
+          <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
+            <span className="agent-card-action-icons">
+              {icons.map((action) => (
+                <button
+                  key={action.id}
+                  type="button"
+                  className="icon-button agent-card-action-icon"
+                  data-testid="agent-card-action-icon"
+                  data-action={action.id}
+                  data-icon={cardIconName(action.icon)}
+                  aria-label={displayText(action.label, DISPLAY_LIMITS.name)}
+                  title={actionHover(action)}
+                  disabled={!action.enabled}
+                  onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token })}
+                ><CardActionIcon name={action.icon} /></button>
+              ))}
+              {moreActions > 0 && (
+                <button
+                  type="button"
+                  className="agent-card-actions-more"
+                  data-testid="agent-card-actions-more"
+                  aria-label={`${moreActions} more actions: show ${name}'s card`}
+                  title={displayTitle(`${moreActions} more ${moreActions === 1 ? "action" : "actions"}: ${iconActions.slice(CARD_ICON_LIMIT).map((action) => action.label).join(", ")}. Open the card to see every action.`)}
+                  onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
+                >+{moreActions}</button>
+              )}
+            </span>
           </span>
         )}
         {close && (

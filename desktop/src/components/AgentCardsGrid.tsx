@@ -1,14 +1,29 @@
-import { BellRing, ListChecks } from "lucide-react";
+import { BellRing, ListChecks, SlidersHorizontal, X } from "lucide-react";
 import { useLayoutEffect, useMemo, useState } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
 import { cardKinds, cardTree, needsYouPath, type CardNode } from "../lib/agentCardsTree";
-import { DISPLAY_LIMITS, displayText, displayTitle, domIdentity } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayText, domIdentity } from "../lib/displayText";
 import { endedRoleOfCard } from "../lib/endedRoles";
 import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "../lib/voiceActions";
 import type { CardSelection } from "../hooks/useAgentCardsView";
 import type { EndedRole } from "../types";
-import { AgentCard, type CardControls, type CardPlace } from "./AgentCard";
+import { CardActionIcon, cardIconName } from "../lib/cardIcons";
+import { AgentCard, batchChoiceHover, type CardControls, type CardPlace } from "./AgentCard";
+
+/**
+ * Issue #2399, decision 2026-11-24 — a batch button's icon: the action's
+ * catalog icon, or Close's own cross for a close (it has no catalog icon).
+ */
+export function BatchChoiceIcon({ choice }: { choice: { icon?: string | null; kind?: string } }) {
+  if (batchIconName(choice) === "close") return <X size={15} aria-hidden="true" focusable="false" />;
+  return <CardActionIcon name={choice.icon} size={15} />;
+}
+
+/** The icon {@link BatchChoiceIcon} draws, by name (`data-icon`). */
+export function batchIconName(choice: { icon?: string | null; kind?: string }): string {
+  return !choice.icon && (choice.kind === "close" || choice.kind === "close_keep_worktree") ? "close" : cardIconName(choice.icon);
+}
 
 /**
  * PRD #2374 — the Cards view's line above every daemon's section: how many
@@ -16,12 +31,14 @@ import { AgentCard, type CardControls, type CardPlace } from "./AgentCard";
  * what to say when there is nothing to show. `cards` is every card on screen,
  * across the daemons, in the daemons' order.
  */
-export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection }: {
+export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection, editor }: {
   cards: readonly PlacedCard[];
   needsYouOnly: boolean;
   controls: Pick<VoiceActionContext, "setNeedsYouFilter" | "toggleCardSelecting" | "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
   /** Issue #2399 — the selection, offered while a deck on screen does batch actions. */
   selection?: CardSelection;
+  /** PRD #2374 decision 2026-11-24 — the Card actions editor's opener, while a daemon on screen has cards. */
+  editor?: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
 }) {
   const total = cards.length;
   const needYou = cards.filter((card) => card.entry.needs_you).length;
@@ -49,6 +66,15 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection }: 
             onClick={() => VOICE_ACTIONS.toggleCardSelecting.run(controls)}
           ><ListChecks size={13} aria-hidden="true" /><span>Select</span></button>
         )}
+        {editor && (
+          <button
+            type="button"
+            className="button secondary compact agent-cards-actions-editor-open"
+            data-testid="agent-cards-actions-editor-open"
+            title="Add, change, hide or remove the actions agents offer on their cards"
+            onClick={() => VOICE_ACTIONS.openCardActionsEditor.run(editor)}
+          ><SlidersHorizontal size={13} aria-hidden="true" /><span>Card actions</span></button>
+        )}
       </div>
       {selecting && selection && (
         <div className="agent-cards-selection" role="group" aria-label="Send to the selected cards" data-testid="agent-cards-selection">
@@ -58,11 +84,13 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection }: 
             <button
               key={choice.id}
               type="button"
-              className="button secondary compact"
+              className="icon-button agent-cards-batch-icon"
               data-testid={`agent-cards-batch-action-${domIdentity(choice.id)}`}
-              title={displayTitle(`Review ${choice.label} for the ${count} selected ${count === 1 ? "agent" : "agents"} before sending it`)}
+              data-icon={batchIconName(choice)}
+              aria-label={displayText(choice.label, DISPLAY_LIMITS.name)}
+              title={batchChoiceHover(choice, `the ${count} selected ${count === 1 ? "agent" : "agents"}`)}
               onClick={() => VOICE_ACTIONS.runSelectionBatch.run(controls, { cardActionId: choice.id })}
-            >{displayText(choice.label, DISPLAY_LIMITS.name)}</button>
+            ><BatchChoiceIcon choice={choice} /></button>
           ))}
         </div>
       )}

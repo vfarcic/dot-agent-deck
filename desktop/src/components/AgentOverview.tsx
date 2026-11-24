@@ -46,6 +46,8 @@ import { OverviewModeSwitch } from "./OverviewModeSwitch";
 import { AgentCardsDeckBody, AgentCardsToolbar } from "./AgentCardsGrid";
 import { AgentCardOverlay } from "./AgentCardOverlay";
 import { AgentCardBatchDialog } from "./AgentCardBatchDialog";
+import { AgentCardActionsEditor } from "./AgentCardActionsEditor";
+import { useCardActionsEditor, type CardActionsDaemon } from "../hooks/useCardActionsEditor";
 import { OverviewRowCard } from "./OverviewRowMenu";
 
 /**
@@ -1738,6 +1740,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       /* PRD #2374 — the cards' members, only while the runtime offers cards;
          `closeAgentCard` only while a card is open. */
       ...(cards.shown ? cards.voice : {}),
+      /* PRD #2374 decision 2026-11-24 — the Card actions editor's members,
+         while the cards are shown and a daemon on screen has them. */
+      ...(cards.shown && cardActionsEditor.shown ? cardActionsEditor.controls : {}),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
@@ -1898,6 +1903,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
   }, [decks, filtering]);
   const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
+  /* PRD #2374 decision 2026-11-24 — the Card actions editor, over the daemons
+     whose cards the dashboard shows, in its order (the local daemon first). */
+  const cardActionDaemons = useMemo<CardActionsDaemon[]>(() => decks.flatMap((deck) => {
+    const deckId = deck.snapshot.connection.deckId;
+    const snapshot = deckId !== undefined ? runtime.agentCards?.[deckId] : undefined;
+    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true }] : [];
+  }), [decks, runtime.agentCards]);
+  const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons });
   /* Issue #1965 — the exited role the open card is for, from its own deck's reply: the overlay says why in full. */
   const overlayCard = cards.overlay?.card;
   const overlayEnded = overlayCard
@@ -2401,7 +2414,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} selection={cards.selection} />}
+          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} selection={cards.selection} editor={cardActionsEditor.shown ? { ...cardActionsEditor.controls, reportRefused: cards.clickControls.reportRefused } : undefined} />}
           {/* PRD #2374 — in the Cards view every deck keeps its own section and
               header, with the daemon's own controls; a deck whose daemon has
               cards shows them as the section's body, and one with no cards (or
@@ -2455,6 +2468,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       </main>
       {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} ended={overlayEnded} />}
       {cards.batch && <AgentCardBatchDialog view={cards.batch} controls={cards.clickControls} daemonName={batchDaemonName} />}
+      {cardActionsEditor.view && <AgentCardActionsEditor view={cardActionsEditor.view} editor={cardActionsEditor} />}
       {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}

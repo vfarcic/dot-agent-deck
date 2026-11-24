@@ -248,9 +248,11 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     } as VoiceResultDto["outcome"], { entries: treeEntries, batch: true });
     await speak(spoken.resolveVoice);
     const dialog = await screen.findByTestId("agent-cards-batch-confirm");
+    // PRD #2374 decision 2026-11-24 (4): a text both agents get is quoted once, above the two agents.
     expect(within(dialog).getAllByTestId("agent-cards-batch-prompt").map((node) => node.textContent)).toEqual([
-      "VOICE-BATCH-2399: go ahead.", "VOICE-BATCH-2399: go ahead.",
+      "VOICE-BATCH-2399: go ahead.",
     ]);
+    expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(2);
     expect(spoken.invokeCardActionBatch).toHaveBeenCalledTimes(1);
     expect(spoken.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, "go-ahead", expect.objectContaining({
       mode: "preview", entries: treeEntries(createFixtureSnapshot("connected").agents).map(({ pane_id, agent_id }) => ({ pane_id, agent_id })),

@@ -8,7 +8,8 @@ import { agentTypeText, issueLabels, referenceDetail, referenceView } from "../l
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
 import type { AgentCardAction, AgentCardCheckedRef, EndedRole } from "../types";
-import { CardReference, cardRef, ExactText, ExactTextNote, IssueLabelChip, SourceBadge, type ReferenceControls } from "./AgentCard";
+import { batchChoiceHover, CardReference, cardRef, ExactText, ExactTextNote, IssueLabelChip, SourceBadge, type ReferenceControls } from "./AgentCard";
+import { BatchChoiceIcon, batchIconName } from "./AgentCardsGrid";
 
 /** The members the overlay's controls dispatch through. */
 export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused" | "runCardActionBatch">>;
@@ -50,7 +51,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
    * under it (`under` of them), when its daemon does batches and it has cards
    * under it. Each opens the batch's confirmation; nothing is sent from here.
    */
-  batch?: { choices: readonly { id: string; label: string }[]; under: number };
+  batch?: { choices: readonly { id: string; label: string; icon?: string | null; kind?: string; text?: string; differs?: boolean }[]; under: number };
 }) {
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => { controls.closeAgentCard(); });
   const [reply, setReply] = useState("");
@@ -317,11 +318,13 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                     <button
                       key={choice.id}
                       type="button"
-                      className="button secondary compact"
+                      className="icon-button agent-cards-batch-icon"
                       data-testid={`agent-card-batch-action-${domIdentity(choice.id)}`}
-                      title={displayTitle(`Review ${choice.label} for ${name} and every agent under it before sending it`)}
+                      data-icon={batchIconName(choice)}
+                      aria-label={displayText(choice.label, DISPLAY_LIMITS.name)}
+                      title={batchChoiceHover(choice, `${name} and every agent under it`)}
                       onClick={() => VOICE_ACTIONS.runCardActionBatch.run(controls as Pick<VoiceActionContext, "runCardActionBatch">, { ...cardRef(card), cardActionId: choice.id })}
-                    >{displayText(choice.label, DISPLAY_LIMITS.name)}</button>
+                    ><BatchChoiceIcon choice={choice} /></button>
                   ))}
                 </div>
               </section>
