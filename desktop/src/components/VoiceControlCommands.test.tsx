@@ -2860,7 +2860,7 @@ describe("sticky dictation in the open agent pane", () => {
   });
 });
 
-describe("experimental deck voice gating", () => {
+describe("the Daemons screen by voice with the experimental flag off (issue #1308)", () => {
   beforeEach(() => {
     window.history.replaceState({}, "", "/?fixture=1");
     window.localStorage.clear();
@@ -2870,10 +2870,10 @@ describe("experimental deck voice gating", () => {
   afterEach(() => vi.useRealTimers());
 
   /**
-   * Scenario: ask for the voice command list on the shipped overview even if
-   * an older command table includes open_deck. Only commands for visible screens are offered.
+   * Scenario: ask for the voice command list on the shipped overview. The
+   * Daemons screen is shown by default, so open_deck is offered with the rest.
    */
-  it("does not offer open_deck when the deck is hidden", async () => {
+  it("offers open_deck on the shipped overview", async () => {
     const voice = microphone(["what can I say?"]);
     const voiceCommands = vi.fn(async () => [
       { id: "open_overview", description: "Show every agent.", callable: true, unavailable_hint: "", params: [] },
@@ -2887,16 +2887,16 @@ describe("experimental deck voice gating", () => {
     await completeUtterance();
 
     const help = screen.getByTestId("voice-help");
-    expect(help.querySelector('[data-command="open_deck"]')).toBeNull();
+    expect(help.querySelector('[data-command="open_deck"]')).not.toBeNull();
     expect(help.querySelector('[data-command="open_overview"]')).not.toBeNull();
     expect(help.querySelector('[data-command="open_settings"]')).not.toBeNull();
   });
 
   /**
-   * Scenario: voice resolves a request to open the gated deck while the flag
-   * is off. The overview remains on screen, including after the dispatch completes.
+   * Scenario: voice resolves a request to open the Daemons screen with the
+   * flag off. The Daemons screen replaces the overview.
    */
-  it("refuses a resolved open_deck command while experimental is off", async () => {
+  it("opens the Daemons screen for a resolved open_deck command", async () => {
     const voice = microphone(["open the deck"]);
     const resolveVoice = vi.fn(async () => dispatch("open_deck", "openDeck", "Opening deck.", "open the deck"));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} initialView={{ kind: "overview" }} />);
@@ -2904,8 +2904,8 @@ describe("experimental deck voice gating", () => {
     await turnVoiceOn();
     await completeUtterance();
 
-    expect(screen.getByTestId("overview-table-region")).toBeVisible();
-    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-tile-planner")).toBeInTheDocument();
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
   });
 });
 
