@@ -2758,12 +2758,44 @@ screen = "overview"
 action = "scroll_to_bottom"
 outcome = "dispatch"
 
+# Issue #1673 — over an open agent's pane the four rows are callable and the
+# app scrolls the pane (PageUp / PageDown to an agent on the alternate screen),
+# or says why it did not. "scroll to the top" there is still `scroll_to_top`,
+# which the app answers, rather than a `scroll_up` that would move one screen.
 [[fixtures]]
-name = "scroll-negative-over-an-agent-pane"
+name = "scroll-down-over-an-agent-pane"
 utterance = "scroll down"
 screen = "agent"
 action = "scroll_down"
-outcome = "unavailable"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-over-an-agent-pane"
+utterance = "scroll up"
+screen = "agent"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-back-up-through-the-agents-output"
+utterance = "scroll back up through what it wrote"
+screen = "agent"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top-over-an-agent-pane"
+utterance = "scroll to the top"
+screen = "agent"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom-over-an-agent-pane"
+utterance = "scroll to the bottom"
+screen = "agent"
+action = "scroll_to_bottom"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "scroll-negative-under-the-new-agent-dialog"

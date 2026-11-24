@@ -1108,9 +1108,12 @@ export const VOICE_ACTIONS = {
 
   /* Issue #1492 — scrolling the agent dashboard, which shows everything
      whether voice is on or off rather than a page at a time. A scroll changes
-     which part of the dashboard is showing and nothing else. */
+     which part of the dashboard is showing and nothing else. The shell routes
+     `scrollDashboard` to what is in front: a pull request open in the app,
+     else an open agent's pane (issue #1673, `lib/paneScroll.ts`), else the
+     dashboard. */
   scrollDown: {
-    label: "Scroll the agent dashboard down by about a screen",
+    label: "Scroll down by about a screen: the agent dashboard, an open agent's pane, or a pull request open in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1120,7 +1123,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollUp: {
-    label: "Scroll the agent dashboard up by about a screen",
+    label: "Scroll up by about a screen: the agent dashboard, an open agent's pane, or a pull request open in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1130,7 +1133,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToTop: {
-    label: "Scroll the agent dashboard to its top",
+    label: "Scroll to the top: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1140,7 +1143,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToBottom: {
-    label: "Scroll the agent dashboard to its bottom",
+    label: "Scroll to the bottom: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {

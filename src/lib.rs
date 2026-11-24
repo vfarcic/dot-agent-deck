@@ -219,6 +219,8 @@ pub mod retained_store;
 // Issue #2110: spacing between orchestration workers' agent starts.
 pub mod role_start_pacing;
 pub mod roles_cli;
+// Issue #1897: each agent run in a cgroup of its own, where systemd delegated one.
+pub mod run_cgroup;
 pub mod schedule_cli;
 // PRD #1885: a schedule's last fire, when it was refused as not approved.
 pub mod schedule_outcome;

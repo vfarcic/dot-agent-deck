@@ -111,6 +111,8 @@ import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bri
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
+import { PAGE_UP, PANE_AGENT_GONE, PANE_COVERED, PANE_SCROLLING_DOWN, PANE_SCROLLING_UP, PANE_TERMINAL_HIDDEN, paneScrollFailed, scrollAgentPane } from "./lib/paneScroll";
+import { getTerminal } from "./lib/terminalRegistry";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 /** Issue #2454: how many times one open of an agent is reported before giving up. */
@@ -1475,13 +1477,46 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          PRD #1401 — while the pull request browser is open it is what is in
          front, so the four scrolls move its PAGE instead, from outside it (a
          fixed script per direction, and nothing read back), unless one of the
-         app's own dialogs is over the browser. */
+         app's own dialogs is over the browser.
+
+         Issue #1673 — with an agent's pane open and no pull request over it,
+         the pane is what is in front, so the four scrolls move the pane
+         (`scrollAgentPane`: the PageUp / PageDown the agent scrolls itself by,
+         or the terminal's own history), never the dashboard behind it. */
       ...(prBrowser
         ? { scrollDashboard: (move: DashboardScroll) => {
           if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
           void onPrBrowserPage(prBrowser.opened, prBrowserHost.scroll(move));
           return undefined;
         } }
+        : agentView
+          ? { scrollDashboard: (move: DashboardScroll) => {
+            /* The pane is itself an `aria-modal` overlay, so `modalOpen()` is
+               always true here; what matters is whether anything is drawn
+               OVER it — a raised sheet, a dialog, a confirmation, the Daemon
+               menu. Settings beneath the pane leaves the pane in front. */
+            if (dialogLayerUp() || confirmationOpen || overlayAbove(document.querySelector(".agent-pane-overlay"))) return PANE_COVERED;
+            if (!voicePane) return PANE_AGENT_GONE;
+            if (voicePane.terminalHidden) return PANE_TERMINAL_HIDDEN;
+            const target = { deckId: voicePane.deckId, agentId: voicePane.agentId, incarnation: voicePane.incarnation };
+            /* Straight to the agent, not through the terminal's `onData`:
+               voice's own scroll is not a hand edit of the prompt (Qodo on
+               PR #2476). `dispatchLost` already held this to the pane the
+               utterance was said over. */
+            /* The write settles after the dispatch returns, so its sentence
+               goes through `reportPending`, called here inside the row's
+               `run`: the resolver's "Scrolling up." is not shown, and the
+               row then says the scroll happened or why it did not, unless a
+               newer utterance has reported since (Qodo on PR #2476). */
+            const sendKey = (key: string) => {
+              const work = runtime.sendTerminalInput(target, key).then(() => undefined, (cause: unknown) => paneScrollFailed(cause));
+              const sentence = key === PAGE_UP ? PANE_SCROLLING_UP : PANE_SCROLLING_DOWN;
+              const reportPending = panelVoiceContext.current?.reportPending;
+              if (reportPending) reportPending(sentence, work, sentence);
+              else void work;
+            };
+            return scrollAgentPane(getTerminal(voicePane.deckId, voicePane.agentId, voicePane.incarnation), move, sendKey, voicePane.inputBlocked);
+          } }
         : overviewVoiceContext.current?.scrollDashboard
           ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
           : {}),
@@ -1530,7 +1565,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view, voicePane, runtime.sendTerminalInput]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
