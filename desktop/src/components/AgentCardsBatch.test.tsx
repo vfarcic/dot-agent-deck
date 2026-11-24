@@ -46,15 +46,15 @@ const INCLUDED: BatchEntry[] = [
 ];
 const SKIPPED: BatchEntry = { pane_id: STOPPED.pane_id, agent_id: STOPPED.agent_id, name: STOPPED.name, outcome: "skipped", code: "agent_stopped", message: "This agent is no longer running." };
 
-function setup({ partial = false }: { partial?: boolean } = {}) {
+function setup({ partial = false, entries = ENTRIES, preview = [...INCLUDED, SKIPPED] }: { partial?: boolean; entries?: AgentCardEntry[]; preview?: BatchEntry[] } = {}) {
   const first = createFixtureFleet("fleet")[0];
-  const deck = { ...first, connection: { ...first.connection, incarnation: INSTANCE }, agents: ENTRIES.filter((card) => card !== STOPPED).map((card) => createFixtureStartedAgent({
+  const deck = { ...first, connection: { ...first.connection, incarnation: INSTANCE }, agents: entries.filter((card) => card.status !== "stopped").map((card) => createFixtureStartedAgent({
     id: card.agent_id, daemonId: FIXTURE_DAEMON_ID, displayName: card.name, command: "claude", cwd: "/w",
   })) };
   const invokeCardAction = vi.fn();
   const invokeCardActionBatch = vi.fn(async (_deckId: string, _actionId: string, options: BatchOptions) => ({
     request_id: options.requestId,
-    entries: options.mode === "preview" ? [...INCLUDED, SKIPPED] : [
+    entries: options.mode === "preview" ? preview : [
       { ...INCLUDED[0], outcome: "delivered", message_id: "m-batch-root", state: "queued" },
       partial
         ? { ...INCLUDED[1], outcome: "failed", code: "stale_action", message: "The action changed after you reviewed it." }
@@ -67,7 +67,7 @@ function setup({ partial = false }: { partial?: boolean } = {}) {
     reconnect: vi.fn(async () => undefined), listProjects: vi.fn(async () => ({ projects: [] })), resolveProject: vi.fn(async () => { throw new Error("unresolved"); }),
     getSettings: vi.fn(), saveSettings: vi.fn(), testEndpoint: vi.fn(), secretStatus: vi.fn(), storeSecret: vi.fn(), forgetSecret: vi.fn(),
     setZoom: vi.fn(async (level: number) => level), desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES },
-    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: ENTRIES, catalogErrors: [], tree: true, batch: true } },
+    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries, catalogErrors: [], tree: true, batch: true } },
     invokeCardAction, invokeCardActionBatch,
   } as unknown as DeckRuntimeState;
   render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
@@ -80,6 +80,15 @@ function card(card: AgentCardEntry) {
   return within(node);
 }
 
+/*
+ * PRD #2374 decision 2026-11-24 (3): the selection toolbar's and the overlay's
+ * batch buttons are icons, named by the action's label. The tests find them by
+ * that name, which a text button and an icon button both carry; what the icon
+ * form itself must look like is `desktop/agent-cards/051`'s.
+ */
+const selectionAction = (label: string) => within(screen.getByTestId("agent-cards-selection")).getByRole("button", { name: label });
+const overlayBatchAction = (label: string) => within(screen.getByTestId("agent-card-batch")).getByRole("button", { name: label });
+
 function selectRoot() {
   fireEvent.click(screen.getByTestId("agent-cards-select"));
   fireEvent.click(card(ROOT).getByRole("checkbox", { name: "Select root" }));
@@ -87,7 +96,7 @@ function selectRoot() {
 
 async function startSelectedBatch() {
   selectRoot();
-  await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+  await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
   return screen.getByTestId("agent-cards-batch-confirm");
 }
 
@@ -154,7 +163,7 @@ describe("batch card actions (#2399)", () => {
     expect(card(ROOT).getByRole("checkbox", { name: "Select root" })).toBeChecked();
     expect(card(OUTSIDE).getByRole("checkbox", { name: "Select outside" })).not.toBeChecked();
     expect(document.querySelector(`article[data-card-key="${CHILD.key}"]`)).toBeNull();
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     expect(calls.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "preview", entries: targets([ROOT, CHILD, STOPPED]) }));
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("agent-cards-batch-cancel"));
@@ -166,7 +175,7 @@ describe("batch card actions (#2399)", () => {
   it("desktop/agent-cards/029: an overlay batch reaches the card's whole subtree", async () => {
     const calls = setup();
     fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(overlayBatchAction("Go ahead")); });
     expect(screen.getByTestId("agent-cards-batch-confirm")).toBeInTheDocument();
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
     expect(calls.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "preview", entries: targets([ROOT, CHILD, STOPPED]) }));
@@ -193,7 +202,7 @@ describe("batch card actions (#2399)", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /^Cancel$/ }));
     expect(screen.queryByTestId("agent-cards-batch-confirm")).toBeNull();
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     await act(async () => { fireEvent.click(within(screen.getByTestId("agent-cards-batch-confirm")).getByRole("button", { name: /^Send$/ })); });
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(3);
     expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({
@@ -230,7 +239,7 @@ describe("batch card actions (#2399)", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
     expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("2 selected");
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     const dialog = screen.getByTestId("agent-cards-batch-confirm");
     const rowFor = (scope: HTMLElement, name: string) => within(scope).getAllByTestId("agent-cards-batch-entry").filter((row) => within(row).queryByText(name, { exact: true }));
     expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(2);
@@ -302,7 +311,7 @@ describe("batch card actions (#2399)", () => {
     fireEvent.keyDown(results, { key: "Escape" });
     expect(screen.queryByTestId("agent-cards-batch-results")).toBeNull();
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     expect(screen.getByTestId("agent-cards-batch-confirm")).toHaveAttribute("data-stage", "review");
     expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "preview" }));
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
@@ -362,7 +371,7 @@ describe("batch card actions (#2399)", () => {
     fireEvent.click(screen.getByTestId("agent-cards-select"));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     const dialog = screen.getByTestId("agent-cards-batch-confirm");
     expect(dialog).toHaveAttribute("data-stage", "review");
     expect(within(dialog).queryByText(/Nothing was sent/)).toBeNull();
@@ -389,7 +398,7 @@ describe("batch card actions (#2399)", () => {
     calls.invokeCardActionBatch.mockImplementation(async (deckId: string) => {
       throw new Error(deckId === FIXTURE_DAEMON_ID ? "the deck is not reachable" : "the far deck timed out");
     });
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     const failed = screen.getByTestId("agent-cards-batch-confirm");
     expect(within(failed).getByRole("alert")).toHaveTextContent("Nothing was sent: the deck is not reachable; the far deck timed out");
     expect(within(failed).queryAllByTestId("agent-cards-batch-entry")).toHaveLength(0);
@@ -432,7 +441,7 @@ describe("batch card actions (#2399)", () => {
     fireEvent.click(screen.getByTestId("agent-cards-select"));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     const dialog = screen.getByTestId("agent-cards-batch-confirm");
     expect(dialog).toHaveAttribute("data-stage", "review");
     const rowFor = (scope: HTMLElement, name: string) => within(scope).getAllByTestId("agent-cards-batch-entry").filter((row) => within(row).queryByText(name, { exact: true }));
@@ -473,7 +482,7 @@ describe("batch card actions (#2399)", () => {
         ? [...closing, SKIPPED]
         : [{ ...INCLUDED[0], outcome: "closed" }, { ...INCLUDED[1], outcome: "failed", code: "close_failed", message: "the agent did not stop" }, { ...third, outcome: "unknown", code: "no_answer", message: "the deck did not answer within 45s" }],
     }) as never);
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     dialog = screen.getByTestId("agent-cards-batch-confirm");
     await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
     results = screen.getByTestId("agent-cards-batch-results");
@@ -504,5 +513,83 @@ describe("batch card actions (#2399)", () => {
     expect(within(results).queryByText(/^Failed$/)).toBeNull();
     expect(results).not.toHaveTextContent(/nothing was delivered|nothing was sent/);
     expect(within(results).getByRole("status")).not.toHaveTextContent(/failed/);
+  });
+
+  /// Scenario: Select a closed root whose three cards all list Go ahead with the same text, then open the root's overlay. The selection toolbar's and the overlay's Go ahead are icon buttons named Go ahead, with no text, whose hover says the label and that exact text; with a child whose Go ahead sends other words, the hover says the text differs per agent instead. Pressing an icon still only opens the confirmation.
+  it("desktop/agent-cards/051: the selection toolbar's and the overlay's batch buttons are icons with the label and text on hover", async () => {
+    const same = action.prompt!;
+    const expectIcon = (button: HTMLElement) => {
+      expect(button.textContent).toBe("");
+      expect(button.querySelector("svg")).not.toBeNull();
+      expect(button).toHaveAttribute("data-icon", "generic");
+      expect(button.title).toContain("Go ahead");
+    };
+    const calls = setup();
+    selectRoot();
+    const toolbar = selectionAction("Go ahead");
+    expectIcon(toolbar);
+    expect(toolbar.title).toContain(same);
+    expect(toolbar.title).not.toMatch(/differs/);
+    await act(async () => { fireEvent.click(toolbar); });
+    expect(screen.getByTestId("agent-cards-batch-confirm")).toBeInTheDocument();
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(screen.getByTestId("agent-cards-batch-confirm")).getByRole("button", { name: /^Cancel$/ }));
+
+    fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
+    const overlayButton = overlayBatchAction("Go ahead");
+    expectIcon(overlayButton);
+    expect(overlayButton.title).toContain(same);
+    cleanup();
+
+    // A child whose Go ahead sends other words: the hover says so rather than quoting one agent's text.
+    const differing = { ...CHILD, actions: [{ ...action, prompt: "Other words for the child." }] };
+    setup({ entries: [ROOT, differing, STOPPED, OUTSIDE] });
+    selectRoot();
+    const mixed = selectionAction("Go ahead");
+    expectIcon(mixed);
+    expect(mixed.title).toMatch(/text differs per agent/);
+    expect(mixed.title).not.toContain(same);
+    expect(mixed.title).not.toContain("Other words for the child.");
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Start a batch whose preview gives the root and the child the same text, then one that also includes an unrelated agent with other text. When every included agent gets the same text, the confirmation quotes it once and then lists the agents that get it; otherwise each distinct text is quoted once, above the agents that get it. Skipped agents keep their reason, and Send still sends exactly the previewed entries.
+  it("desktop/agent-cards/052: the confirmation quotes text every agent shares once, with the list of agents", async () => {
+    const SAME = "SAME-EXACT-2399: proceed.\nThen report.";
+    const OTHER = "OTHER-EXACT-2399: wait for review.";
+    const shared: BatchEntry[] = INCLUDED.map((entry) => ({ ...entry, prompt: SAME }));
+    let calls = setup({ preview: [...shared, SKIPPED] });
+    let dialog = await startSelectedBatch();
+    const prompts = within(dialog).getAllByTestId("agent-cards-batch-prompt");
+    expect(prompts.map((node) => node.textContent)).toEqual([SAME]);
+    for (const name of ["root", "child"]) expect(within(dialog).getByText(name, { exact: true })).toBeInTheDocument();
+    expect(within(dialog).getByText(SKIPPED.message!)).toBeInTheDocument();
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({
+      mode: "execute", entries: shared.map(({ pane_id, agent_id, action_token, instance_id }) => ({ pane_id, agent_id, action_token, instance_id })),
+    }));
+    cleanup();
+
+    // Two texts: each quoted once, above the agents that get it.
+    const outside: BatchEntry = { pane_id: OUTSIDE.pane_id, agent_id: OUTSIDE.agent_id, name: OUTSIDE.name, outcome: "included", prompt: OTHER, action_token: "tok-preview-outside", instance_id: INSTANCE };
+    calls = setup({ preview: [shared[0], outside, shared[1], SKIPPED] });
+    selectRoot();
+    fireEvent.click(card(OUTSIDE).getByRole("checkbox", { name: "Select outside" }));
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
+    dialog = screen.getByTestId("agent-cards-batch-confirm");
+    const quoted = within(dialog).getAllByTestId("agent-cards-batch-prompt");
+    expect(quoted.map((node) => node.textContent)).toEqual([SAME, OTHER]);
+    const groups = within(dialog).getAllByTestId("agent-cards-batch-group");
+    const groupOf = (text: string) => groups.find((group) => within(group).queryAllByTestId("agent-cards-batch-prompt").some((node) => node.textContent === text));
+    const sameGroup = groupOf(SAME);
+    const otherGroup = groupOf(OTHER);
+    expect(sameGroup).toBeDefined();
+    expect(otherGroup).toBeDefined();
+    for (const name of ["root", "child"]) expect(within(sameGroup!).getByText(name, { exact: true })).toBeInTheDocument();
+    expect(within(sameGroup!).queryByText("outside", { exact: true })).toBeNull();
+    expect(within(otherGroup!).getByText("outside", { exact: true })).toBeInTheDocument();
+    expect(within(otherGroup!).queryByText("root", { exact: true })).toBeNull();
+    expect(within(dialog).getByText(SKIPPED.message!)).toBeInTheDocument();
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });
 });

@@ -74,7 +74,7 @@ const actionParam = (label: string): VoiceResolvedParamDto => ({ name: "action",
 type Said = { action: string; invoke: string; params: VoiceResolvedParamDto[] };
 
 /** The real shell on the dashboard's cards, one daemon whose cards are `entries`, and what each utterance resolves to. */
-function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (agents: { id: string }[]) => Record<string, Said>, { holdExecution = false } = {}) {
+function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (agents: { id: string }[]) => Record<string, Said>, { holdExecution = false, extra = {} }: { holdExecution?: boolean; extra?: Record<string, unknown> } = {}) {
   const voice = microphone();
   const base = createFixtureSnapshot("connected");
   const snapshot = { ...base, connection: { ...base.connection, incarnation: INSTANCE }, agents: base.agents.map((agent) => ({ ...agent, incarnation: INSTANCE })) };
@@ -110,8 +110,8 @@ function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (a
     saveSettings: vi.fn(async () => structuredClone(DEFAULT_DESKTOP_SETTINGS)),
     setZoom: vi.fn(async (level: number) => level),
     voiceCommands: vi.fn(async () => []),
-    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: cards, catalogErrors: [], tree: true, batch: true } },
-    invokeCardAction, invokeCardActionBatch, resolveVoice, ...voice,
+    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: cards, catalogErrors: [], tree: true, batch: true, catalogEdit: true } },
+    invokeCardAction, invokeCardActionBatch, resolveVoice, ...voice, ...extra,
   } as unknown as DeckRuntimeState;
   render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
   return { voice, cards, invokeCardAction, invokeCardActionBatch, release: () => release?.() };
@@ -164,7 +164,8 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     const [parent] = run.cards;
     await turnOnVoice();
     fireEvent.click(cardNode(parent).getByTestId("agent-card-details"));
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-batch-action-go-ahead")); });
+    // PRD #2374 decision 2026-11-24 (3): the overlay's batch buttons are icons, found by the action's label.
+    await act(async () => { fireEvent.click(within(screen.getByTestId("agent-card-batch")).getByRole("button", { name: "Go ahead" })); });
     const dialog = screen.getByTestId("agent-cards-batch-confirm");
     await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
     expect(dialog).toHaveAttribute("data-stage", "sending");
@@ -246,5 +247,52 @@ describe("batch card actions by voice (issue 2399 review)", () => {
       expect(commandsSource).toMatch(new RegExp(`id\\s*=\\s*"${row}"[\\s\\S]*?invoke\\s*=\\s*"${id}"`));
     }
     expect(registry.sendCardBatch?.no_voice).toBeTruthy();
+  });
+
+  /// Scenario: By voice, open the card actions editor, open the form for a new action, open Ship it for editing, and ask to remove Ship it. The editor opens on the local daemon's catalog, each request opens what it names, and the removal only opens the editor's own confirmation: nothing is written until it is pressed by hand. The registry entries behind each are voice-enabled with matching command rows, and the confirmation's press stays off voice.
+  it("desktop/agent-cards/060: voice opens the card actions editor, its forms and a removal's confirmation, and writes nothing", async () => {
+    const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };
+    const goDefault = { ...ship, name: "go-ahead", label: "Go ahead", prompt: "Go ahead.", icon: "play", source: "default", default: true };
+    const readCardCatalog = vi.fn(async () => ({ actions: [goDefault, ship], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
+    const editCardCatalog = vi.fn();
+    const run = setup(
+      (agents) => [cardFor(agents[0].id, "coder-card")],
+      () => ({
+        "open the card actions editor": { action: "open_card_actions_editor", invoke: "openCardActionsEditor", params: [] },
+        "add a card action": { action: "add_card_action", invoke: "addCardAction", params: [] },
+        "edit the ship it action": { action: "edit_card_action", invoke: "editCardAction", params: [actionParam("Ship it")] },
+        "remove the ship it action": { action: "remove_card_action", invoke: "removeCardAction", params: [actionParam("Ship it")] },
+      }),
+      { extra: { readCardCatalog, editCardCatalog } },
+    );
+    await turnOnVoice();
+    await speak(run.voice, "open the card actions editor");
+    const editor = screen.getByRole("dialog", { name: "Card actions" });
+    expect(readCardCatalog).toHaveBeenCalledWith(FIXTURE_DAEMON_ID);
+
+    await speak(run.voice, "add a card action");
+    expect((within(editor).getByLabelText("Name") as HTMLInputElement).value).toBe("");
+    expect(within(editor).getByLabelText("Text it sends")).toBeInTheDocument();
+
+    await speak(run.voice, "edit the ship it action");
+    expect((within(editor).getByLabelText("Name") as HTMLInputElement).value).toBe("ship");
+    expect((within(editor).getByLabelText("Label") as HTMLInputElement).value).toBe("Ship it");
+
+    await speak(run.voice, "remove the ship it action");
+    expect(screen.getByRole("alertdialog", { name: "Remove Ship it?" })).toBeInTheDocument();
+    expect(editCardCatalog).not.toHaveBeenCalled();
+    expect(run.invokeCardAction).not.toHaveBeenCalled();
+
+    const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
+    for (const [id, row] of [["openCardActionsEditor", "open_card_actions_editor"], ["addCardAction", "add_card_action"], ["editCardAction", "edit_card_action"], ["removeCardAction", "remove_card_action"]]) {
+      expect(registry[id]?.voice, id).toBe(true);
+      expect(commandsSource).toMatch(new RegExp(`id\\s*=\\s*"${row}"[\\s\\S]*?invoke\\s*=\\s*"${id}"`));
+    }
+    // The press that writes a removal is the user's hand; saving the form is either a voice row or says why it is not.
+    expect(registry.confirmRemoveCardAction?.no_voice).toBeTruthy();
+    const save = registry.saveCardAction;
+    expect(save, "saveCardAction is in the registry").toBeDefined();
+    if (save?.voice) expect(commandsSource).toMatch(/invoke\s*=\s*"saveCardAction"/);
+    else expect(save?.no_voice).toBeTruthy();
   });
 });

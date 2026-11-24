@@ -347,6 +347,436 @@ fn agent_report_batch_003_stale_entries_do_not_block_other_deliveries() {
     );
 }
 
+/// Issue #2399 (PR #2491 scope extension): the desktop card-action editor's
+/// daemon request, `card-catalog-edit`, with an `edit` or without (a read).
+/// Raw JSON keeps these tests buildable before the verb exists.
+fn catalog_edit(endpoint: &impl Endpoint, edit: Option<Value>) -> Value {
+    let mut request = json!({"op": "card-catalog-edit"});
+    if let Some(edit) = edit {
+        request["edit"] = edit;
+    }
+    inbox::attach(endpoint, request)
+}
+
+/// [`catalog_edit`] that must succeed: the editable catalog it answered.
+fn catalog_edit_ok(endpoint: &impl Endpoint, edit: Option<Value>) -> Value {
+    let response = catalog_edit(endpoint, edit.clone());
+    assert_eq!(
+        response["ok"], true,
+        "card-catalog-edit {edit:?} must be supported and accepted: {response:#}"
+    );
+    let catalog = response["card_catalog_edit"].clone();
+    assert!(
+        catalog["actions"].is_array(),
+        "the editable catalog lists actions: {response:#}"
+    );
+    catalog
+}
+
+fn editable<'a>(catalog: &'a Value, name: &str) -> Option<&'a Value> {
+    catalog["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == name)
+}
+
+fn editable_names(catalog: &Value) -> Vec<String> {
+    catalog["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `card catalog --json`, parsed: the catalog every card is built from.
+fn resolved_catalog(endpoint: &impl Endpoint) -> Value {
+    let out = as_user(endpoint, &["card", "catalog", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    serde_json::from_slice(&out.stdout).expect("catalog --json")
+}
+
+fn resolved_action<'a>(resolved: &'a Value, name: &str) -> Option<&'a Value> {
+    resolved["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == name)
+}
+
+fn user_config_text(dir: &tempfile::TempDir) -> String {
+    std::fs::read_to_string(config_path(dir)).expect("read the user config")
+}
+
+const SHIP_PROMPT: &str =
+    "SHIP-2399: release it following this project's procedure, then update your card.";
+const SHIP_PROMPT_B: &str = "SHIP-2399-B: release it now, then update your card.";
+
+/// The settings, catalog field and comments the catalog-edit tests check are
+/// kept through every edit.
+const EDITOR_CONFIG: &str = "# my deck settings\ndefault_command = \"bash\" # keep me\n\n[bell]\non_idle = true\n\n[catalog]\n# my catalog comment\n\n[[catalog.fields]]\nname = \"risk\"\ndescription = \"How risky the change is.\"\ntype = \"text\"\n";
+
+fn assert_settings_kept(saved: &str) {
+    assert!(
+        saved.starts_with("# my deck settings\ndefault_command = \"bash\" # keep me\n"),
+        "the first comment and setting stay as written:\n{saved}"
+    );
+    assert!(saved.contains("# my catalog comment"), "{saved}");
+    let table: toml::Table = toml::from_str(saved).expect("the file stays valid TOML");
+    assert_eq!(table["default_command"].as_str(), Some("bash"), "{saved}");
+    assert_eq!(table["bell"]["on_idle"].as_bool(), Some(true), "{saved}");
+    let fields = table["catalog"]["fields"]
+        .as_array()
+        .expect("catalog fields kept");
+    assert_eq!(fields.len(), 1, "{saved}");
+    assert_eq!(fields[0]["name"].as_str(), Some("risk"), "{saved}");
+}
+
+/// Scenario: A daemon reads a user config with settings, a catalog field and comments. The editor's request reads the catalog actions with their sources, adds an always-offered `ship` action with an icon, updates it and removes it; after each edit `card catalog` and a running agent's card show the change with no restart, and the file keeps every other setting, the field and the comments.
+#[spec("agent-report/catalog-edit/001")]
+#[test]
+fn agent_report_catalog_edit_001_add_update_remove_reach_the_catalog_and_cards() {
+    let (daemon, dir) = daemon_with_config(EDITOR_CONFIG);
+    let hello = inbox::attach(
+        &daemon,
+        json!({"op":"hello", "client_version":dot_agent_deck::daemon_protocol::PROTOCOL_VERSION}),
+    );
+    assert!(
+        hello["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "agent-cards-catalog-edit")),
+        "daemon must advertise agent-cards-catalog-edit: {hello:#}"
+    );
+    let before = user_config_text(&dir);
+    let read = catalog_edit_ok(&daemon, None);
+    assert_eq!(editable_names(&read), ["go-ahead", "merge", "explain"]);
+    for name in ["go-ahead", "merge"] {
+        let default = editable(&read, name).unwrap();
+        assert_eq!(default["source"], "default", "{default:#}");
+        assert_eq!(default["default"], true, "{default:#}");
+        assert_eq!(default["hidden"], false, "{default:#}");
+    }
+    assert_eq!(editable(&read, "merge").unwrap()["icon"], "git-merge");
+    let explain = editable(&read, "explain").unwrap();
+    assert_eq!(explain["source"], "user", "{explain:#}");
+    assert_eq!(explain["default"], false, "{explain:#}");
+    assert_eq!(
+        read["user_config"],
+        config_path(&dir).to_string_lossy().as_ref()
+    );
+    assert_eq!(user_config_text(&dir), before, "a read writes nothing");
+
+    let pane = route::start(&daemon, "catalog-edit-card", json!({}));
+    publish(&daemon, &pane, daemon.cwd(), &json!({"status": "working"}));
+
+    let added = catalog_edit_ok(
+        &daemon,
+        Some(json!({"kind": "add", "action": {
+            "name": "ship", "label": "Ship it", "description": "Offer when the work is ready to release.",
+            "prompt": SHIP_PROMPT, "icon": "rocket", "confirm": true, "always": true,
+        }})),
+    );
+    let ship = editable(&added, "ship").expect("the added action is listed");
+    assert_eq!(ship["source"], "user", "{ship:#}");
+    assert_eq!(ship["default"], false, "{ship:#}");
+    assert_eq!(ship["icon"], "rocket", "{ship:#}");
+    assert_eq!(ship["prompt"], SHIP_PROMPT, "{ship:#}");
+    assert_eq!(
+        (ship["confirm"].clone(), ship["always"].clone()),
+        (json!(true), json!(true))
+    );
+    let resolved = resolved_catalog(&daemon);
+    let listed = resolved_action(&resolved, "ship").expect("card catalog lists the new action");
+    assert_eq!(listed["source"], "user");
+    assert_eq!(listed["label"], "Ship it");
+    assert_eq!(resolved["errors"], json!([]));
+    let entry = wait_entry(&daemon, &key(&pane), "offering the added action", |e| {
+        action(e, "ship").is_some_and(|a| a["prompt"] == SHIP_PROMPT)
+    });
+    let offered = action(&entry, "ship").unwrap();
+    assert_eq!(offered["confirm"], true, "{offered:#}");
+    assert_eq!(offered["icon"], "rocket", "{offered:#}");
+    assert_settings_kept(&user_config_text(&dir));
+
+    let updated = catalog_edit_ok(
+        &daemon,
+        Some(json!({"kind": "update", "action": {
+            "name": "ship", "label": "Ship it now", "description": "Offer when the work is ready to release.",
+            "prompt": SHIP_PROMPT_B, "icon": "rocket", "confirm": false, "always": true,
+        }})),
+    );
+    assert_eq!(editable(&updated, "ship").unwrap()["label"], "Ship it now");
+    wait_entry(&daemon, &key(&pane), "offering the updated text", |e| {
+        action(e, "ship").is_some_and(|a| a["prompt"] == SHIP_PROMPT_B && a["confirm"] == false)
+    });
+    assert_eq!(
+        resolved_action(&resolved_catalog(&daemon), "ship").unwrap()["label"],
+        "Ship it now"
+    );
+    assert_settings_kept(&user_config_text(&dir));
+
+    let removed = catalog_edit_ok(&daemon, Some(json!({"kind": "remove", "name": "ship"})));
+    assert!(editable(&removed, "ship").is_none(), "{removed:#}");
+    wait_entry(&daemon, &key(&pane), "no longer offering it", |e| {
+        action(e, "ship").is_none()
+    });
+    assert!(resolved_action(&resolved_catalog(&daemon), "ship").is_none());
+    let saved = user_config_text(&dir);
+    assert_settings_kept(&saved);
+    assert!(
+        !saved.contains("SHIP-2399"),
+        "the removed action is gone from the file:\n{saved}"
+    );
+}
+
+/// Scenario: Through the editor's request, hide the deck's Merge it, edit the deck's Go ahead and then restore both. Hiding takes Merge it out of `card catalog` and off a card that suggested it, while the editor still lists it as a hidden deck default; the edited Go ahead reads as the user's override with the new text; restoring brings both back exactly as the deck ships them and leaves no `remove` entry or override in the file.
+#[spec("agent-report/catalog-edit/002")]
+#[test]
+fn agent_report_catalog_edit_002_hide_override_and_restore_a_default() {
+    let (daemon, dir) = daemon_with_config(EDITOR_CONFIG);
+    let pane = route::start(&daemon, "catalog-edit-default", json!({}));
+    publish(
+        &daemon,
+        &pane,
+        daemon.cwd(),
+        &json!({"status": "waiting", "actions": [{"name": "merge"}, {"name": "go-ahead"}]}),
+    );
+    wait_entry(&daemon, &key(&pane), "offering merge", |e| {
+        action(e, "merge").is_some()
+    });
+
+    let hidden = catalog_edit_ok(&daemon, Some(json!({"kind": "hide", "name": "merge"})));
+    let merge = editable(&hidden, "merge").expect("a hidden default is still listed");
+    assert_eq!(merge["hidden"], true, "{merge:#}");
+    assert_eq!(merge["source"], "default", "{merge:#}");
+    assert_eq!(merge["prompt"], MERGE_PROMPT, "{merge:#}");
+    assert!(resolved_action(&resolved_catalog(&daemon), "merge").is_none());
+    let table: toml::Table = toml::from_str(&user_config_text(&dir)).unwrap();
+    assert_eq!(
+        table["catalog"]["remove"],
+        toml::Value::Array(vec!["merge".into()])
+    );
+    let entry = wait_entry(&daemon, &key(&pane), "no catalog merge", |e| {
+        action(e, "merge").is_none_or(|a| a["source"] != "catalog")
+    });
+    assert!(action(&entry, "go-ahead").is_some(), "{entry:#}");
+    assert_settings_kept(&user_config_text(&dir));
+
+    const CARRY_ON: &str = "CARRY-ON-2399: carry on, then update your card.";
+    let overridden = catalog_edit_ok(
+        &daemon,
+        Some(json!({"kind": "update", "action": {
+            "name": "go-ahead", "label": "Carry on", "description": "Offer when you may continue.",
+            "prompt": CARRY_ON, "icon": "play",
+        }})),
+    );
+    let go = editable(&overridden, "go-ahead").unwrap();
+    assert_eq!(go["source"], "user", "{go:#}");
+    assert_eq!(go["overridden"], true, "{go:#}");
+    assert_eq!(go["default"], true, "{go:#}");
+    let resolved = resolved_catalog(&daemon);
+    assert_eq!(
+        resolved_action(&resolved, "go-ahead").unwrap()["prompt"],
+        CARRY_ON
+    );
+    wait_entry(&daemon, &key(&pane), "offering the override", |e| {
+        action(e, "go-ahead").is_some_and(|a| a["prompt"] == CARRY_ON && a["label"] == "Carry on")
+    });
+
+    for name in ["go-ahead", "merge"] {
+        catalog_edit_ok(&daemon, Some(json!({"kind": "restore", "name": name})));
+    }
+    let restored = catalog_edit_ok(&daemon, None);
+    for name in ["go-ahead", "merge"] {
+        let default = editable(&restored, name).unwrap();
+        assert_eq!(default["source"], "default", "{default:#}");
+        assert_eq!(
+            (default["hidden"].clone(), default["overridden"].clone()),
+            (json!(false), json!(false))
+        );
+    }
+    let resolved = resolved_catalog(&daemon);
+    assert_eq!(
+        resolved_action(&resolved, "merge").unwrap()["prompt"],
+        MERGE_PROMPT
+    );
+    assert_eq!(
+        resolved_action(&resolved, "go-ahead").unwrap()["prompt"],
+        "Go ahead."
+    );
+    wait_entry(&daemon, &key(&pane), "offering the defaults again", |e| {
+        action(e, "merge").is_some_and(|a| a["prompt"] == MERGE_PROMPT)
+            && action(e, "go-ahead").is_some_and(|a| a["prompt"] == "Go ahead.")
+    });
+    let saved = user_config_text(&dir);
+    assert_settings_kept(&saved);
+    let table: toml::Table = toml::from_str(&saved).unwrap();
+    let removes = table["catalog"]
+        .get("remove")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(removes.is_empty(), "no remove entry is left:\n{saved}");
+    assert!(
+        !saved.contains("CARRY-ON-2399"),
+        "no override is left:\n{saved}"
+    );
+}
+
+/// Scenario: Send the editor's request with edits the catalog refuses or that cannot apply — a bad or reserved name, an empty description, an over-long prompt, a bad icon, an unknown key such as a file path or a command, an unknown kind of edit, adding over a default, removing a default, hiding or restoring a name that is no default. Each is answered with a reason naming the problem, and the user config and the catalog stay exactly as they were.
+#[spec("agent-report/catalog-edit/003")]
+#[test]
+fn agent_report_catalog_edit_003_a_refused_edit_writes_nothing() {
+    let (daemon, dir) = daemon_with_config(EDITOR_CONFIG);
+    let before = user_config_text(&dir);
+    let catalog_before = resolved_catalog(&daemon);
+    let action_with = |overrides: Value| {
+        let mut action =
+            json!({"name": "ship", "description": "Offer when it is ready.", "prompt": "Ship it."});
+        for (k, v) in overrides.as_object().unwrap() {
+            action[k] = v.clone();
+        }
+        json!({"kind": "add", "action": action})
+    };
+    let cases: Vec<(&str, Value, &str)> = vec![
+        ("bad name", action_with(json!({"name": "Ship It"})), "name"),
+        (
+            "reserved name",
+            action_with(json!({"name": "close"})),
+            "reserved",
+        ),
+        (
+            "empty description",
+            action_with(json!({"description": ""})),
+            "description",
+        ),
+        (
+            "over-long prompt",
+            action_with(json!({"prompt": "p".repeat(2001)})),
+            "prompt",
+        ),
+        (
+            "over-long label",
+            action_with(json!({"label": "l".repeat(41)})),
+            "label",
+        ),
+        (
+            "bad icon",
+            action_with(json!({"icon": "../../etc"})),
+            "icon",
+        ),
+        (
+            "a file path",
+            action_with(json!({"path": "/etc/passwd"})),
+            "",
+        ),
+        ("a command", action_with(json!({"command": "rm -rf ~"})), ""),
+        (
+            "an unknown edit",
+            json!({"kind": "write_file", "name": "ship"}),
+            "",
+        ),
+        (
+            "add over a default",
+            action_with(json!({"name": "merge"})),
+            "merge",
+        ),
+        (
+            "remove a default",
+            json!({"kind": "remove", "name": "merge"}),
+            "merge",
+        ),
+        (
+            "hide a non-default",
+            json!({"kind": "hide", "name": "explain"}),
+            "explain",
+        ),
+        (
+            "restore a non-default",
+            json!({"kind": "restore", "name": "nope"}),
+            "nope",
+        ),
+    ];
+    for (case, edit, needle) in cases {
+        let response = catalog_edit(&daemon, Some(edit));
+        assert_eq!(response["ok"], false, "{case}: refused: {response:#}");
+        let error = response["error"].as_str().unwrap_or_default();
+        assert!(!error.is_empty(), "{case}: a reason: {response:#}");
+        assert!(
+            error.to_lowercase().contains(needle),
+            "{case}: the reason names {needle:?}: {error}"
+        );
+        assert_eq!(
+            user_config_text(&dir),
+            before,
+            "{case}: the file is untouched"
+        );
+    }
+    assert_eq!(resolved_catalog(&daemon), catalog_before);
+    // The editor still reads it: refusals left nothing behind.
+    assert_eq!(
+        editable_names(&catalog_edit_ok(&daemon, None)),
+        ["go-ahead", "merge", "explain"]
+    );
+}
+
+/// Scenario: Point the daemon at a user config that is not valid TOML, then at one that is not UTF-8, and ask the editor's request to add an action: each is refused with a reason, and the file is left byte for byte as it was. Then point a daemon at a user config that does not exist yet: adding an action creates the file, and `card catalog` lists the action.
+#[spec("agent-report/catalog-edit/004")]
+#[test]
+fn agent_report_catalog_edit_004_an_unreadable_file_is_refused_and_a_missing_one_created() {
+    let add = json!({"kind": "add", "action": {
+        "name": "ship", "description": "Offer when it is ready.", "prompt": SHIP_PROMPT,
+    }});
+    let (daemon, dir) = daemon_with_config(EDITOR_CONFIG);
+    let unreadable: Vec<(&str, Vec<u8>, &str)> = vec![
+        (
+            "not TOML",
+            b"default_command = \n[catalog]\nremove = [\"merge\"]\n".to_vec(),
+            "toml",
+        ),
+        (
+            "not UTF-8",
+            b"default_command = \"\xff\xfe\"\n".to_vec(),
+            "",
+        ),
+    ];
+    for (case, bytes, needle) in unreadable {
+        std::fs::write(config_path(&dir), &bytes).unwrap();
+        let response = catalog_edit(&daemon, Some(add.clone()));
+        assert_eq!(response["ok"], false, "{case}: refused: {response:#}");
+        let error = response["error"].as_str().unwrap_or_default();
+        assert!(!error.is_empty(), "{case}: a reason: {response:#}");
+        assert!(error.to_lowercase().contains(needle), "{case}: {error}");
+        assert_eq!(
+            std::fs::read(config_path(&dir)).unwrap(),
+            bytes,
+            "{case}: never overwritten"
+        );
+        // A read still answers, and says what is wrong with the file.
+        let read = catalog_edit_ok(&daemon, None);
+        assert!(
+            read["errors"].as_array().is_some_and(|e| !e.is_empty()),
+            "{case}: the read names the problem: {read:#}"
+        );
+    }
+
+    let home = common::harness_tempdir().expect("config tempdir");
+    let missing = home.path().join("config.toml");
+    let fresh =
+        inbox::daemon_unbound(&[("DOT_AGENT_DECK_CONFIG", missing.to_string_lossy().as_ref())]);
+    let added = catalog_edit_ok(&fresh, Some(add));
+    assert!(editable(&added, "ship").is_some(), "{added:#}");
+    let written = std::fs::read_to_string(&missing).expect("an add creates the user config");
+    assert!(written.contains("SHIP-2399"), "{written}");
+    let resolved = resolved_catalog(&fresh);
+    assert_eq!(
+        resolved_action(&resolved, "ship").unwrap()["prompt"],
+        SHIP_PROMPT
+    );
+    assert_eq!(resolved["errors"], json!([]));
+}
+
 /// The user config every test's daemon reads: the deck's default catalog plus
 /// one action that asks for confirmation.
 const DEPLOY_PROMPT: &str = "DEPLOY-PROMPT-7f3a: deploy it, then update your card.";

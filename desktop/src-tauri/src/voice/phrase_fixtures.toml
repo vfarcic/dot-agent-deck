@@ -60,6 +60,24 @@ outcome = "dispatch"
 resolved_agent = "agent-gen-coder"
 resolved_card_action = "go ahead"
 
+# PRD #2374 decision 2026-11-24 (issue #2399 on PR #2491): the card actions
+# editor opens by voice from the agent dashboard, and so does its form for a
+# new action (CLAUDE.md rule 23). TDD (RED): these name commands that do not
+# exist yet, so `voice_desktop_phrases_010` fails until they do.
+[[fixtures]]
+name = "card-actions-editor-open"
+utterance = "open the card actions editor"
+screen = "overview"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-add"
+utterance = "add a new card action"
+screen = "overview"
+action = "add_card_action"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-agent-zoom"
 utterance = "zoom the tester"

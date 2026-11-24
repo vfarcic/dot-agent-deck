@@ -869,6 +869,112 @@ pub fn resolve_from_user_config() -> ResolvedCatalog {
     resolved
 }
 
+/// Issue #2399 (PR #2491 scope extension, PRD #2374 decision 2026-11-24): one
+/// change the desktop app's card-action editor asks the daemon to make to the
+/// `[catalog]` actions of the user config the daemon reads. The request names
+/// no file and no key outside one action: the daemon writes only its own user
+/// config's catalog actions (`[[catalog.actions]]` and `catalog.remove`).
+///
+/// - `add`: a new user action; its name must not be a deck default's or an
+///   existing user action's.
+/// - `update`: replace the user action of that name, or override the deck
+///   default of that name with a user entry of the same name.
+/// - `remove`: delete a user action that overrides no default (a default is
+///   hidden, not removed).
+/// - `hide`: hide a deck default (its name in `catalog.remove`, and any user
+///   override of it gone).
+/// - `restore`: bring a deck default back as the deck ships it (its name out
+///   of `catalog.remove`, and any user override of it gone).
+///
+/// TDD stub (RED): the shape the tests are written against; nothing acts on
+/// it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CatalogActionEdit {
+    Add { action: CatalogActionInput },
+    Update { action: CatalogActionInput },
+    Remove { name: String },
+    Hide { name: String },
+    Restore { name: String },
+}
+
+/// One action as the editor's form sends it: every key a `[[catalog.actions]]`
+/// entry may carry, and nothing else (an unknown key is refused).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogActionInput {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub description: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Placement>,
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub always: bool,
+}
+
+/// One action as the editor lists it: the resolved action (its `source` says
+/// whether the deck's default or the user's entry is in effect), whether a
+/// deck default has its name, whether the user's entry overrides that
+/// default, and whether the user's `remove` hides it (a hidden default is
+/// listed with the deck's own values, so it can be restored).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditableCatalogAction {
+    #[serde(flatten)]
+    pub action: CatalogAction,
+    pub default: bool,
+    pub overridden: bool,
+    pub hidden: bool,
+}
+
+/// The catalog actions the editor shows: deck defaults (hidden ones included)
+/// in catalog order, then the user's own in file order; never the deck's own
+/// actions (reply, open, close, close keeping the worktree). `errors` are the
+/// catalog's problems, as [`ResolvedCatalog::errors`]; `user_config` is the
+/// file read, when there is one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditableCardCatalog {
+    pub actions: Vec<EditableCatalogAction>,
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub user_config: Option<String>,
+}
+
+/// TDD stub (RED): the editable catalog of a user config's raw TOML (`None`:
+/// no file).
+pub fn editable_catalog(_user_config_toml: Option<&str>) -> EditableCardCatalog {
+    unimplemented!("issue #2399: the editable card catalog")
+}
+
+/// TDD stub (RED): the user config's raw TOML (`None`: no file) with `edit`
+/// applied to its catalog actions and nothing else changed — every other
+/// setting, table, the `[catalog]` fields and comments kept. `Err` with the
+/// reason when the edit is invalid (the catalog's own validation) or
+/// impossible, or the file is not valid TOML; nothing is written then.
+pub fn apply_action_edit(
+    _user_config_toml: Option<&str>,
+    _edit: &CatalogActionEdit,
+) -> Result<String, String> {
+    unimplemented!("issue #2399: apply a card-action edit")
+}
+
+/// TDD stub (RED): read the user config at `path` and, with `edit`, apply it
+/// and replace the file atomically; answer the editable catalog afterwards. A
+/// file that cannot be read (not UTF-8, larger than the reader reads, not
+/// valid TOML) is refused and never written; a missing file is created by an
+/// edit; no edit (`None`) writes nothing.
+pub fn edit_user_catalog_at(
+    _path: &std::path::Path,
+    _edit: Option<&CatalogActionEdit>,
+) -> Result<EditableCardCatalog, String> {
+    unimplemented!("issue #2399: edit the user config's card catalog")
+}
+
 /// The text block appended to a dispatched unit's task (both launch shapes)
 /// and printed by `card catalog`: what an agent card is and which fields and
 /// actions the deck knows. `bin` is the deck binary's name.
@@ -1366,5 +1472,592 @@ remove = [\"go-ahead\"]
         assert_eq!(default_label("pull-request"), "Pull request");
         assert!(is_valid_icon("git-merge"));
         assert!(!is_valid_icon("Git"));
+    }
+
+    // Issue #2399 (PR #2491 scope extension): the desktop's card-action editor
+    // changes the daemon's user catalog through these. TDD (RED): written
+    // before the implementation; `editable_catalog`, `apply_action_edit` and
+    // `edit_user_catalog_at` are stubs until it lands.
+
+    fn input(name: &str) -> CatalogActionInput {
+        CatalogActionInput {
+            name: name.to_string(),
+            label: None,
+            description: format!("Offer when {name} applies."),
+            prompt: format!("Do {name}, then update your card."),
+            icon: None,
+            placement: None,
+            confirm: false,
+            always: false,
+        }
+    }
+
+    fn user_action_tables(saved: &str) -> Vec<toml::Table> {
+        let table: toml::Table = toml::from_str(saved).unwrap();
+        table
+            .get("catalog")
+            .and_then(|c| c.get("actions"))
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|t| t.as_table().cloned()).collect())
+            .unwrap_or_default()
+    }
+
+    fn removed_names(saved: &str) -> Vec<String> {
+        let table: toml::Table = toml::from_str(saved).unwrap();
+        table
+            .get("catalog")
+            .and_then(|c| c.get("remove"))
+            .and_then(|r| r.as_array())
+            .map(|r| {
+                r.iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    const EDITED_CONFIG: &str = "\
+# my deck
+default_command = \"claude\" # the usual
+
+[bell]
+on_idle = true
+
+[catalog]
+# keep this catalog comment
+remove = [\"merge\"] # not merge
+
+[[catalog.fields]]
+name = \"risk\"
+description = \"How risky the change is.\"
+type = \"text\"
+
+[[catalog.actions]]
+# the ship comment
+name = \"ship\"
+description = \"Offer when it is ready.\"
+prompt = \"Ship it.\"
+
+[from_a_newer_build]
+answer = 42
+";
+
+    /// Issue #2399: adding, updating and removing a user action through the
+    /// editor changes only `[[catalog.actions]]`; every other setting, table,
+    /// the catalog's fields and `remove`, and the user's comments are kept.
+    #[test]
+    fn an_action_edit_keeps_every_other_setting_comment_and_the_catalog_fields() {
+        let before: toml::Table = toml::from_str(EDITED_CONFIG).unwrap();
+        let deploy = CatalogActionInput {
+            label: Some("Deploy it".into()),
+            description: "Offer when the change can be deployed.".into(),
+            prompt: "Deploy it.\nThen update your card.".into(),
+            icon: Some("rocket".into()),
+            confirm: true,
+            ..input("deploy")
+        };
+        let saved = apply_action_edit(
+            Some(EDITED_CONFIG),
+            &CatalogActionEdit::Add { action: deploy },
+        )
+        .expect("a valid add is written");
+        assert!(
+            saved.starts_with("# my deck\ndefault_command = \"claude\" # the usual\n"),
+            "{saved}"
+        );
+        for kept in [
+            "# keep this catalog comment",
+            "remove = [\"merge\"] # not merge",
+            "# the ship comment",
+        ] {
+            assert!(saved.contains(kept), "{kept:?} kept:\n{saved}");
+        }
+        let after: toml::Table = toml::from_str(&saved).unwrap();
+        for key in ["default_command", "bell", "from_a_newer_build"] {
+            assert_eq!(after[key], before[key], "{key} kept:\n{saved}");
+        }
+        assert_eq!(after["catalog"]["fields"], before["catalog"]["fields"]);
+        assert_eq!(after["catalog"]["remove"], before["catalog"]["remove"]);
+        let resolved = resolve(Some(&saved));
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        assert_eq!(names_a(&resolved), ["go-ahead", "ship", "deploy"]);
+        let added = resolved.action("deploy").unwrap();
+        assert_eq!(added.label, "Deploy it");
+        assert_eq!(added.prompt, "Deploy it.\nThen update your card.");
+        assert_eq!(added.icon.as_deref(), Some("rocket"));
+        assert!(added.confirm && !added.always);
+        assert_eq!(added.source, CatalogSource::User);
+
+        // Update: the entry of that name is replaced; its neighbours are not.
+        let saved = apply_action_edit(
+            Some(&saved),
+            &CatalogActionEdit::Update {
+                action: CatalogActionInput {
+                    label: Some("Ship it now".into()),
+                    prompt: "Ship it now, then update your card.".into(),
+                    always: true,
+                    ..input("ship")
+                },
+            },
+        )
+        .expect("a valid update is written");
+        let resolved = resolve(Some(&saved));
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        assert_eq!(names_a(&resolved), ["go-ahead", "ship", "deploy"]);
+        let ship = resolved.action("ship").unwrap();
+        assert_eq!(ship.label, "Ship it now");
+        assert_eq!(ship.prompt, "Ship it now, then update your card.");
+        assert!(ship.always);
+        assert_eq!(resolved.action("deploy").unwrap().label, "Deploy it");
+        assert_eq!(user_action_tables(&saved).len(), 2, "{saved}");
+
+        // Remove: the user's own action goes; everything else stays.
+        let saved = apply_action_edit(
+            Some(&saved),
+            &CatalogActionEdit::Remove {
+                name: "deploy".into(),
+            },
+        )
+        .expect("removing a user action is written");
+        let resolved = resolve(Some(&saved));
+        assert_eq!(names_a(&resolved), ["go-ahead", "ship"]);
+        let after: toml::Table = toml::from_str(&saved).unwrap();
+        for key in ["default_command", "bell", "from_a_newer_build"] {
+            assert_eq!(after[key], before[key], "{key} kept:\n{saved}");
+        }
+        assert_eq!(after["catalog"]["fields"], before["catalog"]["fields"]);
+        assert!(saved.contains("# keep this catalog comment"), "{saved}");
+
+        // With no file, an add writes a file holding just that action.
+        let fresh = apply_action_edit(
+            None,
+            &CatalogActionEdit::Add {
+                action: input("ship"),
+            },
+        )
+        .expect("an add with no file is written");
+        let resolved = resolve(Some(&fresh));
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        assert_eq!(names_a(&resolved), ["go-ahead", "merge", "ship"]);
+    }
+
+    /// Issue #2399: hiding a deck default writes its name into
+    /// `catalog.remove` and drops any user override of it (which would bring
+    /// it back); editing a default writes a same-name user override; restoring
+    /// undoes both, so the deck's own definition applies again.
+    #[test]
+    fn hiding_editing_and_restoring_a_default_go_through_remove_and_overrides() {
+        let original = "\
+[[catalog.actions]]
+name = \"go-ahead\"
+description = \"Offer when you may continue.\"
+prompt = \"Proceed.\"
+";
+        let hidden = apply_action_edit(
+            Some(original),
+            &CatalogActionEdit::Hide {
+                name: "go-ahead".into(),
+            },
+        )
+        .expect("hiding a default is written");
+        assert_eq!(removed_names(&hidden), ["go-ahead"], "{hidden}");
+        assert!(
+            user_action_tables(&hidden)
+                .iter()
+                .all(|t| t.get("name").and_then(|n| n.as_str()) != Some("go-ahead")),
+            "the override would bring the hidden default back:\n{hidden}"
+        );
+        let resolved = resolve(Some(&hidden));
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        assert_eq!(names_a(&resolved), ["merge"]);
+
+        let restored = apply_action_edit(
+            Some(&hidden),
+            &CatalogActionEdit::Restore {
+                name: "go-ahead".into(),
+            },
+        )
+        .expect("restoring a hidden default is written");
+        assert!(removed_names(&restored).is_empty(), "{restored}");
+        assert_eq!(resolve(Some(&restored)).actions, default_actions());
+
+        let overridden = apply_action_edit(
+            Some(&restored),
+            &CatalogActionEdit::Update {
+                action: CatalogActionInput {
+                    label: Some("Merge it".into()),
+                    prompt: "Merge with a squash commit, then update your card.".into(),
+                    icon: Some("git-merge".into()),
+                    ..input("merge")
+                },
+            },
+        )
+        .expect("editing a default writes an override");
+        let resolved = resolve(Some(&overridden));
+        assert_eq!(names_a(&resolved), ["go-ahead", "merge"]);
+        let merge = resolved.action("merge").unwrap();
+        assert_eq!(merge.source, CatalogSource::User);
+        assert_eq!(
+            merge.prompt,
+            "Merge with a squash commit, then update your card."
+        );
+
+        let back = apply_action_edit(
+            Some(&overridden),
+            &CatalogActionEdit::Restore {
+                name: "merge".into(),
+            },
+        )
+        .expect("restoring an overridden default is written");
+        assert!(user_action_tables(&back).is_empty(), "{back}");
+        assert!(removed_names(&back).is_empty(), "{back}");
+        let resolved = resolve(Some(&back));
+        assert_eq!(resolved.actions, default_actions());
+    }
+
+    /// Issue #2399: an edit the catalog would reject, or one that cannot
+    /// apply, is refused with a reason naming the problem, and nothing is
+    /// produced to write. The values the editor sends are validated as a
+    /// `[[catalog.actions]]` entry in the file is.
+    #[test]
+    fn an_invalid_or_impossible_edit_is_refused_with_its_reason() {
+        let base = "default_command = \"claude\"\n";
+        let mut many = String::from(base);
+        for n in 0..(MAX_CATALOG_ACTIONS - default_actions().len()) {
+            many.push_str(&format!(
+                "\n[[catalog.actions]]\nname = \"a{n}\"\ndescription = \"d\"\nprompt = \"p\"\n"
+            ));
+        }
+        assert!(resolve(Some(&many)).errors.is_empty());
+        let add = |action: CatalogActionInput| CatalogActionEdit::Add { action };
+        let cases: Vec<(&str, String, CatalogActionEdit, &str)> = vec![
+            ("bad name", base.into(), add(input("Ship It")), "name"),
+            (
+                "reserved name",
+                base.into(),
+                add(input("close")),
+                "reserved",
+            ),
+            (
+                "reserved question name",
+                base.into(),
+                add(input("question-x")),
+                "reserved",
+            ),
+            (
+                "empty description",
+                base.into(),
+                add(CatalogActionInput {
+                    description: " ".into(),
+                    ..input("ship")
+                }),
+                "description",
+            ),
+            (
+                "over-long prompt",
+                base.into(),
+                add(CatalogActionInput {
+                    prompt: "p".repeat(MAX_PROMPT_CHARS + 1),
+                    ..input("ship")
+                }),
+                "prompt",
+            ),
+            (
+                "empty prompt",
+                base.into(),
+                add(CatalogActionInput {
+                    prompt: String::new(),
+                    ..input("ship")
+                }),
+                "prompt",
+            ),
+            (
+                "over-long label",
+                base.into(),
+                add(CatalogActionInput {
+                    label: Some("l".repeat(MAX_CATALOG_LABEL_CHARS + 1)),
+                    ..input("ship")
+                }),
+                "label",
+            ),
+            (
+                "multi-line label",
+                base.into(),
+                add(CatalogActionInput {
+                    label: Some("Ship\nit".into()),
+                    ..input("ship")
+                }),
+                "label",
+            ),
+            (
+                "control character in the prompt",
+                base.into(),
+                add(CatalogActionInput {
+                    prompt: "Ship\u{1b}[2Jit".into(),
+                    ..input("ship")
+                }),
+                "prompt",
+            ),
+            (
+                "bad icon",
+                base.into(),
+                add(CatalogActionInput {
+                    icon: Some("Rocket!".into()),
+                    ..input("ship")
+                }),
+                "icon",
+            ),
+            (
+                "add over a default",
+                base.into(),
+                add(input("go-ahead")),
+                "go-ahead",
+            ),
+            (
+                "update of nothing",
+                base.into(),
+                CatalogActionEdit::Update {
+                    action: input("nope"),
+                },
+                "nope",
+            ),
+            (
+                "remove a default",
+                base.into(),
+                CatalogActionEdit::Remove {
+                    name: "merge".into(),
+                },
+                "merge",
+            ),
+            (
+                "remove of nothing",
+                base.into(),
+                CatalogActionEdit::Remove {
+                    name: "nope".into(),
+                },
+                "nope",
+            ),
+            (
+                "hide a user action",
+                base.into(),
+                CatalogActionEdit::Hide {
+                    name: "ship".into(),
+                },
+                "ship",
+            ),
+            (
+                "restore of nothing",
+                base.into(),
+                CatalogActionEdit::Restore {
+                    name: "nope".into(),
+                },
+                "nope",
+            ),
+            ("one past the limit", many.clone(), add(input("ship")), "32"),
+            (
+                "a file that is not TOML",
+                "default_command = \n".into(),
+                add(input("ship")),
+                "TOML",
+            ),
+        ];
+        for (case, file, edit, needle) in cases {
+            match apply_action_edit(Some(&file), &edit) {
+                Ok(saved) => panic!("{case}: refused, not written as:\n{saved}"),
+                Err(reason) => assert!(
+                    reason.to_lowercase().contains(&needle.to_lowercase()),
+                    "{case}: the reason names {needle:?}: {reason}"
+                ),
+            }
+        }
+    }
+
+    /// Issue #2399: the editor lists the deck defaults (a hidden one with the
+    /// deck's own values) and then the user's own actions, each saying where
+    /// the action in effect came from, whether it is a default, overridden or
+    /// hidden; never the deck's own reply, open and close.
+    #[test]
+    fn the_editable_catalog_lists_each_action_with_where_it_came_from() {
+        let none = editable_catalog(None);
+        assert!(none.errors.is_empty(), "{:?}", none.errors);
+        assert_eq!(none.user_config, None);
+        assert_eq!(
+            none.actions
+                .iter()
+                .map(|a| a.action.name.as_str())
+                .collect::<Vec<_>>(),
+            ["go-ahead", "merge"]
+        );
+        assert!(none.actions.iter().all(|a| a.default
+            && !a.overridden
+            && !a.hidden
+            && a.action.source == CatalogSource::Default));
+
+        let file = "\
+[catalog]
+remove = [\"merge\"]
+
+[[catalog.actions]]
+name = \"go-ahead\"
+description = \"Offer when you may continue.\"
+prompt = \"Proceed.\"
+
+[[catalog.actions]]
+name = \"ship\"
+label = \"Ship it\"
+description = \"Offer when it is ready.\"
+prompt = \"Ship it.\"
+icon = \"rocket\"
+";
+        let listed = editable_catalog(Some(file));
+        assert!(listed.errors.is_empty(), "{:?}", listed.errors);
+        let names: Vec<&str> = listed
+            .actions
+            .iter()
+            .map(|a| a.action.name.as_str())
+            .collect();
+        assert_eq!(names, ["go-ahead", "merge", "ship"]);
+        for reserved in RESERVED_ACTION_NAMES {
+            assert!(!names.contains(reserved), "{reserved} is the deck's own");
+        }
+        let by = |name: &str| {
+            listed
+                .actions
+                .iter()
+                .find(|a| a.action.name == name)
+                .unwrap()
+        };
+        let go = by("go-ahead");
+        assert_eq!(go.action.source, CatalogSource::User);
+        assert_eq!(go.action.prompt, "Proceed.");
+        assert!(go.default && go.overridden && !go.hidden);
+        let merge = by("merge");
+        assert_eq!(merge.action.source, CatalogSource::Default);
+        assert_eq!(
+            &merge.action,
+            default_actions()
+                .iter()
+                .find(|a| a.name == "merge")
+                .unwrap()
+        );
+        assert!(merge.default && !merge.overridden && merge.hidden);
+        let ship = by("ship");
+        assert_eq!(ship.action.source, CatalogSource::User);
+        assert_eq!(ship.action.label, "Ship it");
+        assert_eq!(ship.action.icon.as_deref(), Some("rocket"));
+        assert!(!ship.default && !ship.overridden && !ship.hidden);
+
+        // The editor's request carries the action's own keys and nothing
+        // else: a path, a command or any other key is refused at parsing.
+        let wire = serde_json::json!({"kind": "add", "action": {
+            "name": "ship", "description": "d", "prompt": "p", "path": "/etc/passwd"
+        }});
+        assert!(serde_json::from_value::<CatalogActionEdit>(wire).is_err());
+        let wire = serde_json::json!({"kind": "hide", "name": "merge"});
+        assert_eq!(
+            serde_json::from_value::<CatalogActionEdit>(wire).unwrap(),
+            CatalogActionEdit::Hide {
+                name: "merge".into()
+            }
+        );
+    }
+
+    /// Issue #2399: the daemon's write replaces the user config whole, by
+    /// rename (a reader sees the old file or the new one, never half), and
+    /// leaves nothing beside it; a file it cannot read — not UTF-8, larger
+    /// than the catalog reader reads, not valid TOML — is refused and left
+    /// byte for byte as it was, as is a valid file whose edit is refused. A
+    /// read with no edit writes nothing; a missing file is created by an add.
+    #[cfg(unix)]
+    #[test]
+    fn the_catalog_file_is_replaced_whole_and_one_it_cannot_read_is_never_written() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let read = edit_user_catalog_at(&path, None).expect("a read answers");
+        assert_eq!(
+            read.user_config.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode,
+            "a read writes nothing"
+        );
+
+        let refused = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("Bad Name"),
+            }),
+        );
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+
+        let edited = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect("a valid add is written");
+        assert!(edited.actions.iter().any(|a| a.action.name == "deploy"));
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode,
+            "the file is replaced by rename, not rewritten in place"
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("# my deck\n"), "{saved}");
+        assert!(resolve(Some(&saved)).action("deploy").is_some());
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["config.toml"], "no temp file left beside it");
+
+        let unreadable: Vec<(&str, Vec<u8>)> = vec![
+            ("not UTF-8", b"default_command = \"\xff\xfe\"\n".to_vec()),
+            ("not TOML", b"default_command = \n[catalog]\n".to_vec()),
+            (
+                "too large",
+                format!("# {}\n", "x".repeat(MAX_USER_CONFIG_BYTES as usize)).into_bytes(),
+            ),
+        ];
+        for (case, bytes) in unreadable {
+            std::fs::write(&path, &bytes).unwrap();
+            let result = edit_user_catalog_at(
+                &path,
+                Some(&CatalogActionEdit::Add {
+                    action: input("ship"),
+                }),
+            );
+            assert!(result.is_err(), "{case}: refused: {result:?}");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "{case}: never written"
+            );
+        }
+
+        let missing = dir.path().join("new").join("config.toml");
+        let created = edit_user_catalog_at(
+            &missing,
+            Some(&CatalogActionEdit::Add {
+                action: input("ship"),
+            }),
+        )
+        .expect("an add with no file creates it");
+        assert!(created.actions.iter().any(|a| a.action.name == "ship"));
+        let written = std::fs::read_to_string(&missing).unwrap();
+        assert!(
+            resolve(Some(&written)).action("ship").is_some(),
+            "{written}"
+        );
     }
 }

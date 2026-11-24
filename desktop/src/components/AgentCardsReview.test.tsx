@@ -189,8 +189,8 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(screen.queryByTestId("agent-card-action-result")).toBeNull();
   });
 
-  /// Scenario: read a compact card without a summary, then open its overlay. The compact card omits the primary action, and the overlay labels the agent's custom action and fields as the agent's.
-  it("a card without a summary keeps its custom action and labelled fields in the overlay (S2)", () => {
+  /// Scenario: read a compact card without a summary, then open its overlay. The compact card shows the agent's custom action only as an icon whose text is in its hover, never on the card, and the overlay labels the agent's custom action and fields as the agent's.
+  it("a card without a summary keeps its custom action's text and labelled fields in the overlay (S2)", () => {
     const card = entry("7", "coder", {
       report: { source: "agent", status: "working", summary: null, published_at: "2026-11-17T00:00:00Z", revision: 1 },
       fields: [{ name: "risk", label: "Risk", description: null, type: "text", icon: null, placement: "card", custom: true, source: "agent", value: "low" }],
@@ -199,7 +199,12 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     });
     render(<AgentOverview runtime={runtime([card])} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
-    expect(screen.queryByRole("button", { name: /Go ahead/ })).toBeNull();
+    // PRD #2374 decision 2026-11-24 (2): the action is an icon on the card; its text is only in its hover.
+    const icon = screen.getByRole("button", { name: "Go ahead" });
+    expect(icon).toHaveAttribute("data-testid", "agent-card-action-icon");
+    expect(icon.textContent).toBe("");
+    expect(icon.title).toContain("Go on.");
+    expect(screen.queryByText("Go on.")).toBeNull();
     // Issue #2418: the fields are the overlay's, under the agent's label.
     expect(screen.queryByText("low")).toBeNull();
     fireEvent.click(screen.getByTestId("agent-card-details"));

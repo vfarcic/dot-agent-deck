@@ -255,13 +255,16 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     expect(cardNodes().filter((node) => node.getAttribute("data-faded") === "true")).toEqual([]);
   });
 
-  /// Scenario: read a card with a primary action and press its icon-only Close control. The primary action is absent; Close shows the same confirmation and sends the same token as Close in the overlay, while a daemon-disabled Close stays disabled and sends nothing.
-  it("desktop/agent-cards/003: the compact card keeps only Close, with the overlay's confirmation, token and disabled states", async () => {
+  /// Scenario: read a card with a primary action and press its icon-only Close control. The primary action is an icon beside Close whose exact text is only in its hover, never on the card; Close shows the same confirmation and sends the same token as Close in the overlay, while a daemon-disabled Close stays disabled and sends nothing.
+  it("desktop/agent-cards/003: the compact card's Close sits beside its action icons, with the overlay's confirmation, token and disabled states", async () => {
     const close = action("close", { label: "Close", kind: "close", prompt: null, source: "deck", placement: "detail", confirm: true, confirm_detail: "This removes the worktree.", token: "close-round-two" });
     const card = { ...ZULU, actions: [...ZULU.actions.filter((a) => a.id !== "close"), close] };
     const live = runtime({}, [card]);
     const view = cardsView(live);
-    expect(within(cardOf(card.key)).queryByRole("button", { name: "Merge it" })).toBeNull();
+    // PRD #2374 decision 2026-11-24 (2): the primary action is an icon beside Close, its text in its hover only.
+    const merge = within(cardOf(card.key)).getByRole("button", { name: "Merge it" });
+    expect(merge.textContent).toBe("");
+    expect(merge.title).toContain(LONG_PROMPT);
     expect(within(cardOf(card.key)).queryByText(LONG_PROMPT)).toBeNull();
     const closeButton = within(cardOf(card.key)).getByRole("button", { name: /^Close(?: zulu(?:'s agent)?)?$/ });
     expect(closeButton.textContent).toBe("");
@@ -503,5 +506,171 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     expect(consumeOn).toHaveBeenCalledTimes(1);
     rerender(<AgentOverview runtime={live} onNavigate={navigate} />);
     expect(consumeOn).toHaveBeenCalledTimes(1);
+  });
+});
+
+/*
+ * PRD #2374 decision 2026-11-24 (2), issue #2399 on PR #2491 — a card shows an
+ * icon for each prompt action its agent offers right now, beside Close. TDD
+ * (RED): written before the card draws them.
+ *
+ * The contract these hold the implementation to:
+ * - one icon button per prompt action the card lists in its overlay, in the
+ *   daemon's order, but never Reply (or any text-input action), Open, an
+ *   answer to the agent's own question, or the deck's Close / Close keeping
+ *   the worktree (Close keeps its own icon);
+ * - each is `data-testid="agent-card-action-icon"` with `data-action` (the
+ *   action id) and `data-icon` (the catalog icon it draws, or `generic` for no
+ *   icon or one the app does not bundle), has no visible text, is named by the
+ *   action's label, and its hover (`title`) says the label and the exact text;
+ * - a press takes the overlay's path: a catalog action is sent through the one
+ *   `invokeCardAction`, a `confirm` action and text the agent wrote open the
+ *   overlay's confirmation / review first, and a disabled one says why;
+ * - at most {@link CARD_ICON_LIMIT} icons; the rest are one `+N` control
+ *   (`agent-card-actions-more`) that opens the card's overlay.
+ */
+const CARD_ICON_LIMIT = 3;
+
+const iconsOn = (key: string) => within(cardOf(key)).queryAllByTestId("agent-card-action-icon");
+
+function treeSnapshot(entries: AgentCardEntry[]): AgentCardsSnapshot {
+  return { ...snapshot(entries), tree: true };
+}
+
+describe("desktop/agent-cards — action icons on a card (PRD #2374, 2026-11-24)", () => {
+  /// Scenario: read a card whose agent offers two catalog prompt actions, an answer to its own question, Reply, Open, Close and Close keeping the worktree. The card shows one icon per prompt action, in the daemon's order, beside Close, each named by its label with its label and exact text in its hover and no text on the card; a root's card and, once the root is opened, its child's card both do.
+  it("desktop/agent-cards/046: a card shows an icon for each prompt action it offers, beside Close, with the exact text on hover", () => {
+    const question = { id: "base", text: "Which base branch?", source: "agent", options: [{ id: "main", label: "main", action_id: "question/base/main" }], answered: null };
+    const root = entry("41", "root", {
+      questions: [question],
+      actions: [
+        action("explain", { label: "Explain", prompt: "Explain what you did.", icon: null }),
+        action("question/base/main", { label: "main", prompt: "Answer: main", prompt_source: "agent" }),
+        action("merge", { label: "Merge it", prompt: LONG_PROMPT, icon: "git-merge", prompt_source: "catalog" }),
+        ...deckActions(),
+        action("close-keep-worktree", { label: "Close, keep worktree", kind: "close_keep_worktree", prompt: null, source: "deck", placement: "detail", confirm: true }),
+      ],
+      rollup: { total: 1, worst: "idle", counts: { idle: 1 }, needs_you: 0 },
+    });
+    const child = entry("42", "child", { parent: root.key, actions: [action("go-ahead", { label: "Go ahead", prompt: "Go ahead.", icon: "play" }), ...deckActions()] });
+    cardsView(runtime({ agentCards: { [FIXTURE_DAEMON_ID]: treeSnapshot([root, child]) } }, [root, child]));
+
+    const icons = iconsOn(root.key);
+    expect(icons.map((icon) => icon.getAttribute("data-action"))).toEqual(["explain", "merge"]);
+    for (const [icon, label, prompt] of [[icons[0], "Explain", "Explain what you did."], [icons[1], "Merge it", LONG_PROMPT]] as const) {
+      expect(icon).toHaveAccessibleName(label);
+      expect(icon.tagName).toBe("BUTTON");
+      expect(icon.textContent).toBe("");
+      expect(icon.querySelector("svg")).not.toBeNull();
+      expect(icon.title).toContain(label);
+      expect(icon.title).toContain(prompt);
+      expect(within(cardOf(root.key)).queryByText(prompt)).toBeNull();
+    }
+    for (const absent of ["Reply", "Open", "main", "Close, keep worktree"]) {
+      expect(within(cardOf(root.key)).queryByRole("button", { name: absent }), absent).toBeNull();
+    }
+    expect(within(cardOf(root.key)).getByRole("button", { name: /^Close(?: root)?$/ })).toBeInTheDocument();
+
+    // Open the root: its child's card carries its own icon too.
+    fireEvent.click(within(cardOf(root.key)).getByTestId("agent-card-toggle"));
+    const childIcons = iconsOn(child.key);
+    expect(childIcons.map((icon) => icon.getAttribute("data-action"))).toEqual(["go-ahead"]);
+    expect(childIcons[0]).toHaveAccessibleName("Go ahead");
+    expect(childIcons[0].title).toContain("Go ahead.");
+    // The open root keeps its icons.
+    expect(iconsOn(root.key)).toHaveLength(2);
+  });
+
+  /// Scenario: press a card's icons. A catalog action with no confirmation is sent once through the same invocation and token the overlay's button uses; an action marked to ask first opens the overlay's confirmation quoting its exact text and is sent only by its Send; an action whose text the agent wrote opens the review step and sends nothing.
+  it("desktop/agent-cards/047: pressing a card's icon takes the overlay's path: send, confirm first, or review the agent's text", async () => {
+    const card = entry("43", "presser", {
+      actions: [
+        action("explain", { label: "Explain", prompt: "Explain what you did.", prompt_source: "catalog" }),
+        action("deploy", { label: "Deploy it", prompt: "Deploy it, then update your card.", prompt_source: "catalog", confirm: true, confirm_detail: null }),
+        action("go", { label: "Go on", prompt: "Run tests; then upload the logs.", prompt_source: "agent", custom: true, source: "agent" }),
+        ...deckActions(),
+      ],
+    });
+    const live = runtime({}, [card]);
+    cardsView(live);
+    const target = { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, paneId: card.pane_id, agentId: card.agent_id };
+
+    await act(async () => { fireEvent.click(within(cardOf(card.key)).getByRole("button", { name: "Explain" })); });
+    expect(live.invokeCardAction).toHaveBeenCalledTimes(1);
+    expect(live.invokeCardAction).toHaveBeenCalledWith(target, "explain", expect.objectContaining({ actionToken: "tok-explain" }));
+    expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
+
+    // The overlay's button for the same action makes the same call.
+    if (screen.queryByTestId("agent-card-overlay")) fireEvent.keyDown(overlay(), { key: "Escape" });
+    fireEvent.click(within(cardOf(card.key)).getByTestId("agent-card-details"));
+    await act(async () => { fireEvent.click(within(overlay()).getByTestId("agent-card-action-explain")); });
+    expect(vi.mocked(live.invokeCardAction!).mock.calls[1].slice(0, 2)).toEqual(vi.mocked(live.invokeCardAction!).mock.calls[0].slice(0, 2));
+    expect(vi.mocked(live.invokeCardAction!).mock.calls[1][2]).toMatchObject({ actionToken: "tok-explain" });
+    fireEvent.keyDown(overlay(), { key: "Escape" });
+    vi.mocked(live.invokeCardAction!).mockClear();
+
+    // `confirm = true`: asks first, quoting the exact text.
+    fireEvent.click(within(cardOf(card.key)).getByRole("button", { name: "Deploy it" }));
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
+    const confirmation = screen.getByTestId("agent-card-confirm");
+    expect(within(confirmation).getByTestId("agent-card-confirm-prompt").textContent).toBe("Deploy it, then update your card.");
+    await act(async () => { fireEvent.click(within(confirmation).getByTestId("agent-card-confirm-send")); });
+    expect(live.invokeCardAction).toHaveBeenCalledExactlyOnceWith(target, "deploy", expect.objectContaining({ confirm: true, actionToken: "tok-deploy" }));
+    fireEvent.keyDown(overlay(), { key: "Escape" });
+    vi.mocked(live.invokeCardAction!).mockClear();
+
+    // Text the agent wrote: the review step, nothing sent.
+    fireEvent.click(within(cardOf(card.key)).getByRole("button", { name: "Go on" }));
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
+    expect(within(screen.getByTestId("agent-card-confirm")).getByTestId("agent-card-confirm-prompt").textContent).toBe("Run tests; then upload the logs.");
+  });
+
+  /// Scenario: read the card of a stopped agent whose prompt action the daemon disabled. Its icon is drawn disabled, its hover says why in the overlay's words, and pressing it sends nothing and opens nothing.
+  it("desktop/agent-cards/048: a disabled action's icon is disabled and says why on hover", () => {
+    const live = runtime({}, [MIKE]);
+    cardsView(live);
+    const ship = within(cardOf(MIKE.key)).getByRole("button", { name: "Ship it" });
+    expect(ship).toHaveAttribute("data-testid", "agent-card-action-icon");
+    expect(ship).toBeDisabled();
+    expect(ship.title).toContain("Release it.");
+    expect(ship.title).toContain("the agent is not running");
+    fireEvent.click(ship);
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+  });
+
+  /// Scenario: read a card whose actions carry the catalog icons `git-merge` and `play`, no icon, and an icon name the app does not bundle. The two known icons are drawn as themselves; the action with no icon and the one with the unknown icon both get the one generic icon.
+  it("desktop/agent-cards/049: an action with no icon, or one the app does not know, gets the generic icon", () => {
+    const card = entry("44", "icons", {
+      actions: [
+        action("merge", { label: "Merge it", icon: "git-merge" }),
+        action("go-ahead", { label: "Go ahead", icon: "play" }),
+        action("plain", { label: "Plain", icon: null }),
+        ...deckActions(),
+      ],
+    });
+    const other = entry("45", "unknown-icon", { actions: [action("weird", { label: "Weird", icon: "no-such-icon-2399" }), ...deckActions()] });
+    cardsView(runtime({}, [card, other]));
+    expect(iconsOn(card.key).map((icon) => icon.getAttribute("data-icon"))).toEqual(["git-merge", "play", "generic"]);
+    expect(iconsOn(other.key).map((icon) => icon.getAttribute("data-icon"))).toEqual(["generic"]);
+    const svg = (icon: HTMLElement) => icon.querySelector("svg")?.outerHTML;
+    expect(svg(iconsOn(other.key)[0])).toBe(svg(iconsOn(card.key)[2]));
+    expect(svg(iconsOn(card.key)[0])).not.toBe(svg(iconsOn(card.key)[2]));
+  });
+
+  /// Scenario: read a card whose agent offers five prompt actions. The card shows the first three as icons, in the daemon's order, and a `+2` control instead of the rest; pressing it opens the card's overlay, which lists all five, and sends nothing.
+  it("desktop/agent-cards/050: past three icons a card shows +N, which opens its overlay with every action", () => {
+    const five = ["a1", "a2", "a3", "a4", "a5"].map((id) => action(id, { label: `Action ${id}`, prompt: `Do ${id}.` }));
+    const card = entry("46", "busy", { actions: [...five, ...deckActions()] });
+    const live = runtime({}, [card]);
+    cardsView(live);
+    expect(iconsOn(card.key).map((icon) => icon.getAttribute("data-action"))).toEqual(["a1", "a2", "a3"].slice(0, CARD_ICON_LIMIT));
+    const more = within(cardOf(card.key)).getByTestId("agent-card-actions-more");
+    expect(more).toHaveTextContent("+2");
+    expect(more).toHaveAccessibleName(/2 more actions/);
+    expect(within(cardOf(card.key)).getByRole("button", { name: /^Close(?: busy)?$/ })).toBeInTheDocument();
+    fireEvent.click(more);
+    for (const id of ["a1", "a2", "a3", "a4", "a5"]) expect(within(overlay()).getByTestId(`agent-card-action-${id}`)).toBeInTheDocument();
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
   });
 });

@@ -4698,6 +4698,23 @@ impl DaemonClient {
             })
     }
 
+    /// Issue #2399 (PR #2491 scope extension): the desktop's card-action
+    /// editor. With no `edit`, read the daemon's user catalog actions with
+    /// where each came from; with one, apply it to the daemon's own user
+    /// config and answer the catalog afterwards. A refused edit is
+    /// [`ClientError::Server`] with the daemon's reason, nothing written.
+    /// **Withheld unless the daemon's `Hello` on the same connection
+    /// advertised [`crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT`]**,
+    /// answering [`GatedQuery::Unsupported`] without sending anything.
+    ///
+    /// TDD stub (RED): not implemented yet.
+    pub async fn card_catalog_edit(
+        &self,
+        _edit: Option<crate::card_catalog::CatalogActionEdit>,
+    ) -> Result<GatedQuery<crate::card_catalog::EditableCardCatalog>, ClientError> {
+        unimplemented!("issue #2399: the card-action editor's request")
+    }
+
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
     /// admitted on its own connection (PRD #1666 part 2): agent ids are a
     /// per-daemon counter, so a replacement the client would refuse may hold an
@@ -7542,6 +7559,146 @@ mod tests {
             assert_eq!(agent_card_request_inner(batch, 4).await, (true, 1));
             assert_eq!(agent_card_request_inner(batch, 5).await, (true, 1));
         });
+    }
+
+    /// Issue #2399 (PR #2491 scope extension) — the daemon advertises
+    /// `agent-cards-catalog-edit`, and the card-action editor's request (a
+    /// read or an edit) goes only on a connection whose `Hello` named it and
+    /// `hello-follow-on`: against a daemon that names neither, only one, or
+    /// the cards capabilities without it, the call answers Unsupported and
+    /// nothing follows the Hello. Against one that names both, exactly the
+    /// one `card-catalog-edit` request follows, carrying the edit as given.
+    #[cfg(unix)]
+    #[test]
+    fn a_catalog_edit_is_sent_only_to_a_daemon_that_advertises_it() {
+        use crate::card_catalog::{CatalogActionEdit, CatalogActionInput};
+        use crate::daemon_protocol::{
+            CAP_AGENT_CARDS, CAP_AGENT_CARDS_BATCH, CAP_AGENT_CARDS_CATALOG_EDIT,
+            CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON, DAEMON_CAPABILITIES,
+        };
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS_CATALOG_EDIT));
+        let add = CatalogActionEdit::Add {
+            action: CatalogActionInput {
+                name: "ship".into(),
+                description: "Offer when it is ready.".into(),
+                prompt: "Ship it.".into(),
+                icon: Some("rocket".into()),
+                ..Default::default()
+            },
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(
+                    &[
+                        CAP_AGENT_CARDS,
+                        CAP_AGENT_CARDS_TREE,
+                        CAP_AGENT_CARDS_BATCH,
+                        CAP_HELLO_FOLLOW_ON,
+                    ][..],
+                ),
+                Some(&[CAP_AGENT_CARDS_CATALOG_EDIT][..]),
+            ] {
+                for edit in [None, Some(add.clone())] {
+                    let (answered, sent) = catalog_edit_request(advertised, edit).await;
+                    assert!(!answered, "{advertised:?}: Unsupported");
+                    assert!(
+                        sent.is_empty(),
+                        "{advertised:?}: nothing follows the Hello: {sent:?}"
+                    );
+                }
+            }
+            let both = Some(&[CAP_AGENT_CARDS_CATALOG_EDIT, CAP_HELLO_FOLLOW_ON][..]);
+            let (answered, sent) = catalog_edit_request(both, None).await;
+            assert!(answered);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(sent[0]["op"], "card-catalog-edit");
+            assert!(
+                sent[0].get("edit").is_none_or(|edit| edit.is_null()),
+                "a read carries no edit: {sent:?}"
+            );
+            let (answered, sent) = catalog_edit_request(both, Some(add.clone())).await;
+            assert!(answered);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(sent[0]["op"], "card-catalog-edit");
+            assert_eq!(sent[0]["edit"], serde_json::to_value(&add).unwrap());
+        });
+    }
+
+    /// The card-action editor's request against a fake daemon whose `Hello`
+    /// advertises `advertised`: whether it was answered, and every request
+    /// that followed the Hello. The answer is written as raw JSON, so the fake
+    /// needs nothing of the response the daemon will send but its key.
+    #[cfg(unix)]
+    async fn catalog_edit_request(
+        advertised: Option<&'static [&'static str]>,
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
+    ) -> (bool, Vec<serde_json::Value>) {
+        let (_dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("catalog-edit-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = sent.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let mut frames = 0usize;
+                while let Ok(Ok(Some((_kind, payload)))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut stream))
+                        .await
+                {
+                    frames += 1;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).unwrap_or_default();
+                    let op = request.get("op").and_then(|op| op.as_str()).unwrap_or("");
+                    let response = if frames == 1 && op == "hello" {
+                        serde_json::to_value(AttachResponse {
+                            capabilities: advertised
+                                .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                            instance_id: Some("test-instance".to_string()),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        })
+                        .unwrap()
+                    } else {
+                        recorded.lock().unwrap().push(request.clone());
+                        let mut ok = serde_json::to_value(AttachResponse::ok()).unwrap();
+                        if op == "card-catalog-edit" {
+                            ok["card_catalog_edit"] = serde_json::json!({"actions": [], "errors": [], "user_config": null});
+                        }
+                        ok
+                    };
+                    let bytes = serde_json::to_vec(&response).unwrap();
+                    if crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &bytes,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let client = DaemonClient::new(path);
+        let answered = matches!(
+            client.card_catalog_edit(edit).await,
+            Ok(GatedQuery::Answered(_))
+        );
+        server.abort();
+        let sent = sent.lock().unwrap().clone();
+        (answered, sent)
     }
 
     /// Issue #2418 (T8) — [`tree_gate`] keeps the tree fields from a daemon

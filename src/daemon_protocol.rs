@@ -1306,6 +1306,14 @@ pub const CAP_AGENT_CARDS_TREE: &str = "agent-cards-tree";
 /// against it. Advertised on every platform: the arm is not `#[cfg]`-gated.
 pub const CAP_AGENT_CARDS_BATCH: &str = "agent-cards-batch";
 
+/// Capability string for the desktop's card-action editor (issue #2399, PR
+/// #2491 scope extension): a request that reads the user catalog's actions
+/// with where each came from, and adds, updates, removes, hides or restores
+/// one, writing the daemon's own user config. Withheld by its sender unless
+/// the `Hello` on the same connection named this, so no [`PROTOCOL_VERSION`]
+/// bump. TDD stub (RED): not advertised yet, and no request carries it.
+pub const CAP_AGENT_CARDS_CATALOG_EDIT: &str = "agent-cards-catalog-edit";
+
 /// Capability string for [`AttachRequest::AgentOpened`] (issue #2454): a
 /// client tells the daemon the user opened an agent's pane, which deals with
 /// the `waiting`, `done` or `failed` reason the agent's card report raised.
