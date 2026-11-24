@@ -107,6 +107,16 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards-batch",
+        description: "The desktop Cards view's batch confirmation for four selected agents: three included, each with the exact text it gets, and one skipped with its reason (issue #2399).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-results",
+        description: "The same batch after Send: each agent's outcome, two queued for the agent and one failed with the daemon's reason (issue #2399).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "new-agent",
         description: "The New Agent form with a project directory selected.",
         clients: &[Client::Tui, Client::Desktop],

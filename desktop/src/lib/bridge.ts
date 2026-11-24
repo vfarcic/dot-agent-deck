@@ -1,4 +1,4 @@
-import { createFixtureFleet, docsAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -3325,8 +3325,9 @@ class FixtureDeckBridge implements DeckBridge {
    * PRD #2374 — the `agent-cards` docs scene's card list: served only for
    * `/?fixture=1&state=docs&cards=1`, so no other fixture scene shows cards,
    * needs-you bells or row menus; issue #2418's tree scene, with eight roots
-   * and their trees, for `cards=tree`. Every other deck and scene answers as
-   * a daemon without cards does.
+   * and their trees, for `cards=tree`; issue #2399's batch scene, the same
+   * cards from a daemon that does batches, for `cards=batch`. Every other deck
+   * and scene answers as a daemon without cards does.
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
     const cards = this.sceneCards();
@@ -3344,6 +3345,7 @@ class FixtureDeckBridge implements DeckBridge {
     const scene = new URLSearchParams(window.location.search).get("cards");
     if (this.fixtureState !== "docs") return null;
     if (scene === "1") return docsAgentCards();
+    if (scene === "batch") return docsBatchAgentCards();
     if (scene !== "tree" && scene !== "tree-nested") return null;
     if (!this.treeCards) {
       this.treeCards = treeAgentCards(scene);
@@ -3389,8 +3391,9 @@ class FixtureDeckBridge implements DeckBridge {
    * cards it shows: a preview includes each card offering the action enabled,
    * with that card's own exact text, and skips the rest with a reason; an
    * execution queues the text for every confirmed entry, as a daemon answers
-   * it (`state: "queued"`). Nothing changes in the
-   * fixture's state.
+   * it (`state: "queued"`), except the one agent the `cards=batch` scene's
+   * daemon refuses, so its results show a partial failure. Nothing changes in
+   * the fixture's state.
    */
   async invokeCardActionBatch(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult> {
     const shown = this.treeCards ?? this.sceneCards();
@@ -3399,6 +3402,8 @@ class FixtureDeckBridge implements DeckBridge {
       const card = cards.find((candidate) => candidate.pane_id === target.pane_id && candidate.agent_id === target.agent_id);
       const base = { pane_id: target.pane_id, agent_id: target.agent_id, ...(card ? { name: card.name } : {}) };
       if (options.mode === "execute") {
+        const refused = card && new URLSearchParams(window.location.search).get("cards") === "batch" ? docsBatchExecuteFailure(card.agent_id) : undefined;
+        if (refused) return { ...base, outcome: "failed", ...refused };
         return card ? { ...base, outcome: "delivered", message_id: `m-fixture-batch-${target.agent_id}`, state: "queued" } : { ...base, outcome: "failed", code: "unknown_entry", message: "there is no such card" };
       }
       const action = card?.actions.find((candidate) => candidate.id === actionId);

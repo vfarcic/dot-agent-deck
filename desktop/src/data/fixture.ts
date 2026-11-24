@@ -990,6 +990,39 @@ export function docsAgentCards(): AgentCardsSnapshot {
   return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 12, entries, catalogErrors: [], tree: true };
 }
 
+/*
+ * Issue #2399 — the `agent-cards-batch` and `agent-cards-batch-results` docs
+ * scenes (`/?fixture=1&state=docs&cards=batch`): the `agent-cards` scene's
+ * cards from a daemon that does batch actions, with a catalog action,
+ * Status update, offered by the orchestration's three cards and not by the
+ * standalone agent's, so a batch to all four previews three included agents
+ * and one skipped. Its execution fails for one agent, as a daemon refuses a
+ * press on an agent that stopped after the preview, so the results show a
+ * partial failure. Served only for `cards=batch`, so neither the `agent-cards`
+ * scene nor any other shows a Select button.
+ */
+const DOCS_BATCH_ACTION = "status-update";
+const DOCS_BATCH_PROMPT = "Post a short status update on your card: what is done, what is next, and anything that blocks you.";
+const DOCS_BATCH_OFFERED = new Set(["1", "2", "3"]);
+/** The agent whose press the scene's daemon refuses at Send, and the sentence it refuses with. */
+const DOCS_BATCH_EXECUTE_FAILURES: Readonly<Record<string, { code: string; message: string }>> = {
+  "2": { code: "action_disabled", message: "Status update is disabled: the agent is not running" },
+};
+
+/** Issue #2399 — the `cards=batch` scene's cards: `docsAgentCards()` from a daemon that does batches. */
+export function docsBatchAgentCards(): AgentCardsSnapshot {
+  const snapshot = docsAgentCards();
+  const entries = snapshot.entries.map((entry) => DOCS_BATCH_OFFERED.has(entry.agent_id)
+    ? { ...entry, actions: [docsCardAction(DOCS_BATCH_ACTION, { label: "Status update", prompt: DOCS_BATCH_PROMPT, prompt_source: "catalog", placement: "detail", icon: "activity" }), ...entry.actions] }
+    : entry);
+  return { ...snapshot, entries, batch: true };
+}
+
+/** Issue #2399 — how the `cards=batch` scene's daemon refuses `agentId` at Send, if it does. */
+export function docsBatchExecuteFailure(agentId: string): { code: string; message: string } | undefined {
+  return DOCS_BATCH_EXECUTE_FAILURES[agentId];
+}
+
 /** Issue #2418 — one card of the `cards=tree` scene: its name, status and kind, and the cards it started. */
 interface TreeSceneCard {
   name: string;

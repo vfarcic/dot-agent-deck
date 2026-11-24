@@ -106,6 +106,46 @@ desktopScenario("agent-cards", async (page) => {
   await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
 });
 
+// Issue #2399 — desktop-only: the TUI has no cards view. The `agent-cards`
+// scene's cards from a daemon that does batches (`docsBatchAgentCards`, served
+// only with `cards=batch`): Select, the closed orchestrator root (which
+// selects it and its two roles) and the standalone agent, then Status update,
+// which the three orchestration cards offer and the standalone one does not.
+async function openCardsBatch(page: Page): Promise<void> {
+  await page.goto("/?fixture=1&state=docs&cards=batch");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByTestId("overview-mode-cards").click();
+  await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(2);
+  await page.getByTestId("agent-cards-select").click();
+  await page.getByRole("checkbox", { name: "Select Plan / architecture" }).check();
+  await page.getByRole("checkbox", { name: "Select User-path verification" }).check();
+  await expect(page.getByTestId("agent-cards-selection-count")).toHaveText("4 selected");
+  await page.getByTestId("agent-cards-batch-action-status-update").click();
+}
+
+desktopScenario("agent-cards-batch", async (page) => {
+  await openCardsBatch(page);
+  const dialog = page.getByTestId("agent-cards-batch-confirm");
+  await expect(dialog.locator(".agent-cards-batch-entry.is-included")).toHaveCount(3);
+  await expect(dialog.getByTestId("agent-cards-batch-prompt").first()).toContainText("Post a short status update on your card");
+  await expect(dialog.locator(".agent-cards-batch-entry.is-skipped")).toContainText("User-path verification's card does not offer this action");
+  await expect(dialog.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
+});
+
+// The same batch after Send: two agents queued, and one the daemon refused
+// because it stopped after the preview, so the headline reads as a partial
+// failure.
+desktopScenario("agent-cards-batch-results", async (page) => {
+  await openCardsBatch(page);
+  await page.getByTestId("agent-cards-batch-confirm").getByRole("button", { name: "Send", exact: true }).click();
+  const results = page.getByTestId("agent-cards-batch-results");
+  await expect(results.getByTestId("agent-cards-batch-entry")).toHaveCount(3);
+  await expect(results.locator("[data-outcome='failed']")).toContainText("Status update is disabled: the agent is not running");
+  await expect(results.getByRole("status")).toHaveText("2 queued for the agent of 3; 1 failed");
+  await expect(results.getByRole("button", { name: "Close", exact: true })).toBeVisible();
+});
+
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows
 // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`), on the `docs` deck.
 // The host button beside the deck's name, opened: its popover is what the
