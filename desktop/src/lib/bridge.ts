@@ -22,7 +22,7 @@ import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { STAR_THANKS, type StarChoice } from "./starPrompt";
 import { fixtureInterruptedWork } from "../data/fixtureInterrupted";
-import { isDismissOutcome, isInterruptedList, isInterruptedShow, isReclaimOutcome, normalizeInterruptedReply, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "./interruptedWork";
+import { isDismissOutcome, isInterruptedList, isInterruptedShow, isReclaimOutcome, isRestoreOutcome, isStartOverOutcome, normalizeInterruptedReply, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreOutcome, type StartOverOutcome } from "./interruptedWork";
 import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } from "./antigravityNotice";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
@@ -2530,6 +2530,16 @@ export interface DeckBridge {
   interruptedWorkReclaim?(target: InterruptedTarget, id: string, dryRun: boolean): Promise<InterruptedReply<ReclaimOutcome>>;
   /** PRD #1790 stage 2 — dismiss exactly the items `ids` name (`interrupted_work_dismiss`); Dismiss all passes the ids it listed. */
   interruptedWorkDismiss?(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>>;
+  /**
+   * PRD #1790 stage 3 — restore the attempts `agents` of item `id` with their
+   * conversations (`interrupted_work_restore`), or with `dryRun` ask what that
+   * would do. The daemon starts the agent, so both clients restore the same
+   * way; `unsupported` when that daemon does not advertise `restore-agents`.
+   * The person's client: no pane claim.
+   */
+  interruptedWorkRestore?(target: InterruptedTarget, id: string, agents: string[], mode: RestoreMode, dryRun: boolean): Promise<InterruptedReply<RestoreOutcome>>;
+  /** PRD #1790 stage 3 — start attempt `agent` of item `id` over in its folder, without its conversation (`interrupted_work_start_over`). */
+  interruptedWorkStartOver?(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>>;
   dispose(): Promise<void>;
 }
 
@@ -3389,12 +3399,17 @@ class FixtureDeckBridge implements DeckBridge {
    * `interrupted=1` in the URL, `interrupted=many` for 27 more units than
    * the three (a list longer than the dialog), or `interrupted=unread` for an
    * empty list that says the journal could not be read whole (verification
-   * finding N4): a daemon that does not support it otherwise. Dismiss and a
-   * real reclaim remove the item for the rest of the session.
+   * finding N4), or `interrupted=restore` (PRD #1790 stage 3) for a unit
+   * that can be restored and a Pi that can only start over, or
+   * `interrupted=restore-long` for the same with an agent name far longer
+   * than the dialog is tall: a daemon that does not support it otherwise.
+   * Dismiss, a real reclaim, restore and start-over remove the item for the
+   * rest of the session.
    */
   private readonly interrupted = (() => {
     const asked = new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("interrupted");
-    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread", asked === "many" ? 27 : 0, asked === "unread");
+    const restorable = asked === "restore" || asked === "restore-long";
+    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread" || restorable, asked === "many" ? 27 : 0, asked === "unread", restorable, asked === "restore-long");
   })();
   async interruptedWorkList(target: InterruptedTarget): Promise<InterruptedReply<InterruptedList>> {
     return this.interrupted.list(target);
@@ -3407,6 +3422,12 @@ class FixtureDeckBridge implements DeckBridge {
   }
   async interruptedWorkDismiss(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>> {
     return this.interrupted.dismiss(target, ids);
+  }
+  async interruptedWorkRestore(target: InterruptedTarget, id: string, agents: string[], mode: RestoreMode, dryRun: boolean): Promise<InterruptedReply<RestoreOutcome>> {
+    return this.interrupted.restore(target, id, agents, mode, dryRun);
+  }
+  async interruptedWorkStartOver(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>> {
+    return this.interrupted.startOver(target, id, agent, dryRun);
   }
   /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
   async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
@@ -6238,6 +6259,16 @@ export class TauriDeckBridge implements DeckBridge {
   async interruptedWorkDismiss(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>> {
     const invoke = await this.getInvoke();
     return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_dismiss", { deckId: target.deckId, instanceId: target.instance, ids }), isDismissOutcome);
+  }
+
+  async interruptedWorkRestore(target: InterruptedTarget, id: string, agents: string[], mode: RestoreMode, dryRun: boolean): Promise<InterruptedReply<RestoreOutcome>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_restore", { deckId: target.deckId, instanceId: target.instance, id, agents, mode, dryRun }), isRestoreOutcome);
+  }
+
+  async interruptedWorkStartOver(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_start_over", { deckId: target.deckId, instanceId: target.instance, id, agent, dryRun }), isStartOverOutcome);
   }
 
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {

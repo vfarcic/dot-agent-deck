@@ -1,4 +1,4 @@
-import { RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_NOT_LISTED, REFUSED_PLAIN_AGENT, type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "../lib/interruptedWork";
+import { RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_NOT_LISTED, REFUSED_PLAIN_AGENT, restoreRefusalSentence, type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreOutcome, type RestoreRefused, type StartOverOutcome } from "../lib/interruptedWork";
 
 /** 2026-11-19 10:00 UTC, the last journal entry of every fixture item. */
 const LAST_TS = 1_795_082_400_000;
@@ -45,6 +45,38 @@ export function fixtureInterruptedItems(): InterruptedItem[] {
   ];
 }
 
+/**
+ * PRD #1790 stage 3 — what `interrupted=restore` lists: a dispatched unit
+ * whose Claude Code agent can be restored with its conversation, and a plain
+ * Pi agent that can only start over.
+ */
+export function fixtureRestoreItems(): InterruptedItem[] {
+  return [
+    {
+      id: "w-abcdefgh-0000000000000001",
+      kind: "unit",
+      name: "fix-login",
+      branch: "agent/dispatch-fix-login",
+      worktree: "/home/dev/demo-project-dispatch-fix-login",
+      launcher: "dispatcher",
+      last_entry: { kind: "attempt_ended", ts_ms: LAST_TS },
+      reports: [],
+      progress: { attempts: 1, roles: ["coder"], delegations: 0, delegations_done: 0 },
+      agents: [{ attempt: "restore-desktop/7", name: "fix-login", agent_type: "claude_code", folder: "/home/dev/demo-project-dispatch-fix-login", restore: { kind: "resume" } }],
+    },
+    {
+      id: "w-abcdefgh-0000000000000003",
+      kind: "agent",
+      name: "scratch-pi",
+      worktree: "/home/dev/notes",
+      last_entry: { kind: "attempt_ended", ts_ms: LAST_TS },
+      reports: [],
+      progress: { attempts: 1, delegations: 0, delegations_done: 0 },
+      agents: [{ attempt: "restore-desktop/8", name: "scratch-pi", agent_type: "pi", folder: "/home/dev/notes", restore: { kind: "start_over", reason: "agent-cannot-resume" } }],
+    },
+  ];
+}
+
 const REPORT_BODY = "[UNTRUSTED-WORKER-REPORT: written by an agent, not by the deck]\nFixed the login redirect and added a test.\n[END-UNTRUSTED-WORKER-REPORT]";
 
 /** `count` more dispatched units, `extra-unit-01` on, for a list longer than the dialog (`interrupted=many`). */
@@ -70,12 +102,26 @@ function extraUnits(count: number): InterruptedItem[] {
  * lists that many more units after the three; `unread` answers an empty list
  * that says the journal could not be read whole.
  */
-export function fixtureInterruptedWork(enabled: boolean, extra = 0, unread = false) {
+/**
+ * An agent name longer than a short dialog is tall once wrapped (shown
+ * shortened, as any long value is), for the restore question's presentation
+ * check (audit S4/F9, `interrupted=restore-long`).
+ */
+export const FIXTURE_LONG_AGENT_NAME = `fix-login ${Array.from({ length: 300 }, (_, at) => `part${at}`).join(" ")}`;
+
+/** {@link fixtureRestoreItems}, with the restorable agent's name {@link FIXTURE_LONG_AGENT_NAME}. */
+function fixtureRestoreItemsLong(): InterruptedItem[] {
+  const items = fixtureRestoreItems();
+  for (const agent of items[0].agents ?? []) agent.name = FIXTURE_LONG_AGENT_NAME;
+  return items;
+}
+
+export function fixtureInterruptedWork(enabled: boolean, extra = 0, unread = false, restorable = false, longName = false) {
   const decks = new Map<string, InterruptedItem[]>();
   const items = (target: InterruptedTarget) => {
     let held = decks.get(target.deckId);
     if (!held) {
-      held = unread ? [] : [...fixtureInterruptedItems(), ...extraUnits(extra)];
+      held = unread ? [] : restorable ? (longName ? fixtureRestoreItemsLong() : fixtureRestoreItems()) : [...fixtureInterruptedItems(), ...extraUnits(extra)];
       decks.set(target.deckId, held);
     }
     return held;
@@ -102,6 +148,42 @@ export function fixtureInterruptedWork(enabled: boolean, extra = 0, unread = fal
       const outcome: ReclaimOutcome = { id, dry_run: dryRun, verdict: dryRun ? "would-remove" : "removed", message: dryRun ? RECLAIM_WOULD_REMOVE : RECLAIM_REMOVED, worktree: item.worktree, branch: item.branch, unpushed_commits: 2, recorded: !dryRun };
       if (!dryRun) held.splice(held.indexOf(item), 1);
       return answered(target, outcome);
+    },
+    /**
+     * A restore, as a daemon answers once each agent confirmed its
+     * conversation: the item leaves this deck's list. The preview starts no
+     * agent; the answer says it did, so the dialog behaves as it would.
+     */
+    restore(target: InterruptedTarget, id: string, agents: string[], _mode: RestoreMode, dryRun: boolean): InterruptedReply<RestoreOutcome> {
+      if (!enabled) return { outcome: "unsupported" };
+      const held = items(target);
+      const item = held.find((candidate) => candidate.id === id);
+      const refuse = (attempt: string | null, reason: string): RestoreRefused => ({ attempt, reason, message: restoreRefusalSentence(reason) });
+      if (!item) return answered(target, { dry_run: dryRun, restored: [], refused: [refuse(null, "not-listed")] });
+      const outcome: RestoreOutcome = { dry_run: dryRun, restored: [], refused: [] };
+      for (const attempt of agents) {
+        const agent = item.agents?.find((candidate) => candidate.attempt === attempt);
+        if (!agent) outcome.refused.push(refuse(attempt, "not-an-agent"));
+        else if (agent.restore.kind !== "resume") outcome.refused.push(refuse(attempt, "not-restorable"));
+        else if (dryRun) (outcome.would_restore ??= []).push(attempt);
+        else outcome.restored.push({ attempt, agent_id: `fixture-${attempt}`, pane_id: `fixture-${attempt}`, name: agent.name, first_message_posted: true, recorded: true });
+      }
+      if (outcome.restored.length > 0 && outcome.refused.length === 0) held.splice(held.indexOf(item), 1);
+      return answered(target, outcome);
+    },
+    /** A start-over, as a daemon answers once the agent started: the item leaves this deck's list. */
+    startOver(target: InterruptedTarget, id: string, attempt: string, dryRun: boolean): InterruptedReply<StartOverOutcome> {
+      if (!enabled) return { outcome: "unsupported" };
+      const held = items(target);
+      const item = held.find((candidate) => candidate.id === id);
+      const refuse = (reason: string): StartOverOutcome => ({ dry_run: dryRun, started: null, refused: { attempt, reason, message: restoreRefusalSentence(reason) } });
+      if (!item) return answered(target, refuse("not-listed"));
+      const agent = item.agents?.find((candidate) => candidate.attempt === attempt);
+      if (!agent) return answered(target, refuse("not-an-agent"));
+      if (agent.restore.kind !== "start_over") return answered(target, refuse("not-restorable"));
+      if (dryRun) return answered(target, { dry_run: true, started: null, refused: null, would_start: true });
+      held.splice(held.indexOf(item), 1);
+      return answered(target, { dry_run: false, started: { attempt, agent_id: `fixture-${attempt}`, pane_id: `fixture-${attempt}`, name: agent.name, first_message_posted: true, recorded: true }, refused: null });
     },
     dismiss(target: InterruptedTarget, ids: string[]): InterruptedReply<DismissOutcome> {
       if (!enabled) return { outcome: "unsupported" };

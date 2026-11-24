@@ -3100,3 +3100,31 @@ screen = "agent"
 action = "dictate_to_agent"
 outcome = "dispatch"
 dictate_prefix = "type"
+
+[[fixtures]]
+name = "restore-interrupted-selected"
+utterance = "restore the agent"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-bring-back"
+utterance = "bring back fix-login"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-conversation"
+utterance = "resume fix-login's conversation"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-unavailable-in-pane"
+utterance = "restore the agent"
+screen = "agent"
+action = "restore_interrupted"
+outcome = "unavailable"

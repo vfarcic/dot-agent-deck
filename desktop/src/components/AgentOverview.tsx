@@ -1625,6 +1625,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       showReports: (said) => reach((open) => open.showReports(said)),
       nextReports: () => reach((open) => open.nextReports()),
       previousReports: () => reach((open) => open.previousReports()),
+      askRestore: (said) => reach((open) => open.askRestore(said)),
+      restoreAndContinue: () => reach((open) => open.restoreAndContinue()),
+      restoreOnly: () => reach((open) => open.restoreOnly()),
+      startOver: () => reach((open) => open.startOver()),
       back: () => { reach((open) => open.back()); },
       close: () => { reach((open) => open.close()); },
     };
