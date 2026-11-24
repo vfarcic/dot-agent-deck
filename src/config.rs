@@ -1340,12 +1340,14 @@ pub(crate) fn lock_config_edit_by(
 /// relative one from the current folder), following each link where it is
 /// met — in a folder component or in the final file's own chain — and `..`
 /// against the folder reached so far, as the kernel does (final audit A2,
-/// round 4). Each folder a name is looked up in is judged with its parents,
-/// up to the user's home (as `$HOME` names it, or resolved) or up to the root
-/// when the folder is not under it: every folder holding a link that is
-/// followed, at any depth, and every other folder looked in that is not above
-/// the home (home's own parents are judged only where they hold a followed
-/// link). The folder the final file is in is one of those. Refused: more than
+/// round 4). A judged folder is judged with its parents, up to the user's
+/// home (as `$HOME` names it, or resolved) when the folder is under it, and
+/// up to the root otherwise. Judged: the folder the final file is in, whether
+/// or not the file exists and wherever the folder is (round 5, C1); every
+/// folder holding a link that is followed, at any depth; and every other
+/// folder a name is looked up in, except a folder strictly above the home
+/// that the walk passes through on its way down, which is judged only where
+/// it holds a followed link or holds the final file. Refused: more than
 /// [`FOLDER_CHECK_MAX_LINKS`] links followed (a loop among them), a link that
 /// cannot be read, and an entry that cannot be inspected; the final file may
 /// be absent, a folder before it may not. Checked by pathname when the save
@@ -1402,8 +1404,9 @@ fn folder_others_can_change(configured: &Path) -> Result<(), String> {
         }
         Ok(())
     };
-    // A folder strictly above the home: the walk passes through it to reach
-    // the home, and its parents are judged only where it holds a link.
+    // A folder strictly above the home: the walk passes through it on the way
+    // to the home, and it is judged there only where it holds a followed link.
+    // The folder the final file is in is judged wherever it is (round 5, C1).
     let above_home = |dir: &Path| {
         home.as_deref()
             .is_some_and(|home| home != dir && home.starts_with(dir))
@@ -1453,9 +1456,7 @@ fn folder_others_can_change(configured: &Path) -> Result<(), String> {
         let meta = match std::fs::symlink_metadata(&entry) {
             Ok(meta) => meta,
             Err(e) if last && e.kind() == std::io::ErrorKind::NotFound => {
-                if !above_home(&current) {
-                    judge(&current)?;
-                }
+                judge(&current)?;
                 return Ok(());
             }
             Err(e) => {
@@ -1482,7 +1483,7 @@ fn folder_others_can_change(configured: &Path) -> Result<(), String> {
             }
             continue;
         }
-        if !above_home(&current) {
+        if last || !above_home(&current) {
             judge(&current)?;
         }
         if last {
@@ -1491,9 +1492,7 @@ fn folder_others_can_change(configured: &Path) -> Result<(), String> {
         current = entry;
     }
     // The path named a folder (or the root), not a file in one.
-    if !above_home(&current) {
-        judge(&current)?;
-    }
+    judge(&current)?;
     Ok(())
 }
 

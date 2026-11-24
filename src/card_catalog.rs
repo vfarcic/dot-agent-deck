@@ -4158,4 +4158,97 @@ placement = \"card\" # on the card, on purpose
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
         add().expect("saved once the folder is private");
     }
+
+    /// Issue #2399 final audit A2, round 5 (C1): the folder the config is in
+    /// is judged even when it is above the home. With `$HOME` at
+    /// `team/alice` and `team` group-writable, an existing
+    /// `team/config.toml`, an absent `team/new.toml` and `../config.toml`
+    /// from the home are each refused naming `team`, and nothing is written;
+    /// with `team` `0750` all three are saved to.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn an_edit_is_refused_where_the_configs_own_folder_above_the_home_is_shared() {
+        use std::os::unix::fs::PermissionsExt as _;
+        struct Restore {
+            home: Option<std::ffi::OsString>,
+            cwd: std::path::PathBuf,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.cwd);
+                // SAFETY: the test holds STATE_DIR_ENV_LOCK and is serial, so
+                // no other test reads or writes HOME meanwhile.
+                unsafe {
+                    match self.home.take() {
+                        Some(home) => std::env::set_var("HOME", home),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        let _env = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::test_temp::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        let team = fixture.join("team");
+        let home = team.join("alice");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let existing = team.join("config.toml");
+        let absent = team.join("new.toml");
+        std::fs::write(&existing, EDITED_CONFIG).unwrap();
+        let _restore = Restore {
+            home: std::env::var_os("HOME"),
+            cwd: std::env::current_dir().unwrap(),
+        };
+        // SAFETY: see Restore::drop.
+        unsafe { std::env::set_var("HOME", &home) };
+        std::env::set_current_dir(&home).unwrap();
+        let relative = std::path::Path::new("../config.toml");
+        let add = |path: &std::path::Path, name: &str| {
+            edit_user_catalog_at(
+                path,
+                Some(&CatalogActionEdit::Add {
+                    action: input(name),
+                }),
+            )
+        };
+
+        std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o770)).unwrap();
+        for (path, case) in [
+            (existing.as_path(), "an existing config"),
+            (absent.as_path(), "an absent config"),
+            (relative, "a relative config"),
+        ] {
+            let refused = add(path, "deploy").expect_err(&format!(
+                "{case} in a shared folder above the home is refused"
+            ));
+            assert!(refused.contains("other users"), "{case}: {refused}");
+            assert!(
+                refused.contains(&team.display().to_string()),
+                "{case}: {refused}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&existing).unwrap(),
+                EDITED_CONFIG,
+                "{case}"
+            );
+            assert!(!absent.exists(), "{case}");
+        }
+
+        std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o750)).unwrap();
+        add(&existing, "deploy").expect("an existing config is saved to");
+        add(&absent, "deploy").expect("an absent config is created");
+        add(relative, "release").expect("a relative config is saved to");
+        let saved = std::fs::read_to_string(&existing).unwrap();
+        assert!(resolve(Some(&saved)).action("release").is_some(), "{saved}");
+        let created = std::fs::read_to_string(&absent).unwrap();
+        assert!(
+            resolve(Some(&created)).action("deploy").is_some(),
+            "{created}"
+        );
+    }
 }
