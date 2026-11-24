@@ -354,7 +354,7 @@ impl Snapshot {
 
 /// Why [`read_store_file`] produced no value.
 #[derive(Debug)]
-enum StoreFileError {
+pub(crate) enum StoreFileError {
     /// The file could not be read, or is not a regular file within
     /// [`MAX_FILE_BYTES`].
     Io(std::io::Error),
@@ -373,7 +373,7 @@ impl From<std::io::Error> for StoreFileError {
 
 /// The daemon's effective uid, which the store file must be owned by.
 #[cfg(unix)]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -381,20 +381,33 @@ fn current_uid() -> u32 {
 /// Unused off Unix: Windows compares owner SIDs instead (see the Windows
 /// `read_store_file`).
 #[cfg(not(unix))]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     0
 }
 
-/// Read [`LAST_COMMAND_FILE`] at `path`: `Ok(None)` when it does not exist.
+/// Read [`LAST_COMMAND_FILE`] at `path` through [`read_owner_only_file`],
+/// bounded by [`MAX_FILE_BYTES`].
+fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreFileError> {
+    read_owner_only_file(path, owner_uid, MAX_FILE_BYTES)
+}
+
+/// Read a daemon-owned store file at `path`: `Ok(None)` when it does not
+/// exist. Shared with [`crate::prompt_library`], whose file is held to the same
+/// rule for the same reason — what is in it is the user's own text, offered
+/// back to them.
 ///
 /// On Unix the file is opened `O_NOFOLLOW | O_NONBLOCK` and judged from the
 /// open handle, so what is checked is what is read: a symlink at `path` is
 /// refused rather than followed, and the opened file must be regular, owned by
-/// `owner_uid`, and at most [`MAX_FILE_BYTES`] long. `owner_uid` is a parameter
+/// `owner_uid`, and at most `max_bytes` long. `owner_uid` is a parameter
 /// so a test can stand in for "another user" without being root. The Windows
 /// counterpart is the next function.
 #[cfg(unix)]
-fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreFileError> {
+pub(crate) fn read_owner_only_file(
+    path: &Path,
+    owner_uid: u32,
+    max_bytes: u64,
+) -> Result<Option<String>, StoreFileError> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
@@ -430,7 +443,7 @@ fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreF
             "it is owned by another user than the daemon's",
         ));
     }
-    read_opened(file, metadata.len()).map(Some)
+    read_opened(file, metadata.len(), max_bytes).map(Some)
 }
 
 /// The Windows counterpart of the Unix reader above, judged from the open
@@ -439,14 +452,18 @@ fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreF
 /// and is refused; the opened file must be regular, owned by the current user
 /// or by the token's default owner (its owner SID, read through
 /// [`crate::platform::fsperm::verify_file_owner_is_current_user`]), and at most
-/// [`MAX_FILE_BYTES`] long. A directory fails to open at all, which reads as an
+/// `max_bytes` long. A directory fails to open at all, which reads as an
 /// unreadable file.
 ///
 /// The default owner is accepted because the store writes the file without an
 /// explicit owner, so under an elevated administrator token the file it just
 /// wrote is owned by `BUILTIN\Administrators`, not by the user's SID.
 #[cfg(windows)]
-fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, StoreFileError> {
+pub(crate) fn read_owner_only_file(
+    path: &Path,
+    _owner_uid: u32,
+    max_bytes: u64,
+) -> Result<Option<String>, StoreFileError> {
     use std::io::{Error, ErrorKind};
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use std::os::windows::io::AsRawHandle as _;
@@ -486,34 +503,38 @@ fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, Store
             "it is owned by another user than the daemon's, or its owner cannot be read",
         ));
     }
-    read_opened(file, metadata.len()).map(Some)
+    read_opened(file, metadata.len(), max_bytes).map(Some)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, StoreFileError> {
-    Ok(crate::bounded_read::read_config_file(path, MAX_FILE_BYTES)?)
+pub(crate) fn read_owner_only_file(
+    path: &Path,
+    _owner_uid: u32,
+    max_bytes: u64,
+) -> Result<Option<String>, StoreFileError> {
+    Ok(crate::bounded_read::read_config_file(path, max_bytes)?)
 }
 
 /// Read an already-vetted store file of reported length `len`, refusing one
-/// over [`MAX_FILE_BYTES`] — by its length first, then by what is actually
+/// over `max_bytes` — by its length first, then by what is actually
 /// read, in case it grew — and one that is not UTF-8.
 #[cfg(any(unix, windows))]
-fn read_opened(file: std::fs::File, len: u64) -> Result<String, StoreFileError> {
+fn read_opened(file: std::fs::File, len: u64, max_bytes: u64) -> Result<String, StoreFileError> {
     use std::io::{Error, ErrorKind, Read as _};
 
     let too_large = || {
         StoreFileError::Io(Error::new(
             ErrorKind::InvalidData,
-            format!("it is larger than the {MAX_FILE_BYTES}-byte limit"),
+            format!("it is larger than the {max_bytes}-byte limit"),
         ))
     };
-    if len > MAX_FILE_BYTES {
+    if len > max_bytes {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES.saturating_add(1))
+    file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
+    if bytes.len() as u64 > max_bytes {
         return Err(too_large());
     }
     String::from_utf8(bytes)
@@ -523,7 +544,7 @@ fn read_opened(file: std::fs::File, len: u64) -> Result<String, StoreFileError> 
 /// The 1-based line a parse of [`LAST_COMMAND_FILE`] failed on, or `0` when the
 /// parser reports no position — the only detail of a malformed file the daemon
 /// logs, because everything else in it is the command.
-fn unparseable_line(text: &str, error: &toml::de::Error) -> usize {
+pub(crate) fn unparseable_line(text: &str, error: &toml::de::Error) -> usize {
     error.span().map_or(0, |span| {
         let start = span.start.min(text.len());
         text.as_bytes()[..start]
@@ -534,22 +555,28 @@ fn unparseable_line(text: &str, error: &toml::de::Error) -> usize {
     })
 }
 
-/// Replace the file at `path` with one holding `command`, owner-only and
-/// atomically: a sibling temp file created `create_new`, its owner-only
-/// permissions asserted before the first byte, then renamed into place. On Unix
-/// it is created `0600`; on Windows it is created under the inherited DACL and
-/// tightened to the current user before the first byte, held with no sharing
-/// so no other handle can be opened on it while it is looser. The parent
-/// directory is created owner-only if it is missing.
+/// Replace the file at `path` with one holding `command`, through
+/// [`write_owner_only_atomic`].
 fn write_atomic(path: &Path, command: &str) -> Result<(), String> {
-    use std::io::Write;
-
     let contents = toml::to_string(&Persisted {
         last_command: Some(command.to_string()),
     })
     // No serialiser detail in the message: the value being serialised is the
     // command, and this error is logged.
     .map_err(|_| "failed to serialise the last command".to_string())?;
+    write_owner_only_atomic(path, &contents)
+}
+
+/// Replace the file at `path` with one holding `contents`, owner-only and
+/// atomically: a sibling temp file created `create_new`, its owner-only
+/// permissions asserted before the first byte, then renamed into place. On Unix
+/// it is created `0600`; on Windows it is created under the inherited DACL and
+/// tightened to the current user before the first byte, held with no sharing
+/// so no other handle can be opened on it while it is looser. The parent
+/// directory is created owner-only if it is missing.
+pub(crate) fn write_owner_only_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -559,7 +586,7 @@ fn write_atomic(path: &Path, command: &str) -> Result<(), String> {
     let file_name = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| LAST_COMMAND_FILE.to_string());
+        .unwrap_or_else(|| "store".to_string());
 
     let mut opened = None;
     for _ in 0..TEMP_NAME_ATTEMPTS {

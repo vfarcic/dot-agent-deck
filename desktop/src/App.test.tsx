@@ -241,7 +241,6 @@ describe("ControlDeck", () => {
       const selected = createFixtureSnapshot("connected");
       const live = runtime({ mode: "live", snapshot: selected, fleet: [selected, target], desktopFeatures: fixtureDesktopFeatures("") });
       render(<DeckShell runtime={live} />);
-      expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
       const card = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === target.connection.deckId)!;
       const start = within(card).getByTestId("start-daemon");
       fireEvent.click(start);
