@@ -2214,9 +2214,14 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-batch-icon { width: 28px; height: 26px; color: var(--ink); }
 .agent-cards-batch-icon:hover, .agent-cards-batch-icon:focus-visible { color: var(--teal); border-color: var(--teal); }
 /* The status line is a button only so the keyboard reaches the overlay: it is drawn as the line of text it is. */
-.agent-card-meta { flex: none; display: block; width: 100%; height: 18px; padding: 0; border: 0; border-radius: 3px; line-height: 18px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); background: transparent; font: inherit; font-size: var(--text-xs); text-align: left; cursor: pointer; }
+.agent-card-meta { flex: none; display: flex; align-items: center; justify-content: flex-start; gap: 8px; width: 100%; height: 18px; padding: 0; border: 0; border-radius: 3px; line-height: 18px; overflow: hidden; white-space: nowrap; color: var(--muted); background: transparent; font: inherit; font-size: var(--text-xs); text-align: left; cursor: pointer; }
 .agent-card-meta:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
-.agent-card-meta > * + * { margin-left: 8px; }
+/* PR #2491 CI red (desktop/agent-cards/076): the status keeps its own width and the text around it yields, so a wider font than the dev box's
+   truncates the kind ("ORCHES…") instead of cutting the status chip at the card's edge. The ended text yields first, as it did when the line
+   was a single run of text, and the status itself truncates only when it alone is wider than the line. */
+.agent-card-meta > * { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-card-meta > .card-status { flex: 0 0 auto; max-width: 100%; line-height: normal; }
+.agent-card-meta > .agent-card-ended { flex-shrink: 1000; }
 .agent-card-kind { text-transform: uppercase; letter-spacing: .04em; }
 .agent-card-refs { position: relative; flex: none; height: 22px; line-height: 22px; overflow: hidden; white-space: nowrap; }
 /* Issue #2418 review (D-R1): a badge that would be cut is hidden whole, kept in the flow so the ones before it never move, and counted by `+N`. */
