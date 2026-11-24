@@ -823,7 +823,7 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
 /// [`read_dashboard_config_bounded`] and [`DashboardConfig::load`], so the
 /// daemon and `config get` tell a first run from a dangling link the same way
 /// (issue #2156).
-fn config_not_found_verdict(path: &Path) -> Result<(), String> {
+pub(crate) fn config_not_found_verdict(path: &Path) -> Result<(), String> {
     after_open_not_found(std::fs::symlink_metadata(path).map(|m| m.file_type()))
         .and_then(|_| missing_config_folder_verdict(path))
         .map(|_| ())
@@ -1091,6 +1091,109 @@ fn write_config_atomically_with(
     }
 }
 
+/// Issue #2399 (review 1, audit 4): the strict sibling of
+/// [`write_config_atomically`], for the card-action editor's writes through the
+/// daemon. It publishes `bytes` at `target` only by renaming a temp file over
+/// it, and where [`write_config_atomically`] falls back to an in-place write it
+/// refuses instead, leaving the file as it was: a folder that will not take the
+/// temp file, a swap that would change the file's owner or group or split it
+/// from another hard link, a rename the file system will not do. `config set`
+/// keeps its fallbacks; only this caller is strict.
+///
+/// `target` is the file itself, already resolved through any links (the caller
+/// resolved it once, when it read the file), so nothing is resolved again here.
+/// `still_as_read` runs after the temp file is written and synced and just
+/// before the rename: an `Err` from it (the caller's file changed since it was
+/// read) removes the temp file and refuses. After the rename the folder is
+/// synced too, best effort, so the new name survives a power loss; a failure
+/// there is not reported, because the file was replaced.
+///
+/// Every `Err` means the file at `target` was not replaced.
+pub(crate) fn write_config_strictly(
+    target: &Path,
+    bytes: &[u8],
+    still_as_read: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    write_config_strictly_with(
+        target,
+        bytes,
+        |file, bytes| {
+            use std::io::Write as _;
+            file.write_all(bytes)?;
+            file.sync_all()
+        },
+        still_as_read,
+    )
+}
+
+/// [`write_config_strictly`] with the body write and sync supplied, so a test
+/// can make them fail.
+fn write_config_strictly_with(
+    target: &Path,
+    bytes: &[u8],
+    write_body: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    still_as_read: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    match std::fs::OpenOptions::new().write(true).open(target) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("it cannot be written: {e}")),
+    }
+    let target_meta = std::fs::metadata(target).ok();
+    let target_perms = target_meta.as_ref().map(|m| m.permissions());
+    let (mut file, tmp) = create_temp_beside(target, target_perms.as_ref())
+        .map_err(|e| format!("no file can be made beside it to replace it in one step ({e})"))?;
+    let discard = |file: std::fs::File, reason: String| {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        Err(reason)
+    };
+    #[cfg(unix)]
+    match file.metadata() {
+        Ok(replacement) => {
+            let kept = target_meta.as_ref().map(FileOwnership::of);
+            if !swap_keeps_owner_and_links(kept, FileOwnership::of(&replacement)) {
+                let reason = if kept.is_some_and(|k| k.nlink > 1) {
+                    "it has another hard link, which replacing it would split from it"
+                } else {
+                    "replacing it would change its owner or group"
+                };
+                return discard(file, reason.to_string());
+            }
+        }
+        Err(e) => return discard(file, format!("the file made beside it cannot be read: {e}")),
+    }
+    let written = (|| {
+        if let Some(perms) = &target_perms {
+            file.set_permissions(perms.clone())?;
+        }
+        write_body(&mut file, bytes)
+    })();
+    if let Err(e) = written {
+        return discard(file, format!("the new file could not be written: {e}"));
+    }
+    if let Err(reason) = still_as_read() {
+        return discard(file, reason);
+    }
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("it could not be replaced in one step ({e})"));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = target.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(folder) = std::fs::File::open(parent) {
+            let _ = folder.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Create the temp file [`write_config_atomically_with`] stages the new
 /// `config.toml` in, in `target`'s folder so the rename stays on one
 /// filesystem. Opened with `create_new` (`O_EXCL`); a name that is taken is
@@ -1148,7 +1251,7 @@ fn create_temp_beside(
 /// land on, which need not exist. Stops at the first entry that is not a
 /// symlink or cannot be inspected, and after 40 links (the kernel's own limit),
 /// leaving the open or rename to report what is wrong there.
-fn resolve_symlink_chain(path: &Path) -> PathBuf {
+pub(crate) fn resolve_symlink_chain(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     for _ in 0..40 {
         let is_link = std::fs::symlink_metadata(&current)
@@ -3321,6 +3424,73 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "default_command = \"old\"\n"
         );
+        assert!(temp_files_in(dir.path()).is_empty());
+    }
+
+    /// Issue #2399 (review 1, audit 4): the strict save the card-action editor
+    /// uses refuses, with the file untouched and no temp file left, where
+    /// `config set`'s save would fall back to an in-place write — a hard-linked
+    /// config, a folder that takes no new entry — and when the body write fails
+    /// part-way or the caller's last check finds the file changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_strict_config_save_refuses_instead_of_writing_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let old = "default_command = \"old\"\n";
+        let new = b"default_command = \"new\"\n";
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, old).unwrap();
+        let err = write_config_strictly_with(
+            &path,
+            new,
+            |f, b| {
+                use std::io::Write as _;
+                f.write_all(&b[..b.len() / 2])?;
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(err.contains("could not be written"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        assert!(temp_files_in(dir.path()).is_empty());
+
+        let err = write_config_strictly(&path, new, || Err("it changed".into())).unwrap_err();
+        assert_eq!(err, "it changed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        assert!(temp_files_in(dir.path()).is_empty());
+
+        let twin = dir.path().join("twin.toml");
+        std::fs::hard_link(&path, &twin).unwrap();
+        let err = write_config_strictly(&path, new, || Ok(())).unwrap_err();
+        assert!(err.contains("hard link"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        assert!(temp_files_in(dir.path()).is_empty());
+        std::fs::remove_file(&twin).unwrap();
+
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let inside = locked.join("config.toml");
+        std::fs::write(&inside, old).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = locked.join("probe");
+        if std::fs::write(&probe, "").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            eprintln!("SKIP (folder case): this process can write a 0555 folder (root)");
+        } else {
+            let err = write_config_strictly(&inside, new, || Ok(())).unwrap_err();
+            assert!(err.contains("beside it"), "{err}");
+            assert_eq!(std::fs::read_to_string(&inside).unwrap(), old);
+            // `config set`'s save keeps its fallback for the same folder.
+            write_config_atomically(&inside, new).unwrap();
+            assert_eq!(std::fs::read(&inside).unwrap(), new);
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_config_strictly(&path, new, || Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), new);
         assert!(temp_files_in(dir.path()).is_empty());
     }
 

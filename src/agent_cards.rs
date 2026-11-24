@@ -2377,6 +2377,11 @@ struct StoreInner {
     /// own bounds ([`MAX_REMEMBERED_BATCHES`], [`MAX_REMEMBERED_BATCH_BYTES`]).
     batches: HashMap<String, RememberedBatch>,
     catalog: Option<CachedCatalog>,
+    /// Issue #2399 review 4: bumped by [`CardStore::forget_catalog`]. A
+    /// catalog read that began before a bump is not cached, so a read of the
+    /// old file that finishes after the daemon wrote the new one cannot put
+    /// the old catalog back.
+    catalog_generation: u64,
 }
 
 impl StoreInner {
@@ -2692,27 +2697,53 @@ impl CardStore {
             .ok()
             .map(|m| (path.clone(), m.modified().ok(), m.len()));
         let stamp = stamp.or(Some((path, None, u64::MAX)));
-        {
+        self.catalog_from(stamp, card_catalog::resolve_from_user_config)
+    }
+
+    /// [`Self::catalog`] for a file whose look is `stamp`, read by `load`.
+    /// The cache is filled only when no [`Self::forget_catalog`] happened
+    /// while `load` ran; when one did, `load` runs again (a few times at most,
+    /// then the latest read is answered uncached), so the catalog cached is
+    /// never one read before the daemon's own write.
+    fn catalog_from(
+        &self,
+        stamp: Option<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>,
+        mut load: impl FnMut() -> ResolvedCatalog,
+    ) -> Arc<ResolvedCatalog> {
+        let mut generation = {
             let inner = self.lock();
             if let Some(cached) = &inner.catalog
                 && cached.stamp == stamp
             {
                 return Arc::clone(&cached.catalog);
             }
+            inner.catalog_generation
+        };
+        let mut catalog = Arc::new(load());
+        for _ in 0..3 {
+            let mut inner = self.lock();
+            if inner.catalog_generation == generation {
+                inner.catalog = Some(CachedCatalog {
+                    stamp,
+                    catalog: Arc::clone(&catalog),
+                });
+                return catalog;
+            }
+            generation = inner.catalog_generation;
+            drop(inner);
+            catalog = Arc::new(load());
         }
-        let catalog = Arc::new(card_catalog::resolve_from_user_config());
-        self.lock().catalog = Some(CachedCatalog {
-            stamp,
-            catalog: Arc::clone(&catalog),
-        });
         catalog
     }
 
     /// Issue #2399: forget the cached catalog, so the next read resolves the
     /// user config again — after the daemon itself wrote it, whatever its
-    /// modification time and length say.
+    /// modification time and length say — and so a read already under way
+    /// does not cache what it read ([`Self::catalog_from`]).
     pub fn forget_catalog(&self) {
-        self.lock().catalog = None;
+        let mut inner = self.lock();
+        inner.catalog = None;
+        inner.catalog_generation = inner.catalog_generation.wrapping_add(1);
     }
 
     /// Store `report` for the generation `agent_id` in `pane_id`, replacing
@@ -8200,5 +8231,37 @@ mod batch_tests {
             serde_json::json!({"pane_id": "p", "agent_id": "a"}),
             "a preview entry carries no empty handles"
         );
+    }
+
+    /// Issue #2399 review 4: a catalog read that began before the daemon's
+    /// own write — it read the old file, the edit then saved the new one and
+    /// forgot the cache — does not put the old catalog back in the cache,
+    /// even when the file's modification time and length look the same (the
+    /// stamp below never changes). The next read answers the new catalog.
+    #[test]
+    fn a_catalog_read_under_way_during_an_edit_does_not_cache_the_old_file() {
+        use std::sync::Mutex as StdMutex;
+        let store = CardStore::default();
+        let stamp = Some((std::path::PathBuf::from("/same"), None, 7));
+        let file = StdMutex::new("old");
+        let marked = |which: &str| {
+            let mut catalog = card_catalog::defaults();
+            catalog.errors.push(which.to_string());
+            catalog
+        };
+        let mut edited = false;
+        let first = store.catalog_from(stamp.clone(), || {
+            let read = *file.lock().unwrap();
+            if !edited {
+                // The edit lands after this read and before the cache fill.
+                edited = true;
+                *file.lock().unwrap() = "new";
+                store.forget_catalog();
+            }
+            marked(read)
+        });
+        assert_eq!(first.errors, ["new"], "the stale read is not answered");
+        let next = store.catalog_from(stamp, || marked(*file.lock().unwrap()));
+        assert_eq!(next.errors, ["new"], "nor cached");
     }
 }

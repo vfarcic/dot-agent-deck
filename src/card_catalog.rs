@@ -8,8 +8,10 @@
 //! slice: catalog prompts become buttons that type text into an agent, and the
 //! project-trust store approves exact orchestration-role text, not a catalog.
 //!
-//! Everything here is pure except [`resolve_from_user_config`], which reads the
-//! file. The catalog is parsed from the raw TOML separately from the rest of
+//! The parsing, merging and editing of TOML text is pure; the file is touched
+//! in two places: [`resolve_from_user_config`] (and `_at`) reads it, and
+//! [`edit_user_catalog_at`] reads it and, for an edit, replaces it, one edit at
+//! a time in this process (a mutex). The catalog is parsed from the raw TOML separately from the rest of
 //! the config, so a bad catalog never breaks the user's other settings and a
 //! bad setting never hides the catalog. Validation is non-fatal: an offending
 //! entry is skipped, the rest applies, and each problem is one string in
@@ -840,27 +842,26 @@ const MAX_USER_CONFIG_BYTES: u64 = 1024 * 1024;
 /// missing file is the defaults with no error; an unreadable one is the
 /// defaults with one.
 pub fn resolve_from_user_config() -> ResolvedCatalog {
-    let path = crate::config::user_config_path();
+    resolve_from_user_config_at(&crate::config::user_config_path())
+}
+
+/// [`resolve_from_user_config`] for the file at `path`, read as an edit reads
+/// it (`read_user_config`): a FIFO, a device or a folder there is refused
+/// without waiting, and a link whose target is missing is an unreadable
+/// config rather than a missing one.
+pub fn resolve_from_user_config_at(path: &std::path::Path) -> ResolvedCatalog {
     let display = path.display().to_string();
-    let read = std::fs::metadata(&path).and_then(|meta| {
-        if meta.len() > MAX_USER_CONFIG_BYTES {
-            return Err(std::io::Error::other(format!(
-                "it is larger than {MAX_USER_CONFIG_BYTES} bytes"
-            )));
-        }
-        std::fs::read_to_string(&path)
-    });
-    let mut resolved = match read {
-        Ok(raw) => resolve(Some(&raw)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let mut resolved = match read_user_config(path) {
+        Ok(ConfigRead { raw: Some(raw), .. }) => resolve(Some(&raw)),
+        Ok(ConfigRead { raw: None, .. }) => {
             let mut resolved = defaults();
             resolved.user_config = None;
             return resolved;
         }
-        Err(error) => {
+        Err(reason) => {
             let mut resolved = defaults();
             resolved.errors.push(format!(
-                "catalog: the user config {display} could not be read, so the deck defaults apply: {error}"
+                "catalog: the user config {display} could not be read, so the deck defaults apply: {reason}"
             ));
             resolved
         }
@@ -1030,15 +1031,30 @@ fn validated(input: &CatalogActionInput) -> Result<CatalogAction, String> {
 }
 
 /// Write `input`'s keys into the entry `table`: a key the input sets keeps its
-/// place and comments in the file, a key it leaves unset is removed, and so is
-/// any key an action entry may not carry (it would make the catalog skip the
-/// entry the user just saved).
+/// place and comments in the file. A key it leaves unset is removed — unless
+/// keeping it changes nothing the catalog reads, as `always = false` or
+/// `placement = "card"` when the form leaves them at that default: that key
+/// stays, with its comment (issue #2399 review 7). Any key an action entry may
+/// not carry is removed (it would make the catalog skip the entry the user
+/// just saved).
 fn write_entry(table: &mut toml_edit::Table, input: &CatalogActionInput) {
     let wanted = input_table(input);
+    let means = validated(input).ok();
+    let changes_nothing = |key: &str, item: &toml_edit::Item| {
+        let value: toml::Value = match item.as_value() {
+            Some(toml_edit::Value::String(s)) => s.value().clone().into(),
+            Some(toml_edit::Value::Boolean(b)) => (*b.value()).into(),
+            _ => return false,
+        };
+        let mut with = wanted.clone();
+        with.insert(key.to_string(), value);
+        let label = entry_label(Kind::Actions, 0, Some(&input.name));
+        means.is_some() && parse_action(&with, &label).ok() == means
+    };
     let stale: Vec<String> = table
         .iter()
+        .filter(|(key, item)| !wanted.contains_key(*key) && !changes_nothing(key, item))
         .map(|(key, _)| key.to_string())
-        .filter(|key| !wanted.contains_key(key))
         .collect();
     for key in stale {
         table.remove(&key);
@@ -1331,16 +1347,80 @@ fn update_entry(catalog: &mut toml_edit::Table, action: &CatalogActionInput) -> 
     Ok(())
 }
 
-/// The user config at `path`: `None` when there is no file, the reason when
-/// it cannot be read as the catalog reader reads it (larger than
-/// [`MAX_USER_CONFIG_BYTES`], or not UTF-8).
-fn read_user_config(path: &std::path::Path) -> Result<Option<String>, String> {
+/// Which file a path names, so a later look can tell whether it is the same
+/// one: the device and inode on Unix (elsewhere every file compares equal, and
+/// the content comparison is what tells a change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            Self { dev: 0, ino: 0 }
+        }
+    }
+
+    /// The folder `target` sits in, when it is there.
+    fn of_folder(target: &std::path::Path) -> Option<Self> {
+        let folder = match target.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => std::path::Path::new("."),
+        };
+        std::fs::metadata(folder).ok().map(|m| Self::of(&m))
+    }
+}
+
+/// The user config as an edit read it: the file a write must replace (the
+/// path resolved through its links, once), its text (`None`: there is no
+/// file), and which file and folder were there.
+struct ConfigRead {
+    target: std::path::PathBuf,
+    raw: Option<String>,
+    file: Option<FileIdentity>,
+    folder: Option<FileIdentity>,
+}
+
+/// Open `target` for reading without waiting and without following a link at
+/// its last step: `O_NONBLOCK`, because opening a FIFO with no writer waits
+/// for one, and `O_NOFOLLOW`, because `target` is already the end of the link
+/// chain, so a link there now is a change since it was resolved.
+fn open_config_file(target: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    options.open(target)
+}
+
+/// The text of the regular file open in `file` and which file it is, or the
+/// reason it cannot be read as the catalog reader reads it: not a regular
+/// file (a FIFO, a device, a folder), larger than [`MAX_USER_CONFIG_BYTES`],
+/// or not UTF-8.
+fn read_open_config(file: std::fs::File) -> Result<(String, FileIdentity), String> {
     use std::io::Read as _;
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.to_string()),
-    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("it is not a regular file".to_string());
+    }
+    if meta.len() > MAX_USER_CONFIG_BYTES {
+        return Err(format!("it is larger than {MAX_USER_CONFIG_BYTES} bytes"));
+    }
     let mut bytes = Vec::new();
     file.take(MAX_USER_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1348,26 +1428,109 @@ fn read_user_config(path: &std::path::Path) -> Result<Option<String>, String> {
     if bytes.len() as u64 > MAX_USER_CONFIG_BYTES {
         return Err(format!("it is larger than {MAX_USER_CONFIG_BYTES} bytes"));
     }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| "it is not UTF-8 text".to_string())
+    let text = String::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_string())?;
+    Ok((text, FileIdentity::of(&meta)))
+}
+
+/// Read the user config at `path` for the catalog: resolve its links once,
+/// open the file they lead to without waiting ([`open_config_file`]) and read
+/// it ([`read_open_config`]). No file is `raw: None` only when there is
+/// genuinely nothing there (a first run, its folder perhaps missing too); a
+/// link whose target is missing, or a folder above it that is such a link, is
+/// a reason, not an absent config, because the file it leads to may be the
+/// user's real config on a volume that is not mounted.
+fn read_user_config(path: &std::path::Path) -> Result<ConfigRead, String> {
+    let target = crate::config::resolve_symlink_chain(path);
+    let folder = FileIdentity::of_folder(&target);
+    match open_config_file(&target) {
+        Ok(file) => {
+            let (raw, file) = read_open_config(file)?;
+            Ok(ConfigRead {
+                target,
+                raw: Some(raw),
+                file: Some(file),
+                folder,
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::config::config_not_found_verdict(path)?;
+            Ok(ConfigRead {
+                target,
+                raw: None,
+                file: None,
+                folder,
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Whether the user config at `path` is still exactly what `read` found — the
+/// same file behind the same links, in the same folder, with the same bytes,
+/// or still no file — checked by the strict save just before it renames the
+/// new file into place. Another writer (`config set`, another daemon reading
+/// the same file, an editor) that saved in between makes the edit refuse
+/// rather than overwrite what it saved.
+fn still_as_read(path: &std::path::Path, read: &ConfigRead) -> Result<(), String> {
+    const CHANGED: &str = "it changed since the editor read it (another program saved it); \
+                           nothing was saved: read the catalog again and redo the change";
+    if crate::config::resolve_symlink_chain(path) != read.target
+        || FileIdentity::of_folder(&read.target) != read.folder
+    {
+        return Err(CHANGED.to_string());
+    }
+    match &read.raw {
+        Some(raw) => {
+            let file = open_config_file(&read.target).map_err(|_| CHANGED.to_string())?;
+            match read_open_config(file) {
+                Ok((now, identity)) if &now == raw && Some(identity) == read.file => Ok(()),
+                _ => Err(CHANGED.to_string()),
+            }
+        }
+        None => match std::fs::symlink_metadata(&read.target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(CHANGED.to_string()),
+        },
+    }
 }
 
 /// One edit of a user config at a time in this process, so two editors'
-/// read-change-write cycles never interleave.
+/// read-change-write cycles never interleave. It does not reach another
+/// process; [`still_as_read`] is what keeps a catalog edit from overwriting a
+/// save made by one.
 static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Read the user config at `path` and, with `edit`, apply it
-/// ([`apply_action_edit`]) and replace the file atomically, by rename; answer
-/// the editable catalog afterwards, naming the file. A file that cannot be
-/// read — not UTF-8, larger than the catalog reader reads, not valid TOML — is
-/// refused for an edit and never written; a read (`None`) still answers, with
-/// the problem in `errors`. A missing file, and its folder, are created by an
-/// edit. The daemon passes its own user config's path; no path comes from a
-/// client.
+/// ([`apply_action_edit`]) and replace the file by rename
+/// ([`crate::config::write_config_strictly`]); answer the editable catalog
+/// afterwards, naming the file. Refused, with the file left as it was:
+///
+/// - a file that cannot be read — not a regular file, a link whose target is
+///   missing, not UTF-8, larger than the catalog reader reads, not valid TOML
+///   (a read with no edit still answers, with the problem in `errors`);
+/// - a file that changed between the read and the save, or whose links now
+///   lead elsewhere ([`still_as_read`]);
+/// - a file that cannot be replaced by a rename (another hard link, an owner
+///   the swap would change, a folder that takes no new file): there is no
+///   in-place fallback.
+///
+/// A missing file, and its folder, are created by an edit. The daemon passes
+/// its own user config's path; no path comes from a client. Every `Err` means
+/// the config file was not written (a folder an edit created for a missing
+/// file may remain).
 pub fn edit_user_catalog_at(
     path: &std::path::Path,
     edit: Option<&CatalogActionEdit>,
+) -> Result<EditableCardCatalog, String> {
+    edit_user_catalog_at_with(path, edit, || {})
+}
+
+/// [`edit_user_catalog_at`] with `between` run after the file is read and the
+/// edit applied, before the save: a test's other writer.
+fn edit_user_catalog_at_with(
+    path: &std::path::Path,
+    edit: Option<&CatalogActionEdit>,
+    between: impl FnOnce(),
 ) -> Result<EditableCardCatalog, String> {
     let _one_at_a_time = EDIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let display = path.display().to_string();
@@ -1375,8 +1538,8 @@ pub fn edit_user_catalog_at(
         catalog.user_config = Some(display.clone());
         catalog
     };
-    let raw = match read_user_config(path) {
-        Ok(raw) => raw,
+    let mut read = match read_user_config(path) {
+        Ok(read) => read,
         Err(reason) => {
             return match edit {
                 None => {
@@ -1395,19 +1558,24 @@ pub fn edit_user_catalog_at(
         }
     };
     let Some(edit) = edit else {
-        return Ok(named(editable_catalog(raw.as_deref())));
+        return Ok(named(editable_catalog(read.raw.as_deref())));
     };
-    let saved = apply_action_edit(raw.as_deref(), edit)?;
-    if raw.as_deref() != Some(saved.as_str()) {
-        if let Some(parent) = path.parent()
+    let saved = apply_action_edit(read.raw.as_deref(), edit)?;
+    between();
+    if read.raw.as_deref() != Some(saved.as_str()) {
+        if read.folder.is_none()
+            && let Some(parent) = read.target.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|e| {
                 format!("could not create the folder of the user config {display}: {e}")
             })?;
+            read.folder = FileIdentity::of_folder(&read.target);
         }
-        crate::config::write_config_atomically(path, saved.as_bytes())
-            .map_err(|e| format!("could not write the user config {display}: {e}"))?;
+        crate::config::write_config_strictly(&read.target, saved.as_bytes(), || {
+            still_as_read(path, &read)
+        })
+        .map_err(|reason| format!("the user config {display} was not saved: {reason}"))?;
     }
     Ok(named(editable_catalog(Some(&saved))))
 }
@@ -2797,5 +2965,309 @@ prompt = \"Deploy it.\"
             read.errors
         );
         assert!(path.is_dir(), "a read writes nothing");
+    }
+
+    /// Issue #2399 review 7: saving an action whose form leaves a setting at
+    /// its default keeps an entry's explicit default-valued key, and its
+    /// comment, when the edit does not change what that key means: editing
+    /// only the prompt of an entry that says `always = false # rationale`
+    /// keeps that line.
+    #[test]
+    fn an_edit_keeps_an_unchanged_default_valued_key_and_its_comment() {
+        let raw = "\
+[[catalog.actions]]
+name = \"ship\"
+label = \"Ship\" # the label as the deck would write it
+description = \"Offer when it is ready.\"
+prompt = \"Ship it.\"
+confirm = false # ask? no, it is cheap
+always = false # rationale: only when ready
+placement = \"card\" # on the card, on purpose
+";
+        let saved = apply_action_edit(
+            Some(raw),
+            &CatalogActionEdit::Update {
+                action: CatalogActionInput {
+                    description: "Offer when it is ready.".into(),
+                    prompt: "Ship it now.".into(),
+                    ..input("ship")
+                },
+            },
+        )
+        .expect("the edit applies");
+        for kept in [
+            "label = \"Ship\" # the label as the deck would write it",
+            "confirm = false # ask? no, it is cheap",
+            "always = false # rationale: only when ready",
+            "placement = \"card\" # on the card, on purpose",
+        ] {
+            assert!(saved.contains(kept), "{kept:?} kept in:\n{saved}");
+        }
+        assert!(saved.contains("prompt = \"Ship it now.\""), "{saved}");
+        // A key whose meaning the edit changes still goes: `confirm = true`
+        // is not the form's `false`.
+        let changed = apply_action_edit(
+            Some(&raw.replace("confirm = false", "confirm = true")),
+            &CatalogActionEdit::Update {
+                action: CatalogActionInput {
+                    description: "Offer when it is ready.".into(),
+                    prompt: "Ship it.".into(),
+                    ..input("ship")
+                },
+            },
+        )
+        .expect("the edit applies");
+        assert!(!changed.contains("confirm"), "{changed}");
+        assert!(!resolve(Some(&changed)).action("ship").unwrap().confirm);
+    }
+
+    /// Issue #2399 review 1 / audit 4: a catalog edit is published only by
+    /// rename; where the swap would split a hard-linked config from its other
+    /// name, the edit is refused, never written in place the way `config set`
+    /// falls back to, and both names keep the file as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_catalog_edit_is_refused_rather_than_written_in_place() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let other = dir.path().join("dotfiles-config.toml");
+        std::fs::hard_link(&path, &other).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let refused = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect_err("a hard-linked config is not written in place");
+        assert!(refused.contains("hard link"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), EDITED_CONFIG);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["config.toml", "dotfiles-config.toml"],
+            "no temp file"
+        );
+    }
+
+    /// Issue #2399 audit 3: a FIFO at the config path is refused at once, for
+    /// a read and for an edit, without waiting for a writer that never comes
+    /// (the reads run on a thread the test abandons if it hangs, so a
+    /// regression fails here rather than wedging the test process); the
+    /// card reader refuses it the same way.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_config_path_is_refused_without_waiting() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let read = edit_user_catalog_at(&probe, None);
+            let edit = edit_user_catalog_at(
+                &probe,
+                Some(&CatalogActionEdit::Add {
+                    action: input("ship"),
+                }),
+            );
+            let cards = resolve_from_user_config_at(&probe);
+            let _ = tx.send((read, edit, cards));
+        });
+        let (read, edit, cards) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the reads return instead of waiting for a writer");
+        let read = read.expect("a read answers");
+        assert!(
+            read.errors.iter().any(|e| e.contains("not a regular file")),
+            "{:?}",
+            read.errors
+        );
+        let edit = edit.expect_err("an edit is refused");
+        assert!(edit.contains("not a regular file"), "{edit}");
+        assert!(
+            cards
+                .errors
+                .iter()
+                .any(|e| e.contains("not a regular file")),
+            "{:?}",
+            cards.errors
+        );
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    /// Issue #2399 audit 3: a config path that is a link whose target is
+    /// missing is not an absent config: an edit is refused and creates
+    /// nothing at the link's target, and a read reports the problem.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_link_is_refused_not_treated_as_a_new_config() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let target = dir.path().join("unmounted").join("config.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let refused = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("ship"),
+            }),
+        )
+        .expect_err("a dangling link is refused");
+        assert!(
+            refused.contains("link whose target is missing"),
+            "{refused}"
+        );
+        assert!(!target.exists(), "nothing created at the target");
+        assert!(!target.parent().unwrap().exists());
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        let read = edit_user_catalog_at(&path, None).expect("a read answers");
+        assert!(
+            read.errors
+                .iter()
+                .any(|e| e.contains("link whose target is missing")),
+            "{:?}",
+            read.errors
+        );
+    }
+
+    /// Issue #2399 audit 2: another writer that saves the user config between
+    /// the editor's read and its save — `config set`, another daemon reading
+    /// the same file, a hand edit — is never overwritten: the edit is refused
+    /// with nothing written, and the other writer's file is what remains. The
+    /// same holds for a file that appears where there was none.
+    #[test]
+    fn an_edit_is_refused_when_the_file_changed_since_it_was_read() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let theirs = EDITED_CONFIG.replace("on_idle = true", "on_idle = false");
+        let refused = edit_user_catalog_at_with(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+            || std::fs::write(&path, &theirs).unwrap(),
+        )
+        .expect_err("a file saved by someone else meanwhile is not overwritten");
+        assert!(
+            refused.contains("changed since the editor read it"),
+            "{refused}"
+        );
+        assert!(refused.contains("was not saved"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+
+        let fresh = dir.path().join("fresh.toml");
+        let refused = edit_user_catalog_at_with(
+            &fresh,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+            || std::fs::write(&fresh, "# made meanwhile\n").unwrap(),
+        )
+        .expect_err("a file that appeared meanwhile is not overwritten");
+        assert!(refused.contains("changed since"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(&fresh).unwrap(),
+            "# made meanwhile\n"
+        );
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "no temp file left: {left:?}");
+
+        // Unchanged meanwhile, the same edit is saved.
+        edit_user_catalog_at_with(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+            || {},
+        )
+        .expect("an edit of an unchanged file is saved");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("on_idle = false"), "{saved}");
+        assert!(resolve(Some(&saved)).action("deploy").is_some());
+    }
+
+    /// Issue #2399 audit 5: the save replaces exactly the file the edit read.
+    /// When the config's link is pointed at another file between the read and
+    /// the save — the same bytes there included — the edit is refused and
+    /// neither file is written; a linked config that stays put is saved
+    /// through its link, which stays a link.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_is_refused_when_the_config_link_was_retargeted() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        let other = dir.path().join("other.toml");
+        std::fs::write(&real, EDITED_CONFIG).unwrap();
+        std::fs::write(&other, EDITED_CONFIG).unwrap();
+        let path = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        let refused = edit_user_catalog_at_with(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+            || {
+                std::fs::remove_file(&path).unwrap();
+                std::os::unix::fs::symlink(&other, &path).unwrap();
+            },
+        )
+        .expect_err("a retargeted link is refused");
+        assert!(refused.contains("changed since"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), EDITED_CONFIG);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), EDITED_CONFIG);
+
+        // The same file swapped for an identical copy is another file too.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        let refused = edit_user_catalog_at_with(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+            || {
+                let copy = dir.path().join("copy.toml");
+                std::fs::write(&copy, EDITED_CONFIG).unwrap();
+                std::fs::rename(&copy, &real).unwrap();
+            },
+        )
+        .expect_err("a replaced file is refused even with the same bytes");
+        assert!(refused.contains("changed since"), "{refused}");
+
+        edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect("an edit through a link that stays put is saved");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let saved = std::fs::read_to_string(&real).unwrap();
+        assert!(resolve(Some(&saved)).action("deploy").is_some(), "{saved}");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), EDITED_CONFIG);
     }
 }
