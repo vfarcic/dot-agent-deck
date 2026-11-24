@@ -1,4 +1,4 @@
-import { createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureCardCatalog, createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -56,6 +56,8 @@ import type { HandoffEdge,
   CardBatchOptions,
   CardBatchOutcome,
   CardBatchResult,
+  CardCatalogEdit,
+  EditableCardCatalog,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
@@ -2509,6 +2511,19 @@ export interface DeckBridge {
    */
   invokeCardActionBatch?(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult>;
   /**
+   * PRD #2374 decision 2026-11-24 — the card actions editor: read deck
+   * `deckId`'s card actions with where each came from
+   * (`agent_card_catalog_edit` with no edit). The daemon reads its own user
+   * config; a daemon without the editor is sent nothing and the call rejects.
+   */
+  readCardCatalog?(deckId: string): Promise<EditableCardCatalog>;
+  /**
+   * PRD #2374 decision 2026-11-24 — ask deck `deckId`'s daemon to apply one
+   * edit to its own user config's card actions; answers them after the edit.
+   * A refusal rejects with the daemon's reason, and nothing was written.
+   */
+  editCardCatalog?(deckId: string, edit: CardCatalogEdit): Promise<EditableCardCatalog>;
+  /**
    * PRD #1790 stage 2 — one deck's interrupted work (`interrupted_work_list`):
    * what a restart of its daemon left behind, from daemon process
    * `target.instance`, with each item's Git and pull request facts when `git`
@@ -2560,6 +2575,7 @@ export function normalizeAgentCards(value: unknown): AgentCardsSnapshot | null {
     catalogErrors: Array.isArray(record.catalogErrors) ? record.catalogErrors.filter((e): e is string => typeof e === "string") : [],
     tree: record.tree === true,
     batch: record.batch === true,
+    catalogEdit: record.catalogEdit === true,
   };
 }
 
@@ -3406,6 +3422,25 @@ class FixtureDeckBridge implements DeckBridge {
   }
   async interruptedWorkStartOver(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>> {
     return this.interrupted.startOver(target, id, agent, dryRun);
+  }
+  /**
+   * PRD #2374 decision 2026-11-24 — the preview's card actions editor, for
+   * the `cards=tree` scene's daemon (it advertises the editor): a catalog of
+   * the deck's defaults that applies each edit for the rest of the session
+   * ({@link createFixtureCardCatalog}). Any other deck or scene is refused, as
+   * a daemon without the editor is.
+   */
+  private readonly cardCatalog = createFixtureCardCatalog();
+  private cardCatalogFor(deckId: string) {
+    const cards = this.sceneCards();
+    if (!cards || cards.deckId !== deckId || cards.catalogEdit !== true) throw new Error("this deck's daemon is from a release whose card actions cannot be edited from the app");
+    return this.cardCatalog;
+  }
+  async readCardCatalog(deckId: string): Promise<EditableCardCatalog> {
+    return this.cardCatalogFor(deckId).read();
+  }
+  async editCardCatalog(deckId: string, edit: CardCatalogEdit): Promise<EditableCardCatalog> {
+    return this.cardCatalogFor(deckId).edit(edit);
   }
   /**
    * Issue #2399 — the preview answers a batch as a daemon would, from the
@@ -6265,6 +6300,24 @@ export class TauriDeckBridge implements DeckBridge {
       requestId: options.requestId,
       entries: options.entries,
     });
+  }
+
+  async readCardCatalog(deckId: string): Promise<EditableCardCatalog> {
+    return this.cardCatalogEdit(deckId, null);
+  }
+
+  async editCardCatalog(deckId: string, edit: CardCatalogEdit): Promise<EditableCardCatalog> {
+    return this.cardCatalogEdit(deckId, edit);
+  }
+
+  /** `agent_card_catalog_edit`, its refusal an Error carrying the daemon's reason. */
+  private async cardCatalogEdit(deckId: string, edit: CardCatalogEdit | null): Promise<EditableCardCatalog> {
+    const invoke = await this.getInvoke();
+    try {
+      return await invoke<EditableCardCatalog>("agent_card_catalog_edit", { deckId, edit });
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error));
+    }
   }
 
   async invokeCardAction(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {

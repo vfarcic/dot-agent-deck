@@ -18,7 +18,7 @@ import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } f
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
 import { useInterruptedWork } from "./useInterruptedWork";
-import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CardBatchOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
+import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CardBatchOptions, type CardCatalogEdit, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -669,6 +669,12 @@ export function useDeckRuntime(): DeckRuntimeState {
   const invokeCardActionBatch = useMemo(() => (typeof bridge.invokeCardActionBatch === "function"
     ? (deckId: string, actionId: string, options: CardBatchOptions) => bridge.invokeCardActionBatch!(deckId, actionId, options)
     : undefined), [bridge]);
+  const readCardCatalog = useMemo(() => (typeof bridge.readCardCatalog === "function"
+    ? (deckId: string) => bridge.readCardCatalog!(deckId)
+    : undefined), [bridge]);
+  const editCardCatalog = useMemo(() => (typeof bridge.editCardCatalog === "function"
+    ? (deckId: string, edit: CardCatalogEdit) => bridge.editCardCatalog!(deckId, edit)
+    : undefined), [bridge]);
 
   return {
     appliedGeometry,
@@ -691,6 +697,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
     ...(invokeCardAction ? { invokeCardAction } : {}),
     ...(invokeCardActionBatch ? { invokeCardActionBatch } : {}),
+    ...(readCardCatalog ? { readCardCatalog } : {}),
+    ...(editCardCatalog ? { editCardCatalog } : {}),
     ...(interruptedWork ? { interruptedWork } : {}),
     sendTerminalInput,
     resizeTerminal,

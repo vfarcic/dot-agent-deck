@@ -937,7 +937,60 @@ export interface AgentCardsSnapshot {
    * `false` (or absent) for an older daemon, which is never sent a batch.
    */
   batch?: boolean;
+  /**
+   * Issue #2399 (PR #2491 scope extension) — the daemon advertised the card
+   * actions editor's request, so the app may read and edit its card actions
+   * (`readCardCatalog`, `editCardCatalog`). `false` (or absent) for an older
+   * daemon, whose actions the editor shows read-only and sends nothing.
+   */
+  catalogEdit?: boolean;
 }
+
+/**
+ * PRD #2374 decision 2026-11-24 — one card action as the editor lists it, in
+ * the daemon's words: the action in effect (`source` `default` for the deck's
+ * own definition, `user` for the user config's), whether a deck default has
+ * its name, whether the user's entry overrides that default, and whether the
+ * user hid it (a hidden default is listed with the deck's own values).
+ */
+export interface EditableCardAction {
+  name: string;
+  label: string;
+  description: string;
+  prompt: string;
+  icon: string | null;
+  placement: string;
+  confirm: boolean;
+  always: boolean;
+  source: "default" | "user" | string;
+  default: boolean;
+  overridden: boolean;
+  hidden: boolean;
+}
+
+/** A daemon's card actions as the editor lists them, the catalog's problems, and the user config file it reads. */
+export interface EditableCardCatalog {
+  actions: EditableCardAction[];
+  errors: string[];
+  user_config: string | null;
+}
+
+/** One action as the editor's form sends it: the keys a `[[catalog.actions]]` entry may carry, and nothing else. */
+export interface CardActionInput {
+  name: string;
+  label?: string;
+  description: string;
+  prompt: string;
+  icon?: string;
+  placement?: string;
+  confirm: boolean;
+  always: boolean;
+}
+
+/** One change the card actions editor asks a daemon to make to its user catalog. */
+export type CardCatalogEdit =
+  | { kind: "add" | "update"; action: CardActionInput }
+  | { kind: "remove" | "hide" | "restore"; name: string };
 
 /**
  * Issue #2399 — one card a batch names, in the daemon's own words: its pane
@@ -2077,6 +2130,10 @@ export interface DeckRuntimeState {
   invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
   /** Issue #2399 — preview or execute one action on many cards of one deck; the daemon checks and performs each as a single press. */
   invokeCardActionBatch?: (deckId: string, actionId: string, options: CardBatchOptions) => Promise<CardBatchResult>;
+  /** PRD #2374 decision 2026-11-24 — read one daemon's card actions for the editor. Rejects with the reason it could not. */
+  readCardCatalog?: (deckId: string) => Promise<EditableCardCatalog>;
+  /** PRD #2374 decision 2026-11-24 — change one daemon's card actions; answers them after the change, or rejects with the daemon's reason (nothing written). */
+  editCardCatalog?: (deckId: string, edit: CardCatalogEdit) => Promise<EditableCardCatalog>;
   /**
    * PRD #1790 stage 2 — each deck's interrupted work (what a restart of its
    * daemon left behind), the dialog that lists it, and the calls that act on

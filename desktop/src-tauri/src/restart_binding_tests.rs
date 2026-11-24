@@ -64,6 +64,17 @@ struct Script {
     /// PR #2491 review: an `invoke-card-action-batch` is answered with this
     /// per-entry result.
     batch_answer: Option<dot_agent_deck::agent_cards::CardBatchResult>,
+    /// Issue #2399 (PR #2491 scope extension): whether the deck advertises
+    /// `agent-cards-catalog-edit`, when set; unset advertises what this build
+    /// does.
+    catalog_edit_capability: Option<bool>,
+    /// Every `card-catalog-edit` request, as sent.
+    catalog_edit_requests: Vec<serde_json::Value>,
+    /// A `card-catalog-edit` is read and never answered, the connection held
+    /// open.
+    silent_catalog_edit: bool,
+    /// A `card-catalog-edit` is answered with this refusal.
+    refuse_catalog_edit: Option<&'static str>,
     /// PR #2491 review: every `Hello` names this attach protocol, when set —
     /// a deck the establishment handshake classifies incompatible.
     hello_protocol: Option<u32>,
@@ -222,6 +233,16 @@ impl RestartingDeck {
                                     return;
                                 }
                             }
+                            if op == "card-catalog-edit" {
+                                script
+                                    .lock()
+                                    .unwrap()
+                                    .catalog_edit_requests
+                                    .push(request.clone());
+                                if script.lock().unwrap().silent_catalog_edit {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
                             if op == "hello"
                                 && request["follow_on"] == true
                                 && script.lock().unwrap().drop_follow_on_hello
@@ -262,6 +283,20 @@ impl RestartingDeck {
                                     if advertise {
                                         capabilities.push(
                                             dot_agent_deck::daemon_protocol::CAP_GENERATE_CONFIG
+                                                .into(),
+                                        );
+                                    }
+                                }
+                                if let Some(advertise) =
+                                    script.lock().unwrap().catalog_edit_capability
+                                {
+                                    let capabilities = hello.capabilities.get_or_insert_default();
+                                    capabilities.retain(|cap| {
+                                        cap != dot_agent_deck::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT
+                                    });
+                                    if advertise {
+                                        capabilities.push(
+                                            dot_agent_deck::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT
                                                 .into(),
                                         );
                                     }
@@ -317,6 +352,18 @@ impl RestartingDeck {
                                         .unwrap_or_else(|| {
                                             AttachResponse::with_id("m-config".into())
                                         })
+                                } else if op == "card-catalog-edit" {
+                                    match script.lock().unwrap().refuse_catalog_edit {
+                                        Some(refusal) => AttachResponse::err(refusal),
+                                        None => AttachResponse {
+                                            card_catalog_edit: Some(
+                                                dot_agent_deck::card_catalog::editable_catalog(
+                                                    None,
+                                                ),
+                                            ),
+                                            ..AttachResponse::ok()
+                                        },
+                                    }
                                 } else if let Some(refusal) = script
                                     .lock()
                                     .unwrap()
@@ -2066,4 +2113,167 @@ async fn a_card_batch_preview_a_deck_declines_at_its_handshake_skips_each_agent_
             "{tag}: no batch request was written"
         );
     }
+}
+
+/// The edit the card-action editor's transport tests send: add a `ship`
+/// action.
+fn catalog_add() -> dot_agent_deck::card_catalog::CatalogActionEdit {
+    dot_agent_deck::card_catalog::CatalogActionEdit::Add {
+        action: dot_agent_deck::card_catalog::CatalogActionInput {
+            name: "ship".into(),
+            description: "Offer when it is ready.".into(),
+            prompt: "Ship it.".into(),
+            icon: Some("rocket".into()),
+            ..Default::default()
+        },
+    }
+}
+
+/// Scenario (issue #2399, PR #2491 scope extension): the user opens the Card
+/// actions editor on a deck whose daemon does not advertise it, and then on
+/// one that does. The first is sent no request — reading and saving both
+/// answer the sentence that the daemon's release cannot be edited from the
+/// app — and the second gets exactly the request the editor made, the edit
+/// as given, and its catalog comes back.
+#[tokio::test]
+async fn a_card_catalog_edit_goes_only_to_a_deck_that_advertises_it() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-gate", "a");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(false);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+
+    for edit in [None, Some(catalog_add())] {
+        let refused = crate::agent_card_catalog_edit_on(&state, &wire, edit)
+            .await
+            .expect_err("an older daemon cannot edit its card actions");
+        assert_eq!(refused, crate::CARD_CATALOG_EDIT_UNSUPPORTED);
+        assert!(
+            refused.contains("cannot be edited from the app"),
+            "{refused}"
+        );
+    }
+    assert!(
+        deck.script.lock().unwrap().catalog_edit_requests.is_empty(),
+        "nothing is sent to a daemon that does not advertise the editor"
+    );
+
+    drop(_local);
+
+    // Control: a deck that advertises it. The capabilities a trusted link
+    // holds are its `Hello`'s, so this is a deck of its own.
+    let deck = RestartingDeck::start("catalog-edit-gate-on", "b");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let read = crate::agent_card_catalog_edit_on(&state, &wire, None)
+        .await
+        .expect("a read is answered");
+    let names: Vec<_> = read
+        .actions
+        .iter()
+        .map(|a| a.action.name.as_str())
+        .collect();
+    assert_eq!(names, ["go-ahead", "merge"]);
+    crate::agent_card_catalog_edit_on(&state, &wire, Some(catalog_add()))
+        .await
+        .expect("an edit is answered");
+    let script = deck.script.lock().unwrap();
+    assert_eq!(script.catalog_edit_requests.len(), 2);
+    assert_eq!(script.catalog_edit_requests[0]["op"], "card-catalog-edit");
+    assert!(
+        script.catalog_edit_requests[0]
+            .get("edit")
+            .is_none_or(|edit| edit.is_null()),
+        "a read carries no edit"
+    );
+    assert_eq!(
+        script.catalog_edit_requests[1]["edit"],
+        serde_json::to_value(catalog_add()).unwrap()
+    );
+}
+
+/// Scenario (issue #2399, PR #2491 scope extension): the user saves an action
+/// the deck's daemon refuses. The editor is given the daemon's own reason, as
+/// the daemon worded it, and nothing else is sent.
+#[tokio::test]
+async fn a_refused_card_catalog_edit_comes_back_as_the_daemon_s_reason() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-refused", "a");
+    const REASON: &str = "catalog.actions \"Ship It\": bad name; use 1 to 40 lowercase letters, digits and '-', starting with a letter or digit";
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.catalog_edit_capability = Some(true);
+        script.refuse_catalog_edit = Some(REASON);
+    }
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let refused = crate::agent_card_catalog_edit_on(&state, &wire, Some(catalog_add()))
+        .await
+        .expect_err("a refused edit is an error");
+    assert_eq!(refused, REASON, "the daemon's reason, as it gave it");
+    assert_eq!(deck.script.lock().unwrap().catalog_edit_requests.len(), 1);
+}
+
+/// Scenario (issue #2399, PR #2491 scope extension): the user saves an action
+/// on a deck that takes the request and never answers. The editor is told,
+/// at the ordinary round-trip bound, that the deck did not answer and that
+/// the action may have been saved; the request was sent once, not again. A
+/// read the deck never answers ends at the same bound.
+#[tokio::test]
+async fn a_card_catalog_edit_the_deck_never_answers_is_bounded() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-silent", "a");
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.catalog_edit_capability = Some(true);
+        script.silent_catalog_edit = true;
+    }
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let bound = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let edited = crate::agent_card_catalog_edit_on(&state, &wire, Some(catalog_add())).await;
+    let waited = started.elapsed();
+    let read = crate::agent_card_catalog_edit_on(&state, &wire, None).await;
+    tokio::time::resume();
+
+    let edited = edited.expect_err("an unanswered edit is an error");
+    assert!(
+        edited.contains("did not answer") && edited.contains("may have been saved"),
+        "{edited}"
+    );
+    assert!(
+        waited >= bound && waited < bound + std::time::Duration::from_secs(1),
+        "the wait ends at the bound: {waited:?}"
+    );
+    let read = read.expect_err("an unanswered read is an error");
+    assert!(read.contains("did not answer"), "{read}");
+    assert!(!read.contains("saved"), "a read saves nothing: {read}");
+    assert_eq!(
+        deck.script.lock().unwrap().catalog_edit_requests.len(),
+        2,
+        "each request was sent once"
+    );
 }

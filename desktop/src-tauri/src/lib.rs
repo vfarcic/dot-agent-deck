@@ -1857,6 +1857,11 @@ pub(crate) struct DesktopAgentCards {
     /// may offer them (`agent_card_invoke_batch`). `false` for an older
     /// daemon, which the shared client never sends a batch.
     batch: bool,
+    /// Issue #2399 (PR #2491 scope extension): the daemon advertised the
+    /// card-action editor's request, so the webview may edit its card
+    /// actions (`agent_card_catalog_edit`). `false` for an older daemon,
+    /// whose actions the editor shows read-only.
+    catalog_edit: bool,
 }
 
 impl DesktopAgentCards {
@@ -1870,6 +1875,7 @@ impl DesktopAgentCards {
             catalog_errors: list.catalog_errors,
             tree: answer.tree,
             batch: answer.batch,
+            catalog_edit: answer.catalog_edit,
         }
     }
 }
@@ -2181,6 +2187,75 @@ async fn agent_card_invoke_batch(
         entries,
     )
     .await
+}
+
+/// Issue #2399 (PR #2491 scope extension): the card-action editor. With no
+/// `edit`, read deck `deck_id`'s editable card actions; with one, ask its
+/// daemon to apply it to the daemon's own user config and answer the actions
+/// afterwards. The webview names no file: the daemon writes only its own user
+/// config. A refused edit is the daemon's reason; a daemon without the editor's
+/// capability is sent nothing. The wait is bounded
+/// ([`crate::daemon_bridge::DECK_REPLY_TIMEOUT`]).
+#[tauri::command]
+async fn agent_card_catalog_edit(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    edit: Option<dot_agent_deck::card_catalog::CatalogActionEdit>,
+) -> Result<dot_agent_deck::card_catalog::EditableCardCatalog, String> {
+    ensure_main_webview(&webview)?;
+    agent_card_catalog_edit_on(&state, &deck_id, edit).await
+}
+
+/// What the editor says for a deck whose daemon cannot edit card actions.
+pub(crate) const CARD_CATALOG_EDIT_UNSUPPORTED: &str = "this deck's daemon is from a release whose card actions cannot be edited from the app; upgrade it, or edit its user config file";
+
+/// [`agent_card_catalog_edit`] minus the webview. Reaching and trusting the
+/// deck and the exchange run against one deadline,
+/// [`crate::daemon_bridge::DECK_REPLY_TIMEOUT`] from when it starts, so a deck
+/// that never answers holds the editor no longer than any round trip. A
+/// refusal is the daemon's reason as it gave it. An edit whose answer was lost
+/// after it was sent says it may have been saved, so the editor reads the
+/// catalog again rather than repeat it.
+pub(crate) async fn agent_card_catalog_edit_on(
+    state: &DesktopState,
+    deck_id: &str,
+    edit: Option<dot_agent_deck::card_catalog::CatalogActionEdit>,
+) -> Result<dot_agent_deck::card_catalog::EditableCardCatalog, String> {
+    let deadline = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+    let until = tokio::time::Instant::now() + deadline;
+    let edits = edit.is_some();
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = match tokio::time::timeout_at(until, state.daemon.trusted(scope.endpoint())).await
+    {
+        Ok(Ok(daemon)) => daemon,
+        Ok(Err(error)) => return Err(safe_message(error)),
+        Err(_) => {
+            return Err(format!(
+                "the deck could not be reached within {}s; nothing was saved",
+                deadline.as_secs()
+            ));
+        }
+    };
+    daemon.require_compatible()?;
+    let unknown = if edits {
+        "; it may have been saved, so check the list before saving again"
+    } else {
+        ""
+    };
+    match tokio::time::timeout_at(until, daemon.client.card_catalog_edit(edit)).await {
+        Ok(Ok(GatedQuery::Answered(catalog))) => Ok(catalog),
+        Ok(Ok(GatedQuery::Unsupported)) => Err(CARD_CATALOG_EDIT_UNSUPPORTED.to_string()),
+        Ok(Err(ClientError::Server(reason))) => Err(safe_message(reason)),
+        Ok(Err(ClientError::Unanswered(detail))) => Err(safe_message(format!(
+            "the deck's answer was lost or could not be read ({detail}){unknown}"
+        ))),
+        Ok(Err(error)) => Err(safe_message(error.to_string())),
+        Err(_) => Err(format!(
+            "the deck did not answer within {}s{unknown}",
+            deadline.as_secs()
+        )),
+    }
 }
 
 /// Issue #2399 re-review: the outcome of an executed entry whose fate the
@@ -8067,6 +8142,7 @@ pub fn run() {
             agent_cards_list,
             agent_card_invoke,
             agent_card_invoke_batch,
+            agent_card_catalog_edit,
             interrupted_work_list,
             interrupted_work_show,
             interrupted_work_reclaim,

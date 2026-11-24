@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentCardAction, AgentCardEntry, AgentCardsSnapshot, AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { AgentCardAction, AgentCardEntry, AgentCardsSnapshot, CardActionInput, CardCatalogEdit, EditableCardAction, EditableCardCatalog, AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
 import type { ProjectTrustRole } from "../lib/projectTrust";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
@@ -1107,7 +1107,7 @@ export function treeAgentCards(scene: "tree" | "tree-nested" = "tree"): AgentCar
     return [entry, ...below];
   };
   for (const root of scene === "tree-nested" ? TREE_NESTED_SCENE : TREE_SCENE) add(root, undefined, undefined, undefined);
-  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 1, entries, catalogErrors: [], tree: true };
+  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 1, entries, catalogErrors: [], tree: true, catalogEdit: true };
 }
 
 const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
@@ -2742,4 +2742,88 @@ export function fixtureSelfUpgradeApi(search: string = window.location.search): 
     }, FIXTURE_UPGRADE_STEP_MS)),
     relaunch: async () => undefined,
   };
+}
+
+/**
+ * PRD #2374 decision 2026-11-24 — the preview's card actions editor for the
+ * `cards=tree` scene: a catalog holding the deck's two defaults (Go ahead and
+ * Merge it, as the deck ships them) that applies each edit as a daemon would —
+ * an add, an update (an override for a default), a removal of the user's own,
+ * hiding and restoring a default — refusing what the daemon refuses with its
+ * words. It lives for the page's session; nothing is written anywhere.
+ */
+export function createFixtureCardCatalog(userConfig = "~/.config/dot-agent-deck/config.toml") {
+  type Action = EditableCardAction;
+  const deck = (name: string, label: string, prompt: string, icon: string, description: string): Action => ({
+    name, label, description, prompt, icon, placement: "card", confirm: false, always: false, source: "default", default: true, overridden: false, hidden: false,
+  });
+  const defaults: Action[] = [
+    deck("go-ahead", "Go ahead", "Go ahead.", "play", "Offer when you are waiting for the user's approval to continue."),
+    deck("merge", "Merge it", "Merge it, following this project's own merge procedure, then update your card.", "git-merge", "Offer when your work is ready to merge."),
+  ];
+  const overrides = new Map<string, Action>();
+  const hidden = new Set<string>();
+  const own: Action[] = [];
+  const isDefault = (name: string) => defaults.some((action) => action.name === name);
+  const read = (): EditableCardCatalog => ({
+    actions: [
+      ...defaults.map((action) => {
+        if (hidden.has(action.name)) return { ...action, hidden: true };
+        const override = overrides.get(action.name);
+        return override ? { ...override, default: true, overridden: true, hidden: false } : { ...action };
+      }),
+      ...own.map((action) => ({ ...action })),
+    ],
+    errors: [],
+    user_config: userConfig,
+  });
+  const entry = (input: CardActionInput): Action => {
+    const where = `catalog.actions ${JSON.stringify(input.name)}`;
+    if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(input.name)) throw new Error(`${where}: bad name; use 1 to 40 lowercase letters, digits and '-', starting with a letter or digit`);
+    if (["open", "reply", "close", "close-keep-worktree"].includes(input.name) || input.name.startsWith("question")) throw new Error(`${where}: ${JSON.stringify(input.name)} is a reserved name`);
+    if (!input.description.trim()) throw new Error(`${where}: "description" is empty`);
+    if (!input.prompt.trim()) throw new Error(`${where}: "prompt" is empty`);
+    if (input.icon !== undefined && !/^[a-z0-9-]{1,32}$/.test(input.icon)) throw new Error(`${where}: bad icon ${JSON.stringify(input.icon)}; use 1 to 32 lowercase letters, digits and '-'`);
+    return {
+      name: input.name, label: input.label?.trim() ? input.label : input.name.replace(/-/g, " ").replace(/^./, (first) => first.toUpperCase()),
+      description: input.description, prompt: input.prompt, icon: input.icon ?? null, placement: input.placement ?? "card",
+      confirm: input.confirm, always: input.always, source: "user", default: false, overridden: false, hidden: false,
+    };
+  };
+  const edit = (change: CardCatalogEdit): EditableCardCatalog => {
+    const at = (name: string) => own.findIndex((action) => action.name === name);
+    switch (change.kind) {
+      case "add": {
+        const added = entry(change.action);
+        if (isDefault(added.name)) throw new Error(`${JSON.stringify(added.name)} is a deck default; edit it instead of adding it`);
+        if (at(added.name) >= 0) throw new Error(`an action named ${JSON.stringify(added.name)} already exists; edit it instead`);
+        own.push(added);
+        break;
+      }
+      case "update": {
+        const updated = entry(change.action);
+        if (isDefault(updated.name)) { hidden.delete(updated.name); overrides.set(updated.name, updated); break; }
+        const index = at(updated.name);
+        if (index < 0) throw new Error(`no action named ${JSON.stringify(updated.name)} in your catalog to edit`);
+        own[index] = updated;
+        break;
+      }
+      case "remove": {
+        if (isDefault(change.name)) throw new Error(`${JSON.stringify(change.name)} is a deck default; hide it instead of removing it`);
+        const index = at(change.name);
+        if (index < 0) throw new Error(`no action named ${JSON.stringify(change.name)} in your catalog to remove`);
+        own.splice(index, 1);
+        break;
+      }
+      case "hide":
+      case "restore": {
+        if (!isDefault(change.name)) throw new Error(`${JSON.stringify(change.name)} is not a deck default; only a deck default can be ${change.kind === "hide" ? "hidden" : "restored"}`);
+        overrides.delete(change.name);
+        if (change.kind === "hide") hidden.add(change.name); else hidden.delete(change.name);
+        break;
+      }
+    }
+    return read();
+  };
+  return { read, edit };
 }
