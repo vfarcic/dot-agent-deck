@@ -1334,51 +1334,45 @@ pub(crate) fn lock_config_edit_by(
 /// than this one could change — group- or world-writable without the sticky
 /// bit, or owned by someone other than this user and root — named with the
 /// reason. Such a folder lets another user swap the file between the save's
-/// checks and its rename, so a strict save refuses there. Three walks, each
-/// from a folder up to the user's home (as `$HOME` names it, or resolved), or
-/// up to the root when the folder is not under it: the folder of `configured`
-/// as written and of `target` as written, component by component — a folder
-/// that holds a link on the path can point that link elsewhere (final audit
-/// A2) — and the folder `target` resolves to. Checked by pathname when the
-/// save starts; a folder changed afterwards is not caught.
+/// checks and its rename, so a strict save refuses there.
+///
+/// The path is resolved here, one component at a time from the root (a
+/// relative one from the current folder), following each link where it is
+/// met — in a folder component or in the final file's own chain — and `..`
+/// against the folder reached so far, as the kernel does (final audit A2,
+/// round 4). Each folder a name is looked up in is judged with its parents,
+/// up to the user's home (as `$HOME` names it, or resolved) or up to the root
+/// when the folder is not under it: every folder holding a link that is
+/// followed, at any depth, and every other folder looked in that is not above
+/// the home (home's own parents are judged only where they hold a followed
+/// link). The folder the final file is in is one of those. Refused: more than
+/// [`FOLDER_CHECK_MAX_LINKS`] links followed (a loop among them), a link that
+/// cannot be read, and an entry that cannot be inspected; the final file may
+/// be absent, a folder before it may not. Checked by pathname when the save
+/// starts; a folder changed afterwards is not caught.
 #[cfg(unix)]
-fn folder_others_can_change(configured: &Path, target: &Path) -> Result<(), String> {
+fn folder_others_can_change(configured: &Path) -> Result<(), String> {
+    use std::collections::{HashSet, VecDeque};
+    use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt as _;
-    let folder_of = |file: &Path| match file.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let absolute = |dir: PathBuf| -> Result<PathBuf, String> {
-        if dir.is_absolute() {
-            return Ok(dir);
-        }
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&dir))
-            .map_err(|e| format!("its folder {} cannot be resolved ({e})", dir.display()))
-    };
-    let resolved = std::fs::canonicalize(folder_of(target)).map_err(|e| {
-        format!(
-            "its folder {} cannot be resolved ({e})",
-            folder_of(target).display()
-        )
-    })?;
-    let walks = [
-        absolute(folder_of(configured))?,
-        absolute(folder_of(target))?,
-        resolved,
-    ];
+    use std::path::Component;
+
     let home_as_named = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from);
     let home = home_as_named
         .as_deref()
         .and_then(|home| std::fs::canonicalize(home).ok());
+    let is_home =
+        |dir: &Path| home.as_deref() == Some(dir) || home_as_named.as_deref() == Some(dir);
     // SAFETY: `geteuid` takes no arguments and cannot fail.
     let me = unsafe { libc::geteuid() };
-    for start in &walks {
+    let mut judged: HashSet<PathBuf> = HashSet::new();
+    let mut judge = |start: &Path| -> Result<(), String> {
         for dir in start.ancestors() {
-            // Through a link, `metadata` judges where it leads; the link
-            // itself is judged by the folder holding it, the next ancestor.
+            if !judged.insert(dir.to_path_buf()) {
+                break;
+            }
             let meta = std::fs::metadata(dir)
                 .map_err(|e| format!("the folder {} cannot be inspected ({e})", dir.display()))?;
             let mode = meta.mode();
@@ -1402,13 +1396,111 @@ fn folder_others_can_change(configured: &Path, target: &Path) -> Result<(), Stri
                     dir.display()
                 ));
             }
-            if home.as_deref() == Some(dir) || home_as_named.as_deref() == Some(dir) {
+            if is_home(dir) {
                 break;
             }
         }
+        Ok(())
+    };
+    // A folder strictly above the home: the walk passes through it to reach
+    // the home, and its parents are judged only where it holds a link.
+    let above_home = |dir: &Path| {
+        home.as_deref()
+            .is_some_and(|home| home != dir && home.starts_with(dir))
+    };
+
+    let absolute = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(configured))
+            .map_err(|e| {
+                format!(
+                    "the folder of {} cannot be resolved ({e})",
+                    configured.display()
+                )
+            })?
+    };
+    let mut rest: VecDeque<OsString> = VecDeque::new();
+    let push_front = |rest: &mut VecDeque<OsString>, path: &Path| -> bool {
+        let mut parts = Vec::new();
+        let mut rooted = false;
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::Prefix(_) => rooted = true,
+                Component::CurDir => {}
+                Component::ParentDir => parts.push(OsString::from("..")),
+                Component::Normal(name) => parts.push(name.to_os_string()),
+            }
+        }
+        for part in parts.into_iter().rev() {
+            rest.push_front(part);
+        }
+        rooted
+    };
+    push_front(&mut rest, &absolute);
+    let mut current = PathBuf::from("/");
+    let mut links = 0usize;
+    while let Some(name) = rest.pop_front() {
+        if name == ".." {
+            if let Some(parent) = current.parent() {
+                current = parent.to_path_buf();
+            }
+            continue;
+        }
+        let last = rest.is_empty();
+        let entry = current.join(&name);
+        let meta = match std::fs::symlink_metadata(&entry) {
+            Ok(meta) => meta,
+            Err(e) if last && e.kind() == std::io::ErrorKind::NotFound => {
+                if !above_home(&current) {
+                    judge(&current)?;
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "the folder {} cannot be resolved ({e})",
+                    entry.display()
+                ));
+            }
+        };
+        if meta.file_type().is_symlink() {
+            links += 1;
+            if links > FOLDER_CHECK_MAX_LINKS {
+                return Err(format!(
+                    "{} leads through more than {FOLDER_CHECK_MAX_LINKS} links, so the folders \
+                     it passes through cannot be checked",
+                    configured.display()
+                ));
+            }
+            let target = std::fs::read_link(&entry)
+                .map_err(|e| format!("the link {} cannot be read ({e})", entry.display()))?;
+            judge(&current)?;
+            if push_front(&mut rest, &target) {
+                current = PathBuf::from("/");
+            }
+            continue;
+        }
+        if !above_home(&current) {
+            judge(&current)?;
+        }
+        if last {
+            return Ok(());
+        }
+        current = entry;
+    }
+    // The path named a folder (or the root), not a file in one.
+    if !above_home(&current) {
+        judge(&current)?;
     }
     Ok(())
 }
+
+/// The most links [`folder_others_can_change`] follows on one path, as the
+/// kernel's own limit for a path lookup.
+#[cfg(unix)]
+const FOLDER_CHECK_MAX_LINKS: usize = 40;
 
 /// Issue #2399 re-audit new 1: open `target` for writing to learn that it can
 /// be written and what it is, without waiting and without following a link:
@@ -1513,7 +1605,7 @@ fn write_config_strictly_with(
     still_as_read: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    folder_others_can_change(configured, target)?;
+    folder_others_can_change(configured)?;
     #[cfg(not(unix))]
     let _ = configured;
     let target_meta = probe_for_write(target)?;
@@ -3968,6 +4060,45 @@ mod tests {
                 "{facts:?}: {found:?}"
             );
         }
+    }
+
+    /// Issue #2399 final audit A2, round 4: the folder check follows the
+    /// path's links itself, and refuses a path whose links it cannot follow
+    /// to an end: a loop of folder links, a loop of file links, and a chain
+    /// longer than its cap of 40 links (here 41, ending at a real file) are
+    /// each refused, naming the path; a chain of 40 is followed.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_check_refuses_a_link_loop_or_a_chain_past_its_cap() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let home = dir.path();
+        std::os::unix::fs::symlink(home.join("loop-dir"), home.join("loop-dir")).unwrap();
+        std::os::unix::fs::symlink(home.join("b.toml"), home.join("a.toml")).unwrap();
+        std::os::unix::fs::symlink(home.join("a.toml"), home.join("b.toml")).unwrap();
+        std::fs::write(home.join("real.toml"), "").unwrap();
+        let chain = |len: usize, prefix: &str| {
+            let mut next = home.join("real.toml");
+            for i in 0..len {
+                let link = home.join(format!("{prefix}{i}.toml"));
+                std::os::unix::fs::symlink(&next, &link).unwrap();
+                next = link;
+            }
+            next
+        };
+        let long = chain(41, "long-");
+        let at_cap = chain(40, "cap-");
+
+        for path in [
+            home.join("loop-dir").join("config.toml"),
+            home.join("a.toml"),
+            long,
+        ] {
+            let refused = folder_others_can_change(&path)
+                .expect_err("a loop or an over-long chain is refused");
+            assert!(refused.contains("links"), "{refused}");
+            assert!(refused.contains(&path.display().to_string()), "{refused}");
+        }
+        folder_others_can_change(&at_cap).expect("a chain of 40 links is followed");
     }
 
     /// Issue #2399 final audit A1: the strict writer's staging file is

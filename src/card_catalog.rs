@@ -4071,4 +4071,91 @@ placement = \"card\" # on the card, on purpose
         )
         .expect("saved once the folder is private");
     }
+
+    /// Issue #2399 final audit A2, round 4: a folder holding a link is judged
+    /// even when the path reaches it only through another link's expansion.
+    /// `outer -> shared/alias` and `shared/alias -> private`, with `shared`
+    /// group-writable: `outer/config.toml` is refused naming `shared`, though
+    /// neither the path as written nor where it ends passes through `shared`,
+    /// and the file is left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_is_refused_where_a_shared_folder_holds_a_link_inside_another_links_expansion() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let private = home.join("private");
+        let shared = home.join("shared");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&private, shared.join("alias")).unwrap();
+        std::os::unix::fs::symlink(shared.join("alias"), home.join("outer")).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        std::fs::write(private.join("config.toml"), EDITED_CONFIG).unwrap();
+        let path = home.join("outer").join("config.toml");
+        let add = || {
+            edit_user_catalog_at(
+                &path,
+                Some(&CatalogActionEdit::Add {
+                    action: input("deploy"),
+                }),
+            )
+        };
+
+        let refused = add().expect_err("a shared folder inside a link's expansion is refused");
+        assert!(refused.contains("other users"), "{refused}");
+        assert!(refused.contains("shared"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(private.join("config.toml")).unwrap(),
+            EDITED_CONFIG
+        );
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        add().expect("saved once the folder is private");
+    }
+
+    /// Issue #2399 final audit A2, round 4: a folder holding a hop of the
+    /// final file's own link chain is judged, not only the chain's two ends.
+    /// `via-hop.toml -> shared/hop.toml -> private/config.toml`, with `shared`
+    /// group-writable, is refused naming `shared`, and the file is left as it
+    /// was.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_is_refused_where_a_shared_folder_holds_a_hop_of_the_files_link_chain() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let private = home.join("private");
+        let shared = home.join("shared");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(private.join("config.toml"), EDITED_CONFIG).unwrap();
+        std::os::unix::fs::symlink(private.join("config.toml"), shared.join("hop.toml")).unwrap();
+        std::os::unix::fs::symlink(shared.join("hop.toml"), home.join("via-hop.toml")).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let path = home.join("via-hop.toml");
+        let add = || {
+            edit_user_catalog_at(
+                &path,
+                Some(&CatalogActionEdit::Add {
+                    action: input("deploy"),
+                }),
+            )
+        };
+
+        let refused = add().expect_err("a shared folder holding a hop of the chain is refused");
+        assert!(refused.contains("other users"), "{refused}");
+        assert!(refused.contains("shared"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(private.join("config.toml")).unwrap(),
+            EDITED_CONFIG
+        );
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        add().expect("saved once the folder is private");
+    }
 }
