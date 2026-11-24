@@ -190,6 +190,8 @@ pub use unix::{
     process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
     terminate_child_with_grace_and_wait, terminate_pid,
 };
+#[cfg(unix)]
+pub(crate) use unix::{answer_signal_request, signal_group};
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
@@ -210,6 +212,396 @@ pub fn session_of(pid: u32) -> Option<u32> {
 }
 #[cfg(windows)]
 pub fn session_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// PRD #1790 stage 3 (review R1 / audit B1): what the OS says of process
+/// `pid`, keeping "gone" apart from "could not look". [`process_start_of`]
+/// answers `None` for both, so a caller deciding that a process is gone must
+/// ask this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessProbe {
+    /// The kernel says no process holds the pid (`ESRCH`).
+    Absent,
+    /// Audit F4b/S3: the process holding the pid has exited and only waits
+    /// to be reaped (Linux: state `Z` or `X`). It runs nothing and writes
+    /// nothing, so a stop proof and a later "is it gone" check both read it
+    /// as gone ([`can_run`]).
+    Exited,
+    /// A process holds the pid, and started at this time
+    /// ([`process_start_of`]'s unit).
+    Started(u64),
+    /// Neither could be established: the start time could not be read and
+    /// the kernel did not say the pid is free (a process another user owns,
+    /// a restricted or missing `/proc`, a refused `proc_pidinfo`, a platform
+    /// without start times).
+    Unknown,
+}
+
+/// Probe process `pid` ([`ProcessProbe`]). The start time first; when it
+/// cannot be read, `kill(pid, 0)`, whose `ESRCH` is the one answer taken as
+/// absence (`EPERM` means a process holds the pid).
+pub fn probe_process(pid: u32) -> ProcessProbe {
+    match probe_process_with(pid, process_start_of, pid_is_free) {
+        ProcessProbe::Started(_) if is_zombie(pid) => ProcessProbe::Exited,
+        probe => probe,
+    }
+}
+
+/// [`probe_process`] with its two observations injected, for a test.
+pub fn probe_process_with(
+    pid: u32,
+    start_of: impl Fn(u32) -> Option<u64>,
+    is_free: impl Fn(u32) -> Option<bool>,
+) -> ProcessProbe {
+    if let Some(started) = start_of(pid) {
+        return ProcessProbe::Started(started);
+    }
+    match is_free(pid) {
+        Some(true) => ProcessProbe::Absent,
+        Some(false) | None => ProcessProbe::Unknown,
+    }
+}
+
+/// Whether no process holds `pid`: `Some(true)` on `ESRCH` from
+/// `kill(pid, 0)`, `Some(false)` when the signal could be sent or was refused
+/// for permission, `None` otherwise (a pid `pid_t` cannot hold, a platform
+/// without the call).
+#[cfg(unix)]
+fn pid_is_free(pid: u32) -> Option<bool> {
+    let pid = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: signal 0 delivers nothing; the call only checks the pid.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Some(false);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(true),
+        Some(libc::EPERM) => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn pid_is_free(_pid: u32) -> Option<bool> {
+    None
+}
+
+/// PRD #1790 stage 3 (audit "later slices" 2): whether any process is in
+/// the session `sid` names, `getsid(2)` asked of every process the OS lists
+/// (Linux: `/proc`; macOS: `proc_listallpids`). `None` when that cannot be
+/// established: the list could not be read, or a listed process's session
+/// could not be read for any reason but the process having exited. Elsewhere
+/// always `None`.
+pub fn session_has_members(sid: u32) -> Option<bool> {
+    session_has_members_in(sid, all_pids()?, running_session_of)
+}
+
+/// Audit F4b/S3: the one definition of "a process that can still run" that
+/// a stop proof ([`session_members`]) and every later check of a session
+/// ([`session_has_members`]) share: a process that exists and has not exited
+/// waiting to be reaped. `Some(Some(sid))` for such a process in `sid`,
+/// `Some(None)` for one that is gone or a zombie, `None` when its session
+/// could not be read. A state that cannot be read is not taken for a zombie,
+/// so it stays unknown or running, never gone.
+fn running_session_of(pid: u32) -> Option<Option<u32>> {
+    if is_zombie(pid) {
+        Some(None)
+    } else {
+        session_of_checked(pid)
+    }
+}
+
+/// [`session_has_members`] over `pids`, with `session_of` answering
+/// `Some(Some(sid))`, `Some(None)` for a process that exited meanwhile, and
+/// `None` for one whose session could not be read.
+pub fn session_has_members_in(
+    sid: u32,
+    pids: impl IntoIterator<Item = u32>,
+    session_of: impl Fn(u32) -> Option<Option<u32>>,
+) -> Option<bool> {
+    let mut unknown = false;
+    for pid in pids {
+        match session_of(pid) {
+            Some(Some(found)) if found == sid => return Some(true),
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
+}
+
+/// PRD #1790 stage 3 (audit F4): the processes in the session `sid` names
+/// that can still run, as [`session_has_members`] finds them, each with the
+/// start time it had when listed ([`process_start_of`]); `None` when that
+/// cannot be established. A member is named by both, so a pid reissued to
+/// another process after the listing does not answer to it
+/// ([`SessionMember`]).
+pub fn session_members(sid: u32) -> Option<Vec<SessionMember>> {
+    let pids = session_members_in(sid, all_pids()?, running_session_of)?;
+    let mut members = Vec::with_capacity(pids.len());
+    for pid in pids {
+        match process_start_of(pid) {
+            Some(start) => members.push(SessionMember { pid, start }),
+            // Gone since it was listed: nothing to stop.
+            None if pid_is_free(pid) == Some(true) => {}
+            None => return None,
+        }
+    }
+    Some(members)
+}
+
+/// One process of a session, as [`session_members`] listed it: its pid and
+/// its start time, which together name one process and not whichever holds
+/// the pid later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionMember {
+    pub pid: u32,
+    pub start: u64,
+}
+
+/// Audit F4a/S2: a handle on one process that a signal sent through it
+/// reaches only that process, never one that holds its pid after it. Linux
+/// holds a pidfd (`pidfd_open(2)`); a kernel without the call (`ENOSYS`,
+/// before 5.3), and every other Unix, holds the bare pid, so there a pid
+/// reissued between the last check and the signal is the documented
+/// residual window (`docs/develop/agent-restore.md`). On a kernel that has
+/// the call, any other failure to open one leaves the process unopened
+/// ([`Opened::Unusable`], round-4 F5): it is not signalled by its bare pid.
+#[cfg(unix)]
+pub struct ProcessHandle {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+
+/// What opening a handle on a process found ([`ProcessHandle::open`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Opened<H> {
+    /// A handle on the process that held the pid when it was opened.
+    Handle(H),
+    /// No process holds the pid, or it is not one a process can hold.
+    Absent,
+    /// A process may hold it, but no handle that pins it could be had (a
+    /// full descriptor table, a refused call): it must not be signalled.
+    Unusable,
+}
+
+/// Round-4 F5: what a failed `pidfd_open(2)`, its `errno` `errno`, leaves
+/// [`ProcessHandle::open`] with: `ESRCH` names no process; `ENOSYS`, a
+/// kernel without the call, falls back to the bare pid (`Handle(())`, the
+/// documented window); anything else is [`Opened::Unusable`].
+#[cfg(unix)]
+pub fn pidfd_open_failure(errno: Option<i32>) -> Opened<()> {
+    match errno {
+        Some(libc::ESRCH) => Opened::Absent,
+        Some(libc::ENOSYS) => Opened::Handle(()),
+        _ => Opened::Unusable,
+    }
+}
+
+#[cfg(unix)]
+impl ProcessHandle {
+    /// Open a handle on the process holding `pid` now ([`Opened`]).
+    pub fn open(pid: u32) -> Opened<Self> {
+        let Some(raw) = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0) else {
+            return Opened::Absent;
+        };
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd as _;
+            // SAFETY: `pidfd_open(2)` takes a pid and flags and returns a
+            // new descriptor or -1; it touches no memory of ours.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw, 0) };
+            if fd >= 0 {
+                // SAFETY: a descriptor the kernel just returned to us, owned
+                // by nothing else.
+                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+                return Opened::Handle(ProcessHandle { pid, fd: Some(fd) });
+            }
+            match pidfd_open_failure(std::io::Error::last_os_error().raw_os_error()) {
+                Opened::Handle(()) => Opened::Handle(ProcessHandle { pid, fd: None }),
+                Opened::Absent => Opened::Absent,
+                Opened::Unusable => Opened::Unusable,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = raw;
+            Opened::Handle(ProcessHandle { pid })
+        }
+    }
+
+    /// The pid the handle was opened for.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Whether the handle pins its process: a signal through it cannot
+    /// reach a later holder of the pid.
+    pub fn is_pinned(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.fd.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Send `SIGKILL` through the handle. `true` when it was delivered.
+    pub fn kill(&self) -> bool {
+        self.signal(libc::SIGKILL)
+    }
+
+    /// Send `SIGSTOP` through the handle. `true` when it was delivered.
+    pub fn stop(&self) -> bool {
+        self.signal(libc::SIGSTOP)
+    }
+
+    fn signal(&self, signal: libc::c_int) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.fd {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: a pidfd we own, a valid signal number, no siginfo,
+            // no flags.
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            return sent == 0;
+        }
+        let Ok(pid) = libc::pid_t::try_from(self.pid) else {
+            return false;
+        };
+        // SAFETY: a positive pid the caller checked was the listed process
+        // just now; see the type's docs for the window that remains.
+        unsafe { libc::kill(pid, signal) == 0 }
+    }
+}
+
+/// Round-4 F5: [`probe_process`] without its reading of a zombie as
+/// [`ProcessProbe::Exited`]: a process that exited and waits to be reaped
+/// still holds its pid, and is named by its start time like a running one.
+pub fn probe_process_held(pid: u32) -> ProcessProbe {
+    probe_process_with(pid, process_start_of, pid_is_free)
+}
+
+/// Whether `pid` has exited and only waits to be reaped (Linux: state `Z`
+/// or `X` in `/proc/<pid>/stat`): a process that holds nothing and runs
+/// nothing, which neither [`session_members`] nor [`session_has_members`]
+/// counts. `false` wherever that cannot be read.
+#[cfg(target_os = "linux")]
+pub fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, rest) = stat.rsplit_once(')')?;
+            rest.trim_start().chars().next()
+        })
+        .is_some_and(|state| matches!(state, 'Z' | 'X'))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// [`session_members`] over `pids`, with `session_of` as for
+/// [`session_has_members_in`].
+pub fn session_members_in(
+    sid: u32,
+    pids: impl IntoIterator<Item = u32>,
+    session_of: impl Fn(u32) -> Option<Option<u32>>,
+) -> Option<Vec<u32>> {
+    let mut members = Vec::new();
+    for pid in pids {
+        match session_of(pid)? {
+            Some(found) if found == sid => members.push(pid),
+            _ => {}
+        }
+    }
+    Some(members)
+}
+
+/// `getsid(pid)`: `Some(Some(sid))`, `Some(None)` on `ESRCH` (or a pid no
+/// process can hold), `None` on any other error.
+#[cfg(unix)]
+fn session_of_checked(pid: u32) -> Option<Option<u32>> {
+    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0) else {
+        return Some(None);
+    };
+    // SAFETY: `getsid(2)` has no side effects and only reads the process table.
+    let sid = unsafe { libc::getsid(pid) };
+    if sid >= 0 {
+        return Some(u32::try_from(sid).ok());
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(None),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn session_of_checked(_pid: u32) -> Option<Option<u32>> {
+    None
+}
+
+/// Every process id the OS lists, or `None` when the list cannot be read.
+#[cfg(target_os = "linux")]
+fn all_pids() -> Option<Vec<u32>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut pids = Vec::new();
+    for entry in entries {
+        let entry = entry.ok()?;
+        if let Some(pid) = entry.file_name().to_str().and_then(|n| {
+            (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<u32>().ok())
+                .flatten()
+        }) {
+            pids.push(pid);
+        }
+    }
+    // A `/proc` that lists no process at all (not mounted, a bare directory)
+    // cannot answer: this process is always in a real one.
+    (!pids.is_empty()).then_some(pids)
+}
+
+/// See the Linux variant.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Option<Vec<u32>> {
+    // SAFETY: a null buffer of size 0 asks only for the count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let count = usize::try_from(count).ok().filter(|c| *c > 0)?;
+    // Room for processes started between the two calls.
+    let capacity = count + 256;
+    let mut buffer: Vec<libc::pid_t> = vec![0; capacity];
+    let bytes = libc::c_int::try_from(capacity * std::mem::size_of::<libc::pid_t>()).ok()?;
+    // SAFETY: `buffer` is a live, writable buffer of exactly `bytes` bytes;
+    // the call writes at most that many and answers how many pids it wrote.
+    let written = unsafe { libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes) };
+    let written = usize::try_from(written).ok().filter(|w| *w > 0)?;
+    // A full buffer may have been cut short: refuse to answer from it.
+    if written >= capacity {
+        return None;
+    }
+    buffer.truncate(written);
+    Some(
+        buffer
+            .into_iter()
+            .filter_map(|pid| u32::try_from(pid).ok())
+            .collect(),
+    )
+}
+
+/// See the Linux variant.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn all_pids() -> Option<Vec<u32>> {
     None
 }
 
@@ -478,6 +870,106 @@ pub(crate) mod test_child {
 mod tests {
     use super::*;
 
+    /// PRD #1790 stage 3 (review R1 / audit B1): a start time that cannot be
+    /// read is absence only when the kernel says the pid is free; a refused
+    /// or failed lookup is unknown, never gone.
+    #[test]
+    fn a_failed_identity_lookup_is_unknown_and_only_esrch_is_absence() {
+        let none = |_| None;
+        assert_eq!(
+            probe_process_with(42, |_| Some(7), |_| Some(true)),
+            ProcessProbe::Started(7)
+        );
+        assert_eq!(
+            probe_process_with(42, none, |_| Some(true)),
+            ProcessProbe::Absent
+        );
+        assert_eq!(
+            probe_process_with(42, none, |_| Some(false)),
+            ProcessProbe::Unknown,
+            "a live process whose start time could not be read"
+        );
+        assert_eq!(
+            probe_process_with(42, none, |_| None),
+            ProcessProbe::Unknown
+        );
+    }
+
+    /// The real probe: this process is running with a start time where the
+    /// platform reads one, and a pid no process can hold is absent.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_probe_sees_this_process_and_not_a_free_pid() {
+        assert!(matches!(
+            probe_process(std::process::id()),
+            ProcessProbe::Started(_)
+        ));
+        assert_eq!(pid_is_free(i32::MAX as u32), Some(true));
+    }
+
+    /// PRD #1790 stage 3 (audit F4b/S3): a session whose only process has
+    /// exited and is held unreaped (a zombie) is empty for every check alike:
+    /// the stop proof's member list, the later "is anything left" scan, and
+    /// the leader's own probe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_retained_zombie_is_gone_for_every_session_check() {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        // SAFETY: `setsid` is async-signal-safe and touches nothing shared.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        // Not reaped: it stays a zombie until `wait` below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never became a zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(probe_process(pid), ProcessProbe::Exited);
+        assert_eq!(session_has_members(pid), Some(false));
+        assert_eq!(session_members(pid), Some(Vec::new()));
+        child.wait().unwrap();
+    }
+
+    /// PRD #1790 stage 3: a session is empty only when every listed process
+    /// answered; one whose session could not be read makes it unknown, one
+    /// that exited meanwhile does not.
+    #[test]
+    fn a_session_scan_that_could_not_read_a_process_is_unknown() {
+        let table = |pid: u32| match pid {
+            1 => Some(Some(1)),
+            2 => Some(Some(50)),
+            3 => Some(None),
+            _ => None,
+        };
+        assert_eq!(session_has_members_in(50, [1, 2, 3], table), Some(true));
+        assert_eq!(session_has_members_in(60, [1, 2, 3], table), Some(false));
+        assert_eq!(session_has_members_in(60, [1, 4], table), None);
+        assert_eq!(session_has_members_in(50, [4, 2], table), Some(true));
+    }
+
+    /// The real scan: this process's own session has a member, and a session
+    /// no process can be in has none.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_session_scan_finds_this_processs_own_session() {
+        let own = session_of(std::process::id()).expect("this process's session");
+        assert_eq!(session_has_members(own), Some(true));
+        assert_ne!(session_has_members(i32::MAX as u32), Some(true));
+    }
+
     /// R2-fix4 (U2): a walk that runs out of steps is told apart from one
     /// that ends outside the root's tree, and from one that cannot read a
     /// parent; [`descends_from_with`] still answers it `Some(false)`.
@@ -581,5 +1073,35 @@ mod tests {
             "an already-exited child must not cost the full grace window (took {:?})",
             started.elapsed()
         );
+    }
+
+    /// PRD #1790 stage 3 (round-4 F5): a `pidfd_open` that fails says the
+    /// process is gone only on `ESRCH`; a kernel without the call falls back
+    /// to the bare pid; every other failure (a full descriptor table, a
+    /// refused call) leaves nothing that may be signalled.
+    #[cfg(unix)]
+    #[test]
+    fn a_pidfd_that_cannot_be_opened_is_not_signalled_by_its_pid() {
+        assert_eq!(pidfd_open_failure(Some(libc::ESRCH)), Opened::Absent);
+        assert_eq!(pidfd_open_failure(Some(libc::ENOSYS)), Opened::Handle(()));
+        for errno in [
+            Some(libc::EMFILE),
+            Some(libc::ENFILE),
+            Some(libc::EPERM),
+            Some(libc::EINVAL),
+            Some(libc::ENOMEM),
+            None,
+        ] {
+            assert_eq!(pidfd_open_failure(errno), Opened::Unusable, "{errno:?}");
+        }
+        // A pid no process can hold opens nothing.
+        assert!(matches!(ProcessHandle::open(0), Opened::Absent));
+        assert!(matches!(ProcessHandle::open(u32::MAX), Opened::Absent));
+        // This process, which the test may name, is held, never absent.
+        match ProcessHandle::open(std::process::id()) {
+            Opened::Handle(handle) => assert_eq!(handle.pid(), std::process::id()),
+            Opened::Unusable => {}
+            Opened::Absent => panic!("this process reads as absent"),
+        }
     }
 }

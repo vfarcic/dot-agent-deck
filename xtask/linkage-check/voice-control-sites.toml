@@ -594,54 +594,6 @@ reason = "Projects sheet (experimental; its opener `openProjects` is `no_voice`)
 file = "desktop/src/components/ConfigurationPanels.tsx"
 handler = "onMouseDown"
 code = "onClose"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): backdrop, a dismissal."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onClick"
-code = "onClose"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): close X, a dismissal."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onClick"
-code = "onAdd"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): Add prompt; a browse-and-edit surface whose operations are typed."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onClick"
-code = "() => onSelect(item.id)"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): selects a saved prompt to edit; follows the sheet's classification."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onChange"
-code = "(event) => onUpdate(prompt.id, { name: event.target.value })"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): typing a prompt's name: field editing."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onChange"
-code = "(event) => onUpdate(prompt.id, { body: event.target.value })"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): typing a prompt's body: field editing."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onChange"
-code = "(event) => onUpdate(prompt.id, { note: event.target.value })"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): typing a prompt's note: field editing."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onClick"
-code = "() => { if (removeArmed) onRemove(prompt.id); else setRemoveArmed(true); }"
-reason = "Prompt library sheet (experimental; its opener `openPromptLibrary` is `no_voice`): Remove / Confirm remove deletes a saved prompt; kept manual, and follows the sheet's classification."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onMouseDown"
-code = "onClose"
 reason = "Agent profiles sheet (experimental; its opener `openAgentProfiles` is `no_voice`): backdrop, a dismissal."
 
 [[site]]
@@ -748,18 +700,6 @@ reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder
 
 [[site]]
 file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onChange"
-code = "(event) => { const prompt = prompts.find((candidate) => candidate.id === event.target.value); if (prompt) setTaskPrompt(prompt.body); }"
-reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Insert saved prompt select copies a prompt into the task field; a per-field edit of the launch form."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
-handler = "onChange"
-code = "(event) => setTaskPrompt(event.target.value)"
-reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): typing the task prompt: field editing."
-
-[[site]]
-file = "desktop/src/components/ConfigurationPanels.tsx"
 handler = "onClick"
 code = "onChooseProject"
 reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Choose one forwards `onChooseProject`, which App.tsx wires to VOICE_ACTIONS.openProjects."
@@ -785,7 +725,7 @@ reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder
 [[site]]
 file = "desktop/src/components/ConfigurationPanels.tsx"
 handler = "onClick"
-code = '() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })'
+code = '() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })'
 reason = "Orchestration editor (experimental; its opener `openOrchestrationOrder` is `no_voice`): Activate orchestration launches the configured run; follows the editor's classification."
 
 [[site]]

@@ -1374,6 +1374,11 @@ mod tests {
                     "previousInterruptedReports",
                     vec!["overview"]
                 ),
+                (
+                    "restore_interrupted",
+                    "askRestoreInterrupted",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -2487,6 +2492,7 @@ mod tests {
                 "show_interrupted_reports",
                 "next_interrupted_reports",
                 "previous_interrupted_reports",
+                "restore_interrupted",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

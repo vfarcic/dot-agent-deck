@@ -113,7 +113,7 @@ import type { InterruptedDialogControls } from "./interruptedWork";
  * that needed it would be a change to where the state lives rather than a
  * change to the table.
  */
-export type DeckOverlay = "projects" | "prompts" | "profiles" | "orchestration" | "settings";
+export type DeckOverlay = "projects" | "profiles" | "orchestration" | "settings";
 
 /** Issue #1492 — where a spoken scroll moves the agent dashboard: a screen down or up, or to either end. */
 export type DashboardScroll = "down" | "up" | "top" | "bottom";
@@ -1158,13 +1158,6 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
   },
 
-  openPromptLibrary: {
-    label: "Open the prompt library",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4)",
-    needs: ["openOverlay"],
-    run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
-  },
-
   openAgentProfiles: {
     label: "Open agent profiles",
     no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
@@ -1414,6 +1407,42 @@ export const VOICE_ACTIONS = {
       const refused = context.interruptedDialog.previousReports();
       if (refused !== undefined) context.reportRefused?.(refused);
     },
+  },
+
+  /* PRD #1790 stage 3 — Restore. Voice never starts an agent (PRD #802 D5):
+     this asks the restore question about the item the words name, and the
+     agent starts on the person's own click or key on it. The Restore button
+     and `s` open the same question through this entry; for an item that
+     lists no agent the dialog asks nothing and says so. */
+  askRestoreInterrupted: {
+    label: "Ask to restore an interrupted agent",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.askRestore(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  restoreAndContinueInterrupted: {
+    label: "Restore the agent the question names, and let it continue",
+    no_voice: "Restore and continue starts an agent that spends credits and may push or send; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `c` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreAndContinue(); },
+  },
+
+  restoreOnlyInterrupted: {
+    label: "Restore the agent the question names, waiting",
+    no_voice: "Restore only starts an agent that spends credits and may push or send once told to continue; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `o` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreOnly(); },
+  },
+
+  startOverInterrupted: {
+    label: "Start the agent the question names over in its worktree",
+    no_voice: "Start over starts an agent that spends credits and may push or send, with its saved task; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `w` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.startOver(); },
   },
 
   backInterruptedWork: {
