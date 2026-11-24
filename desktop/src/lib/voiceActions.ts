@@ -742,6 +742,8 @@ export type VoiceActionContext = {
   saveCardAction: () => string | undefined;
   /** The form's Cancel: close it, writing nothing. */
   cancelCardActionForm: () => string | undefined;
+  /** One icon of the form's icon grid: set the form's icon to `name`. Writes nothing. */
+  chooseCardActionIcon: (name: string) => string | undefined;
 };
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
@@ -1878,6 +1880,16 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  chooseCardActionIcon: {
+    label: "Choose the icon of the card action in the editor's form",
+    no_voice: "one icon in the form's icon grid, which only sets the form's icon field and writes nothing; icons are pictures chosen by eye from the grid, by a name such as `git-commit` or `circle-dot` nobody knows to say before seeing them, and the form that holds the choice is saved by hand (`saveCardAction`)",
+    needs: ["chooseCardActionIcon"],
+    run: (context: Pick<VoiceActionContext, "chooseCardActionIcon"> & Partial<Pick<VoiceActionContext, "reportRefused">>, name: string) => {
+      const refused = context.chooseCardActionIcon(name);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   cancelCardActionForm: {
     label: "Close the Card actions editor's form without saving",
     no_voice: "the form's Cancel, which only closes the form; voice's `close` closes the editor it is in, and saying another action's name (`edit_card_action`, `add_card_action`) replaces the form",
@@ -2555,7 +2567,7 @@ export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "cl
 export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
 
 /** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
-export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm";
+export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

@@ -1908,7 +1908,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const cardActionDaemons = useMemo<CardActionsDaemon[]>(() => decks.flatMap((deck) => {
     const deckId = deck.snapshot.connection.deckId;
     const snapshot = deckId !== undefined ? runtime.agentCards?.[deckId] : undefined;
-    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true }] : [];
+    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true, local: deck.snapshot.connection.deckKind === "local" }] : [];
   }), [decks, runtime.agentCards]);
   const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons });
   /* Issue #1965 — the exited role the open card is for, from its own deck's reply: the overlay says why in full. */

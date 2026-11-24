@@ -2,7 +2,7 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
-import type { CardActionFormValues, CardActionsEditor, CardActionsEditorView } from "../hooks/useCardActionsEditor";
+import type { CardActionFormValues, CardActionPlacement, CardActionsEditor, CardActionsEditorView } from "../hooks/useCardActionsEditor";
 import { CardActionIcon, CARD_ICON_NAMES, cardIconName, GENERIC_CARD_ICON, searchCardIcons } from "../lib/cardIcons";
 import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
@@ -121,7 +121,7 @@ function ActionRow({ action, busy, editor }: { action: EditableCardAction; busy:
       <div className="card-actions-editor-row-head">
         <span className="card-actions-editor-row-icon" data-icon={cardIconName(action.icon)}><CardActionIcon name={action.icon} size={15} /></span>
         <strong className="card-actions-editor-row-label">{label}</strong>
-        <span className={`card-actions-editor-source is-${action.default ? "deck" : "user"}`}>{sourceWords(action)}</span>
+        <span className={`card-actions-editor-source is-${action.default ? "deck" : "user"}`} data-testid="agent-card-actions-editor-source">{sourceWords(action)}</span>
         {action.hidden && <span className="card-actions-editor-hidden">hidden</span>}
         {action.confirm && <span className="card-actions-editor-flag" title="Asks before sending">asks first</span>}
         {action.always && <span className="card-actions-editor-flag" title="Offered on every card">every card</span>}
@@ -138,6 +138,13 @@ function ActionRow({ action, busy, editor }: { action: EditableCardAction; busy:
     </li>
   );
 }
+
+/** The placements the form offers, in the catalog's words, with what each means. */
+const PLACEMENTS: readonly { value: CardActionPlacement; label: string }[] = [
+  { value: "card", label: "card (the default)" },
+  { value: "compact", label: "compact" },
+  { value: "detail", label: "detail" },
+];
 
 /** The form for a new action, or for one listed action (its name fixed). */
 function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEditorView["form"]>; busy: boolean; editor: { controls: EditorControls; setField: CardActionsEditor["setField"] } }) {
@@ -186,12 +193,19 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
             <input type="search" aria-label="Search icons" placeholder="Search icons" value={query} onChange={(event) => setQuery(event.target.value)} />
             <div className="card-actions-editor-icons" role="listbox" aria-label="Icons">
               {shownIcons.map((name) => (
-                <button key={name} type="button" role="option" aria-label={name} aria-selected={values.icon === name} title={name} data-icon={name} className={`icon-button card-actions-editor-icon-option${values.icon === name ? " is-chosen" : ""}`} onClick={() => { setField("icon", name); setPicking(false); }}><CardActionIcon name={name} size={16} /></button>
+                <button key={name} type="button" role="option" aria-label={name} aria-selected={values.icon === name} title={name} data-icon={name} className={`icon-button card-actions-editor-icon-option${values.icon === name ? " is-chosen" : ""}`} onClick={() => { VOICE_ACTIONS.chooseCardActionIcon.run(controls, name); setPicking(false); }}><CardActionIcon name={name} size={16} /></button>
               ))}
               {shownIcons.length === 0 && <p className="agent-card-hint">No icon matches.</p>}
             </div>
           </div>
         )}
+      </div>
+      <div className="card-actions-editor-field">
+        <label htmlFor={id("placement")}>Placement</label>
+        <select id={id("placement")} value={values.placement} aria-describedby={`${id("placement")}-hint`} onChange={(event) => setField("placement", event.target.value as CardActionPlacement)}>
+          {PLACEMENTS.map((placement) => <option key={placement.value} value={placement.value}>{placement.label}</option>)}
+        </select>
+        <small id={`${id("placement")}-hint`}>The catalog's <code>placement</code> for this action, as the config file writes it.</small>
       </div>
       <label className="card-actions-editor-check"><input type="checkbox" checked={values.confirm} onChange={(event) => setField("confirm", event.target.checked)} />Ask before sending</label>
       <label className="card-actions-editor-check"><input type="checkbox" checked={values.always} onChange={(event) => setField("always", event.target.checked)} />Offer on every card</label>
