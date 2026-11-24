@@ -571,11 +571,27 @@ impl DashboardConfig {
         self.save_to(&config_path())
     }
 
-    fn save_to(&self, path: &Path) -> Result<(), String> {
+    /// Save to `path`: read the file as it is now, merge this config's own
+    /// keys into it ([`merge_dashboard_config`]) and replace it
+    /// ([`write_config_atomically`]), all under the lock the card-action
+    /// editor takes too ([`lock_config_edit`], issue #2399 re-audit 2), so a
+    /// catalog edit in a daemon and this save never interleave. Where there is
+    /// no lock to take — a folder that takes no sidecar, which is also where
+    /// the save falls back to writing in place, or a file system that cannot
+    /// lock — it saves unlocked, as it always did; the other writer holding
+    /// the lock for [`CONFIG_LOCK_WAIT`] is an error, and nothing is saved.
+    pub(crate) fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config directory: {e}"))?;
         }
+        let _locked = match lock_config_edit(path, CONFIG_LOCK_WAIT) {
+            Ok(file) => Some(file),
+            Err(ConfigLockProblem::Busy(why)) => {
+                return Err(format!("Not saving config at {}: {why}", path.display()));
+            }
+            Err(ConfigLockProblem::Unavailable(_)) => None,
+        };
         let ours =
             toml::to_string_pretty(self).map_err(|e| format!("Failed to serialize config: {e}"))?;
         let existing = match std::fs::read_to_string(path) {
@@ -1091,6 +1107,222 @@ fn write_config_atomically_with(
     }
 }
 
+/// Issue #2399 re-audit new 3: what a strict save must find unchanged about
+/// the config it replaces — which file it is (device and inode), its
+/// permission bits, its owner and group, and how many names it has. The
+/// reader takes it from the handle it read through; [`write_config_strictly`]
+/// compares it with the handle its write probe opens, and the caller's last
+/// check compares it again before the rename. Outside Unix every file has the
+/// same stamp, and the bytes are what tell a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+}
+
+impl FileStamp {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mode: meta.mode(),
+                uid: meta.uid(),
+                gid: meta.gid(),
+                nlink: meta.nlink(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            Self {
+                dev: 0,
+                ino: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                nlink: 0,
+            }
+        }
+    }
+}
+
+/// Why a strict save refuses a config that is no longer what was read: the
+/// card-action editor's words, shared by [`write_config_strictly`]'s probe and
+/// the editor's last check.
+pub(crate) const CONFIG_CHANGED_SINCE_READ: &str = "it changed since the editor read it (another program saved it); nothing was saved: \
+     read the catalog again and redo the change";
+
+/// Issue #2399 re-audit 2: the sidecar both cooperating writers of the user
+/// config lock — the card-action editor ([`crate::card_catalog`]) and
+/// `config set`'s [`DashboardConfig::save_to`] — for their whole read, merge
+/// and save, so neither saves between the other's read and save. A fixed name,
+/// like the temp file's, so a config whose own name is near the 255-byte limit
+/// still has one.
+pub(crate) const CONFIG_LOCK_NAME: &str = ".dot-agent-deck-config.lock";
+
+/// How long a writer waits for the other to finish before giving up. A daemon
+/// request holds no longer than this for the lock, well inside the desktop's
+/// round-trip deadline.
+pub(crate) const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const CONFIG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Why [`lock_config_edit`] holds no lock.
+#[derive(Debug)]
+pub(crate) enum ConfigLockProblem {
+    /// Another writer kept it for the whole wait.
+    Busy(String),
+    /// There is no lock to take here: the folder takes no sidecar, the name is
+    /// something other than a regular file, or the file system cannot lock.
+    Unavailable(String),
+}
+
+/// Take the exclusive lock on [`CONFIG_LOCK_NAME`] beside the file `path`
+/// resolves to (through its links, so two writers reaching one file by
+/// different paths take one lock), waiting up to `wait`; released when the
+/// returned file is dropped. The sidecar is created owner-only, never
+/// replaced or deleted, and opened without following a link or waiting on a
+/// FIFO. It is an advisory `flock`: it orders the deck's own writers, not an
+/// editor that does not take it, which the writers' compare-before-rename
+/// checks are for.
+pub(crate) fn lock_config_edit(
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<std::fs::File, ConfigLockProblem> {
+    let target = resolve_symlink_chain(path);
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let lock_path = dir.join(CONFIG_LOCK_NAME);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let unavailable = |why: String| {
+        ConfigLockProblem::Unavailable(format!(
+            "its lock file {} cannot be used ({why})",
+            lock_path.display()
+        ))
+    };
+    let file = options
+        .open(&lock_path)
+        .map_err(|e| unavailable(e.to_string()))?;
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(unavailable("it is not a regular file".into())),
+        Err(e) => return Err(unavailable(e.to_string())),
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(CONFIG_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(ConfigLockProblem::Busy(format!(
+                    "another program was saving it ({} stayed locked for {} seconds); try again",
+                    lock_path.display(),
+                    wait.as_secs()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(unavailable(e.to_string())),
+        }
+    }
+}
+
+/// Issue #2399 re-audit 5: a folder on the config's path that a user other
+/// than this one could change — group- or world-writable without the sticky
+/// bit, or owned by someone other than this user and root — named with the
+/// reason, checked from the config's folder (resolved through its links) up to
+/// the user's home, or up to the root when the config is not under it. Such a
+/// folder lets another user swap the file between the save's checks and its
+/// rename, so a strict save refuses there. It is checked by pathname when the
+/// save starts; a folder changed afterwards is not caught.
+#[cfg(unix)]
+fn folder_others_can_change(target: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let folder = std::fs::canonicalize(parent)
+        .map_err(|e| format!("its folder {} cannot be resolved ({e})", parent.display()))?;
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    for dir in folder.ancestors() {
+        let meta = std::fs::metadata(dir)
+            .map_err(|e| format!("the folder {} cannot be inspected ({e})", dir.display()))?;
+        let mode = meta.mode();
+        let why = if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            Some("it is group- or world-writable")
+        } else if meta.uid() != me && meta.uid() != 0 {
+            Some("it belongs to another user")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(format!(
+                "the folder {} can be changed by other users ({why}), so another user could \
+                 replace the file while it is saved; make it writable only by you",
+                dir.display()
+            ));
+        }
+        if home.as_deref() == Some(dir) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Issue #2399 re-audit new 1: open `target` for writing to learn that it can
+/// be written and what it is, without waiting and without following a link:
+/// `O_NONBLOCK`, because a FIFO put in its place with no reader would hold the
+/// open (and the editor's lock) indefinitely, and `O_NOFOLLOW`, because
+/// `target` is already the end of its link chain. The handle must be a regular
+/// file; its metadata is answered. `None`: there is no file.
+fn probe_for_write(target: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    match options.open(target) {
+        Ok(file) => {
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("it cannot be inspected: {e}"))?;
+            if !meta.is_file() {
+                return Err("it is not a regular file".to_string());
+            }
+            Ok(Some(meta))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        #[cfg(unix)]
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENXIO | libc::ELOOP)) => Err(
+            "it is not a regular file (a FIFO, a socket or a link is in its place now)".to_string(),
+        ),
+        Err(e) => Err(format!("it cannot be written: {e}")),
+    }
+}
+
 /// Issue #2399 (review 1, audit 4): the strict sibling of
 /// [`write_config_atomically`], for the card-action editor's writes through the
 /// daemon. It publishes `bytes` at `target` only by renaming a temp file over
@@ -1102,21 +1334,29 @@ fn write_config_atomically_with(
 ///
 /// `target` is the file itself, already resolved through any links (the caller
 /// resolved it once, when it read the file), so nothing is resolved again here.
-/// `still_as_read` runs after the temp file is written and synced and just
-/// before the rename: an `Err` from it (the caller's file changed since it was
-/// read) removes the temp file and refuses. After the rename the folder is
-/// synced too, best effort, so the new name survives a power loss; a failure
-/// there is not reported, because the file was replaced.
+/// `expected` is the file as read ([`FileStamp`]; `None`: there was none).
+/// Refused before anything is written: a folder on the path that other users
+/// can change ([`folder_others_can_change`], Unix), a file the write probe
+/// finds is not a regular file or is not the one read ([`probe_for_write`]).
+/// The temp file is owner-only while it is written; `still_as_read` runs after
+/// it is written and synced: an `Err` from it (the caller's file changed since
+/// it was read) removes the temp file and refuses. Then the temp file takes
+/// the mode the file had when it was read (a new config's: `0666` less the
+/// umask) and is renamed over the file. After the rename the folder is synced
+/// too, best effort, so that the new name reaches the disk; a failure there is
+/// not reported, because the file was replaced.
 ///
 /// Every `Err` means the file at `target` was not replaced.
 pub(crate) fn write_config_strictly(
     target: &Path,
     bytes: &[u8],
+    expected: Option<FileStamp>,
     still_as_read: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     write_config_strictly_with(
         target,
         bytes,
+        expected,
         |file, bytes| {
             use std::io::Write as _;
             file.write_all(bytes)?;
@@ -1131,49 +1371,70 @@ pub(crate) fn write_config_strictly(
 fn write_config_strictly_with(
     target: &Path,
     bytes: &[u8],
+    expected: Option<FileStamp>,
     write_body: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
     still_as_read: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    match std::fs::OpenOptions::new().write(true).open(target) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("it cannot be written: {e}")),
+    #[cfg(unix)]
+    folder_others_can_change(target)?;
+    let target_meta = probe_for_write(target)?;
+    if target_meta.as_ref().map(FileStamp::of) != expected {
+        return Err(CONFIG_CHANGED_SINCE_READ.to_string());
     }
-    let target_meta = std::fs::metadata(target).ok();
-    let target_perms = target_meta.as_ref().map(|m| m.permissions());
-    let (mut file, tmp) = create_temp_beside(target, target_perms.as_ref())
+    let (mut file, tmp) = create_temp_beside(target, None)
         .map_err(|e| format!("no file can be made beside it to replace it in one step ({e})"))?;
     let discard = |file: std::fs::File, reason: String| {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
         Err(reason)
     };
+    // The mode it is published with: the file's as read, or a new file's.
+    let published = match &target_meta {
+        Some(meta) => meta.permissions(),
+        None => match file.metadata() {
+            Ok(created) => created.permissions(),
+            Err(e) => {
+                return discard(file, format!("the file made beside it cannot be read: {e}"));
+            }
+        },
+    };
     #[cfg(unix)]
-    match file.metadata() {
-        Ok(replacement) => {
-            let kept = target_meta.as_ref().map(FileOwnership::of);
-            if !swap_keeps_owner_and_links(kept, FileOwnership::of(&replacement)) {
-                let reason = if kept.is_some_and(|k| k.nlink > 1) {
-                    "it has another hard link, which replacing it would split from it"
-                } else {
-                    "replacing it would change its owner or group"
-                };
-                return discard(file, reason.to_string());
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            return discard(
+                file,
+                format!("the file made beside it cannot be made private: {e}"),
+            );
+        }
+        match file.metadata() {
+            Ok(replacement) => {
+                let kept = target_meta.as_ref().map(FileOwnership::of);
+                if !swap_keeps_owner_and_links(kept, FileOwnership::of(&replacement)) {
+                    let reason = if kept.is_some_and(|k| k.nlink > 1) {
+                        "it has another hard link, which replacing it would split from it"
+                    } else {
+                        "replacing it would change its owner or group"
+                    };
+                    return discard(file, reason.to_string());
+                }
+            }
+            Err(e) => {
+                return discard(file, format!("the file made beside it cannot be read: {e}"));
             }
         }
-        Err(e) => return discard(file, format!("the file made beside it cannot be read: {e}")),
     }
-    let written = (|| {
-        if let Some(perms) = &target_perms {
-            file.set_permissions(perms.clone())?;
-        }
-        write_body(&mut file, bytes)
-    })();
-    if let Err(e) = written {
+    if let Err(e) = write_body(&mut file, bytes) {
         return discard(file, format!("the new file could not be written: {e}"));
     }
     if let Err(reason) = still_as_read() {
         return discard(file, reason);
+    }
+    if let Err(e) = file.set_permissions(published) {
+        return discard(
+            file,
+            format!("the new file could not be given its mode: {e}"),
+        );
     }
     drop(file);
     if let Err(e) = std::fs::rename(&tmp, target) {
@@ -3442,9 +3703,11 @@ mod tests {
         let dir = crate::test_temp::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, old).unwrap();
+        let stamp = |p: &Path| Some(FileStamp::of(&std::fs::metadata(p).unwrap()));
         let err = write_config_strictly_with(
             &path,
             new,
+            stamp(&path),
             |f, b| {
                 use std::io::Write as _;
                 f.write_all(&b[..b.len() / 2])?;
@@ -3457,14 +3720,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
         assert!(temp_files_in(dir.path()).is_empty());
 
-        let err = write_config_strictly(&path, new, || Err("it changed".into())).unwrap_err();
+        let err = write_config_strictly(&path, new, stamp(&path), || Err("it changed".into()))
+            .unwrap_err();
         assert_eq!(err, "it changed");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
         assert!(temp_files_in(dir.path()).is_empty());
 
         let twin = dir.path().join("twin.toml");
         std::fs::hard_link(&path, &twin).unwrap();
-        let err = write_config_strictly(&path, new, || Ok(())).unwrap_err();
+        let err = write_config_strictly(&path, new, stamp(&path), || Ok(())).unwrap_err();
         assert!(err.contains("hard link"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
         assert!(temp_files_in(dir.path()).is_empty());
@@ -3480,7 +3744,7 @@ mod tests {
             let _ = std::fs::remove_file(&probe);
             eprintln!("SKIP (folder case): this process can write a 0555 folder (root)");
         } else {
-            let err = write_config_strictly(&inside, new, || Ok(())).unwrap_err();
+            let err = write_config_strictly(&inside, new, stamp(&inside), || Ok(())).unwrap_err();
             assert!(err.contains("beside it"), "{err}");
             assert_eq!(std::fs::read_to_string(&inside).unwrap(), old);
             // `config set`'s save keeps its fallback for the same folder.
@@ -3489,7 +3753,7 @@ mod tests {
         }
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        write_config_strictly(&path, new, || Ok(())).unwrap();
+        write_config_strictly(&path, new, stamp(&path), || Ok(())).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), new);
         assert!(temp_files_in(dir.path()).is_empty());
     }

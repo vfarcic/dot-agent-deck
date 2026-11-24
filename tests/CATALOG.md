@@ -15771,6 +15771,15 @@ The desktop app's card actions editor (PRD #2374 decision 2026-11-24, issue #239
 - **Does not assert:** an oversized file (the `card_catalog` unit test `the_catalog_file_is_replaced_whole_and_one_it_cannot_read_is_never_written`); file permissions, which a test running as root would not see.
 - **Platform coverage:** mac+linux.
 
+##### agent-report/catalog-edit/005 — An edit based on a stale read of the action is refused, and the other writer's file is kept.
+
+- **Test:** `agent_report_catalog_edit_005_an_edit_based_on_a_stale_read_is_refused` in `tests/e2e_agent_cards.rs`.
+- **Layer:** L2 headless daemon, lane 1.
+- **Agent:** none.
+- **Asserts:** after the editor's read, another writer changes the user's `explain` prompt and hides `merge` in the file; an update of `explain`, a remove of `explain` and a restore of `merge`, each carrying the action as read in `base`, are refused with a reason saying it changed since the editor read it and naming Refresh, and the file stays byte for byte as the other writer left it; after a fresh read the same update, with the new `base`, is saved and the other writer's hide is kept (issue #2399 re-review N5).
+- **Does not assert:** the cross-process lock between two cooperating writers (the `card_catalog` unit test `a_catalog_edit_and_config_set_interleaved_after_their_reads_both_land`); the desktop's Refresh offer (`desktop/agent-cards/057`).
+- **Platform coverage:** mac+linux.
+
 #### agent-report/live
 
 ##### agent-report/live/001 — A real agent publishes its card and acts on a card action.

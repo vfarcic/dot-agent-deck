@@ -887,16 +887,81 @@ pub fn resolve_from_user_config_at(path: &std::path::Path) -> ResolvedCatalog {
 /// - `restore`: bring a deck default back as the deck ships it (its name out
 ///   of `catalog.remove`, and any user override of it gone).
 ///
+/// `update`, `remove`, `hide` and `restore` may carry `base` (issue #2399
+/// re-review N5): the action of that name as the editor read it, or `null`
+/// when it read none. With a `base`, the edit is refused when the file's
+/// action of that name is not that one any more — another program or another
+/// editor changed it since the editor's read — and nothing is written. An
+/// edit with no `base` (an app from before it) is applied to the action as
+/// the file has it. Additive: a daemon from before it ignores the key.
+///
 /// [`apply_action_edit`] applies one; the daemon's `card-catalog-edit` request
 /// carries it ([`edit_user_catalog_at`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CatalogActionEdit {
-    Add { action: CatalogActionInput },
-    Update { action: CatalogActionInput },
-    Remove { name: String },
-    Hide { name: String },
-    Restore { name: String },
+    Add {
+        action: CatalogActionInput,
+    },
+    Update {
+        action: CatalogActionInput,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "base_as_read"
+        )]
+        base: Option<Option<EditableCatalogAction>>,
+    },
+    Remove {
+        name: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "base_as_read"
+        )]
+        base: Option<Option<EditableCatalogAction>>,
+    },
+    Hide {
+        name: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "base_as_read"
+        )]
+        base: Option<Option<EditableCatalogAction>>,
+    },
+    Restore {
+        name: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "base_as_read"
+        )]
+        base: Option<Option<EditableCatalogAction>>,
+    },
+}
+
+impl CatalogActionEdit {
+    /// The name the edit acts on, and the action as the editor read it, when
+    /// it says (`Some(None)`: it read none).
+    fn base(&self) -> (&str, Option<Option<&EditableCatalogAction>>) {
+        match self {
+            Self::Add { action } => (&action.name, None),
+            Self::Update { action, base } => (&action.name, base.as_ref().map(Option::as_ref)),
+            Self::Remove { name, base }
+            | Self::Hide { name, base }
+            | Self::Restore { name, base } => (name, base.as_ref().map(Option::as_ref)),
+        }
+    }
+}
+
+/// A `base` that is present: `null` is "the editor read no such action"
+/// (`Some(None)`), told apart from a missing key (`None`, no check).
+fn base_as_read<'de, D>(deserializer: D) -> Result<Option<Option<EditableCatalogAction>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<EditableCatalogAction>::deserialize(deserializer).map(Some)
 }
 
 /// One action as the editor's form sends it: every key a `[[catalog.actions]]`
@@ -1204,6 +1269,17 @@ pub fn apply_action_edit(
         })?,
     };
     let before = resolve(user_config_toml);
+    if let (name, Some(base)) = edit.base() {
+        let listed = editable_catalog(user_config_toml);
+        if listed.actions.iter().find(|a| a.action.name == name) != base {
+            return Err(format!(
+                "{} changed since the editor read it (another program or editor saved the user \
+                 config); nothing was saved: press Refresh to read it again, then make the \
+                 change again",
+                quoted_name(name)
+            ));
+        }
+    }
     let defaults = default_actions();
     let is_default = |name: &str| defaults.iter().any(|d| d.name == name);
     let catalog = catalog_table(&mut doc)?;
@@ -1236,7 +1312,7 @@ pub fn apply_action_edit(
             tables.push(table);
             expect = Some(parsed);
         }
-        CatalogActionEdit::Update { action } => {
+        CatalogActionEdit::Update { action, .. } => {
             let parsed = validated(action)?;
             let default = is_default(&action.name);
             if default {
@@ -1260,7 +1336,7 @@ pub fn apply_action_edit(
             }
             expect = Some(parsed);
         }
-        CatalogActionEdit::Remove { name } => {
+        CatalogActionEdit::Remove { name, .. } => {
             if is_default(name) {
                 return Err(format!(
                     "{} is a deck default; hide it instead of removing it",
@@ -1274,7 +1350,7 @@ pub fn apply_action_edit(
                 ));
             }
         }
-        CatalogActionEdit::Hide { name } => {
+        CatalogActionEdit::Hide { name, .. } => {
             if !is_default(name) {
                 return Err(format!(
                     "{} is not a deck default; only a deck default can be hidden (remove your \
@@ -1285,7 +1361,7 @@ pub fn apply_action_edit(
             drop_user_entries(catalog, name)?;
             set_removed(catalog, name, true)?;
         }
-        CatalogActionEdit::Restore { name } => {
+        CatalogActionEdit::Restore { name, .. } => {
             if !is_default(name) {
                 return Err(format!(
                     "{} is not a deck default; only a deck default can be restored",
@@ -1347,9 +1423,9 @@ fn update_entry(catalog: &mut toml_edit::Table, action: &CatalogActionInput) -> 
     Ok(())
 }
 
-/// Which file a path names, so a later look can tell whether it is the same
-/// one: the device and inode on Unix (elsewhere every file compares equal, and
-/// the content comparison is what tells a change).
+/// Which folder a path names, so a later look can tell whether it is the same
+/// one: the device and inode on Unix (elsewhere every folder compares equal).
+/// The file itself is compared by its [`crate::config::FileStamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     dev: u64,
@@ -1385,11 +1461,12 @@ impl FileIdentity {
 
 /// The user config as an edit read it: the file a write must replace (the
 /// path resolved through its links, once), its text (`None`: there is no
-/// file), and which file and folder were there.
+/// file), which file it was — with its mode, owner and links — and which
+/// folder held it.
 struct ConfigRead {
     target: std::path::PathBuf,
     raw: Option<String>,
-    file: Option<FileIdentity>,
+    file: Option<crate::config::FileStamp>,
     folder: Option<FileIdentity>,
 }
 
@@ -1408,11 +1485,11 @@ fn open_config_file(target: &std::path::Path) -> std::io::Result<std::fs::File> 
     options.open(target)
 }
 
-/// The text of the regular file open in `file` and which file it is, or the
+/// The text of the regular file open in `file` and its stamp, or the
 /// reason it cannot be read as the catalog reader reads it: not a regular
 /// file (a FIFO, a device, a folder), larger than [`MAX_USER_CONFIG_BYTES`],
 /// or not UTF-8.
-fn read_open_config(file: std::fs::File) -> Result<(String, FileIdentity), String> {
+fn read_open_config(file: std::fs::File) -> Result<(String, crate::config::FileStamp), String> {
     use std::io::Read as _;
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
@@ -1429,7 +1506,7 @@ fn read_open_config(file: std::fs::File) -> Result<(String, FileIdentity), Strin
         return Err(format!("it is larger than {MAX_USER_CONFIG_BYTES} bytes"));
     }
     let text = String::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_string())?;
-    Ok((text, FileIdentity::of(&meta)))
+    Ok((text, crate::config::FileStamp::of(&meta)))
 }
 
 /// Read the user config at `path` for the catalog: resolve its links once,
@@ -1466,14 +1543,15 @@ fn read_user_config(path: &std::path::Path) -> Result<ConfigRead, String> {
 }
 
 /// Whether the user config at `path` is still exactly what `read` found — the
-/// same file behind the same links, in the same folder, with the same bytes,
-/// or still no file — checked by the strict save just before it renames the
-/// new file into place. Another writer (`config set`, another daemon reading
-/// the same file, an editor) that saved in between makes the edit refuse
-/// rather than overwrite what it saved.
+/// same file behind the same links, in the same folder, with the same mode,
+/// owner, group, number of links and bytes, or still no file — checked by the
+/// strict save just before it renames the new file into place. A change that
+/// is visible when this runs refuses the edit rather than being overwritten:
+/// a save by a writer that does not take the config lock (a hand edit, an
+/// older deck), a `chmod`, a new hard link. A change made after it, before
+/// the rename, is not caught.
 fn still_as_read(path: &std::path::Path, read: &ConfigRead) -> Result<(), String> {
-    const CHANGED: &str = "it changed since the editor read it (another program saved it); \
-                           nothing was saved: read the catalog again and redo the change";
+    const CHANGED: &str = crate::config::CONFIG_CHANGED_SINCE_READ;
     if crate::config::resolve_symlink_chain(path) != read.target
         || FileIdentity::of_folder(&read.target) != read.folder
     {
@@ -1495,29 +1573,36 @@ fn still_as_read(path: &std::path::Path, read: &ConfigRead) -> Result<(), String
 }
 
 /// One edit of a user config at a time in this process, so two editors'
-/// read-change-write cycles never interleave. It does not reach another
-/// process; [`still_as_read`] is what keeps a catalog edit from overwriting a
-/// save made by one.
+/// read-change-write cycles never interleave. Another process is kept out by
+/// the config lock ([`crate::config::lock_config_edit`]) when it is a deck
+/// writer, and a writer that takes no lock by [`still_as_read`].
 static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Read the user config at `path` and, with `edit`, apply it
 /// ([`apply_action_edit`]) and replace the file by rename
 /// ([`crate::config::write_config_strictly`]); answer the editable catalog
-/// afterwards, naming the file. Refused, with the file left as it was:
+/// afterwards, naming the file. An edit holds the config lock
+/// ([`crate::config::lock_config_edit`]) from before its read until the file
+/// is replaced, so `config set` and another daemon's editor wait for it
+/// rather than save in between. Refused, with the file left as it was:
 ///
 /// - a file that cannot be read — not a regular file, a link whose target is
 ///   missing, not UTF-8, larger than the catalog reader reads, not valid TOML
 ///   (a read with no edit still answers, with the problem in `errors`);
-/// - a file that changed between the read and the save, or whose links now
-///   lead elsewhere ([`still_as_read`]);
+/// - an edit whose `base` is not the action as the file has it now
+///   ([`apply_action_edit`]);
+/// - the lock, held by another writer for
+///   [`crate::config::CONFIG_LOCK_WAIT`], or not available at all;
+/// - a file that changed between the read and the save, as far as the last
+///   check sees ([`still_as_read`]), or whose links now lead elsewhere;
 /// - a file that cannot be replaced by a rename (another hard link, an owner
-///   the swap would change, a folder that takes no new file): there is no
-///   in-place fallback.
+///   the swap would change, a folder that takes no new file, a folder on its
+///   path other users can change): there is no in-place fallback.
 ///
 /// A missing file, and its folder, are created by an edit. The daemon passes
 /// its own user config's path; no path comes from a client. Every `Err` means
 /// the config file was not written (a folder an edit created for a missing
-/// file may remain).
+/// file may remain, and so does the lock file beside the config).
 pub fn edit_user_catalog_at(
     path: &std::path::Path,
     edit: Option<&CatalogActionEdit>,
@@ -1537,6 +1622,26 @@ fn edit_user_catalog_at_with(
     let named = |mut catalog: EditableCardCatalog| {
         catalog.user_config = Some(display.clone());
         catalog
+    };
+    let not_saved = |reason: String| format!("the user config {display} was not saved: {reason}");
+    let lock = || {
+        crate::config::lock_config_edit(path, crate::config::CONFIG_LOCK_WAIT).map_err(|problem| {
+            not_saved(match problem {
+                crate::config::ConfigLockProblem::Busy(why)
+                | crate::config::ConfigLockProblem::Unavailable(why) => why,
+            })
+        })
+    };
+    // The lock is taken before the read when the config's folder is there; a
+    // config with no folder yet is locked once the folder is made, and the
+    // last check then confirms there is still no file.
+    let mut locked = match edit {
+        Some(_)
+            if FileIdentity::of_folder(&crate::config::resolve_symlink_chain(path)).is_some() =>
+        {
+            Some(lock()?)
+        }
+        _ => None,
     };
     let mut read = match read_user_config(path) {
         Ok(read) => read,
@@ -1572,11 +1677,15 @@ fn edit_user_catalog_at_with(
             })?;
             read.folder = FileIdentity::of_folder(&read.target);
         }
-        crate::config::write_config_strictly(&read.target, saved.as_bytes(), || {
+        if locked.is_none() {
+            locked = Some(lock()?);
+        }
+        crate::config::write_config_strictly(&read.target, saved.as_bytes(), read.file, || {
             still_as_read(path, &read)
         })
-        .map_err(|reason| format!("the user config {display} was not saved: {reason}"))?;
+        .map_err(not_saved)?;
     }
+    drop(locked);
     Ok(named(editable_catalog(Some(&saved))))
 }
 
@@ -2197,6 +2306,7 @@ answer = 42
         let saved = apply_action_edit(
             Some(&saved),
             &CatalogActionEdit::Update {
+                base: None,
                 action: CatalogActionInput {
                     label: Some("Ship it now".into()),
                     prompt: "Ship it now, then update your card.".into(),
@@ -2220,6 +2330,7 @@ answer = 42
         let saved = apply_action_edit(
             Some(&saved),
             &CatalogActionEdit::Remove {
+                base: None,
                 name: "deploy".into(),
             },
         )
@@ -2261,6 +2372,7 @@ prompt = \"Proceed.\"
         let hidden = apply_action_edit(
             Some(original),
             &CatalogActionEdit::Hide {
+                base: None,
                 name: "go-ahead".into(),
             },
         )
@@ -2279,6 +2391,7 @@ prompt = \"Proceed.\"
         let restored = apply_action_edit(
             Some(&hidden),
             &CatalogActionEdit::Restore {
+                base: None,
                 name: "go-ahead".into(),
             },
         )
@@ -2289,6 +2402,7 @@ prompt = \"Proceed.\"
         let overridden = apply_action_edit(
             Some(&restored),
             &CatalogActionEdit::Update {
+                base: None,
                 action: CatalogActionInput {
                     label: Some("Merge it".into()),
                     prompt: "Merge with a squash commit, then update your card.".into(),
@@ -2310,6 +2424,7 @@ prompt = \"Proceed.\"
         let back = apply_action_edit(
             Some(&overridden),
             &CatalogActionEdit::Restore {
+                base: None,
                 name: "merge".into(),
             },
         )
@@ -2422,6 +2537,7 @@ prompt = \"Proceed.\"
                 "update of nothing",
                 base.into(),
                 CatalogActionEdit::Update {
+                    base: None,
                     action: input("nope"),
                 },
                 "nope",
@@ -2430,6 +2546,7 @@ prompt = \"Proceed.\"
                 "remove a default",
                 base.into(),
                 CatalogActionEdit::Remove {
+                    base: None,
                     name: "merge".into(),
                 },
                 "merge",
@@ -2438,6 +2555,7 @@ prompt = \"Proceed.\"
                 "remove of nothing",
                 base.into(),
                 CatalogActionEdit::Remove {
+                    base: None,
                     name: "nope".into(),
                 },
                 "nope",
@@ -2446,6 +2564,7 @@ prompt = \"Proceed.\"
                 "hide a user action",
                 base.into(),
                 CatalogActionEdit::Hide {
+                    base: None,
                     name: "ship".into(),
                 },
                 "ship",
@@ -2454,6 +2573,7 @@ prompt = \"Proceed.\"
                 "restore of nothing",
                 base.into(),
                 CatalogActionEdit::Restore {
+                    base: None,
                     name: "nope".into(),
                 },
                 "nope",
@@ -2562,6 +2682,7 @@ icon = \"rocket\"
         assert_eq!(
             serde_json::from_value::<CatalogActionEdit>(wire).unwrap(),
             CatalogActionEdit::Hide {
+                base: None,
                 name: "merge".into()
             }
         );
@@ -2623,6 +2744,7 @@ icon = \"rocket\"
         let left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != crate::config::CONFIG_LOCK_NAME)
             .collect();
         assert_eq!(left, ["config.toml"], "no temp file left beside it");
 
@@ -2673,7 +2795,7 @@ icon = \"rocket\"
     /// accepted by both, so the editor refuses no more than the file does.
     #[test]
     fn an_update_is_validated_as_an_add_is_and_the_limits_are_accepted() {
-        let update = |action: CatalogActionInput| CatalogActionEdit::Update { action };
+        let update = |action: CatalogActionInput| CatalogActionEdit::Update { action, base: None };
         for name in ["ship", "go-ahead"] {
             let cases: Vec<(&str, CatalogActionInput, &str)> = vec![
                 (
@@ -2862,6 +2984,7 @@ prompt = \"Deploy it.\"
         let updated = apply_action_edit(
             Some(COMMENTED_CONFIG),
             &CatalogActionEdit::Update {
+                base: None,
                 action: CatalogActionInput {
                     label: Some("Ship it now".into()),
                     description: "Offer when it is ready.".into(),
@@ -2880,6 +3003,7 @@ prompt = \"Deploy it.\"
         let overridden = apply_action_edit(
             Some(&updated),
             &CatalogActionEdit::Update {
+                base: None,
                 action: CatalogActionInput {
                     prompt: "Carry on.".into(),
                     ..input("go-ahead")
@@ -2892,6 +3016,7 @@ prompt = \"Deploy it.\"
         let hidden = apply_action_edit(
             Some(&overridden),
             &CatalogActionEdit::Hide {
+                base: None,
                 name: "go-ahead".into(),
             },
         )
@@ -2902,6 +3027,7 @@ prompt = \"Deploy it.\"
         let restored = apply_action_edit(
             Some(&hidden),
             &CatalogActionEdit::Restore {
+                base: None,
                 name: "go-ahead".into(),
             },
         )
@@ -2916,6 +3042,7 @@ prompt = \"Deploy it.\"
         let removed = apply_action_edit(
             Some(&restored),
             &CatalogActionEdit::Remove {
+                base: None,
                 name: "ship".into(),
             },
         )
@@ -2987,6 +3114,7 @@ placement = \"card\" # on the card, on purpose
         let saved = apply_action_edit(
             Some(raw),
             &CatalogActionEdit::Update {
+                base: None,
                 action: CatalogActionInput {
                     description: "Offer when it is ready.".into(),
                     prompt: "Ship it now.".into(),
@@ -3009,6 +3137,7 @@ placement = \"card\" # on the card, on purpose
         let changed = apply_action_edit(
             Some(&raw.replace("confirm = false", "confirm = true")),
             &CatalogActionEdit::Update {
+                base: None,
                 action: CatalogActionInput {
                     description: "Offer when it is ready.".into(),
                     prompt: "Ship it.".into(),
@@ -3049,6 +3178,7 @@ placement = \"card\" # on the card, on purpose
         let mut left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != crate::config::CONFIG_LOCK_NAME)
             .collect();
         left.sort();
         assert_eq!(
@@ -3269,5 +3399,365 @@ placement = \"card\" # on the card, on purpose
         let saved = std::fs::read_to_string(&real).unwrap();
         assert!(resolve(Some(&saved)).action("deploy").is_some(), "{saved}");
         assert_eq!(std::fs::read_to_string(&other).unwrap(), EDITED_CONFIG);
+    }
+
+    /// Issue #2399 re-audit 2: the catalog editor and `config set`'s writer
+    /// take one lock beside the config for their whole read, merge and save.
+    /// With the editor held just after its read, `config set` waits instead of
+    /// saving under it, and saves once the editor has published, merging into
+    /// the editor's file: both changes land, neither refused nor lost.
+    #[test]
+    fn a_catalog_edit_and_config_set_interleaved_after_their_reads_both_land() {
+        use std::time::Duration;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let editor_path = path.clone();
+        let editor = std::thread::spawn(move || {
+            edit_user_catalog_at_with(
+                &editor_path,
+                Some(&CatalogActionEdit::Add {
+                    action: input("deploy"),
+                }),
+                || {
+                    read_tx.send(()).unwrap();
+                    let _ = go_rx.recv_timeout(Duration::from_secs(20));
+                },
+            )
+        });
+        read_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the editor read the file");
+        let (set_tx, set_rx) = std::sync::mpsc::channel();
+        let setter_path = path.clone();
+        let setter = std::thread::spawn(move || {
+            let config = crate::config::DashboardConfig {
+                default_command: "zsh".into(),
+                ..Default::default()
+            };
+            let saved = config.save_to(&setter_path);
+            let _ = set_tx.send(());
+            saved
+        });
+        let waited = set_rx.recv_timeout(Duration::from_millis(500)).is_err();
+        go_tx.send(()).unwrap();
+        let edited = editor.join().unwrap();
+        let set = setter.join().unwrap();
+        edited.expect("the editor's save lands");
+        set.expect("config set's save lands after it");
+        assert!(waited, "config set waited for the editor's lock");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(resolve(Some(&saved)).action("deploy").is_some(), "{saved}");
+        assert!(saved.contains("default_command = \"zsh\""), "{saved}");
+    }
+
+    /// The child of
+    /// [`a_fifo_swapped_in_before_the_save_is_refused_and_the_lock_released`]:
+    /// nothing unless `DAD_CATALOG_FIFO_CHILD` names a config. It edits that
+    /// config with a FIFO put in the file's place after the read, prints the
+    /// outcome, then puts a regular file back and edits again.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_swap_child() {
+        let Some(path) = std::env::var_os("DAD_CATALOG_FIFO_CHILD") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let swapped = edit_user_catalog_at_with(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+            || {
+                std::fs::remove_file(&path).unwrap();
+                let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            },
+        );
+        println!("SWAPPED-REFUSED: {}", swapped.is_err());
+        if let Err(reason) = &swapped {
+            println!("SWAPPED-REASON: {}", reason.replace('\n', " "));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let again = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        );
+        println!("AGAIN-SAVED: {}", again.is_ok());
+    }
+
+    /// Issue #2399 re-audit new 1: a FIFO put in the config's place after the
+    /// editor read a regular file is refused by the save's write probe without
+    /// waiting for a reader, and the edit lock is released: the same process
+    /// then saves an edit. It runs in a child process that is killed after a
+    /// bound, so a probe that waits fails here instead of wedging the tests.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_before_the_save_is_refused_and_the_lock_released() {
+        use std::io::Read as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "card_catalog::tests::fifo_swap_child",
+                "--nocapture",
+            ])
+            .env("DAD_CATALOG_FIFO_CHILD", &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the save waited on the FIFO put in the config's place");
+        }
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert!(status.unwrap().success(), "{out}\n{err}");
+        assert!(out.contains("SWAPPED-REFUSED: true"), "{out}\n{err}");
+        assert!(out.contains("AGAIN-SAVED: true"), "{out}\n{err}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(resolve(Some(&saved)).action("deploy").is_some(), "{saved}");
+    }
+
+    /// Issue #2399 re-audit 5: a save is refused where another user could
+    /// swap the config by changing a folder on its path — here the config's
+    /// own folder is group-writable — and the file is left as it was. A
+    /// sticky world-writable folder (as `/tmp` is) and a private one are
+    /// saved to.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_is_refused_where_another_user_can_change_a_folder_on_the_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let folder = dir.path().join("shared");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let add = |name: &str| {
+            edit_user_catalog_at(
+                &path,
+                Some(&CatalogActionEdit::Add {
+                    action: input(name),
+                }),
+            )
+        };
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let refused = add("deploy").expect_err("a group-writable folder is refused");
+        assert!(refused.contains("other users"), "{refused}");
+        assert!(refused.contains("shared"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        add("deploy").expect("a sticky folder is saved to");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        add("release").expect("a private folder is saved to");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(resolve(Some(&saved)).action("release").is_some(), "{saved}");
+    }
+
+    /// Issue #2399 re-audit new 3: the last check before the rename compares
+    /// the config's mode, owner and link count with the read, not only its
+    /// file and bytes. A `chmod 0600` or a new hard link made between the read
+    /// and that check refuses the save, and the file keeps the mode and links
+    /// it was given.
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_or_link_change_before_the_last_check_refuses_the_save() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let read = read_user_config(&path).unwrap();
+        let refused =
+            crate::config::write_config_strictly(&read.target, b"new = 1\n", read.file, || {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                still_as_read(&path, &read)
+            })
+            .expect_err("a chmod since the read is refused");
+        assert!(refused.contains("changed since"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+
+        let read = read_user_config(&path).unwrap();
+        let twin = dir.path().join("twin.toml");
+        let refused =
+            crate::config::write_config_strictly(&read.target, b"new = 1\n", read.file, || {
+                std::fs::hard_link(&path, &twin).unwrap();
+                still_as_read(&path, &read)
+            })
+            .expect_err("a hard link made since the read is refused");
+        assert!(refused.contains("changed since"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&twin).unwrap(), EDITED_CONFIG);
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+    }
+
+    /// Issue #2399 re-review N5: an edit carrying the action as the editor
+    /// read it (`base`) is refused when the file's action of that name is not
+    /// that one any more, and applied when it is; `null` means the editor read
+    /// none, and an edit with no `base` is applied as before. The key is read
+    /// from the wire as the desktop sends it.
+    #[test]
+    fn an_edit_whose_base_is_not_the_file_action_is_refused() {
+        let raw = format!("{EDITED_CONFIG}\n");
+        let listed = editable_catalog(Some(&raw));
+        let ship = listed
+            .actions
+            .iter()
+            .find(|a| a.action.name == "ship")
+            .unwrap()
+            .clone();
+        let theirs = raw.replace("prompt = \"Ship it.\"", "prompt = \"Ship it now.\"");
+        assert_ne!(theirs, raw);
+        let relabel = |base| CatalogActionEdit::Update {
+            base,
+            action: CatalogActionInput {
+                label: Some("Ship!".into()),
+                description: "Offer when it is ready.".into(),
+                prompt: "Ship it.".into(),
+                ..input("ship")
+            },
+        };
+        let refused = apply_action_edit(Some(&theirs), &relabel(Some(Some(ship.clone()))))
+            .expect_err("a stale base is refused");
+        assert!(
+            refused.contains("changed since the editor read it") && refused.contains("Refresh"),
+            "{refused}"
+        );
+        let saved = apply_action_edit(Some(&raw), &relabel(Some(Some(ship.clone()))))
+            .expect("a base that is the file's action is applied");
+        assert_eq!(resolve(Some(&saved)).action("ship").unwrap().label, "Ship!");
+        apply_action_edit(Some(&theirs), &relabel(None)).expect("no base: applied as before");
+
+        let removed = CatalogActionEdit::Remove {
+            name: "ship".into(),
+            base: Some(Some(ship.clone())),
+        };
+        apply_action_edit(Some(&theirs), &removed).expect_err("a stale remove is refused");
+        let ghost = CatalogActionEdit::Remove {
+            name: "ghost".into(),
+            base: Some(None),
+        };
+        let refused =
+            apply_action_edit(Some(&raw), &ghost).expect_err("no action named ghost to remove");
+        assert!(refused.contains("no action named"), "{refused}");
+        let with_ghost = format!(
+            "{raw}\n[[catalog.actions]]\nname = \"ghost\"\ndescription = \"Boo.\"\nprompt = \"Boo.\"\n"
+        );
+        let refused = apply_action_edit(Some(&with_ghost), &ghost)
+            .expect_err("an action that appeared since the read is refused");
+        assert!(refused.contains("changed since"), "{refused}");
+
+        let hidden = listed
+            .actions
+            .iter()
+            .find(|a| a.action.name == "merge")
+            .unwrap()
+            .clone();
+        assert!(hidden.hidden);
+        let restore = CatalogActionEdit::Restore {
+            name: "merge".into(),
+            base: Some(Some(hidden)),
+        };
+        let shown_again = raw.replace("remove = [\"merge\"] # not merge\n", "");
+        apply_action_edit(Some(&shown_again), &restore)
+            .expect_err("a restore of a default no longer hidden is refused");
+        apply_action_edit(Some(&raw), &restore).expect("a restore as read is applied");
+
+        let wire: CatalogActionEdit = serde_json::from_value(serde_json::json!({
+            "kind": "hide", "name": "merge", "base": null,
+        }))
+        .unwrap();
+        assert_eq!(
+            wire,
+            CatalogActionEdit::Hide {
+                name: "merge".into(),
+                base: Some(None)
+            }
+        );
+        let wire: CatalogActionEdit =
+            serde_json::from_value(serde_json::json!({"kind": "hide", "name": "merge"})).unwrap();
+        assert_eq!(
+            wire,
+            CatalogActionEdit::Hide {
+                name: "merge".into(),
+                base: None
+            }
+        );
+        let round: CatalogActionEdit =
+            serde_json::from_value(serde_json::to_value(relabel(Some(Some(ship)))).unwrap())
+                .unwrap();
+        assert!(matches!(
+            round,
+            CatalogActionEdit::Update {
+                base: Some(Some(_)),
+                ..
+            }
+        ));
+    }
+
+    /// Issue #2399 re-audit 2: while another deck writer holds the config
+    /// lock past the bounded wait, an edit is refused with that reason — the
+    /// daemon's request never waits longer — and the file is left as it was.
+    #[test]
+    fn an_edit_refuses_when_the_config_stays_locked() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, EDITED_CONFIG).unwrap();
+        let held = crate::config::lock_config_edit(&path, std::time::Duration::ZERO)
+            .expect("the test takes the lock");
+        let started = std::time::Instant::now();
+        let refused = edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect_err("a held lock refuses the edit");
+        assert!(
+            started.elapsed() < crate::config::CONFIG_LOCK_WAIT * 2,
+            "the wait is bounded"
+        );
+        assert!(refused.contains("stayed locked"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EDITED_CONFIG);
+        drop(held);
+        edit_user_catalog_at(
+            &path,
+            Some(&CatalogActionEdit::Add {
+                action: input("deploy"),
+            }),
+        )
+        .expect("saved once the lock is free");
     }
 }

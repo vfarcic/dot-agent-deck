@@ -869,6 +869,74 @@ fn agent_report_catalog_edit_004_an_unreadable_file_is_refused_and_a_missing_one
     assert_eq!(resolved["errors"], json!([]));
 }
 
+/// Scenario: The editor reads the daemon's card actions, then another program changes the user's Explain action and hides the deck's Merge it in the file. Saving a label change to Explain, removing Explain and restoring Merge it, each carrying the action as the editor read it, are refused with a reason that says to read the list again, and the file stays as the other program left it; after a fresh read the same edit is saved.
+#[spec("agent-report/catalog-edit/005")]
+#[test]
+fn agent_report_catalog_edit_005_an_edit_based_on_a_stale_read_is_refused() {
+    let (daemon, dir) = daemon_with_config(EDITOR_CONFIG);
+    let read = catalog_edit_ok(&daemon, None);
+    let explain_as_read = editable(&read, "explain").expect("explain listed").clone();
+    let merge_as_read = editable(&read, "merge").expect("merge listed").clone();
+
+    // Another writer (a hand edit) changes Explain's text and hides Merge it.
+    let theirs = user_config_text(&dir)
+        .replace(
+            EXPLAIN_PROMPT,
+            "THEIRS-2399: explain it in one line, then update your card.",
+        )
+        .replace(
+            "[catalog]\n# my catalog comment\n",
+            "[catalog]\n# my catalog comment\nremove = [\"merge\"]\n",
+        );
+    std::fs::write(config_path(&dir), &theirs).unwrap();
+
+    let relabel = |base: &Value| {
+        json!({"kind": "update", "base": base, "action": {
+            "name": "explain", "label": "Explain yourself",
+            "description": explain_as_read["description"], "prompt": EXPLAIN_PROMPT, "always": true,
+        }})
+    };
+    let stale_edits = [
+        ("update", relabel(&explain_as_read)),
+        (
+            "remove",
+            json!({"kind": "remove", "name": "explain", "base": explain_as_read}),
+        ),
+        (
+            "restore",
+            json!({"kind": "restore", "name": "merge", "base": merge_as_read}),
+        ),
+    ];
+    for (case, edit) in stale_edits {
+        let response = catalog_edit(&daemon, Some(edit));
+        assert_eq!(response["ok"], false, "{case}: refused: {response:#}");
+        let error = response["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("changed since the editor read it") && error.contains("Refresh"),
+            "{case}: the reason says to read the list again: {error}"
+        );
+        assert_eq!(
+            user_config_text(&dir),
+            theirs,
+            "{case}: the other writer's file is left as it was"
+        );
+    }
+
+    let fresh = catalog_edit_ok(&daemon, None);
+    let explain_now = editable(&fresh, "explain").unwrap().clone();
+    let saved = catalog_edit_ok(&daemon, Some(relabel(&explain_now)));
+    assert_eq!(
+        editable(&saved, "explain").unwrap()["label"],
+        "Explain yourself"
+    );
+    let text = user_config_text(&dir);
+    assert!(text.contains("Explain yourself"), "{text}");
+    assert!(
+        text.contains("remove = [\"merge\"]"),
+        "the other writer's hide is kept: {text}"
+    );
+}
+
 /// The user config every test's daemon reads: the deck's default catalog plus
 /// one action that asks for confirmation.
 const DEPLOY_PROMPT: &str = "DEPLOY-PROMPT-7f3a: deploy it, then update your card.";
