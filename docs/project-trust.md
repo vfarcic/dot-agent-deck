@@ -9,7 +9,7 @@ This page covers both clients and the command line: what the review shows, how t
 The deck asks before it starts an orchestration that you have never approved, or whose text changed since you approved it:
 
 - **TUI:** when you pick an orchestration in the New Agent form (`Ctrl+n`) and press `Enter`, and when the TUI recreates an orchestration tab from your saved workspace (see [Restoring a saved workspace](#restoring-a-saved-workspace)).
-- **Desktop app:** when you press **Activate orchestration** in the [New agent](desktop/new-agent.md) dialog, or start one from the experimental Orchestrations editor.
+- **Desktop app:** when you press **Activate orchestration** in the [New agent](desktop/new-agent.md) dialog, or start an orchestration from the experimental deck screen.
 
 An orchestration you approved, whose text has not changed, starts with no question, as it did before. Nothing from the orchestration starts while the review is open.
 

@@ -1522,10 +1522,6 @@ pub enum DesktopAction {
         /// basename and an empty orchestration name is derived from that
         /// basename (PRD #220).
         cwd: String,
-        /// The coordinator's task, which may be empty (issue #1044): the
-        /// daemon then composes the context without a task section and the
-        /// coordinator waits for the user's instructions, as under the TUI.
-        task_prompt: String,
         roles: Vec<OrchestrationRoleInput>,
         rows: Option<u16>,
         cols: Option<u16>,
@@ -2285,11 +2281,11 @@ pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
 /// belong to the app, not to any one deck, and the app observes several.
 ///
 /// All `false` is the shipped default. The overview, the agent overlay and
-/// Settings have no field because they are never gated, and the deck and the
-/// prompt library have none since they left the flag (issues #1308, #1310).
+/// Settings have no field because they are never gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopFeatures {
+    pub show_deck: bool,
     pub show_projects: bool,
     pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
@@ -2302,6 +2298,7 @@ impl DesktopFeatures {
     pub(crate) fn current() -> Self {
         use dot_agent_deck::features;
         Self {
+            show_deck: features::show_desktop_deck(),
             show_projects: features::show_desktop_projects(),
             show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
@@ -6394,6 +6391,7 @@ mod tests {
         assert_eq!(
             DesktopFeatures::current(),
             DesktopFeatures {
+                show_deck: false,
                 show_projects: false,
                 show_orchestrations: false,
                 show_agent_profiles: false,
@@ -6405,6 +6403,7 @@ mod tests {
         assert_eq!(
             DesktopFeatures::current(),
             DesktopFeatures {
+                show_deck: true,
                 show_projects: true,
                 show_orchestrations: true,
                 show_agent_profiles: true,
@@ -6418,6 +6417,7 @@ mod tests {
     #[test]
     fn desktop_features_serialise_in_camel_case() {
         let value = serde_json::to_value(DesktopFeatures {
+            show_deck: true,
             show_projects: false,
             show_orchestrations: false,
             show_agent_profiles: true,
@@ -6427,6 +6427,7 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({
+                "showDeck": true,
                 "showProjects": false,
                 "showOrchestrations": false,
                 "showAgentProfiles": true,

@@ -379,7 +379,7 @@ test.describe("the fleet view (PRD #742 M4)", () => {
       await expect(button).toHaveAttribute("aria-expanded", "false");
       await page.mouse.move(5, 790);
 
-      for (const width of [1440, 1439, 1241, 1240, 1181, 1180, 961, 681, 400]) {
+      for (const width of [1440, 1439, 1181, 1180, 961, 681, 400]) {
         await page.setViewportSize({ width, height: 800 });
         await expect(button, `the counters button is off screen at ${width}px`).toBeInViewport();
         await button.hover();

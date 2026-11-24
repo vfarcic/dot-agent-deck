@@ -682,10 +682,10 @@ export type NewAgentOptions =
  * It is the DESKTOP process's flag and belongs to the app, not to a deck — do
  * not confuse it with {@link NewAgentOptions}' per-deck `experimental`. All
  * `false` is the shipped default. The agent overview, the agent overlay and
- * Settings have no field because they are never gated, and the deck and the
- * prompt library have none since they left the flag (issues #1308, #1310).
+ * Settings have no field because they are never gated.
  */
 export interface DesktopFeatures {
+  showDeck: boolean;
   showProjects: boolean;
   showOrchestrations: boolean;
   showAgentProfiles: boolean;
@@ -698,6 +698,7 @@ export interface DesktopFeatures {
 
 /** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
 export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
+  showDeck: false,
   showProjects: false,
   showOrchestrations: false,
   showAgentProfiles: false,
@@ -983,23 +984,6 @@ export type NewAgentOrchestrations =
   | ({ kind: "project" } & DaemonResolvedProject)
   | { kind: "not_project" }
   | { kind: "unsupported"; reason: string };
-
-export interface DeckPrompt {
-  id: string;
-  name: string;
-  body: string;
-  note?: string;
-}
-
-/**
- * Issue #824 — a deck's prompt library as its daemon keeps it, in order, or
- * the deck's answer that it keeps none (`unsupported`: a daemon from before the
- * library, which was sent nothing). The app keeps its own copy only for such a
- * deck.
- */
-export type DeckPromptLibrary =
-  | { kind: "deck"; prompts: DeckPrompt[] }
-  | { kind: "unsupported" };
 
 export interface WorkflowStage {
   id: string;
@@ -1677,13 +1661,13 @@ export type DeckAction =
    */
   | { type: "allow_build_mismatch"; deckId?: string }
   /**
-   * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
-   * then composes a coordinator context with no task section and the
-   * coordinator waits for instructions, as under the TUI's `Ctrl+n`.
+   * The Runs screen's launch. It sends no task: the deck composes a
+   * coordinator context with no task section and the coordinator waits for
+   * the user to type one into its pane, as under the TUI's `Ctrl+n`.
    * `displayTitle` is the run's name — absent when the form's Name is empty, so
    * the run takes the orchestration's name, as `start_orchestration`'s does.
    */
-  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks
@@ -1806,8 +1790,6 @@ export interface OrchestrationLaunchConfig {
    * daemon, and is kept off the text nodes the same way any title is.
    */
   displayTitle?: string;
-  /** May be empty: the coordinator then waits for instructions (issue #1044). */
-  taskPrompt: string;
   roles: OrchestrationLaunchRole[];
   rows: number;
   cols: number;
@@ -2098,16 +2080,6 @@ export interface DeckRuntimeState {
   /** PRD #1223 M4 — what the New agent form needs to know about the deck `deckId` names. */
   newAgentOptions?: (deckId: string) => Promise<NewAgentOptions>;
   /**
-   * Issue #824 — the prompt library of the deck `deckId` names, and the three
-   * ways to change it; each resolves the library as it stands afterwards.
-   * Optional for the reason the two above are: a runtime without them keeps
-   * the library on this device, as the app did before decks owned it.
-   */
-  listPrompts?: (deckId: string) => Promise<DeckPromptLibrary>;
-  savePrompt?: (deckId: string, prompt: DeckPrompt) => Promise<DeckPromptLibrary>;
-  deletePrompt?: (deckId: string, id: string) => Promise<DeckPromptLibrary>;
-  seedPrompts?: (deckId: string, prompts: DeckPrompt[]) => Promise<DeckPromptLibrary>;
-  /**
    * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
    * on the deck `deckId` names. Optional for the reason the two above are; a
    * runtime without it offers no orchestration chips.
@@ -2319,7 +2291,7 @@ export interface DeckRuntimeState {
 /**
  * The features a runtime carries, with a missing answer read as the shipped
  * default (issue #1198). Every gated call site reads through this, so it reads
- * `features.showProjects` rather than guarding `undefined` itself.
+ * `features.showDeck` rather than guarding `undefined` itself.
  */
 export function desktopFeaturesOf(runtime: Pick<DeckRuntimeState, "desktopFeatures">): DesktopFeatures {
   return runtime.desktopFeatures ?? DEFAULT_DESKTOP_FEATURES;

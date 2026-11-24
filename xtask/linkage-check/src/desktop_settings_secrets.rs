@@ -684,8 +684,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 33] = [
 /// rediscovering.
 ///
 /// Whether each of these *belongs* in `localStorage` is issue #824's question,
-/// not this check's; `docs/develop/desktop-gui.md` ("Every webview storage
-/// key, classified") records the answer for each. What this check refuses is a **new** one arriving
+/// not this check's. What this check refuses is a **new** one arriving
 /// unnoticed — including one holding a credential, which is the half of PRD
 /// #803's rule that had no enforcement at all.
 /// `PROJECTS_STORAGE_KEY` (`dot-agent-deck.desktop.projects.v1`) was the sixth
@@ -698,7 +697,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 33] = [
 /// the role-order key moved to `ORCHESTRATION_STORAGE_KEY`. The old one stays
 /// pinned as `LEGACY_WORKFLOW_STORAGE_KEY` because `App.tsx` still reads it once,
 /// to migrate a saved order, and then removes it.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 9] = [
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 8] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -717,15 +716,6 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 9] = [
     (
         "LEGACY_WORKFLOW_STORAGE_KEY",
         "dot-agent-deck.desktop.workflow-preview.v1",
-        true,
-    ),
-    // Issue #824 — the prompt library is the daemon's now. The key stays
-    // pinned because `usePromptLibrary` still reads it once, to hand an
-    // existing library to a deck that keeps prompts, and writes it for a deck
-    // from before the library.
-    (
-        "PROMPTS_STORAGE_KEY",
-        "dot-agent-deck.desktop.prompts.v1",
         true,
     ),
     (
@@ -1777,7 +1767,7 @@ pub struct VoiceSettings {
     #[test]
     fn the_localstorage_scan_reads_the_key_expression_it_is_handed() {
         let source = r#"
-window.localStorage.setItem(PROMPTS_STORAGE_KEY, JSON.stringify({ prompts }));
+window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns }));
 const raw = window.localStorage.getItem("dot-agent-deck.desktop.api-key.v1");
 window.localStorage.removeItem(`${base}.${mode}`);
 window.localStorage.clear();
@@ -1796,7 +1786,7 @@ localStorage.setItem(modeScopedKey("dot-agent-deck.desktop.new.v1"), token);
                 .map(|(line, op, arg)| (*line, op.as_str(), arg.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (2, "setItem", "PROMPTS_STORAGE_KEY"),
+                (2, "setItem", "OVERVIEW_COLUMNS_STORAGE_KEY"),
                 (3, "getItem", "\"dot-agent-deck.desktop.api-key.v1\""),
                 (4, "removeItem", "`${base}.${mode}`"),
                 (
@@ -1818,7 +1808,7 @@ localStorage.setItem(modeScopedKey("dot-agent-deck.desktop.new.v1"), token);
         for (_, _, argument) in &keyed {
             assert_eq!(
                 pinned.contains(argument.as_str()),
-                argument == "PROMPTS_STORAGE_KEY",
+                argument == "OVERVIEW_COLUMNS_STORAGE_KEY",
                 "unexpected verdict for {argument}"
             );
         }
@@ -1906,7 +1896,7 @@ const { setItem } = window.localStorage;
  * never reads localStorage — see PRD #803.
  */
 // window.localStorage.setItem(ROGUE_KEY, secret);
-window.localStorage.getItem(PROMPTS_STORAGE_KEY);
+window.localStorage.getItem(OVERVIEW_COLUMNS_STORAGE_KEY);
 "#;
         let masked = mask_comments(prose);
         assert!(
@@ -1919,7 +1909,7 @@ window.localStorage.getItem(PROMPTS_STORAGE_KEY);
             vec![StorageUse::Keyed {
                 line: 7,
                 op: "getItem".to_string(),
-                argument: "PROMPTS_STORAGE_KEY".to_string()
+                argument: "OVERVIEW_COLUMNS_STORAGE_KEY".to_string()
             }]
         );
 

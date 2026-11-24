@@ -1344,17 +1344,6 @@ pub const CAP_ADDRESSED_MESSAGE: &str = "addressed-message";
 /// [`PROTOCOL_VERSION`] bump. Advertised on every platform.
 pub const CAP_ADDRESSED_MESSAGE_AGENT: &str = "addressed-message-agent";
 
-/// Capability string for the deck's prompt library (issue #824):
-/// [`AttachRequest::ListPrompts`], [`AttachRequest::SavePrompt`],
-/// [`AttachRequest::DeletePrompt`] and [`AttachRequest::SeedPrompts`] — one
-/// feature, so one string. Each is withheld by
-/// [`crate::daemon_client::DaemonClient`] unless the daemon advertises this,
-/// so no [`PROTOCOL_VERSION`] bump; a client talking to an older daemon keeps
-/// its own copy of the library. Advertised on every platform: none of the four
-/// arms is `#[cfg]`-gated, and the store is an owner-only file under the state
-/// directory on every platform this builds for, as [`CAP_LAST_COMMAND`]'s is.
-pub const CAP_PROMPT_LIBRARY: &str = "prompt-library";
-
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1546,7 +1535,6 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AGENT_CARDS_TREE,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
-    CAP_PROMPT_LIBRARY,
     CAP_AGENT_OPENED,
 ];
 #[cfg(not(unix))]
@@ -1581,7 +1569,6 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AGENT_CARDS_TREE,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
-    CAP_PROMPT_LIBRARY,
     CAP_AGENT_OPENED,
 ];
 
@@ -2641,43 +2628,6 @@ pub enum AttachRequest {
         /// The calling agent's pane claim. Absent: a person.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<CallerClaim>,
-    },
-    /// Issue #824: the deck's prompt library, in order
-    /// ([`crate::prompt_library::PromptLibraryStore::list`]). Answered with
-    /// [`AttachResponse::prompts`].
-    ///
-    /// A struct variant with no fields, for the reason [`Self::ListProjects`]
-    /// gives. **Withheld unless the daemon advertises [`CAP_PROMPT_LIBRARY`]**:
-    /// an older daemon has no such variant and refuses it with the generic
-    /// `malformed request: …`, changing nothing — so no [`PROTOCOL_VERSION`]
-    /// bump.
-    ListPrompts {},
-    /// Issue #824: add `prompt` to the library, or replace the prompt with its
-    /// id in place. Refused with `ok: false` and a sentence naming the limit
-    /// (never the text) when the prompt or the library would exceed a
-    /// [`crate::prompt_library`] bound. Answered with the library as it stands
-    /// afterwards on [`AttachResponse::prompts`].
-    ///
-    /// **Withheld unless the daemon advertises [`CAP_PROMPT_LIBRARY`].**
-    SavePrompt {
-        prompt: crate::prompt_library::Prompt,
-    },
-    /// Issue #824: remove the prompt with `id`. An id the library does not hold
-    /// is not an error. Answered with the library on [`AttachResponse::prompts`].
-    ///
-    /// **Withheld unless the daemon advertises [`CAP_PROMPT_LIBRARY`].**
-    DeletePrompt {
-        id: String,
-    },
-    /// Issue #824: hand over a library a client kept before the daemon owned
-    /// one — add each prompt whose id the daemon does not hold, never replacing
-    /// one it does ([`crate::prompt_library::PromptLibraryStore::seed`]). All
-    /// or nothing: a refusal adds none of them, so the client keeps its copy.
-    /// Answered with the library on [`AttachResponse::prompts`].
-    ///
-    /// **Withheld unless the daemon advertises [`CAP_PROMPT_LIBRARY`].**
-    SeedPrompts {
-        prompts: Vec<crate::prompt_library::Prompt>,
     },
     CloseAgents {
         selector: CloseSelector,
@@ -4706,13 +4656,6 @@ pub struct AttachResponse {
     /// Additive and optional, and its request is capability-gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupted_dismiss: Option<crate::interrupted_work::DismissOutcome>,
-    /// Issue #824: the deck's prompt library, answering
-    /// [`AttachRequest::ListPrompts`], [`AttachRequest::SavePrompt`],
-    /// [`AttachRequest::DeletePrompt`] and [`AttachRequest::SeedPrompts`].
-    /// `None` on every other response. Additive and optional, and its requests
-    /// are capability-gated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompts: Option<Vec<crate::prompt_library::Prompt>>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -9170,32 +9113,6 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
-        // Issue #824: the deck's prompt library. The store is bound in its own
-        // statement so the `AppState` read guard drops before it is used; a
-        // change is made in memory and written on a detached task, so the
-        // answer never waits for the disk.
-        AttachRequest::ListPrompts {} => {
-            let store = state.read().await.prompt_library();
-            let resp = prompt_library_reply(store, "list-prompts", |_| {
-                Ok(crate::prompt_library::LibraryOutcome::Unchanged)
-            });
-            write_resp(&mut stream, &resp).await?
-        }
-        AttachRequest::SavePrompt { prompt } => {
-            let store = state.read().await.prompt_library();
-            let resp = prompt_library_reply(store, "save-prompt", |store| store.save(prompt));
-            write_resp(&mut stream, &resp).await?
-        }
-        AttachRequest::DeletePrompt { id } => {
-            let store = state.read().await.prompt_library();
-            let resp = prompt_library_reply(store, "delete-prompt", |store| Ok(store.delete(&id)));
-            write_resp(&mut stream, &resp).await?
-        }
-        AttachRequest::SeedPrompts { prompts } => {
-            let store = state.read().await.prompt_library();
-            let resp = prompt_library_reply(store, "seed-prompts", |store| store.seed(prompts));
-            write_resp(&mut stream, &resp).await?
-        }
         // Issue #1540: set the deck's last command only if it has none. `ok`
         // whether or not it was taken — the caller has nothing to do either way.
         AttachRequest::SeedLastCommand { command } => {
@@ -9485,38 +9402,6 @@ async fn record_last_command(state: &SharedState, command: &str) {
     };
     if store.remember(command) == crate::last_command::StoreOutcome::Set {
         persist_last_command(store, "start-agent");
-    }
-}
-
-/// Issue #824: answer a prompt-library verb — run `change` on the daemon's
-/// store, answer the library as it stands afterwards, and when the library
-/// changed write it to disk on a detached blocking task, so the reply never
-/// waits for the state directory. A refusal is `ok: false` with the store's
-/// sentence, which names a limit and never the user's text.
-fn prompt_library_reply(
-    store: Option<Arc<crate::prompt_library::PromptLibraryStore>>,
-    verb: &'static str,
-    change: impl FnOnce(
-        &crate::prompt_library::PromptLibraryStore,
-    ) -> Result<crate::prompt_library::LibraryOutcome, String>,
-) -> AttachResponse {
-    let Some(store) = store else {
-        return AttachResponse::err(format!("{verb}: this daemon keeps no prompt library"));
-    };
-    match change(&store) {
-        Ok(outcome) => {
-            let mut resp = AttachResponse::ok();
-            resp.prompts = Some(store.list());
-            if outcome == crate::prompt_library::LibraryOutcome::Changed {
-                drop(tokio::task::spawn_blocking(move || {
-                    if let Err(error) = store.persist() {
-                        warn!(verb, %error, "could not persist the prompt library");
-                    }
-                }));
-            }
-            resp
-        }
-        Err(reason) => AttachResponse::err(format!("{verb}: {reason}")),
     }
 }
 
@@ -16560,115 +16445,6 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the seeded command never reached disk"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        server.abort();
-    }
-
-    /// Issue #824: the prompt library through the real dispatch — list, save,
-    /// replace, delete and the migration seed, each answering the library as
-    /// it stands; a refusal changes nothing; and the change reaches disk, so it
-    /// survives a daemon restart.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_prompt_library_round_trips_through_the_dispatch() {
-        use crate::daemon_client::{ClientError, DaemonClient, GatedQuery};
-        use crate::prompt_library::{
-            MAX_PROMPT_BODY_BYTES, PROMPTS_FILE, Prompt, PromptLibraryStore,
-        };
-
-        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
-        let sock = dir.path().join("attach.sock");
-        let store_path = dir.path().join(PROMPTS_FILE);
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let (event_tx, _rx) = broadcast::channel(16);
-        let state: SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        state
-            .write()
-            .await
-            .set_prompt_library(Arc::new(PromptLibraryStore::load(store_path.clone())));
-        let server = {
-            let sock = sock.clone();
-            let state = state.clone();
-            tokio::spawn(async move {
-                let _ = run_attach_server_with_counter(
-                    &sock,
-                    registry,
-                    event_tx,
-                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                    state,
-                )
-                .await;
-            })
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::net::UnixStream::connect(&sock).await.is_err() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "attach socket never came up"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let client = DaemonClient::new(sock);
-        let prompt = |id: &str, name: &str, body: &str| Prompt {
-            id: id.into(),
-            name: name.into(),
-            body: body.into(),
-            note: None,
-        };
-        let answered = |reply: GatedQuery<Vec<Prompt>>| match reply {
-            GatedQuery::Answered(prompts) => prompts,
-            GatedQuery::Unsupported => panic!("this build advertises the prompt library"),
-        };
-
-        assert!(answered(client.list_prompts().await.unwrap()).is_empty());
-        assert_eq!(
-            answered(client.save_prompt(prompt("a", "A", "1")).await.unwrap()),
-            vec![prompt("a", "A", "1")]
-        );
-        client.save_prompt(prompt("b", "B", "2")).await.unwrap();
-        assert_eq!(
-            answered(client.save_prompt(prompt("a", "A2", "1b")).await.unwrap()),
-            vec![prompt("a", "A2", "1b"), prompt("b", "B", "2")],
-            "a save of a known id replaces it in place"
-        );
-        assert_eq!(
-            answered(
-                client
-                    .seed_prompts(vec![prompt("a", "stale", "old"), prompt("c", "C", "3")])
-                    .await
-                    .unwrap()
-            ),
-            vec![
-                prompt("a", "A2", "1b"),
-                prompt("b", "B", "2"),
-                prompt("c", "C", "3")
-            ],
-            "a seed adds absent ids and never overwrites"
-        );
-        assert_eq!(
-            answered(client.delete_prompt("b").await.unwrap()),
-            vec![prompt("a", "A2", "1b"), prompt("c", "C", "3")]
-        );
-        let refused = client
-            .save_prompt(prompt("d", "D", &"x".repeat(MAX_PROMPT_BODY_BYTES + 1)))
-            .await;
-        assert!(
-            matches!(&refused, Err(ClientError::Server(reason)) if reason.contains("body")),
-            "{refused:?}"
-        );
-        assert_eq!(answered(client.list_prompts().await.unwrap()).len(), 2);
-
-        // Persisted after the answer, on a detached task: wait for it, bounded.
-        let expected = vec![prompt("a", "A2", "1b"), prompt("c", "C", "3")];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while PromptLibraryStore::load(store_path.clone()).list() != expected {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the prompt library never reached disk, so it would not survive a \
-                 daemon restart"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

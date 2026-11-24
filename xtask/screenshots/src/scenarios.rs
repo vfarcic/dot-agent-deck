@@ -162,11 +162,6 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
-        name: "prompt-library",
-        description: "The desktop Prompts library open over the Daemons screen with the experimental flag off (issue #1310): one saved prompt chosen, with its name, prompt body and note, and the notice saying where the library is kept.",
-        clients: &[Client::Desktop],
-    },
-    Scenario {
         name: "settings-voice",
         description: "Desktop Voice settings.",
         clients: &[Client::Desktop],

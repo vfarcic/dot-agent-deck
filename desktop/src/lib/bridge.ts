@@ -46,8 +46,6 @@ import type { HandoffEdge,
   DeckDirectoryListing,
   DeckFleet,
   DeckListingOptions,
-  DeckPrompt,
-  DeckPromptLibrary,
   DeckSnapshot,
   DesktopFeatures,
   AgentCardEntry,
@@ -1904,7 +1902,7 @@ export type DesktopRunActionDto =
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
-  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; deckId: string; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
 
@@ -2370,23 +2368,6 @@ export interface DeckBridge {
    */
   newAgentOptions(deckId: string): Promise<NewAgentOptions>;
   /**
-   * Issue #824 — the prompt library of the deck `deckId` names, which that
-   * deck's daemon keeps. Resolves `unsupported`, having sent nothing, for a
-   * deck from before the library; rejects exactly as {@link listDirectories}
-   * does.
-   */
-  listPrompts(deckId: string): Promise<DeckPromptLibrary>;
-  /** Issue #824 — add `prompt` to that deck's library, or replace the prompt with its id. Rejects with the deck's refusal when a limit is exceeded. */
-  savePrompt(deckId: string, prompt: DeckPrompt): Promise<DeckPromptLibrary>;
-  /** Issue #824 — remove the prompt with `id` from that deck's library; an unknown id is not an error. */
-  deletePrompt(deckId: string, id: string): Promise<DeckPromptLibrary>;
-  /**
-   * Issue #824 — hand the library this app kept on this device to that deck:
-   * it adds the prompts it does not hold and replaces none, all or nothing, so
-   * a rejection added nothing.
-   */
-  seedPrompts(deckId: string, prompts: DeckPrompt[]): Promise<DeckPromptLibrary>;
-  /**
    * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
    * on the deck `deckId` names: the project's, `not_project` for an ordinary
    * directory, or `unsupported` with the reason for a deck that cannot launch
@@ -2573,24 +2554,6 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 }
 
 /**
- * Issue #824 — read a prompt-library reply field by field: a `deck` reply's
- * prompts keep only entries with the four fields' types, and anything that is
- * not a recognisable reply is an error rather than an empty library, so a
- * malformed answer can never be mistaken for "this deck holds no prompts".
- */
-export function normalizePromptLibrary(value: unknown): DeckPromptLibrary {
-  const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
-  if (record.kind === "unsupported") return { kind: "unsupported" };
-  if (record.kind !== "deck" || !Array.isArray(record.prompts)) throw new Error("The daemon's prompt library reply could not be read.");
-  const prompts = record.prompts.flatMap((entry): DeckPrompt[] => {
-    const prompt = typeof entry === "object" && entry !== null ? entry as Record<string, unknown> : {};
-    if (typeof prompt.id !== "string" || typeof prompt.name !== "string" || typeof prompt.body !== "string") return [];
-    return [{ id: prompt.id, name: prompt.name, body: prompt.body, ...(typeof prompt.note === "string" ? { note: prompt.note } : {}) }];
-  });
-  return { kind: "deck", prompts };
-}
-
-/**
  * Fixture mode's answer to {@link DeckBridge.desktopFeatures}: all OFF, the
  * shipped default, unless the preview URL carries `?experimental=1` (or
  * `true`) — the seam the vitest and Playwright suites use to see the gated
@@ -2600,7 +2563,7 @@ export function normalizePromptLibrary(value: unknown): DeckPromptLibrary {
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
-  return { showProjects: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
+  return { showDeck: true, showProjects: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
 }
 
 
@@ -3451,8 +3414,6 @@ class FixtureDeckBridge implements DeckBridge {
   private starAnswered = false;
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
-  /** Issue #824 — each fixture deck's prompt library, kept in memory as its daemon would keep it. */
-  private promptLibraries = new Map<string, DeckPrompt[]>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
   private upgradesInFlight = new Set<string>();
   private upgradeQuestions = new Map<string, { questionId: number; answer: (choice: UpgradeChoice) => void }>();
@@ -4254,39 +4215,6 @@ class FixtureDeckBridge implements DeckBridge {
 
   async previewWorktreeClose(): Promise<WorktreeCloseReport> {
     return NO_WORKTREE_CLOSE_REPORT;
-  }
-
-  /** Issue #824 — the named fixture deck's prompt library, or `unsupported` for one this preview plays as older. */
-  async listPrompts(deckId: string): Promise<DeckPromptLibrary> {
-    return this.changePromptLibrary(deckId, (prompts) => prompts);
-  }
-
-  async savePrompt(deckId: string, prompt: DeckPrompt): Promise<DeckPromptLibrary> {
-    return this.changePromptLibrary(deckId, (prompts) => (
-      prompts.some((held) => held.id === prompt.id) ? prompts.map((held) => (held.id === prompt.id ? { ...prompt } : held)) : [...prompts, { ...prompt }]
-    ));
-  }
-
-  async deletePrompt(deckId: string, id: string): Promise<DeckPromptLibrary> {
-    return this.changePromptLibrary(deckId, (prompts) => prompts.filter((held) => held.id !== id));
-  }
-
-  /** The daemon's seed rule: add the ids it does not hold, in order, and replace none. */
-  async seedPrompts(deckId: string, seed: DeckPrompt[]): Promise<DeckPromptLibrary> {
-    return this.changePromptLibrary(deckId, (prompts) => {
-      const next = [...prompts];
-      for (const prompt of seed) if (!next.some((held) => held.id === prompt.id)) next.push({ ...prompt });
-      return next;
-    });
-  }
-
-  private async changePromptLibrary(deckId: string, change: (prompts: DeckPrompt[]) => DeckPrompt[]): Promise<DeckPromptLibrary> {
-    await Promise.resolve();
-    this.connectedDeck(deckId);
-    if (this.isOlderDeck(deckId)) return { kind: "unsupported" };
-    const next = change(this.promptLibraries.get(deckId) ?? []);
-    this.promptLibraries.set(deckId, next);
-    return { kind: "deck", prompts: next.map((prompt) => ({ ...prompt })) };
   }
 
   /** PRD #1223 M4 — the named fixture deck's options, or `unsupported` for one this preview plays as older. */
@@ -6378,27 +6306,6 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOptions>("desktop_new_agent_options", { deckId });
-  }
-
-  /** Issue #824 — every prompt-library answer goes through {@link normalizePromptLibrary}. */
-  async listPrompts(deckId: string): Promise<DeckPromptLibrary> {
-    const invoke = await this.getInvoke();
-    return normalizePromptLibrary(await invoke<unknown>("desktop_list_prompts", { deckId }));
-  }
-
-  async savePrompt(deckId: string, prompt: DeckPrompt): Promise<DeckPromptLibrary> {
-    const invoke = await this.getInvoke();
-    return normalizePromptLibrary(await invoke<unknown>("desktop_save_prompt", { deckId, prompt }));
-  }
-
-  async deletePrompt(deckId: string, id: string): Promise<DeckPromptLibrary> {
-    const invoke = await this.getInvoke();
-    return normalizePromptLibrary(await invoke<unknown>("desktop_delete_prompt", { deckId, id }));
-  }
-
-  async seedPrompts(deckId: string, prompts: DeckPrompt[]): Promise<DeckPromptLibrary> {
-    const invoke = await this.getInvoke();
-    return normalizePromptLibrary(await invoke<unknown>("desktop_seed_prompts", { deckId, prompts }));
   }
 
   async previewWorktreeClose(deckId: string, paneIds: string[], incarnation?: string): Promise<WorktreeCloseReport> {

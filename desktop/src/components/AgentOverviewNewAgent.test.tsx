@@ -157,22 +157,6 @@ describe("the overview's New agent entry points (PRD #1223 M4)", () => {
     expect(highlightedDeck()).toBe(FIXTURE_DAEMON_ID);
   });
 
-  /**
-   * Scenario: a healthy deck running nothing, with the experimental flag off
-   * and then on. The Daemons screen is shown either way (issue #1308), but its
-   * Orchestrations panel only with the flag on, so only then does the note
-   * send the user to it.
-   */
-  it("names the Orchestrations panel only while it is shown", () => {
-    const { unmount } = render(<AgentOverview runtime={runtime({ fleet: [createFixtureSnapshot("empty")], desktopFeatures: { showProjects: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false } })} onNavigate={vi.fn()} />);
-    expect(screen.getByTestId("overview-first-run")).toHaveTextContent("Create an agent on this daemon.");
-    expect(screen.getByTestId("overview-first-run")).not.toHaveTextContent("Orchestrations panel");
-    unmount();
-
-    render(<AgentOverview runtime={runtime({ fleet: [createFixtureSnapshot("empty")], desktopFeatures: { showProjects: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true } })} onNavigate={vi.fn()} />);
-    expect(screen.getByTestId("overview-first-run")).toHaveTextContent("Orchestrations panel");
-  });
-
   /** Everything focusable that is neither inside the dialog nor under an `inert`. */
   function reachableOutside(flow: HTMLElement): Element[] {
     const candidates = document.querySelectorAll("button, a[href], input, select, textarea, [tabindex]");

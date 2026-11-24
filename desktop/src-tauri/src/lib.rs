@@ -29,7 +29,6 @@ mod local_deck;
 mod model_service;
 /// PRD #1401: the in-app pull request browser.
 mod pr_browser;
-mod prompt_library;
 // PRD #802 M4 — the credential seam PRD #803 M5 named, over the OS keychain.
 // Not voice-specific, so it is a module of its own rather than one under
 // `voice`: the rule it serves is #803's and any later feature needing a
@@ -91,14 +90,13 @@ use tauri::{AppHandle, Emitter, Manager, State, Webview};
 use crate::agent_view::{AgentView, RECONCILE_INTERVAL};
 use crate::daemon_bridge::{DaemonLinks, bootstrap, get_snapshot, snapshot_with, trusted_daemon};
 use crate::dto::{
-    BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
-    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions,
-    DesktopNewAgentOptions, DesktopNewAgentOrchestrations, DesktopProjectListing,
-    DesktopResolvedProject, DesktopSnapshot, OrchestrationRoleInput, TerminalAttachResult,
-    desktop_agent_registry, ensure_desktop_orchestration_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, validate_agent_id,
-    validate_dimensions, validate_orchestration_shape, validate_pasted_project_path,
-    validate_start_fields,
+    BootstrapOptions, ConnectionStatus, DesktopAction, DesktopActionError, DesktopActionResult,
+    DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions, DesktopNewAgentOptions,
+    DesktopNewAgentOrchestrations, DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot,
+    OrchestrationRoleInput, TerminalAttachResult, desktop_agent_registry,
+    ensure_desktop_orchestration_platform_supported, map_project_listing, map_resolved_project,
+    mint_desktop_pane_id, safe_message, validate_agent_id, validate_dimensions,
+    validate_orchestration_shape, validate_pasted_project_path, validate_start_fields,
 };
 use crate::secrets::{
     KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
@@ -209,26 +207,10 @@ async fn prepare_orchestration_launch<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     name: &str,
     cwd: &str,
-    task_prompt: &str,
     requested: &[OrchestrationRoleInput],
     config_revision: Option<&str>,
 ) -> Result<(Vec<OrchestrationRoleInput>, PreparedOrchestration), String> {
-    // An EMPTY task is allowed (issue #1044), as it is by the daemon and by the
-    // TUI's `Ctrl+n`: the user starts the orchestration as-is and types the task
-    // into the coordinator's own input. What the coordinator context looks like
-    // without one is the daemon's call — it omits the whole `## Your task`
-    // section and sends the "wait for instructions" pointer — so the empty
-    // string goes to it verbatim and nothing here composes a stand-in.
-    let task_prompt = task_prompt.trim();
-    // A UI affordance, not the bound: the daemon applies its own
-    // `bounded_read::MAX_TASK_BYTES` before it touches a filesystem, and it is
-    // not entitled to trust this one.
-    if task_prompt.len() > COMMAND_MAX_BYTES || task_prompt.contains('\0') {
-        return Err(format!(
-            "task prompt must be at most {COMMAND_MAX_BYTES} bytes and contain no NUL"
-        ));
-    }
-    let prepare = daemon.prepare_orchestration(cwd, name, task_prompt, config_revision);
+    let prepare = daemon.prepare_orchestration(cwd, name, config_revision);
     // Issue #1233 item 4: bounded only against a deck that owns a deadline of
     // its own (`prepare-deadline`). That deck answers first, and a preparation
     // it did not finish in time is withdrawn rather than published late, so
@@ -378,7 +360,6 @@ trait OrchestrationDaemon {
         &self,
         cwd: &str,
         orchestration: &str,
-        task: &str,
         config_revision: Option<&str>,
     ) -> Result<PreparedOrchestration, String>;
 
@@ -450,10 +431,11 @@ impl OrchestrationDaemon for DaemonClient {
         &self,
         cwd: &str,
         orchestration: &str,
-        task: &str,
         config_revision: Option<&str>,
     ) -> Result<PreparedOrchestration, String> {
-        DaemonClient::prepare_orchestration(self, cwd, orchestration, task, config_revision)
+        // The desktop sends no task: the coordinator starts, reads its role
+        // and waits for the user to type the task into its pane, as in the TUI.
+        DaemonClient::prepare_orchestration(self, cwd, orchestration, "", config_revision)
             .await
             .map_err(|error| safe_message(error.to_string()))
     }
@@ -4078,6 +4060,9 @@ async fn desktop_voice_resolve(
         },
         voice::Transcript::new(utterance),
         settings.labels,
+        // Issue #1198: the deck is an experimental surface, so voice neither
+        // offers nor dispatches the way there while it is hidden.
+        dot_agent_deck::features::show_desktop_deck(),
     )
     .await
 }
@@ -4113,6 +4098,7 @@ async fn resolve_declared_utterance(
     declared: VoiceDeclaration<'_>,
     transcript: voice::Transcript,
     labels: crate::settings::LabelSharing,
+    show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
     let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     with_other_agents(&mut decks, declared.other_agents);
@@ -4133,6 +4119,7 @@ async fn resolve_declared_utterance(
         declared.reading,
         transcript,
         labels,
+        show_deck,
     )
     .await;
     voice::address_deck_switch(&mut result.outcome, |deck_id| {
@@ -5507,6 +5494,9 @@ async fn desktop_voice_commands(
             .voice
             .unwrap_or_default()
             .labels,
+        // Issue #1198: the list marks the deck's row unavailable while the deck
+        // is hidden, for the same reason the resolver refuses it.
+        dot_agent_deck::features::show_desktop_deck(),
     ))
 }
 
@@ -6275,7 +6265,6 @@ struct ActivateOrchestrationRequest {
     /// The run's name (issue #1044), absent when the form's Name is empty.
     display_title: Option<String>,
     cwd: String,
-    task_prompt: String,
     roles: Vec<OrchestrationRoleInput>,
     rows: Option<u16>,
     cols: Option<u16>,
@@ -6304,7 +6293,6 @@ async fn activate_orchestration_action(
         name,
         display_title,
         cwd,
-        task_prompt,
         roles,
         rows,
         cols,
@@ -6348,7 +6336,6 @@ async fn activate_orchestration_action(
         &launch_client,
         &name,
         &cwd,
-        &task_prompt,
         &roles,
         config_revision.as_deref(),
     )
@@ -7205,7 +7192,6 @@ async fn desktop_run_action(
             name,
             display_title,
             cwd,
-            task_prompt,
             roles,
             rows,
             cols,
@@ -7218,7 +7204,6 @@ async fn desktop_run_action(
                     name,
                     display_title,
                     cwd,
-                    task_prompt,
                     roles,
                     rows,
                     cols,
@@ -7696,10 +7681,6 @@ pub fn run() {
             antigravity_notice::desktop_antigravity_notice_start,
             antigravity_notice::desktop_antigravity_notice_choose,
             desktop_list_directories,
-            prompt_library::desktop_list_prompts,
-            prompt_library::desktop_save_prompt,
-            prompt_library::desktop_delete_prompt,
-            prompt_library::desktop_seed_prompts,
             desktop_inbox_action,
             desktop_generate_config,
             desktop_agent_opened,
@@ -8495,6 +8476,7 @@ mod tests {
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
+            true,
         )
         .await
     }
@@ -10383,7 +10365,6 @@ mod tests {
     struct PrepareRequest {
         cwd: String,
         orchestration: String,
-        task: String,
         config_revision: Option<String>,
     }
 
@@ -10486,13 +10467,11 @@ mod tests {
             &self,
             cwd: &str,
             orchestration: &str,
-            task: &str,
             config_revision: Option<&str>,
         ) -> Result<PreparedOrchestration, String> {
             self.prepare_requests.lock().unwrap().push(PrepareRequest {
                 cwd: cwd.to_string(),
                 orchestration: orchestration.to_string(),
-                task: task.to_string(),
                 config_revision: config_revision.map(str::to_string),
             });
             // Read and released before the await: the guard is not `Send`, and
@@ -10761,26 +10740,19 @@ command = "configured-planner"
         let cwd = project_dir.to_str().unwrap().to_string();
         let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
 
-        let (roles, prepared) = prepare_orchestration_launch(
-            &daemon,
-            "loop",
-            &cwd,
-            "  Build the requested feature.  ",
-            &requested,
-            Some("revision-7"),
-        )
-        .await
-        .unwrap();
+        let (roles, prepared) =
+            prepare_orchestration_launch(&daemon, "loop", &cwd, &requested, Some("revision-7"))
+                .await
+                .unwrap();
 
-        // The request went out verbatim — including the trimmed task and the
-        // revision the picker resolved against, which is what closes the window
-        // between the pick and the write.
+        // The request went out verbatim, including the revision the picker
+        // resolved against, which is what closes the window between the pick
+        // and the write.
         assert_eq!(
             *daemon.prepare_requests.lock().unwrap(),
             [PrepareRequest {
                 cwd: cwd.clone(),
                 orchestration: "loop".into(),
-                task: "Build the requested feature.".into(),
                 config_revision: Some("revision-7".into()),
             }]
         );
@@ -10818,7 +10790,6 @@ command = "configured-planner"
             // directory's — which is exactly what makes an empty orchestration
             // name resolve differently on the two spellings.
             "/home/dev/current",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -10866,41 +10837,6 @@ command = "configured-planner"
                 Some("prep-token-1".to_string())
             ]
         );
-    }
-
-    /// Issue #1044. Scenario: the Runs form submits a blank task — nothing
-    /// typed, or only whitespace. The preparation must go to the daemon with
-    /// the empty string rather than being refused here, because the daemon and
-    /// the TUI allow it and the daemon decides what a task-less coordinator
-    /// context looks like; the launch then proceeds on the daemon's answer.
-    #[tokio::test]
-    async fn a_blank_task_is_prepared_by_the_daemon_rather_than_refused() {
-        for blank in ["", "  \n\t "] {
-            let daemon = FakeOrchestrationDaemon::new(std::iter::empty(), Ok(()));
-            let (roles, prepared) = prepare_orchestration_launch(
-                &daemon,
-                "loop",
-                "/home/dev/project",
-                blank,
-                &launch_roles("claude"),
-                None,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("a blank task {blank:?} was refused: {error}"));
-
-            assert_eq!(
-                *daemon.prepare_requests.lock().unwrap(),
-                [PrepareRequest {
-                    cwd: "/home/dev/project".into(),
-                    orchestration: "loop".into(),
-                    task: String::new(),
-                    config_revision: None,
-                }],
-                "a blank task reaches the daemon as the empty string"
-            );
-            assert_eq!(roles.len(), 2);
-            assert_eq!(prepared.prompt, prepared_orchestration().prompt);
-        }
     }
 
     /// Issue #1044. Scenario: launch from the Runs form once with a run name
@@ -10990,7 +10926,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/project",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11154,7 +11089,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/repo",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11184,7 +11118,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/repo",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11207,7 +11140,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/repo",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11230,7 +11162,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/gone",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11273,7 +11204,6 @@ command = "configured-planner"
                 &daemon,
                 "loop",
                 "/home/dev/project",
-                "Build it.",
                 &launch_roles("claude"),
                 None,
             )
@@ -11316,7 +11246,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/project",
-            "Build it.",
             &launch_roles("claude"),
             None,
         )
@@ -11341,7 +11270,6 @@ command = "configured-planner"
             &daemon,
             "loop",
             "/home/dev/project",
-            "Build it.",
             &launch_roles("pi"),
             None,
         )

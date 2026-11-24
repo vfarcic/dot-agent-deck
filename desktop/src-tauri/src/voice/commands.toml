@@ -583,8 +583,7 @@ report      = "Closed."
 # hidden is picked as `open_deck` and reaches this row only by this row's own
 # `yes` (audit A1). Asked together with `open_deck`, the meaning check answered
 # "go back" `no` for "close what is on top" 3 times in 3 manifest runs
-# (`deck-hidden-go-back`, 2026-10-20; the fixture went with the Daemons
-# screen's flag in issue #1308). Saying what the close does, as the
+# (`deck-hidden-go-back`, 2026-10-20). Saying what the close does, as the
 # description's first sentence does, names the going back.
 asks_to     = "close what is on top and go back to what is under it"
 try_saying  = "close this"
