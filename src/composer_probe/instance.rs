@@ -1115,14 +1115,21 @@ pub fn scan_proc(visit: &mut dyn FnMut(&[u8])) -> Result<(), ScanError> {
 /// Visit the environment and maps of each of `pids` that is this user's. A
 /// process that is gone by the time it is read is skipped, and so is one
 /// whose `environ` or `maps` read is refused (`EACCES`, `EPERM`) while its
-/// `stat` shows no controlling terminal (issue #2467): every deck agent runs
-/// on its pane's terminal, and a process of this user that the kernel won't
-/// let us read and that has none (`systemd --user`, `(sd-pam)`,
-/// `ssh-agent`, an `sshd-session`) is not one of them; until #2467 one such
-/// process kept every instance on the host for good. Any other failure to
-/// read one, its owner included, is [`ScanError::Unreadable`]: a refused
-/// process on a terminal, or one whose `stat` can't be read, still keeps
-/// everything.
+/// `stat` shows no controlling terminal (issue #2467). Every deck agent runs
+/// on its pane's terminal, and the processes this skips on a real host are
+/// `systemd --user`, `(sd-pam)`, `ssh-agent` and `sshd-session`; until #2467
+/// any one of them kept every instance on the host for good, which filled a
+/// RAM-backed runtime directory and left later daemons with no helper.
+/// **What this gives up:** a descendant of an installed agent that detached
+/// from its terminal and made itself unreadable (a daemonising tool such as
+/// an `ssh-agent` the agent's shell started) still holds the helper path in
+/// its environment, and once that agent's daemon is gone its instance can be
+/// removed under it; an editor it launches through that path then fails.
+/// Such a process has no terminal to show an editor in, and the instance
+/// goes only after the daemon that would read its checks is gone. Any other
+/// failure to read one, its owner included, is [`ScanError::Unreadable`]: a
+/// refused process on a terminal, or one whose `stat` can't be read, still
+/// keeps everything.
 /// Ownership is the real uid in `/proc/<pid>/status` ([`owned_by`]), not the
 /// owner of `/proc/<pid>`, which reads as root for a process that made
 /// itself non-dumpable. An entry that reads empty is visited as empty when
