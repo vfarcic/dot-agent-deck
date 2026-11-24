@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, resolveProfileCommand } from "../lib/profileCommands";
 import type { DaemonProjectsState } from "../hooks/useDaemonProjects";
+import type { PromptLibrarySource } from "../hooks/usePromptLibrary";
 import { SelectDeckNote } from "./SelectDeckNote";
 import { ORCHESTRATION_TITLE_TAKEN, RUN_NAME_UNUSABLE, SAME_DIRECTORY_ORCHESTRATION, directoryLabel, isUsableRunName, orchestrationRunTitle, suggestOrchestrationName } from "../lib/newAgent";
 import type { AgentProfile, DaemonResolvedProject, DeckPrompt, Provider, RuntimeMode, OrchestrationLaunchConfig } from "../types";
@@ -145,6 +146,10 @@ export function ProjectsPanel({ open, state, onClose, onConfigureOrchestration, 
 interface PromptLibraryPanelProps {
   open: boolean;
   prompts: DeckPrompt[];
+  /** Issue #824 — where the library on screen is kept. Absent reads as this device, the old behaviour. */
+  source?: PromptLibrarySource;
+  /** A hand-over or save outcome the user should see, in the library's own words. */
+  notice?: string;
   selectedId: string;
   onSelect: (id: string) => void;
   onClose: () => void;
@@ -153,7 +158,29 @@ interface PromptLibraryPanelProps {
   onRemove: (id: string) => void;
 }
 
-export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClose, onAdd, onUpdate, onRemove }: PromptLibraryPanelProps) {
+/**
+ * Issue #824 — the sentence under the panel's header that says where the
+ * library is kept. A daemon keeps it now, so it follows the deck; a daemon from
+ * before the library leaves it on this device, as it always was.
+ */
+function promptSourceNotice(source: PromptLibrarySource): { title: string; text: string } {
+  switch (source.kind) {
+    case "deck":
+      return { title: "Daemon library", text: "these prompts are kept by the selected daemon, so every desktop app connected to it shows the same library. Nothing is written to the project's .dot-agent-deck.toml." };
+    case "device":
+      return source.reason === "older-deck"
+        ? { title: "Local library", text: "this daemon is older than the shared prompt library, so these prompts are stored on this device only. Upgrade the daemon to keep them with it." }
+        : { title: "Local library", text: "prompts are stored on this device only. Nothing is written to the project's .dot-agent-deck.toml." };
+    case "loading":
+      return { title: "Daemon library", text: "asking the selected daemon for its prompts…" };
+    case "no-deck":
+      return { title: "No daemon selected", text: "the prompt library is kept by each daemon. Choose one daemon in the Daemon selector to see its prompts." };
+    case "unavailable":
+      return { title: "Daemon library unavailable", text: `the selected daemon's prompts could not be read: ${source.message}` };
+  }
+}
+
+export function PromptLibraryPanel({ open, prompts, source = { kind: "device", reason: "no-runtime" }, notice, selectedId, onSelect, onClose, onAdd, onUpdate, onRemove }: PromptLibraryPanelProps) {
   const [removeArmed, setRemoveArmed] = useState(false);
   const prompt = prompts.find((candidate) => candidate.id === selectedId) ?? prompts[0];
   useEffect(() => setRemoveArmed(false), [selectedId, open]);
@@ -164,14 +191,15 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
     <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
       <section ref={sheet.ref} tabIndex={-1} className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="prompts-title" data-testid="prompt-library-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="sheet-header">
-          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the orchestration task prompt and for messaging a running agent.</p></div>
+          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text to insert into an orchestration's task prompt.</p></div>
           <button className="icon-button" aria-label="Close prompt library" onClick={onClose}><X size={18} /></button>
         </header>
-        <div className="local-only-notice project-notice"><BookMarked size={15} /><span><strong>Local library</strong> — prompts are stored on this device only. Nothing is written to the project's <code>.dot-agent-deck.toml</code>.</span></div>
+        <div className="local-only-notice project-notice" data-testid="prompt-library-source" data-source={source.kind}><BookMarked size={15} /><span><strong>{promptSourceNotice(source).title}</strong> — {promptSourceNotice(source).text}</span></div>
+        {notice && <div className="local-only-notice project-notice" role="status" data-testid="prompt-library-notice"><AlertTriangle size={15} /><span>{notice}</span></div>}
 
         <div className="projects-layout">
           <aside className="project-library">
-            <button className="add-project" onClick={onAdd}><Plus size={14} /> Add prompt</button>
+            <button className="add-project" onClick={onAdd} disabled={source.kind !== "deck" && source.kind !== "device"}><Plus size={14} /> Add prompt</button>
             <nav aria-label="Saved prompts">
               {prompts.map((item) => (
                 <button key={item.id} className={item.id === prompt?.id ? "is-selected" : ""} onClick={() => onSelect(item.id)}>
@@ -195,7 +223,7 @@ export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClos
               </div>
               <footer className="sheet-footer project-footer">
                 <button type="button" className={removeArmed ? "button danger" : "button secondary"} onClick={() => { if (removeArmed) onRemove(prompt.id); else setRemoveArmed(true); }}><Trash2 size={14} /> {removeArmed ? "Confirm remove" : "Remove prompt"}</button>
-                <div><span>Auto-saved locally</span></div>
+                <div><span>{source.kind === "deck" ? "Saved to the daemon as you type" : "Auto-saved locally"}</span></div>
               </footer>
             </form>
           ) : <div className="configuration-empty">Add a prompt to reuse it when activating an orchestration.</div>}

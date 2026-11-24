@@ -18,7 +18,7 @@ import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } f
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
 import { useInterruptedWork } from "./useInterruptedWork";
-import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
+import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckPrompt, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -455,6 +455,13 @@ export function useDeckRuntime(): DeckRuntimeState {
   // says in place, not faults of the screen behind it.
   const listDirectories = useCallback((deckId: string, path?: string, options?: DeckListingOptions) => (options ? bridge.listDirectories(deckId, path, options) : bridge.listDirectories(deckId, path)), [bridge]);
   const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
+  // Issue #824 — async, so a render-only test bridge without these methods
+  // rejects instead of throwing during render; the library then reads as
+  // unavailable, as it does for a deck that could not be asked.
+  const listPrompts = useCallback(async (deckId: string) => bridge.listPrompts(deckId), [bridge]);
+  const savePrompt = useCallback(async (deckId: string, prompt: DeckPrompt) => bridge.savePrompt(deckId, prompt), [bridge]);
+  const deletePrompt = useCallback(async (deckId: string, id: string) => bridge.deletePrompt(deckId, id), [bridge]);
+  const seedPrompts = useCallback(async (deckId: string, prompts: DeckPrompt[]) => bridge.seedPrompts(deckId, prompts), [bridge]);
   const newAgentOrchestrations = useCallback((deckId: string, path: string) => bridge.newAgentOrchestrations(deckId, path), [bridge]);
   // PRD #1885, for the same reason: a review the deck could not answer is the
   // launching screen's to say, not the global toast's.
@@ -699,6 +706,10 @@ export function useDeckRuntime(): DeckRuntimeState {
     resolveProject,
     listDirectories,
     newAgentOptions,
+    listPrompts,
+    savePrompt,
+    deletePrompt,
+    seedPrompts,
     newAgentOrchestrations,
     projectTrustState,
     approveProjectTrust,

@@ -1395,12 +1395,13 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 @media (max-width: 1439px) {
   .dashboard-counters-button .dashboard-counters-word { display: none; }
 }
-/* From 1180px down to the phone layout the dashboard's actions do not fit
+/* From 1240px down to the phone layout the dashboard's actions do not fit
    beside its title with room to spare (measured locally they fit to about
    990px; CI's wider fallback font overflowed at 961px; with the Table | Cards
-   switch, PRD #2374, to about 1135px), so they take a row of their own under
-   it. */
-@media (max-width: 1180px) and (min-width: 681px) {
+   switch, PRD #2374, to about 1135px; and 1180px became 1240px when the Open
+   daemons button joined the shipped actions, issue #1308), so they take a row
+   of their own under it. */
+@media (max-width: 1240px) and (min-width: 681px) {
   .topbar.overview-topbar { grid-template-columns: minmax(0, 1fr); row-gap: 0; padding-bottom: 10px; }
   .overview-topbar .top-actions { justify-content: flex-start; flex-wrap: wrap; }
 }
