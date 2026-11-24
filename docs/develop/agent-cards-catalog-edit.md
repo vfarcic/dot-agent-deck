@@ -35,7 +35,7 @@ Every value is validated by the catalog's own `parse_action`, the code that read
 ## The desktop
 
 - Tauri command `agent_card_catalog_edit { deckId, edit|null }`, one deadline (`DECK_REPLY_TIMEOUT`) for reaching the deck and the exchange. A refusal is the daemon's reason as given; a daemon without the capability answers `CARD_CATALOG_EDIT_UNSUPPORTED`; an edit whose answer was lost says it may have been saved. Transport tests sit beside the batch ones in `desktop/src-tauri/src/restart_binding_tests.rs`.
-- The cards snapshot's `catalogEdit` carries the capability, as `batch` does. The editor (`useCardActionsEditor`, `AgentCardActionsEditor`) lists the daemons whose cards are on the Dashboard, in its order, and starts on the first, which is the local daemon.
+- The cards snapshot's `catalogEdit` carries the capability, as `batch` does. The editor (`useCardActionsEditor`, `AgentCardActionsEditor`) lists the daemons whose cards are on the Dashboard, in its order, and starts on the local one (`deckKind: "local"`), wherever it is listed, else the first. A read or an edit answering after the daemon shown changed is dropped (a read sequence number), and changing the daemon closes an open form, so nothing typed for one daemon is saved to another.
 - The desktop names `dot_agent_deck::card_catalog`'s wire types; linkage-check rule 12 allows the module, with the argument in `desktop_project_boundary.rs`.
 - The fixture bridge answers the editor for the `cards=tree` scene from `createFixtureCardCatalog`, the deck's two defaults, applying edits for the session (Playwright `desktop/agent-cards/061`, screenshot scene `agent-cards-actions-editor`).
 
@@ -43,9 +43,11 @@ Every value is validated by the catalog's own `parse_action`, the code that read
 
 The app draws card action icons from a curated set of the lucide icons it already bundles, keyed by the catalog's `icon` name (`desktop/src/lib/cardIcons.tsx`, `CARD_ICON_NAMES`); the editor's picker offers exactly that set. The daemon validates only the icon's syntax, so a catalog may name an icon a newer app has; this app draws its generic icon for it. A card draws up to `CARD_ICON_LIMIT` (3) icons, then `+N`, which keeps a 224-pixel card's name readable; they sit at the end of the status line, under Close, because three icons beside Close in the header left a card with Needs you and a tree toggle no room for its name.
 
+The card's icons and the batch buttons are `ActionTipButton`s (`desktop/src/components/ActionTipButton.tsx`). A pointer gets the native `title`; keyboard focus gets the same text as a `role="tooltip"` portalled to `document.body`, positioned `fixed` from the button's box so no card's `overflow` clips it, and named by the button's `aria-describedby` while shown. A disabled action is `aria-disabled`, not `disabled`: a native disabled button leaves the Tab order, and with it the only keyboard route to the reason. Its press does nothing.
+
 ## Voice
 
-`open_card_actions_editor`, `add_card_action`, `edit_card_action` and `remove_card_action` are voice rows (the last two take a `card_action` param, the action's label as said). Every write is `no_voice`: `saveCardAction`, `confirmRemoveCardAction`, `hideCardAction`, `restoreCardAction`, so a misheard word never becomes text an agent is sent. The form's field edits and the icon grid are listed in linkage-check rule 14's control-site ratchet. Pressing a card's icon is the existing `run_card_action` row.
+`open_card_actions_editor`, `add_card_action`, `edit_card_action` and `remove_card_action` are voice rows (the last two take a `card_action` param, the action's label as said). Every write is `no_voice`: `saveCardAction`, `confirmRemoveCardAction`, `hideCardAction`, `restoreCardAction`, so a misheard word never becomes text an agent is sent. Choosing the daemon (`chooseCardActionsDaemon`) and an icon (`chooseCardActionIcon`) are `no_voice` with their reasons; `desktop/agent-cards/060` fails when one of the editor's registry entries has neither a row nor a reason. The form's field edits (Placement included) are listed in linkage-check rule 14's control-site ratchet. Pressing a card's icon is the existing `run_card_action` row.
 
 ## The TUI
 
