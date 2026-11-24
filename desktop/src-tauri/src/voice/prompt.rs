@@ -810,6 +810,10 @@ pub(crate) mod tests {
                 "unselect_agent_card".to_string(),
                 "run_card_action_on_selection".to_string(),
                 "reply_to_agent_card".to_string(),
+                "open_card_actions_editor".to_string(),
+                "add_card_action".to_string(),
+                "edit_card_action".to_string(),
+                "remove_card_action".to_string(),
                 "none".to_string(),
             ]
         );

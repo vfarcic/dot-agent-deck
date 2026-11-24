@@ -3073,3 +3073,72 @@ try_saying  = "reply to {agent} go ahead"
   [[commands.params]]
   name = "reply"
   kind = "reply_text"
+
+# PRD #2374 decision 2026-11-24 — the Card actions editor, where the user adds,
+# changes, hides and removes the actions agents offer on their cards (CLAUDE.md
+# rule 23). Voice OPENS: the editor, its form for a new action, one action's
+# form, and the confirmation of a removal. Nothing said here writes the
+# daemon's config — the form's Save, the removal's Remove, Hide and Restore
+# are presses by hand — so a misheard word never becomes text an agent is sent
+# or takes an action off the cards.
+[[commands]]
+id          = "open_card_actions_editor"
+description = """Open the Card actions editor on the agent dashboard: the list of actions agents can
+offer on their cards (such as Go ahead and Merge it), where the user adds, changes, hides and removes
+them. Use for open the card actions editor, edit card actions, manage card actions, show the card
+actions. It only OPENS the editor and changes nothing. Pressing an action on an agent's card is
+`run_card_action`."""
+invoke      = "openCardActionsEditor"
+screens     = ["overview"]
+unavailable_hint = "the Card actions editor opens from the agent dashboard's cards"
+report      = "Opened the Card actions editor."
+asks_to     = "open the Card actions editor"
+try_saying  = "open the card actions editor"
+
+[[commands]]
+id          = "add_card_action"
+description = """Open the Card actions editor's form for a NEW card action, empty, for the user to fill
+in and save by hand. Use for add a card action, new card action, create a card action. It opens the
+editor first when it is closed. It saves nothing: the user types the fields and presses Save.
+Changing an action that is already listed is `edit_card_action`."""
+invoke      = "addCardAction"
+screens     = ["overview"]
+unavailable_hint = "card actions are added in the Card actions editor, from the agent dashboard"
+report      = "The form for a new card action is open: fill it in and press Save."
+asks_to     = "add a new card action"
+try_saying  = "add a card action"
+
+[[commands]]
+id          = "edit_card_action"
+description = """Open the Card actions editor's form for one listed card action, to change its text,
+label, icon or settings by hand. Use for edit the merge it action, change the go ahead action, open
+the ship it action. Set `action` to the action's label as the user said it. It saves nothing: the user
+changes the fields and presses Save. A new action is `add_card_action`; pressing an action on an
+agent's card is `run_card_action`."""
+invoke      = "editCardAction"
+screens     = ["overview"]
+unavailable_hint = "card actions are changed in the Card actions editor, from the agent dashboard"
+report      = "The form for {action} is open: change it and press Save."
+asks_to     = "change one of the card actions"
+try_saying  = "edit the {action} action"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"
+
+[[commands]]
+id          = "remove_card_action"
+description = """Ask to remove one of the user's OWN card actions in the Card actions editor. Set
+`action` to the action's label as the user said it. It only opens the editor's confirmation, which
+names the action; nothing is removed until the user presses Remove by hand. A deck default (Go ahead,
+Merge it) cannot be removed, only hidden, and hiding is done by hand in the editor."""
+invoke      = "removeCardAction"
+screens     = ["overview"]
+unavailable_hint = "card actions are removed in the Card actions editor, from the agent dashboard"
+report      = "Confirm removing {action} in the Card actions editor: press Remove."
+asks_to     = "remove one of my card actions"
+try_saying  = "remove the {action} action"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"

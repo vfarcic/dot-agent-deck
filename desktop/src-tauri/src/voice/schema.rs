@@ -494,6 +494,10 @@ mod tests {
                 "unselect_agent_card".to_string(),
                 "run_card_action_on_selection".to_string(),
                 "reply_to_agent_card".to_string(),
+                "open_card_actions_editor".to_string(),
+                "add_card_action".to_string(),
+                "edit_card_action".to_string(),
+                "remove_card_action".to_string(),
                 "none".to_string(),
             ]
         );
@@ -625,6 +629,10 @@ mod tests {
                 "unselect_agent_card",
                 "run_card_action_on_selection",
                 "reply_to_agent_card",
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
                 "none"
             ]
         );
@@ -878,6 +886,10 @@ mod tests {
                 ("unselect_agent_card".to_string(), false),
                 ("run_card_action_on_selection".to_string(), false),
                 ("reply_to_agent_card".to_string(), false),
+                ("open_card_actions_editor".to_string(), false),
+                ("add_card_action".to_string(), false),
+                ("edit_card_action".to_string(), false),
+                ("remove_card_action".to_string(), false),
             ]
         );
         assert_eq!(
@@ -979,6 +991,10 @@ mod tests {
                 ("unselect_agent_card".to_string(), true),
                 ("run_card_action_on_selection".to_string(), true),
                 ("reply_to_agent_card".to_string(), true),
+                ("open_card_actions_editor".to_string(), true),
+                ("add_card_action".to_string(), true),
+                ("edit_card_action".to_string(), true),
+                ("remove_card_action".to_string(), true),
             ]
         );
         assert_eq!(
@@ -1073,6 +1089,10 @@ mod tests {
                 ("unselect_agent_card".to_string(), false),
                 ("run_card_action_on_selection".to_string(), false),
                 ("reply_to_agent_card".to_string(), false),
+                ("open_card_actions_editor".to_string(), false),
+                ("add_card_action".to_string(), false),
+                ("edit_card_action".to_string(), false),
+                ("remove_card_action".to_string(), false),
             ]
         );
     }

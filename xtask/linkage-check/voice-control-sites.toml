@@ -1284,6 +1284,69 @@ handler = "onChange"
 code = "(event) => onSave({ ...settings, zoom: { level: clampZoom(Number(event.target.value)) } })"
 reason = "Settings → Zoom level select; a preference edit inside the Settings sheet (opened by `open_settings`) — no row sets the zoom."
 
+# --- desktop/src/components/AgentCardActionsEditor.tsx ---
+#
+# PRD #2374 decision 2026-11-24 — the Card actions editor's form. Voice opens
+# the editor, the form for a new action and an action's form
+# (`open_card_actions_editor`, `add_card_action`, `edit_card_action`); what the
+# form holds is typed by hand, and its Save (`saveCardAction`, `no_voice`) is
+# the press that writes it, so a misheard word never becomes text an agent is
+# sent. These are keystrokes and choices inside that form, not capabilities.
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("name", event.target.value)'
+reason = "A keystroke into the Card actions form's Name field (a new action's name). The form opens by voice (`add_card_action`); its fields are typed by hand and written only by the form's Save."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("label", event.target.value)'
+reason = "A keystroke into the Card actions form's Label field. The form opens by voice (`add_card_action`, `edit_card_action`); its fields are typed by hand and written only by the form's Save."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("prompt", event.target.value)'
+reason = "A keystroke into the Card actions form's Text it sends field — the exact text agents are sent, so it is typed and read by hand, never taken from a transcript. The form opens by voice; only its Save writes it."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("description", event.target.value)'
+reason = "A keystroke into the Card actions form's When agents should offer it field. The form opens by voice (`add_card_action`, `edit_card_action`); its fields are typed by hand and written only by the form's Save."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("confirm", event.target.checked)'
+reason = "The Card actions form's Ask before sending checkbox: a field of the form, set by hand and written only by the form's Save, like the text fields beside it."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("always", event.target.checked)'
+reason = "The Card actions form's Offer on every card checkbox: a field of the form, set by hand and written only by the form's Save, like the text fields beside it."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onClick"
+code = "() => setPicking((open) => !open)"
+reason = "The Card actions form's Choose icon button: shows or hides the icon grid inside the form, a pointer aid for picking the form's icon field. It writes nothing; the form's Save does."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = "(event) => setQuery(event.target.value)"
+reason = "A keystroke into the icon grid's Search icons box, which only narrows the grid shown inside the Card actions form."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onClick"
+code = '() => { setField("icon", name); setPicking(false); }'
+reason = "One icon in the Card actions form's icon grid: sets the form's icon field and closes the grid, a choice inside the form written only by its Save. Icons are pictures picked by eye, so a spoken name would add nothing the grid does not."
+
 # --- desktop/src/components/AgentCardOverlay.tsx ---
 
 [[site]]

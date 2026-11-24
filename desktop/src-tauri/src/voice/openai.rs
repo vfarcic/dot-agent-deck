@@ -419,6 +419,10 @@ mod tests {
                 "unselect_agent_card",
                 "run_card_action_on_selection",
                 "reply_to_agent_card",
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
                 "none"
             ]
         );

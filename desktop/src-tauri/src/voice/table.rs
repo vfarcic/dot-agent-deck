@@ -1556,6 +1556,14 @@ mod tests {
                     vec!["overview"]
                 ),
                 ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
+                (
+                    "open_card_actions_editor",
+                    "openCardActionsEditor",
+                    vec!["overview"]
+                ),
+                ("add_card_action", "addCardAction", vec!["overview"]),
+                ("edit_card_action", "editCardAction", vec!["overview"]),
+                ("remove_card_action", "removeCardAction", vec!["overview"]),
             ]
         );
     }
@@ -2557,7 +2565,11 @@ mod tests {
                 "select_agent_card",
                 "unselect_agent_card",
                 "run_card_action_on_selection",
-                "reply_to_agent_card"
+                "reply_to_agent_card",
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action"
             ]
         );
         assert_eq!(

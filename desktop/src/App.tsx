@@ -253,6 +253,8 @@ const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
 const RUN_CARD_ACTION_INVOKE: keyof typeof VOICE_ACTIONS = "runCardAction";
 const RUN_CARD_ACTION_BATCH_INVOKE: keyof typeof VOICE_ACTIONS = "runCardActionBatch";
 const RUN_SELECTION_BATCH_INVOKE: keyof typeof VOICE_ACTIONS = "runSelectionBatch";
+/* PRD #2374 decision 2026-11-24 — the card actions editor's rows that name an action by its label. */
+const CARD_ACTION_EDITOR_INVOKES: readonly (keyof typeof VOICE_ACTIONS)[] = ["editCardAction", "removeCardAction"];
 const REPLY_TO_AGENT_CARD_INVOKE: keyof typeof VOICE_ACTIONS = "replyToAgentCard";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
@@ -1425,7 +1427,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The action's label as the user said it (a `card_action`, held to the
          transcript), and a reply's words (a `reply_text`: the transcript's
          own slice), each for its own row only. */
-      ...((outcome.invoke === RUN_CARD_ACTION_INVOKE || outcome.invoke === RUN_CARD_ACTION_BATCH_INVOKE || outcome.invoke === RUN_SELECTION_BATCH_INVOKE) && namedCardAction ? { cardActionLabel: namedCardAction.value } : {}),
+      ...((outcome.invoke === RUN_CARD_ACTION_INVOKE || outcome.invoke === RUN_CARD_ACTION_BATCH_INVOKE || outcome.invoke === RUN_SELECTION_BATCH_INVOKE || CARD_ACTION_EDITOR_INVOKES.includes(outcome.invoke as keyof typeof VOICE_ACTIONS)) && namedCardAction ? { cardActionLabel: namedCardAction.value } : {}),
       ...(outcome.invoke === REPLY_TO_AGENT_CARD_INVOKE && namedReplyText ? { cardReplyText: namedReplyText.value } : {}),
     };
     let moved = false;
