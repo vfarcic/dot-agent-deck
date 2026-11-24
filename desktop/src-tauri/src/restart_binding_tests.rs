@@ -2295,6 +2295,75 @@ async fn a_card_catalog_edit_the_deck_never_answers_is_bounded() {
     );
 }
 
+/// Scenario (PR #2491 review, Qodo 10): the user saves an action on a deck
+/// whose daemon goes away, or goes quiet, before the edit is written: it closes
+/// the connection on the `Hello` that would carry the edit, or never answers
+/// that `Hello`. The editor is told plainly that nothing was saved, not that
+/// it may have been, and no edit request reached the deck. Control: a deck
+/// that reads the edit and never answers still says it may have been saved.
+#[tokio::test]
+async fn a_card_catalog_edit_that_fails_before_it_is_written_says_nothing_was_saved() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-unsent", "a");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+
+    // The deck closes the connection on the `Hello` that would carry the edit.
+    deck.script.lock().unwrap().drop_follow_on_hello = true;
+    let dropped = crate::agent_card_catalog_edit_on(&state, &wire, Some(catalog_add()))
+        .await
+        .expect_err("an edit that was never written is an error");
+    assert!(
+        !dropped.contains(crate::CARD_CATALOG_EDIT_MAY_HAVE_SAVED),
+        "nothing was sent, so nothing may have been saved: {dropped}"
+    );
+    assert!(dropped.contains("nothing was saved"), "{dropped}");
+
+    // The deck never answers that `Hello`: the bound runs out before the edit
+    // is written.
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.drop_follow_on_hello = false;
+        script.silent_hello = true;
+    }
+    tokio::time::pause();
+    let silent = crate::agent_card_catalog_edit_on(&state, &wire, Some(catalog_add())).await;
+    tokio::time::resume();
+    let silent = silent.expect_err("an edit whose `Hello` is never answered is an error");
+    assert!(
+        !silent.contains(crate::CARD_CATALOG_EDIT_MAY_HAVE_SAVED),
+        "the edit was never written: {silent}"
+    );
+    assert!(silent.contains("nothing was saved"), "{silent}");
+    assert!(
+        deck.script.lock().unwrap().catalog_edit_requests.is_empty(),
+        "no edit reached the deck"
+    );
+
+    // Control: the deck reads the edit and never answers it.
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.silent_hello = false;
+        script.silent_catalog_edit = true;
+    }
+    tokio::time::pause();
+    let unanswered = crate::agent_card_catalog_edit_on(&state, &wire, Some(catalog_add())).await;
+    tokio::time::resume();
+    let unanswered = unanswered.expect_err("an unanswered edit is an error");
+    assert!(
+        unanswered.contains(crate::CARD_CATALOG_EDIT_MAY_HAVE_SAVED),
+        "{unanswered}"
+    );
+    assert_eq!(deck.script.lock().unwrap().catalog_edit_requests.len(), 1);
+}
+
 /// Scenario (issue #2399 review, finding 1): the Card actions editor reads and
 /// saves the deck it names. With deck A selected, a read and an edit naming A
 /// reach A alone; a read or an edit naming deck B, which the app is not

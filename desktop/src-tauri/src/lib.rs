@@ -2221,10 +2221,11 @@ pub(crate) const CARD_CATALOG_EDIT_MAY_HAVE_SAVED: &str = "it may have been save
 /// [`crate::daemon_bridge::DECK_REPLY_TIMEOUT`] from when it starts, so a deck
 /// that never answers holds the editor no longer than any round trip. A
 /// refusal is the daemon's reason as it gave it, and nothing was written. An
-/// edit whose answer was lost after it was sent, or that failed in a way that
-/// cannot say whether the daemon got it, says it may have been saved
-/// ([`CARD_CATALOG_EDIT_MAY_HAVE_SAVED`]); the editor then reads the catalog
-/// once more instead of repeating the edit.
+/// edit that failed, or ran out of time, once it was being written says it
+/// may have been saved ([`CARD_CATALOG_EDIT_MAY_HAVE_SAVED`]); the editor then
+/// reads the catalog once more instead of repeating the edit. One that failed
+/// or ran out of time before that, connecting or on the `Hello`, says nothing
+/// was saved.
 pub(crate) async fn agent_card_catalog_edit_on(
     state: &DesktopState,
     deck_id: &str,
@@ -2246,14 +2247,33 @@ pub(crate) async fn agent_card_catalog_edit_on(
         }
     };
     daemon.require_compatible()?;
-    let unknown = if edits {
-        format!("; {CARD_CATALOG_EDIT_MAY_HAVE_SAVED}, so check the list before saving again")
+    let (unsent, unknown) = if edits {
+        (
+            "; nothing was saved".to_string(),
+            format!("; {CARD_CATALOG_EDIT_MAY_HAVE_SAVED}, so check the list before saving again"),
+        )
     } else {
-        String::new()
+        (String::new(), String::new())
     };
-    match tokio::time::timeout_at(until, daemon.client.card_catalog_edit(edit)).await {
-        Ok(Ok(GatedQuery::Answered(catalog))) => Ok(catalog),
-        Ok(Ok(GatedQuery::Unsupported)) => Err(CARD_CATALOG_EDIT_UNSUPPORTED.to_string()),
+    // PR #2491 review (Qodo 10): the connection and its `Hello` first, with
+    // nothing of the edit written, so a failure or the bound running out here
+    // says plainly that nothing was saved; only once the edit is being
+    // written may it have been saved whatever became of the answer.
+    let connection =
+        match tokio::time::timeout_at(until, daemon.client.card_catalog_edit_connection()).await {
+            Ok(Ok(Some(connection))) => connection,
+            Ok(Ok(None)) => return Err(CARD_CATALOG_EDIT_UNSUPPORTED.to_string()),
+            Ok(Err(ClientError::Server(reason))) => return Err(safe_message(reason)),
+            Ok(Err(error)) => return Err(safe_message(format!("{error}{unsent}"))),
+            Err(_) => {
+                return Err(format!(
+                    "the deck did not answer within {}s{unsent}",
+                    deadline.as_secs()
+                ));
+            }
+        };
+    match tokio::time::timeout_at(until, connection.send(edit)).await {
+        Ok(Ok(catalog)) => Ok(catalog),
         Ok(Err(ClientError::Server(reason))) => Err(safe_message(reason)),
         Ok(Err(ClientError::Unanswered(detail))) => Err(safe_message(format!(
             "the deck's answer was lost or could not be read ({detail}){unknown}"

@@ -1261,6 +1261,42 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
     }
 }
 
+/// A connection to a daemon that advertised the card-action editor, from
+/// [`DaemonClient::card_catalog_edit_connection`], on which nothing has been
+/// written yet. [`Self::send`] writes the one request it carries.
+pub struct CardCatalogEditConnection {
+    rd: TransportReadHalf,
+    wr: TransportWriteHalf,
+}
+
+impl CardCatalogEditConnection {
+    /// Write `edit` (or, with none, the read) and wait for the daemon's
+    /// answer. A refused edit is [`ClientError::Server`] with the daemon's
+    /// reason, nothing written; every other failure, from the request's first
+    /// byte on, is [`ClientError::Unanswered`]: an edit may have been written
+    /// whatever became of the reply.
+    pub async fn send(
+        mut self,
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
+    ) -> Result<crate::card_catalog::EditableCardCatalog, ClientError> {
+        let resp = issue_command(
+            &mut self.rd,
+            &mut self.wr,
+            &AttachRequest::CardCatalogEdit { edit },
+        )
+        .await
+        .map_err(|error| ClientError::Unanswered(error.to_string()))?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "card-catalog-edit failed".into()),
+            ));
+        }
+        resp.card_catalog_edit
+            .ok_or_else(|| ClientError::Unanswered("card-catalog-edit answered no catalog".into()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PRD #819 M5: the client's reading of the daemon's advertised capability set.
 // ---------------------------------------------------------------------------
@@ -4725,24 +4761,25 @@ impl DaemonClient {
         &self,
         edit: Option<crate::card_catalog::CatalogActionEdit>,
     ) -> Result<GatedQuery<crate::card_catalog::EditableCardCatalog>, ClientError> {
-        let Some((mut rd, mut wr, _)) = self
-            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT)
-            .await?
-        else {
+        let Some(connection) = self.card_catalog_edit_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
-        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::CardCatalogEdit { edit })
-            .await
-            .map_err(|error| ClientError::Unanswered(error.to_string()))?;
-        if !resp.ok {
-            return Err(ClientError::Server(
-                resp.error
-                    .unwrap_or_else(|| "card-catalog-edit failed".into()),
-            ));
-        }
-        resp.card_catalog_edit
-            .map(GatedQuery::Answered)
-            .ok_or_else(|| ClientError::Unanswered("card-catalog-edit answered no catalog".into()))
+        connection.send(edit).await.map(GatedQuery::Answered)
+    }
+
+    /// [`Self::card_catalog_edit`]'s first step: the connection whose `Hello`
+    /// advertised [`crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT`],
+    /// with nothing of the request written yet, or `None` when the daemon
+    /// does not advertise it. A caller that bounds the exchange can tell a
+    /// failure or a timeout here, where nothing was sent, from one after
+    /// [`CardCatalogEditConnection::send`] began writing (PR #2491 review).
+    pub async fn card_catalog_edit_connection(
+        &self,
+    ) -> Result<Option<CardCatalogEditConnection>, ClientError> {
+        Ok(self
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT)
+            .await?
+            .map(|(rd, wr, _)| CardCatalogEditConnection { rd, wr }))
     }
 
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
