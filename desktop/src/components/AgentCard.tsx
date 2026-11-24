@@ -281,7 +281,8 @@ export interface CardPlace {
  * pull requests and issues its agent reported as the deck checked them, the
  * first checked issue's labels, what is under it (closed, with its roll-up),
  * an icon for each prompt action its agent offers (up to
- * {@link CARD_ICON_LIMIT}, then a `+N`), and Close. Everything comes from the daemon's entry as received;
+ * {@link CARD_ICON_LIMIT}, then a `+N`) at the end of its status line, right
+ * under Close, and Close. Everything comes from the daemon's entry as received;
  * nothing here decides status, needs-you, roll-ups or references.
  *
  * Round 2 (D11, D12): the name opens the agent, as a table row does; a click
@@ -387,6 +388,29 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
             >{place.open ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}</button>
           </span>
         )}
+        {close && (
+          <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
+            <button
+              type="button"
+              className="icon-button agent-card-close"
+              data-testid="agent-card-close-agent"
+              aria-label={`Close ${name}`}
+              title={displayTitle(closeTitle ?? "")}
+              disabled={!close.enabled}
+              onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: close.id, cardActionToken: close.token })}
+            ><X size={14} aria-hidden="true" /></button>
+          </span>
+        )}
+      </header>
+      {/* PRD #2374 decision 2026-11-24 — the status line carries the action icons at its end, under Close, so the name keeps the header. */}
+      <div className="agent-card-meta-row">
+        {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the overlay.
+            Its name starts with the kind and status it shows, so a screen reader announces them and a spoken label of what is visible matches it (round 2 review). */}
+        <button type="button" className="agent-card-meta" data-testid="agent-card-details" aria-label={`${place.kind} ${statusText}${endedText ? `, ${endedText}` : ""}: show ${name}'s card`} title={displayTitle(metaTitle)}>
+          <span className="agent-card-kind" data-testid="agent-card-kind">{place.kind}</span>
+          <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status">{statusText}</span>
+          {ended && endedText && <span className="agent-card-ended" data-testid="agent-card-ended" title={displayTitle(ended.headline)}>{endedText}</span>}
+        </button>
         {icons.length > 0 && (
           <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
             <span className="agent-card-action-icons">
@@ -417,27 +441,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
             </span>
           </span>
         )}
-        {close && (
-          <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
-            <button
-              type="button"
-              className="icon-button agent-card-close"
-              data-testid="agent-card-close-agent"
-              aria-label={`Close ${name}`}
-              title={displayTitle(closeTitle ?? "")}
-              disabled={!close.enabled}
-              onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: close.id, cardActionToken: close.token })}
-            ><X size={14} aria-hidden="true" /></button>
-          </span>
-        )}
-      </header>
-      {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the overlay.
-          Its name starts with the kind and status it shows, so a screen reader announces them and a spoken label of what is visible matches it (round 2 review). */}
-      <button type="button" className="agent-card-meta" data-testid="agent-card-details" aria-label={`${place.kind} ${statusText}${endedText ? `, ${endedText}` : ""}: show ${name}'s card`} title={displayTitle(metaTitle)}>
-        <span className="agent-card-kind" data-testid="agent-card-kind">{place.kind}</span>
-        <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status">{statusText}</span>
-        {ended && endedText && <span className="agent-card-ended" data-testid="agent-card-ended" title={displayTitle(ended.headline)}>{endedText}</span>}
-      </button>
+      </div>
       {place.tree && (refs.length > 0
         ? <CardReferences card={card} refs={refs} name={name} controls={controls} />
         : <div className="agent-card-refs is-empty" aria-hidden="true" />)}

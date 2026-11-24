@@ -13,7 +13,7 @@ import { AgentCard, batchChoiceHover, type CardControls, type CardPlace } from "
 
 /**
  * Issue #2399, decision 2026-11-24 — a batch button's icon: the action's
- * catalog icon, or Close's own cross for a close (it has no catalog icon).
+ * catalog icon, or for a close the cross the card's own Close draws.
  */
 export function BatchChoiceIcon({ choice }: { choice: { icon?: string | null; kind?: string } }) {
   if (batchIconName(choice) === "close") return <X size={15} aria-hidden="true" focusable="false" />;
@@ -22,7 +22,7 @@ export function BatchChoiceIcon({ choice }: { choice: { icon?: string | null; ki
 
 /** The icon {@link BatchChoiceIcon} draws, by name (`data-icon`). */
 export function batchIconName(choice: { icon?: string | null; kind?: string }): string {
-  return !choice.icon && (choice.kind === "close" || choice.kind === "close_keep_worktree") ? "close" : cardIconName(choice.icon);
+  return choice.kind === "close" || choice.kind === "close_keep_worktree" ? "close" : cardIconName(choice.icon);
 }
 
 /**
