@@ -100,6 +100,13 @@ const NOT_LOADED = "The card actions are still being read; try again in a moment
 const NO_DAEMON_NAMED = "Say which daemon's card actions to show, by the name the dashboard gives it.";
 const SAVING_FORM = "The form is being saved; wait for it before opening another.";
 
+/* PR #2491 review (Qodo 3): why a spoken edit or removal that waited for the list did not happen, when the editor stops waiting for another reason. */
+const CLOSED_BEFORE_READ = "The Card actions editor was closed before its list was read.";
+const OTHER_DAEMON = "Another daemon's card actions were shown before the list was read.";
+const SUPERSEDED = "A later request replaced this one.";
+
+const unknownAction = (wanted: { name?: string; label?: string }) => `No single card action is called "${displayText(wanted.label ?? wanted.name ?? "", DISPLAY_LIMITS.name)}" in the editor.`;
+
 const EMPTY_FORM: CardActionFormValues = { name: "", label: "", prompt: "", description: "", icon: null, placement: "card", confirm: false, always: false };
 
 /**
@@ -116,6 +123,9 @@ function formPlacement(placement: string | null | undefined): CardActionPlacemen
 function homeDaemon(daemons: readonly CardActionsDaemon[]): CardActionsDaemon | undefined {
   return daemons.find((candidate) => candidate.local) ?? daemons[0];
 }
+
+/** A spoken edit or removal, by the action's name or label. */
+type VoiceAsk = { kind: "edit" | "remove"; wanted: { name?: string; label?: string } };
 
 /** The listed action a spoken or pressed name means: by name, else by label, ignoring case; `undefined` when none or several match. */
 function findAction(catalog: EditableCardCatalog, wanted: { name?: string; label?: string }): EditableCardAction | undefined {
@@ -205,8 +215,17 @@ export function useCardActionsEditor({ runtime, daemons }: {
   /* The generation the next form gets: a Save's answer changes only the form
      it was sent from (issue #2399 review 6). */
   const formSeq = useRef(0);
-  /* What voice asked for before the catalog was read, done once it is. */
-  const pending = useRef<{ kind: "edit" | "remove"; wanted: { name?: string; label?: string } } | undefined>(undefined);
+  /* What voice asked for before the catalog was read, done once it is.
+     `settle` ends the spoken request: `undefined` once its form or
+     confirmation is open, or the sentence saying why it was not (PR #2491
+     review, Qodo 3), so a request never ends in silence. */
+  const pending = useRef<(VoiceAsk & { settle: (refused: string | undefined) => void }) | undefined>(undefined);
+  /* End the waiting request, if any, with `refused`. */
+  const dropPending = useCallback((refused: string) => {
+    const asked = pending.current;
+    pending.current = undefined;
+    asked?.settle(refused);
+  }, []);
   const daemon = daemons.find((candidate) => candidate.deckId === deckId) ?? homeDaemon(daemons);
 
   const load = useCallback((target: CardActionsDaemon | undefined) => {
@@ -218,7 +237,11 @@ export function useCardActionsEditor({ runtime, daemons }: {
     setRefreshing(false);
     setReread(undefined);
     rereadSeq.current += 1;
-    if (!target || !target.editable || !read) { setLoading(false); return; }
+    if (!target || !target.editable || !read) {
+      setLoading(false);
+      dropPending(target ? readOnly(displayText(target.name, DISPLAY_LIMITS.name)) : NOT_AVAILABLE);
+      return;
+    }
     setLoading(true);
     read(target.deckId).then((answer) => {
       if (seq !== readSeq.current) return;
@@ -226,10 +249,12 @@ export function useCardActionsEditor({ runtime, daemons }: {
       setLoading(false);
     }, (failure: unknown) => {
       if (seq !== readSeq.current) return;
-      setError(`The card actions could not be read: ${reason(failure)}`);
+      const why = `The card actions could not be read: ${reason(failure)}`;
+      setError(why);
       setLoading(false);
+      dropPending(why);
     });
-  }, [read]);
+  }, [dropPending, read]);
 
   /* Read the list again, keeping the form and what it holds: Refresh, and
      once after an edit whose outcome is unknown (`check`). One read, never
@@ -282,8 +307,8 @@ export function useCardActionsEditor({ runtime, daemons }: {
     load(home);
   }, [daemons, deckId, load, open]);
 
-  const latest = useRef({ open, daemon, catalog, form, removing, busy, shown, refreshing });
-  latest.current = { open, daemon, catalog, form, removing, busy, shown, refreshing };
+  const latest = useRef({ open, daemon, catalog, form, removing, busy, shown, refreshing, loading });
+  latest.current = { open, daemon, catalog, form, removing, busy, shown, refreshing, loading };
 
   /* The action of `name` as the editor last read it, the `base` an edit sends; `null`: none. */
   const asRead = (name: string): EditableCardAction | null => latest.current.catalog?.actions.find((action) => action.name === name) ?? null;
@@ -331,35 +356,52 @@ export function useCardActionsEditor({ runtime, daemons }: {
     return undefined;
   }, []);
 
-  /* What voice asked for before the catalog was read. */
+  /* What voice asked for before the catalog was read: done now, or refused
+     in words (an action the list does not name, a save under way). */
   useEffect(() => {
     const asked = pending.current;
     if (!asked || !catalog) return;
     pending.current = undefined;
-    if (latest.current.busy) return;
+    if (latest.current.busy) { asked.settle(asked.kind === "edit" ? SAVING_FORM : STILL_SAVING); return; }
     const action = findAction(catalog, asked.wanted);
-    if (!action) return;
-    if (asked.kind === "edit") startForm(action); else askRemove(action);
+    if (!action) { asked.settle(unknownAction(asked.wanted)); return; }
+    if (asked.kind === "edit") { startForm(action); asked.settle(undefined); } else asked.settle(askRemove(action));
   }, [askRemove, catalog, startForm]);
 
-  /* An editor member that needs the editor open on an editable daemon with its actions read. */
-  const editing = (then: (catalog: EditableCardCatalog) => string | undefined, voiceAsk?: { kind: "edit" | "remove"; wanted: { name?: string; label?: string } }): string | undefined => {
+  /* Wait for the list, then do `voiceAsk`: what it answers settles once the list is read, or the read fails. */
+  const queue = (voiceAsk: VoiceAsk): Promise<string | undefined> => new Promise((settle) => {
+    dropPending(SUPERSEDED);
+    pending.current = { ...voiceAsk, settle };
+  });
+
+  /*
+   * An editor member that needs the editor open on an editable daemon with
+   * its actions read. A spoken edit or removal (`voiceAsk`) asked before the
+   * list is read waits for it, and answers a promise of how it ended; one for
+   * a daemon whose card actions cannot be edited is refused at once, and
+   * nothing waits (PR #2491 review, Qodo 3).
+   */
+  function editing(then: (catalog: EditableCardCatalog) => string | undefined): string | undefined;
+  function editing(then: (catalog: EditableCardCatalog) => string | undefined, voiceAsk: VoiceAsk): string | undefined | Promise<string | undefined>;
+  function editing(then: (catalog: EditableCardCatalog) => string | undefined, voiceAsk?: VoiceAsk): string | undefined | Promise<string | undefined> {
     const now = latest.current;
     if (!now.shown) return NOT_AVAILABLE;
     if (!now.open) {
       if (!voiceAsk) return NOT_OPEN;
+      const home = homeDaemon(daemons);
       openEditor();
-      pending.current = voiceAsk;
-      return undefined;
+      if (!home?.editable) return readOnly(displayText(home?.name ?? "This", DISPLAY_LIMITS.name));
+      return queue(voiceAsk);
     }
     if (!now.daemon?.editable) return readOnly(displayText(now.daemon?.name ?? "This", DISPLAY_LIMITS.name));
     if (!now.catalog) {
       if (!voiceAsk) return NOT_LOADED;
-      pending.current = voiceAsk;
-      return undefined;
+      /* A read that failed is not waited on: it is read again (as Refresh does). */
+      if (!now.loading) load(now.daemon);
+      return queue(voiceAsk);
     }
     return then(now.catalog);
-  };
+  }
 
   /* A member that sets one of the open form's values; refused with no form, or while it is being saved. */
   const formValue = (change: (values: CardActionFormValues) => CardActionFormValues): string | undefined => {
@@ -379,7 +421,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
     return undefined;
   }
 
-  const unknown = (wanted: { name?: string; label?: string }) => `No single card action is called "${displayText(wanted.label ?? wanted.name ?? "", DISPLAY_LIMITS.name)}" in the editor.`;
+  const unknown = unknownAction;
 
   /* What a failed Remove, Hide or Restore says: it was not done (a refusal), or it may have been; the reading-again says the rest. */
   const outcome = (label: string, done: string) => (why: string, unsure: boolean) => setError(unsure
@@ -393,7 +435,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
       if (latest.current.removing) { setRemoving(undefined); return undefined; }
       readSeq.current += 1;
       rereadSeq.current += 1;
-      pending.current = undefined;
+      dropPending(CLOSED_BEFORE_READ);
       setReread(undefined);
       setOpen(false);
       setCatalog(undefined);
@@ -409,7 +451,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
       const target = daemons.find((candidate) => candidate.deckId === wanted);
       if (!target) return "That daemon is not on the dashboard.";
       if (target.deckId === latest.current.daemon?.deckId) return undefined;
-      pending.current = undefined;
+      dropPending(OTHER_DAEMON);
       setDeckId(target.deckId);
       load(target);
       return undefined;

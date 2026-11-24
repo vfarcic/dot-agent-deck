@@ -17677,6 +17677,13 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** an icon whose text (a line, forty empty lines and a sentinel) is drawn cut in the small window, shown by keyboard focus, is drawn again whole and inside the window when the window grows with focus staying on it; a click, and on a second pass an Enter, then each open the review with the whole text and send nothing, rather than sending because the press measured the text as fitting (issue #2399 final audit A4).
 - **Does not assert:** a hover-shown tooltip across the resize at 375 px, where the growing window moves the icon from under the pointer and the hover ends (a fresh hover then draws it whole).
 
+##### desktop/agent-cards/084 — A spoken edit or removal with the editor closed ends in what it asked for or a refusal.
+
+- **Test:** vitest `desktop/agent-cards/084: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
+- **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech; a stubbed catalog read.
+- **Asserts:** with the Card actions editor closed, `edit_card_action` and `remove_card_action` on a daemon that did not advertise the editor are refused at once in words saying its card actions cannot be edited from the app, with no catalog read, no form and no confirmation; on a daemon that did, a read listing no action of the spoken label ends in the sentence that no single card action is called that, for an edit and for a removal; a read that fails ends in the sentence that the card actions could not be read, with its reason; a listed action opens its form, and then (editor closed again) the removal's confirmation, each with voice saying so; nothing is written (PR #2491 review, Qodo 3).
+- **Does not assert:** that the model picks these rows for the words (`desktop/agent-cards/060`'s phrase fixtures).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

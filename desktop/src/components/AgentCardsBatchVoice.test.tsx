@@ -1,13 +1,13 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DeckShell } from "../App";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { ANOTHER_BATCH_SENDING, BATCH_STILL_SENDING } from "../hooks/useAgentCardsView";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
-import { VOICE_ACTIONS } from "../lib/voiceActions";
+import { CARD_ACTION_FORM_OPENED, CARD_ACTION_REMOVAL_ASKED, VOICE_ACTIONS } from "../lib/voiceActions";
 import type { AgentCardAction, AgentCardEntry, CardBatchOutcome, DeckRuntimeState } from "../types";
 import { VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
 
@@ -95,7 +95,7 @@ const actionParam = (label: string): VoiceResolvedParamDto => ({ name: "action",
 type Said = { action: string; invoke: string; params: VoiceResolvedParamDto[] };
 
 /** The real shell on the dashboard's cards, one daemon whose cards are `entries`, and what each utterance resolves to. */
-function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (agents: { id: string }[]) => Record<string, Said>, { holdExecution = false, extra = {} }: { holdExecution?: boolean; extra?: Record<string, unknown> } = {}) {
+function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (agents: { id: string }[]) => Record<string, Said>, { holdExecution = false, extra = {}, catalogEdit = true }: { holdExecution?: boolean; extra?: Record<string, unknown>; catalogEdit?: boolean } = {}) {
   const voice = microphone();
   const base = createFixtureSnapshot("connected");
   const snapshot = { ...base, connection: { ...base.connection, incarnation: INSTANCE }, agents: base.agents.map((agent) => ({ ...agent, incarnation: INSTANCE })) };
@@ -131,7 +131,7 @@ function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (a
     saveSettings: vi.fn(async () => structuredClone(DEFAULT_DESKTOP_SETTINGS)),
     setZoom: vi.fn(async (level: number) => level),
     voiceCommands: vi.fn(async () => []),
-    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: cards, catalogErrors: [], tree: true, batch: true, catalogEdit: true } },
+    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: cards, catalogErrors: [], tree: true, batch: true, catalogEdit } },
     invokeCardAction, invokeCardActionBatch, resolveVoice, ...voice, ...extra,
   } as unknown as DeckRuntimeState;
   render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
@@ -425,6 +425,97 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     for (const [id, name, params] of rows) {
       expect(registry[id]?.voice, id).toBe(true);
       expectRow(name, id, ["overview"], params);
+    }
+  });
+  /// Scenario: With the Card actions editor closed, ask by voice to edit or remove a card action. On a daemon whose card actions cannot be edited from the app, voice says so at once and nothing is read or queued; when the list is read and has no action of that name, or the read fails, voice says that instead of going quiet; and when the action is listed, its form, or the removal's confirmation, opens and voice says so. Nothing is written.
+  it("desktop/agent-cards/084: a spoken edit or removal with the editor closed always ends in what it asked for or a refusal", async () => {
+    const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };
+    const listed = { actions: [ship], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" };
+    const said = () => ({
+      "edit the ship it action": { action: "edit_card_action", invoke: "editCardAction", params: [actionParam("Ship it")] },
+      "edit the deploy it action": { action: "edit_card_action", invoke: "editCardAction", params: [actionParam("Deploy it")] },
+      "remove the deploy it action": { action: "remove_card_action", invoke: "removeCardAction", params: [actionParam("Deploy it")] },
+      "remove the ship it action": { action: "remove_card_action", invoke: "removeCardAction", params: [actionParam("Ship it")] },
+      "close the card actions editor": { action: "close", invoke: "closeTopmost", params: [] },
+    });
+    const settled = async () => { await act(async () => { await vi.advanceTimersByTimeAsync(0); }); await act(async () => { await Promise.resolve(); await Promise.resolve(); }); };
+    const report = () => screen.getByTestId("voice-report");
+    const cards = (agents: { id: string }[]) => [cardFor(agents[0].id, "coder-card")];
+
+    // A daemon whose card actions cannot be edited from the app: refused at once, nothing read, nothing waiting.
+    {
+      const readCardCatalog = vi.fn(async () => listed);
+      const editCardCatalog = vi.fn();
+      const run = setup(cards, said, { catalogEdit: false, extra: { readCardCatalog, editCardCatalog } });
+      await turnOnVoice();
+      await speak(run.voice, "edit the ship it action");
+      await settled();
+      expect(report()).toHaveTextContent(/cannot be edited from the app/);
+      expect(readCardCatalog).not.toHaveBeenCalled();
+      expect(screen.queryByLabelText("Name")).toBeNull();
+      await speak(run.voice, "remove the ship it action");
+      await settled();
+      expect(report()).toHaveTextContent(/cannot be edited from the app/);
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(readCardCatalog).not.toHaveBeenCalled();
+      expect(editCardCatalog).not.toHaveBeenCalled();
+      cleanup();
+    }
+
+    // The list is read and names no such action: voice says so, for an edit and for a removal.
+    {
+      const readCardCatalog = vi.fn(async () => listed);
+      const editCardCatalog = vi.fn();
+      const run = setup(cards, said, { extra: { readCardCatalog, editCardCatalog } });
+      await turnOnVoice();
+      await speak(run.voice, "edit the deploy it action");
+      await settled();
+      expect(readCardCatalog).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("dialog", { name: "Card actions" })).toBeInTheDocument();
+      expect(report()).toHaveTextContent('No single card action is called "Deploy it" in the editor.');
+      expect(screen.queryByLabelText("Name")).toBeNull();
+      await speak(run.voice, "close the card actions editor");
+      await settled();
+      expect(screen.queryByRole("dialog", { name: "Card actions" })).toBeNull();
+      await speak(run.voice, "remove the deploy it action");
+      await settled();
+      expect(report()).toHaveTextContent('No single card action is called "Deploy it" in the editor.');
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(editCardCatalog).not.toHaveBeenCalled();
+      cleanup();
+    }
+
+    // The read fails: voice says why, rather than going quiet.
+    {
+      const readCardCatalog = vi.fn(async () => { throw new Error("the daemon did not answer"); });
+      const run = setup(cards, said, { extra: { readCardCatalog, editCardCatalog: vi.fn() } });
+      await turnOnVoice();
+      await speak(run.voice, "edit the ship it action");
+      await settled();
+      expect(report()).toHaveTextContent("The card actions could not be read: the daemon did not answer");
+      expect(screen.queryByLabelText("Name")).toBeNull();
+      cleanup();
+    }
+
+    // The action is listed: its form opens, and then the removal's confirmation, each from a closed editor, and voice says so.
+    {
+      const readCardCatalog = vi.fn(async () => listed);
+      const editCardCatalog = vi.fn();
+      const run = setup(cards, said, { extra: { readCardCatalog, editCardCatalog } });
+      await turnOnVoice();
+      await speak(run.voice, "edit the ship it action");
+      await settled();
+      const editor = screen.getByRole("dialog", { name: "Card actions" });
+      expect((within(editor).getByLabelText("Name") as HTMLInputElement).value).toBe("ship");
+      expect(report()).toHaveTextContent(CARD_ACTION_FORM_OPENED);
+      await speak(run.voice, "close the card actions editor");
+      await settled();
+      expect(screen.queryByRole("dialog", { name: "Card actions" })).toBeNull();
+      await speak(run.voice, "remove the ship it action");
+      await settled();
+      expect(screen.getByRole("alertdialog", { name: "Remove Ship it?" })).toBeInTheDocument();
+      expect(report()).toHaveTextContent(CARD_ACTION_REMOVAL_ASKED);
+      expect(editCardCatalog).not.toHaveBeenCalled();
     }
   });
 });

@@ -732,10 +732,16 @@ export type VoiceActionContext = {
   refreshCardActions: () => string | undefined;
   /** Open the editor's form for a new action. */
   addCardAction: () => string | undefined;
-  /** Open the editor's form for one listed action, by name (a button) or by label as spoken. */
-  editCardAction: (action: { name?: string; label?: string }) => string | undefined;
-  /** Ask to remove one of the user's own actions: opens the editor's confirmation. Writes nothing. */
-  removeCardAction: (action: { name?: string; label?: string }) => string | undefined;
+  /**
+   * Open the editor's form for one listed action, by name (a button) or by
+   * label as spoken. With the list not read yet (the editor closed, or still
+   * reading) it answers a promise instead, settled once the list is read: with
+   * `undefined` when the form opened, or the sentence saying why it did not
+   * (PR #2491 review, Qodo 3).
+   */
+  editCardAction: (action: { name?: string; label?: string }) => string | undefined | Promise<string | undefined>;
+  /** Ask to remove one of the user's own actions: opens the editor's confirmation. Writes nothing. Answers as {@link editCardAction} does. */
+  removeCardAction: (action: { name?: string; label?: string }) => string | undefined | Promise<string | undefined>;
   /** The removal confirmation's Remove: write the removal. */
   confirmRemoveCardAction: () => string | undefined;
   /** Hide a deck default from every card, by name. Writes the daemon's config. */
@@ -817,6 +823,10 @@ export const CARD_REPLY_UNHEARD = "Say what to reply.";
 export const CARD_BATCH_UNHEARD = "Say which action to send to the card and every card under it, by the label on its button.";
 /** What the editor's voice members say when no action name was heard. */
 export const CARD_ACTION_EDIT_UNHEARD = "Say which card action, by its label in the Card actions editor.";
+/** PR #2491 review (Qodo 3): what voice says while a spoken edit or removal waits for the editor to read the list, and once it is done. */
+export const CARD_ACTIONS_READING = "Reading the card actions…";
+export const CARD_ACTION_FORM_OPENED = "Opened the action's form.";
+export const CARD_ACTION_REMOVAL_ASKED = "Asking to confirm the removal.";
 export const CARD_ICON_UNHEARD = "Say which icon, by its name in the Card actions form's icon grid, such as rocket or git merge.";
 export const CARD_SELECTION_BATCH_UNHEARD = "Say which action to send to the selected cards, by the label on its button.";
 
@@ -1839,14 +1849,16 @@ export const VOICE_ACTIONS = {
     label: "Open one card action's form in the Card actions editor",
     voice: true,
     needs: ["editCardAction"],
-    run: (context: Pick<VoiceActionContext, "editCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+    /* A request that waits for the editor to read its list is reported as it settles: the form opened, or why not. */
+    run: (context: Pick<VoiceActionContext, "editCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
       const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
         ? CARD_ACTION_EDIT_UNHEARD
         : context.editCardAction({
           ...(target.cardActionId !== undefined ? { name: target.cardActionId } : {}),
           ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
         });
-      if (refused !== undefined) context.reportRefused?.(refused);
+      if (typeof refused === "string") context.reportRefused?.(refused);
+      else if (refused !== undefined) context.reportPending?.(CARD_ACTIONS_READING, refused, CARD_ACTION_FORM_OPENED);
     },
   },
 
@@ -1854,14 +1866,16 @@ export const VOICE_ACTIONS = {
     label: "Ask to remove one of your own card actions",
     voice: true,
     needs: ["removeCardAction"],
-    run: (context: Pick<VoiceActionContext, "removeCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+    /* A request that waits for the editor to read its list is reported as it settles: the form opened, or why not. */
+    run: (context: Pick<VoiceActionContext, "removeCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
       const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
         ? CARD_ACTION_EDIT_UNHEARD
         : context.removeCardAction({
           ...(target.cardActionId !== undefined ? { name: target.cardActionId } : {}),
           ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
         });
-      if (refused !== undefined) context.reportRefused?.(refused);
+      if (typeof refused === "string") context.reportRefused?.(refused);
+      else if (refused !== undefined) context.reportPending?.(CARD_ACTIONS_READING, refused, CARD_ACTION_REMOVAL_ASKED);
     },
   },
 
