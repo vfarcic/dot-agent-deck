@@ -60,7 +60,7 @@ fn probe_002_one_touch_one_empty_probe_is_empty() {
     );
 }
 
-/// Scenario: Between a probe's admission and its settlement, write a voice answer, a human byte, a deck write no job names, another deck job's byte, an external edit, and reports shaped like exempt ones that aren't (a focus report with focus reporting off, a DA1 reply nobody asked for, a CPR reply to an outstanding query), each in its own run. None applies the observation and the box stays touched.
+/// Scenario: Between a probe's admission and its settlement, write a voice answer, a human byte, a deck write no job names, another deck job's byte, an external edit, and reports shaped like exempt ones that aren't (a focus report with focus reporting off, a DA1 reply nobody asked for, a CPR reply to an outstanding query in a modified F3 key's shape), each in its own run. None applies the observation and the box stays touched.
 #[spec("inbox/probe/002")]
 #[test]
 fn probe_002_anything_after_the_probe_refuses_it() {
@@ -93,10 +93,10 @@ fn probe_002_anything_after_the_probe_refuses_it() {
                 Enqueued::Moved(_)
             ));
         }),
-        ("CPR reply", |i| {
+        ("CPR reply shaped as a modified F3", |i| {
             i.on_output(&[OutputNote::Query(QueryKind::Cpr)], Instant::now());
             assert!(matches!(
-                i.enqueue(Writer::Human, b"\x1b[3;1R"),
+                i.enqueue(Writer::Human, b"\x1b[1;2R"),
                 Enqueued::Moved(_)
             ));
         }),
