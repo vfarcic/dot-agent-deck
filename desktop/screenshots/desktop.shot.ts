@@ -1,4 +1,4 @@
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 
 import { desktopScenario } from "./support";
 
@@ -104,6 +104,10 @@ desktopScenario("agent-cards", async (page) => {
   await expect(page.locator("article[data-card-key]")).toHaveCount(4);
   await expect(page.getByTestId("agent-card-issue-label").first()).toHaveText("enhancement");
   await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
+  // PRD #2374 decision 2026-11-24: each card's prompt actions are icons beside Close, drawn whole.
+  const icons = page.getByTestId("agent-card-action-icon");
+  expect(await icons.count()).toBeGreaterThan(0);
+  for (const icon of await icons.all()) await expect(icon).toBeInViewport({ ratio: 1 });
 });
 
 // Issue #2399 — desktop-only: the TUI has no cards view. The `agent-cards`
@@ -134,6 +138,21 @@ async function openCardsBatch(page: Page): Promise<void> {
   await page.getByTestId("agent-cards-batch-action-go-ahead").click();
 }
 
+// Decision 2026-11-24: batch buttons are icons named by the action's label,
+// with no text; each is drawn whole, with its icon, and its hover names it.
+async function expectBatchIcons(scope: Locator, labels: readonly string[]): Promise<void> {
+  const buttons = scope.getByRole("button");
+  await expect(buttons).toHaveCount(labels.length);
+  for (const [index, label] of labels.entries()) {
+    const button = buttons.nth(index);
+    await expect(button).toHaveAccessibleName(label);
+    await expect(button).toHaveText("");
+    await expect(button.locator("svg")).toHaveCount(1);
+    expect(await button.getAttribute("title")).toContain(label);
+    await expect(button).toBeInViewport({ ratio: 1 });
+  }
+}
+
 // How cards are selected: Select pressed (it reads as on), each card's
 // checkbox, the two ticked, and the selection bar's count with a button per
 // action the selected cards offer. No dialog is open.
@@ -143,12 +162,7 @@ desktopScenario("agent-cards-select", async (page) => {
   await expect(page.getByTestId("agent-card-select")).toHaveCount(2);
   await expect(page.getByRole("checkbox", { name: "Select Plan / architecture" })).toBeChecked();
   await expect(page.getByRole("checkbox", { name: "Select User-path verification" })).toBeChecked();
-  const bar = page.getByTestId("agent-cards-selection");
-  await expect(bar.getByRole("button")).toHaveText(["Go ahead", "Close"]);
-  for (const button of await bar.getByRole("button").all()) {
-    await expect(button).toBeInViewport({ ratio: 1 });
-    expect(await button.evaluate((node) => node.scrollWidth <= node.clientWidth), "the action's label is drawn whole").toBe(true);
-  }
+  await expectBatchIcons(page.getByTestId("agent-cards-selection"), ["Go ahead", "Close"]);
   await expect(page.getByTestId("agent-cards-batch-confirm")).toHaveCount(0);
 });
 
@@ -162,16 +176,18 @@ desktopScenario("agent-cards-tree-batch", async (page) => {
   await expect(overlay.getByRole("heading", { name: "Plan / architecture", exact: true })).toBeVisible();
   const batch = overlay.getByTestId("agent-card-batch");
   await expect(batch.getByRole("heading")).toHaveText("Plan / architecture and the 2 agents under it");
-  await expect(batch.getByRole("button")).toHaveText(["Go ahead", "Close"]);
   await batch.scrollIntoViewIfNeeded();
   await expect(batch).toBeInViewport({ ratio: 1 });
+  await expectBatchIcons(batch, ["Go ahead", "Close"]);
 });
 
 desktopScenario("agent-cards-batch", async (page) => {
   await openCardsBatch(page);
   const dialog = page.getByTestId("agent-cards-batch-confirm");
   await expect(dialog.locator(".agent-cards-batch-entry.is-included")).toHaveCount(3);
-  await expect(dialog.getByTestId("agent-cards-batch-prompt")).toHaveText(["Go ahead.", "Go ahead.", "Go ahead."]);
+  // Decision 2026-11-24: the text all three get is quoted once, above the three of them.
+  await expect(dialog.getByTestId("agent-cards-batch-prompt")).toHaveText(["Go ahead."]);
+  await expect(dialog.getByTestId("agent-cards-batch-group")).toHaveCount(1);
   await expect(dialog.locator(".agent-cards-batch-entry.is-skipped")).toContainText("User-path verification's card does not offer this action");
   await expect(dialog.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
 });
@@ -187,6 +203,35 @@ desktopScenario("agent-cards-batch-results", async (page) => {
   await expect(results.locator("[data-outcome='failed']")).toContainText("Go ahead is disabled: the agent is not running");
   await expect(results.getByRole("status")).toHaveText("2 queued for the agent of 3; 1 failed");
   await expect(results.getByRole("button", { name: "Close", exact: true })).toBeVisible();
+});
+
+// PRD #2374 decision 2026-11-24 — desktop-only: the TUI has no cards view.
+// The Card actions editor on the `cards=tree` scene's daemon (it advertises
+// the editor; the fixture bridge answers from the deck's two defaults), with
+// Add action's form filled in for a Deploy it action and its icon grid open
+// on the rocket chosen.
+desktopScenario("agent-cards-actions-editor", async (page) => {
+  await page.goto("/?fixture=1&state=docs&cards=tree");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByTestId("overview-mode-cards").click();
+  await page.getByRole("button", { name: "Card actions", exact: true }).click();
+  const editor = page.getByRole("dialog", { name: "Card actions" });
+  await expect(editor.locator('[data-testid="agent-card-actions-editor-row"][data-action="go-ahead"]')).toHaveAttribute("data-source", "deck");
+  await expect(editor.locator('[data-testid="agent-card-actions-editor-row"][data-action="merge"]')).toHaveAttribute("data-source", "deck");
+  await editor.getByRole("button", { name: "Add action", exact: true }).click();
+  await editor.getByLabel("Name", { exact: true }).fill("deploy");
+  await editor.getByLabel("Label", { exact: true }).fill("Deploy it");
+  await editor.getByLabel("Text it sends", { exact: true }).fill("Deploy it to staging.\nThen update your card.");
+  await editor.getByLabel("When agents should offer it", { exact: true }).fill("Offer when the change can be deployed.");
+  await editor.getByLabel("Ask before sending", { exact: true }).check();
+  await editor.getByRole("button", { name: "Choose icon", exact: true }).click();
+  await editor.getByRole("listbox", { name: "Icons" }).getByRole("option", { name: "rocket", exact: true }).click();
+  await editor.getByRole("button", { name: "Choose icon", exact: true }).click();
+  const grid = editor.getByRole("listbox", { name: "Icons" });
+  await expect(grid.getByRole("option", { name: "rocket", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(editor.getByTestId("agent-card-actions-editor-icon")).toHaveAttribute("data-icon", "rocket");
+  await expect(grid).toBeInViewport();
 });
 
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows

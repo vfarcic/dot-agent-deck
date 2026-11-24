@@ -127,6 +127,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards-actions-editor",
+        description: "The desktop Card actions editor's form for a new action, Deploy it, with its text over two lines and its icon grid open on the rocket; the listed actions are below it (PRD #2374 decision 2026-11-24).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "new-agent",
         description: "The New Agent form with a project directory selected.",
         clients: &[Client::Tui, Client::Desktop],
