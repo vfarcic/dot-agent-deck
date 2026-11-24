@@ -17649,6 +17649,20 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** a Save of an edited action sends the action as listed as `base`; the daemon's refusal that it changed since the editor read it is shown in the form, naming Refresh, with the typed label kept; Refresh lists the other writer's text and keeps the draft, and the next Save sends the action as just read as `base`; Remove, Hide and Restore send the listed action as `base` (issue #2399 re-review N5).
 - **Does not assert:** the daemon's refusal itself (`agent-report/catalog-edit/005`).
 
+##### desktop/agent-cards/080 — A hover the window cannot hold whole keeps inside the window and opens the review.
+
+- **Test:** Playwright `desktop/agent-cards/080 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×600 and 1440×900), against `cards=tree` through the fixture bridge, chromium and webkit.
+- **Layer:** desktop browser (production build, `vite preview`).
+- **Asserts:** a catalog action that does not ask first, whose text is a short line, eighty empty lines and a sentinel instruction — under the hover's 1,200 characters — draws, on hover and on keyboard focus alike, a tooltip whose box is inside the window on both axes and which ends, in view, by saying it is too long to show here; a click and an Enter each open the review with the whole text, sentinel included, and send nothing; the page never scrolls sideways (issue #2399 re-review N2, re-audit new 2).
+- **Does not assert:** a spoken action, which sends as it always did (the review is a safeguard for icon presses).
+
+##### desktop/agent-cards/081 — A root at its fullest while selecting keeps its name.
+
+- **Test:** Playwright `desktop/agent-cards/081 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
+- **Layer:** desktop browser (production build, `vite preview`).
+- **Asserts:** with Select on, a root with agents under it, a long name, Needs you, a long status and five actions draws the checkbox, the name, Needs you as its bell (whose tooltip and screen-reader words remain), the tree toggle and Close in its header; the name shows at least 48 px of itself, as `076` requires without Select; no header control overlaps another and all are inside the card; the checkbox can be ticked and Close pressed; the page never scrolls sideways (issue #2399 re-review N6).
+- **Does not assert:** other widths.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

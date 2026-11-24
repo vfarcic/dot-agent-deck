@@ -380,7 +380,10 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
             onClick={() => VOICE_ACTIONS.openAgent.run(controls, openTarget?.(card) ?? { deckId: card.deckId, agentId: entry.agent_id, from: "overview", ...(entry.instance_id ? { incarnation: entry.instance_id } : {}) })}
           >{name}</button>
         </span>
-        {entry.needs_you && <span className="agent-card-needs-you" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" />Needs you</span>}
+        {/* Issue #2399 re-review N6: while cards are being selected, the checkbox takes header room, so Needs you is its bell alone; its words stay its tooltip and what a screen reader reads, and the name keeps its room. */}
+        {entry.needs_you && (place.selected !== undefined
+          ? <span className="agent-card-needs-you is-compact" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" /><span className="overview-sr-only">Needs you</span></span>
+          : <span className="agent-card-needs-you" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" />Needs you</span>)}
         {place.hasChildren && (
           <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
             <button
@@ -439,7 +442,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
                   aria-label={displayText(action.label, DISPLAY_LIMITS.name)}
                   tip={actionHover(action)}
                   unavailable={!action.enabled}
-                  onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token, ...(hoverCutsPrompt(action.prompt) ? { cardActionReview: true } : {}) })}
+                  onClick={(_, shown) => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token, ...(hoverCutsPrompt(action.prompt) || !shown.whole ? { cardActionReview: true } : {}) })}
                 ><CardActionIcon name={action.icon} /></ActionTipButton>
               ))}
               {moreActions > 0 && (

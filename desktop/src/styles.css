@@ -2190,6 +2190,7 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-header .agent-card-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; }
 .agent-card-toggle, .agent-card-close { flex: 0 0 auto; width: 22px; height: 20px; }
 .agent-card-header .agent-card-needs-you { flex: none; white-space: nowrap; }
+.agent-card-header .agent-card-needs-you.is-compact { position: relative; gap: 0; padding: 2px 3px; }
 /* PRD #2374 decision 2026-11-24: the status line keeps its height whatever it holds. */
 .agent-card-meta-row { flex: none; height: 18px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .agent-card-meta-row .agent-card-meta { flex: 1 1 auto; width: auto; min-width: 0; }
@@ -2203,6 +2204,10 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-action-icon:disabled, .agent-card-action-icon[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
 /* Issue #2399 review — an action icon's explanation on keyboard focus, drawn over the page so no card clips it. */
 .action-tip { position: fixed; z-index: 1000; max-width: 320px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-strong); color: var(--ink); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); font-size: var(--text-sm); line-height: 1.35; white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }
+/* Issue #2399 re-review N2: a text taller than the room the window has is cut, and says so on a line that is always drawn. */
+.action-tip.is-cut { display: flex; flex-direction: column; overflow: hidden; }
+.action-tip.is-cut .action-tip-text { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.action-tip-cut { flex: none; margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line); font-style: italic; white-space: normal; }
 .agent-card-actions-more { flex: none; height: 18px; min-width: 24px; padding: 0 3px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: transparent; font-size: var(--text-xs); font-weight: 700; cursor: pointer; }
 .agent-card-actions-more:hover, .agent-card-actions-more:focus-visible { color: var(--teal); border-color: var(--teal); }
 /* The batch buttons of the selection and the overlay, as icons (decision 2026-11-24). */
