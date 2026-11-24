@@ -1,4 +1,4 @@
-import { useId, useState, type ButtonHTMLAttributes, type CSSProperties, type FocusEvent, type KeyboardEvent, type MouseEvent } from "react";
+import { useEffect, useId, useRef, useState, type ButtonHTMLAttributes, type CSSProperties, type FocusEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 
 /** The gap between the button and its tooltip, and the tooltip's margin from the window's edges, in pixels. */
@@ -79,9 +79,12 @@ export function tipLayout(box: DOMRect, tip: string): TipLayout {
  *
  * The tooltip is sized from its text and kept inside the window on both axes
  * ({@link tipLayout}); a text the window has no room for ends, visibly, with
- * {@link TIP_CUT_NOTE}. `onClick` is told whether the whole text fits beside
- * the button (`whole`), measured when it is pressed, by pointer or keyboard
- * alike, so a caller can show the whole text first when it does not.
+ * {@link TIP_CUT_NOTE}. While it is shown it is measured again when its text
+ * changes, on a window resize or scroll, and when the button's size changes
+ * (final review F1). `onClick` is told whether the whole text fits beside the
+ * button (`whole`), by pointer or keyboard alike: true only when it fits at
+ * the press and the tooltip was not drawn cut since it was last shown (final
+ * audit A4), so a caller can show the whole text first otherwise.
  */
 export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, onBlur, onKeyDown, onMouseEnter, onMouseLeave, ...button }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, "disabled" | "title" | "type" | "onClick"> & {
   /** The explanation: the tooltip's text and the button's accessible description. */
@@ -90,10 +93,42 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
   onClick?: (event: MouseEvent<HTMLButtonElement>, shown: { whole: boolean }) => void;
 }) {
   const id = useId();
+  const own = useRef<HTMLButtonElement>(null);
   const [at, setAt] = useState<TipLayout | undefined>(undefined);
   const [hovered, setHovered] = useState(false);
   const [focused, setFocused] = useState(false);
-  const place = (target: HTMLButtonElement) => setAt(tipLayout(target.getBoundingClientRect(), tip));
+  // Final audit A4: whether the tooltip has been drawn cut since it was last
+  // shown. A press then asks for the whole text even when the window has
+  // since grown to hold it: nothing says the newly drawn text was read.
+  const cutSinceShown = useRef(false);
+  const draw = (layout: TipLayout) => {
+    if (!layout.whole) cutSinceShown.current = true;
+    setAt(layout);
+  };
+  const close = () => {
+    cutSinceShown.current = false;
+    setAt(undefined);
+  };
+  const place = (target: HTMLButtonElement) => draw(tipLayout(target.getBoundingClientRect(), tip));
+  const shown = at !== undefined;
+  // Final review F1: a tooltip that is shown is measured again when its text
+  // changes, when the window is resized or anything scrolls, and when the
+  // button's own size changes, so its place and its cut note stay true.
+  useEffect(() => {
+    const button = own.current;
+    if (!shown || !button) return;
+    const again = () => draw(tipLayout(button.getBoundingClientRect(), tip));
+    again();
+    window.addEventListener("resize", again);
+    window.addEventListener("scroll", again, true);
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(again);
+    observer?.observe(button);
+    return () => {
+      window.removeEventListener("resize", again);
+      window.removeEventListener("scroll", again, true);
+      observer?.disconnect();
+    };
+  }, [shown, tip]);
   const show = (event: FocusEvent<HTMLButtonElement>) => {
     onFocus?.(event);
     setFocused(true);
@@ -102,7 +137,7 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
   const hide = (event: FocusEvent<HTMLButtonElement>) => {
     onBlur?.(event);
     setFocused(false);
-    if (!hovered) setAt(undefined);
+    if (!hovered) close();
   };
   const enter = (event: MouseEvent<HTMLButtonElement>) => {
     onMouseEnter?.(event);
@@ -112,15 +147,17 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
   const leave = (event: MouseEvent<HTMLButtonElement>) => {
     onMouseLeave?.(event);
     setHovered(false);
-    if (!focused) setAt(undefined);
+    if (!focused) close();
   };
   const key = (event: KeyboardEvent<HTMLButtonElement>) => {
     onKeyDown?.(event);
-    if (event.key === "Escape" && at) setAt(undefined);
+    if (event.key === "Escape" && at) close();
   };
   const press = (event: MouseEvent<HTMLButtonElement>) => {
-    const { whole } = tipLayout(event.currentTarget.getBoundingClientRect(), tip);
-    setAt(undefined);
+    // Whole only when it fits now and was not drawn cut while shown: a
+    // measurement at the press never turns a cut tooltip into a direct send.
+    const whole = tipLayout(event.currentTarget.getBoundingClientRect(), tip).whole && !cutSinceShown.current && (at?.whole ?? true);
+    close();
     if (unavailable) {
       event.preventDefault();
       return;
@@ -131,6 +168,7 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
     <>
       <button
         {...button}
+        ref={own}
         type="button"
         aria-disabled={unavailable ? true : undefined}
         aria-describedby={id}

@@ -17663,6 +17663,20 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** with Select on, a root with agents under it, a long name, Needs you, a long status and five actions draws the checkbox, the name, Needs you as its bell (whose tooltip and screen-reader words remain), the tree toggle and Close in its header; the name shows at least 48 px of itself, as `076` requires without Select; no header control overlaps another and all are inside the card; the checkbox can be ticked and Close pressed; the page never scrolls sideways (issue #2399 re-review N6).
 - **Does not assert:** other widths.
 
+##### desktop/agent-cards/082 — A shown hover is drawn again when its text changes.
+
+- **Test:** Playwright `desktop/agent-cards/082 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×600 and 1440×900), against `cards=tree` through the fixture bridge, chromium and webkit.
+- **Layer:** desktop browser (production build, `vite preview`).
+- **Asserts:** with an icon's one-line hover shown, by the pointer and then by keyboard focus, and drawn whole, a daemon update that makes the action's text eighty empty lines and a sentinel line redraws the shown tooltip without the pointer moving or focus changing: it carries the sentinel, its box is inside the window on both axes, and it ends, in view, by saying it is too long to show here; focus stays on the icon; the page never scrolls sideways (issue #2399 final review F1).
+- **Does not assert:** a scroll or a change in the button's size while shown, which take the same path as the resize `083` drives.
+
+##### desktop/agent-cards/083 — A hover drawn cut keeps the review after the window grows.
+
+- **Test:** Playwright `desktop/agent-cards/083 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×600 → 375×1200 and 1440×680 → 1440×1200), against `cards=tree` through the fixture bridge, chromium and webkit.
+- **Layer:** desktop browser (production build, `vite preview`).
+- **Asserts:** an icon whose text (a line, forty empty lines and a sentinel) is drawn cut in the small window, shown by keyboard focus, is drawn again whole and inside the window when the window grows with focus staying on it; a click, and on a second pass an Enter, then each open the review with the whole text and send nothing, rather than sending because the press measured the text as fitting (issue #2399 final audit A4).
+- **Does not assert:** a hover-shown tooltip across the resize at 375 px, where the growing window moves the icon from under the pointer and the hover ends (a fresh hover then draws it whole).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

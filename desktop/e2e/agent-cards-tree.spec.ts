@@ -995,6 +995,106 @@ test.describe("desktop/agent-cards/080 — a hover the window cannot hold whole 
   }
 });
 
+/** Give the card named `name` a catalog action that does not ask first, or change that action's text. */
+async function catalogAction(page: Page, name: string, id: string, label: string, prompt: string): Promise<void> {
+  await pushCards(page, `
+    const bench = byName(${JSON.stringify(name)});
+    const action = { id: ${JSON.stringify(id)}, label: ${JSON.stringify(label)}, kind: "prompt", prompt: ${JSON.stringify(prompt)}, prompt_source: "catalog", text_input: false, confirm: false, confirm_detail: null, icon: "rocket",
+      placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: "tok-" + ${JSON.stringify(id)} };
+    bench.actions = [action, ...bench.actions.filter((other) => other.id !== action.id)];
+  `);
+}
+
+/** Show the icon's hover by pointer or by keyboard, from a page where it is hidden. */
+async function showTip(page: Page, how: "pointer" | "keyboard", icon: ReturnType<Page["locator"]>): Promise<void> {
+  await page.mouse.move(0, 0);
+  if (how === "pointer") await icon.hover(); else await icon.focus();
+  await expect(page.getByRole("tooltip"), how).toBeVisible();
+}
+
+/** The shown tooltip is inside the window on both axes. */
+async function expectTipInWindow(page: Page, width: number, height: number, what: string): Promise<void> {
+  const box = (await page.getByRole("tooltip").boundingBox())!;
+  expect(box.y, `${what}: the tooltip starts inside the window`).toBeGreaterThanOrEqual(-TOLERANCE);
+  expect(box.y + box.height, `${what}: the tooltip ends inside the window`).toBeLessThanOrEqual(height + TOLERANCE);
+  expect(box.x, `${what}: the tooltip starts inside the window`).toBeGreaterThanOrEqual(-TOLERANCE);
+  expect(box.x + box.width, `${what}: the tooltip ends inside the window`).toBeLessThanOrEqual(width + TOLERANCE);
+}
+
+/*
+ * Issue #2399 final review F1 — a tooltip that is shown is drawn again when
+ * its text changes, so a short hover that becomes a tall one while the icon
+ * keeps the pointer or focus stays inside the window and says it is cut.
+ */
+test.describe("desktop/agent-cards/082 — a shown hover follows its text", () => {
+  for (const [width, height] of [[375, 600], [1440, 900]] as const) {
+    /// Scenario: At this window size, give a card a catalog action that does not ask first with a one-line text, and hover its icon, then focus it from the keyboard. While the tooltip is shown, the action's text becomes eighty empty lines and a sentinel line; the tooltip, without the pointer moving or focus changing, stays inside the window and ends by saying it is too long to show here.
+    test(`a short hover that becomes eighty lines while shown stays in the window and says it is cut at ${width}x${height}`, async ({ page }) => {
+      await page.setViewportSize({ width, height });
+      await openCardsTree(page);
+      const short = "Go ahead.";
+      const tall = [short, ...Array.from({ length: 80 }, () => ""), "GROW-SENTINEL-2399: and delete the release branch."].join("\n");
+      for (const how of ["pointer", "keyboard"] as const) {
+        await catalogAction(page, "bench", "grow", "Grows", short);
+        const icon = (await cardNamed(page, "bench")).getByRole("button", { name: "Grows" });
+        await showTip(page, how, icon);
+        const tip = page.getByRole("tooltip");
+        await expect(tip.getByTestId("action-tip-cut"), `${how}: the short hover is whole`).toHaveCount(0);
+        await catalogAction(page, "bench", "grow", "Grows", tall);
+        await expect(tip, `${how}: the shown hover has the new text`).toContainText("GROW-SENTINEL-2399");
+        const cut = tip.getByTestId("action-tip-cut");
+        await expect(cut, `${how}: it says it cannot show all of it`).toBeVisible();
+        await expect(cut).toBeInViewport({ ratio: 1 });
+        await expectTipInWindow(page, width, height, how);
+        if (how === "keyboard") await expect(icon, "focus stayed on the icon").toBeFocused();
+        await page.keyboard.press("Escape");
+        await page.mouse.move(0, 0);
+        await icon.blur();
+        await expect(page.getByRole("tooltip")).toHaveCount(0);
+      }
+      await expectNoSidewaysScroll(page);
+    });
+  }
+});
+
+/*
+ * Issue #2399 final audit A4 — a hover drawn cut keeps the press on the
+ * review, even when the window grows enough to hold the text before the
+ * press: a measurement at the press alone never turns it into a direct send.
+ */
+test.describe("desktop/agent-cards/083 — a cut hover keeps the review after the window grows", () => {
+  for (const [width, small, large] of [[375, 600, 1200], [1440, 680, 1200]] as const) {
+    /// Scenario: At a window this small, give the first card a catalog action that does not ask first whose text is a first line, forty empty lines and a sentinel line, and focus its icon: the tooltip says it is too long to show here. The window then grows tall enough to hold the whole text, with focus staying on the icon, and the tooltip is drawn again inside the window, whole; clicking the icon, and on a second pass pressing Enter on it, each open the review with the whole text and send nothing.
+    test(`a hover shown cut at ${width}x${small} still opens the review after growing to ${width}x${large}, by pointer and keyboard`, async ({ page }) => {
+      const prompt = ["Go ahead.", ...Array.from({ length: 40 }, () => ""), "GROWN-SENTINEL-2399: and delete the release branch."].join("\n");
+      for (const how of ["pointer", "keyboard"] as const) {
+        await page.setViewportSize({ width, height: small });
+        if (how === "pointer") await openCardsTree(page);
+        const first = (await page.locator("article[data-card-key][data-depth='0'] .agent-card-name").first().textContent())!;
+        await catalogAction(page, first, "grown", "Grown one", prompt);
+        const icon = (await cardNamed(page, first)).getByRole("button", { name: "Grown one" });
+        // Shown by focus, which a window resize does not end; a hover ends when the resize moves the icon from under the pointer.
+        await showTip(page, "keyboard", icon);
+        const tip = page.getByRole("tooltip");
+        await expect(tip.getByTestId("action-tip-cut"), `${how}: the hover is cut at ${width}x${small}`).toBeVisible();
+        await page.setViewportSize({ width, height: large });
+        await expect(tip.getByTestId("action-tip-cut"), `${how}: the larger window holds the whole text, so the press alone measures it whole`).toHaveCount(0);
+        await expect(icon, `${how}: focus stayed on the icon`).toBeFocused();
+        await expectTipInWindow(page, width, large, how);
+        if (how === "pointer") await icon.click(); else await page.keyboard.press("Enter");
+        const review = page.getByTestId("agent-card-confirm");
+        await expect(review, `${how}: the press opens the review`).toBeVisible();
+        await expect(review.getByTestId("agent-card-confirm-prompt")).toContainText("GROWN-SENTINEL-2399");
+        await expect(page.getByTestId("agent-card-action-result"), `${how}: nothing is sent`).toHaveCount(0);
+        await review.getByTestId("agent-card-confirm-cancel").click();
+        await page.keyboard.press("Escape");
+        await expect(page.getByTestId("agent-card-overlay")).toHaveCount(0);
+        await page.mouse.move(0, 0);
+      }
+    });
+  }
+});
+
 /*
  * Issue #2399 re-review N6 — with Select on, a card's checkbox takes header
  * room; Needs you shrinks to its bell, so a root's name keeps as much room as
