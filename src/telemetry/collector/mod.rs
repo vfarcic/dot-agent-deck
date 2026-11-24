@@ -8,7 +8,8 @@
 //! inherit in `OTEL_RESOURCE_ATTRIBUTES` ([`identity`]), falling back to their
 //! parent's run, and credits CPU per process so that a child's time is counted
 //! once whether it is seen alive or only through its parent's reaped-children
-//! time ([`aggregate`]).
+//! time ([`aggregate`]). A run the deck started in a cgroup of its own
+//! (issue #1897) also gets that cgroup's figures ([`cgroup`]).
 //!
 //! This module holds the parsers ([`procfs`]), the `/proc` reader
 //! ([`reader`], Linux only), the attribution and accounting state machine
@@ -19,6 +20,7 @@
 //! (`src/bin/dot-agent-deck-collector.rs`).
 
 pub mod aggregate;
+pub mod cgroup;
 pub mod config;
 pub mod discovery;
 pub mod disk;
@@ -34,7 +36,7 @@ pub const SCOPE_NAME: &str = "dot-agent-deck-collector";
 
 /// `deck.collector.schema_version`: changes when the set or meaning of the
 /// collector's metrics or attributes changes.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 /// Resource and data point attribute keys the collector writes.
 pub mod keys {
@@ -57,4 +59,7 @@ pub mod metrics {
     pub const MEMORY_PSS: &str = "deck.run.memory.pss";
     pub const PROCESSES: &str = "deck.run.processes";
     pub const DISK_USAGE: &str = "deck.worktree.disk.usage";
+    /// Issue #1897: from the run's own cgroup, where it has one.
+    pub const CGROUP_CPU_TIME: &str = "deck.run.cgroup.cpu.time";
+    pub const CGROUP_MEMORY: &str = "deck.run.cgroup.memory";
 }

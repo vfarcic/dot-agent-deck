@@ -1790,6 +1790,16 @@ try_saying  = "previous page"
 # top" itself, without moving anything. Like a page turn, a scroll moves the
 # view only and opens, chooses, starts and stops nothing.
 #
+# Issue #1673 — and the `agent` screen: over an open agent's pane the app sends
+# "scroll up / down" to the pane as PageUp / PageDown (the agents measured for
+# the issue all scroll their own transcript by them), scrolls the terminal's
+# own history when the pane is on the main screen and holds one, or answers the
+# TUI's "Nothing to scroll" sentence. "To the top / bottom" stays callable there
+# so the model does not reach for `scroll_up` / `scroll_down` instead; the app
+# answers that a pane scrolls a screen at a time, because the agents disagree
+# on the key for either end. Which surface a scroll goes to is the app's: a
+# pull request open over the pane, then the pane, then the dashboard.
+#
 # `scroll_up`'s "up" is also `go_to_parent`'s word; that row needs a directory
 # listing on screen, which only the New agent dialog shows, and these need the
 # dialog closed, so the two are never callable together. That alone did not
@@ -1812,13 +1822,14 @@ and agents below what is on screen. Use for scroll down, scroll down a bit, go d
 show what is below; "page down" is next page, which scrolls the dashboard the same way. A request to
 scroll down is THIS one even while the New agent dialog is open and it is `callable: false`: pick it
 anyway rather than `next_page`, and the app says to close the dialog. It changes which part of the dashboard is showing and nothing else: it
-opens, chooses, starts and stops nothing. While a pull request is open in the app it scrolls that page instead, the same way."""
+opens, chooses, starts and stops nothing. While a pull request is open in the app it scrolls that page instead, the same way.
+While an agent's pane is open it scrolls the agent's output down instead, as PageDown does in that pane."""
 invoke      = "scrollDown"
-screens     = ["overview", "pull_request"]
+screens     = ["overview", "agent", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
+unavailable_hint = "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed"
 report      = "Scrolling down."
-asks_to     = "scroll the dashboard down"
+asks_to     = "scroll down"
 try_saying  = "scroll down"
 
 [[commands]]
@@ -1828,13 +1839,15 @@ and agents above what is on screen. Use for scroll up, scroll up a bit, go up, m
 is above; "page up" is previous page, which scrolls the dashboard the same way. With the New agent
 dialog closed a bare "go up" is THIS one, never `go_to_parent`: there is no directory browser to
 leave. It changes which part of the dashboard is showing and nothing else: it opens,
-chooses, starts and stops nothing. While a pull request is open in the app it scrolls that page instead, the same way."""
+chooses, starts and stops nothing. While a pull request is open in the app it scrolls that page instead, the same way.
+While an agent's pane is open it scrolls the agent's output up instead, back through what the agent wrote, as PageUp does in
+that pane."""
 invoke      = "scrollUp"
-screens     = ["overview", "pull_request"]
+screens     = ["overview", "agent", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
+unavailable_hint = "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed"
 report      = "Scrolling up."
-asks_to     = "scroll the dashboard up"
+asks_to     = "scroll up"
 try_saying  = "scroll up"
 
 [[commands]]
@@ -1842,13 +1855,14 @@ id          = "scroll_to_top"
 description = """Scroll the agent dashboard all the way to its top, where the first daemon is. Use for
 scroll to the top, go to the top, back to the top, the top of the dashboard, or the beginning. It
 changes which part of the dashboard is showing and nothing else: it opens, chooses, starts and stops
-nothing. While a pull request is open in the app it scrolls that page to its top instead."""
+nothing. While a pull request is open in the app it scrolls that page to its top instead. A request to scroll to the top
+while an agent's pane is open is THIS one too, not `scroll_up`: the app answers it there."""
 invoke      = "scrollToTop"
-screens     = ["overview", "pull_request"]
+screens     = ["overview", "agent", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
+unavailable_hint = "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed"
 report      = "Scrolled to the top."
-asks_to     = "scroll to the top of the dashboard"
+asks_to     = "scroll to the top"
 try_saying  = "scroll to the top"
 
 [[commands]]
@@ -1856,13 +1870,14 @@ id          = "scroll_to_bottom"
 description = """Scroll the agent dashboard all the way to its bottom, where the last daemon is. Use
 for scroll to the bottom, go to the bottom, the bottom of the dashboard, or the end. It changes which
 part of the dashboard is showing and nothing else: it opens, chooses, starts and stops nothing. While
-a pull request is open in the app it scrolls that page to its bottom instead."""
+a pull request is open in the app it scrolls that page to its bottom instead. A request to scroll to the bottom while an
+agent's pane is open is THIS one too, not `scroll_down`: the app answers it there."""
 invoke      = "scrollToBottom"
-screens     = ["overview", "pull_request"]
+screens     = ["overview", "agent", "pull_request"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app"
+unavailable_hint = "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed"
 report      = "Scrolled to the bottom."
-asks_to     = "scroll to the bottom of the dashboard"
+asks_to     = "scroll to the bottom"
 try_saying  = "scroll to the bottom"
 
 # PRD #1401 — an agent's pull request, in the app's own browser: GitHub's page

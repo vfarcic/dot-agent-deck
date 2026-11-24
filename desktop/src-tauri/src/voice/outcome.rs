@@ -10252,10 +10252,11 @@ mod tests {
 
     /// Scenario: "scroll down", "scroll up", "scroll to the top" and "scroll
     /// to the bottom" on the agent dashboard dispatch the dashboard's scroll
-    /// (issue #1492). They are not available on the Daemons screen, over an
-    /// agent's pane, or while the New agent dialog covers the dashboard.
+    /// (issue #1492), and over an open agent's pane the same rows, which the
+    /// app sends to the pane (issue #1673). They are not available on the
+    /// Daemons screen, or while the New agent dialog covers the dashboard.
     #[tokio::test]
-    async fn voice_outcome_scrolls_dispatch_on_the_dashboard_only() {
+    async fn voice_outcome_scrolls_dispatch_on_the_dashboard_and_an_agent_pane() {
         let dialog = VoiceNewAgent { form: None };
         for (said, id, invoke, sentence) in [
             (
@@ -10291,15 +10292,20 @@ mod tests {
                 },
                 "{said}"
             );
-            for screen in [Screen::Deck, Screen::Agent] {
-                assert!(
-                    matches!(
-                        run_with(&resolver, screen, None, said).await,
-                        VoiceOutcome::Unavailable { .. }
-                    ),
-                    "{said} on {screen:?}"
-                );
-            }
+            assert!(
+                matches!(
+                    run_with(&resolver, Screen::Agent, None, said).await,
+                    VoiceOutcome::Dispatch { ref action, .. } if action == id
+                ),
+                "{said} over an agent's pane"
+            );
+            assert!(
+                matches!(
+                    run_with(&resolver, Screen::Deck, None, said).await,
+                    VoiceOutcome::Unavailable { .. }
+                ),
+                "{said} on the Daemons screen"
+            );
             let under_dialog = handle_utterance(
                 &resolver,
                 table(),
