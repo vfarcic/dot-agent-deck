@@ -2708,6 +2708,13 @@ impl CardStore {
         catalog
     }
 
+    /// Issue #2399: forget the cached catalog, so the next read resolves the
+    /// user config again — after the daemon itself wrote it, whatever its
+    /// modification time and length say.
+    pub fn forget_catalog(&self) {
+        self.lock().catalog = None;
+    }
+
     /// Store `report` for the generation `agent_id` in `pane_id`, replacing
     /// whatever it published before, and clearing answered questions. The
     /// empty report (`card publish --clear`) removes the report, so the card

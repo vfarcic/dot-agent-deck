@@ -1311,7 +1311,8 @@ pub const CAP_AGENT_CARDS_BATCH: &str = "agent-cards-batch";
 /// with where each came from, and adds, updates, removes, hides or restores
 /// one, writing the daemon's own user config. Withheld by its sender unless
 /// the `Hello` on the same connection named this, so no [`PROTOCOL_VERSION`]
-/// bump. TDD stub (RED): not advertised yet, and no request carries it.
+/// bump: [`AttachRequest::CardCatalogEdit`]. Advertised on every platform: the
+/// arm is not `#[cfg]`-gated.
 pub const CAP_AGENT_CARDS_CATALOG_EDIT: &str = "agent-cards-catalog-edit";
 
 /// Capability string for [`AttachRequest::AgentOpened`] (issue #2454): a
@@ -1562,6 +1563,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AGENT_CARDS,
     CAP_AGENT_CARDS_TREE,
     CAP_AGENT_CARDS_BATCH,
+    CAP_AGENT_CARDS_CATALOG_EDIT,
     CAP_INTERRUPTED_WORK,
     CAP_RESTORE_AGENTS,
     CAP_REARM_ORCHESTRATOR,
@@ -1598,6 +1600,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AGENT_CARDS,
     CAP_AGENT_CARDS_TREE,
     CAP_AGENT_CARDS_BATCH,
+    CAP_AGENT_CARDS_CATALOG_EDIT,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
     CAP_AGENT_OPENED,
@@ -3709,6 +3712,21 @@ pub enum AttachRequest {
         #[serde(default)]
         entries: Vec<crate::agent_cards::CardBatchEntry>,
     },
+    /// Issue #2399 (PR #2491 scope extension): the desktop's card-action
+    /// editor. With no `edit` it reads the user catalog's actions with where
+    /// each came from and writes nothing; with one it applies that one change
+    /// to the `[catalog]` actions of **the daemon's own user config**
+    /// ([`crate::config::user_config_path`]) — the request names no file and
+    /// no key outside one action — and answers the catalog as it is after the
+    /// write. A refused edit is `ok: false` with the reason, nothing written.
+    /// The reply rides back on [`AttachResponse::card_catalog_edit`].
+    /// **Withheld unless the daemon advertises
+    /// [`CAP_AGENT_CARDS_CATALOG_EDIT`]** on the connection that carries it,
+    /// so no [`PROTOCOL_VERSION`] bump.
+    CardCatalogEdit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
+    },
     /// Issue #2454: the user opened the agent in `pane_id` — its pane in the
     /// desktop app's overlay or full window, or in the TUI. That deals with
     /// the `waiting`, `done` or `failed` reason its card report raised, so
@@ -4693,6 +4711,12 @@ pub struct AttachResponse {
     /// and optional; the request is capability-gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card_action_batch: Option<crate::agent_cards::CardBatchResult>,
+    /// Issue #2399 (PR #2491 scope extension): the answer to
+    /// [`AttachRequest::CardCatalogEdit`], the editable catalog after the
+    /// edit (or as read). Additive and optional; the request is
+    /// capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_catalog_edit: Option<crate::card_catalog::EditableCardCatalog>,
     /// PRD #1666 part 3 (Q35-15): the `e2e` build's answer to
     /// [`AttachRequest::E2eComposerControl`]'s `fence-status`. Compiled into
     /// that build alone, which is the only one that can ask for it.
@@ -8705,6 +8729,30 @@ async fn handle_connection(
             let resp = AttachResponse {
                 card_action: Some(result),
                 ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::CardCatalogEdit { edit } => {
+            // The daemon's own user config, never a path from the client.
+            let path = crate::config::user_config_path();
+            let edits = edit.is_some();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::card_catalog::edit_user_catalog_at(&path, edit.as_ref())
+            })
+            .await;
+            let resp = match result {
+                Ok(Ok(catalog)) => {
+                    if edits {
+                        // The next card read resolves the file just written.
+                        registry.agent_cards().forget_catalog();
+                    }
+                    AttachResponse {
+                        card_catalog_edit: Some(catalog),
+                        ..AttachResponse::ok()
+                    }
+                }
+                Ok(Err(reason)) => AttachResponse::err(reason),
+                Err(_) => AttachResponse::err("the catalog edit did not finish"),
             };
             write_resp(&mut stream, &resp).await?
         }

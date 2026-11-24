@@ -886,8 +886,8 @@ pub fn resolve_from_user_config() -> ResolvedCatalog {
 /// - `restore`: bring a deck default back as the deck ships it (its name out
 ///   of `catalog.remove`, and any user override of it gone).
 ///
-/// TDD stub (RED): the shape the tests are written against; nothing acts on
-/// it yet.
+/// [`apply_action_edit`] applies one; the daemon's `card-catalog-edit` request
+/// carries it ([`edit_user_catalog_at`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CatalogActionEdit {
@@ -945,34 +945,471 @@ pub struct EditableCardCatalog {
     pub user_config: Option<String>,
 }
 
-/// TDD stub (RED): the editable catalog of a user config's raw TOML (`None`:
-/// no file).
-pub fn editable_catalog(_user_config_toml: Option<&str>) -> EditableCardCatalog {
-    unimplemented!("issue #2399: the editable card catalog")
+/// The editable catalog of a user config's raw TOML (`None`: no file): every
+/// deck default in catalog order — the user's override in its place when there
+/// is one, the deck's own values when the user's `remove` hides it — then the
+/// user's own actions in file order. The deck's own actions are never listed:
+/// a catalog cannot name them. `user_config` is left `None`; the caller that
+/// read a file names it.
+pub fn editable_catalog(user_config_toml: Option<&str>) -> EditableCardCatalog {
+    let resolved = resolve(user_config_toml);
+    let defaults = default_actions();
+    let mut actions: Vec<EditableCatalogAction> = defaults
+        .iter()
+        .map(|default| match resolved.action(&default.name) {
+            Some(in_effect) => EditableCatalogAction {
+                overridden: in_effect.source == CatalogSource::User,
+                action: in_effect.clone(),
+                default: true,
+                hidden: false,
+            },
+            None => EditableCatalogAction {
+                action: default.clone(),
+                default: true,
+                overridden: false,
+                hidden: true,
+            },
+        })
+        .collect();
+    actions.extend(
+        resolved
+            .actions
+            .iter()
+            .filter(|a| !defaults.iter().any(|d| d.name == a.name))
+            .map(|a| EditableCatalogAction {
+                action: a.clone(),
+                default: false,
+                overridden: false,
+                hidden: false,
+            }),
+    );
+    EditableCardCatalog {
+        actions,
+        errors: resolved.errors,
+        user_config: None,
+    }
 }
 
-/// TDD stub (RED): the user config's raw TOML (`None`: no file) with `edit`
-/// applied to its catalog actions and nothing else changed — every other
-/// setting, table, the `[catalog]` fields and comments kept. `Err` with the
-/// reason when the edit is invalid (the catalog's own validation) or
-/// impossible, or the file is not valid TOML; nothing is written then.
+/// A name as an edit's refusal quotes it: escaped, and cut short.
+fn quoted_name(name: &str) -> String {
+    format!("{:?}", truncate_chars(name, MAX_NAME_CHARS + 8))
+}
+
+/// `input` as the `[[catalog.actions]]` entry it becomes, for the catalog's
+/// own validation ([`parse_action`]).
+fn input_table(input: &CatalogActionInput) -> toml::Table {
+    let mut table = toml::Table::new();
+    table.insert("name".into(), input.name.clone().into());
+    if let Some(label) = &input.label {
+        table.insert("label".into(), label.clone().into());
+    }
+    table.insert("description".into(), input.description.clone().into());
+    table.insert("prompt".into(), input.prompt.clone().into());
+    if let Some(icon) = &input.icon {
+        table.insert("icon".into(), icon.clone().into());
+    }
+    if let Some(placement) = input.placement {
+        table.insert("placement".into(), placement.as_str().into());
+    }
+    if input.confirm {
+        table.insert("confirm".into(), true.into());
+    }
+    if input.always {
+        table.insert("always".into(), true.into());
+    }
+    table
+}
+
+/// The action `input` describes, validated exactly as a `[[catalog.actions]]`
+/// entry in the file is: name syntax, reserved names, the description, label
+/// and prompt (required where required, length limits, no control characters
+/// beyond a prompt's line breaks and tabs), the icon's syntax.
+fn validated(input: &CatalogActionInput) -> Result<CatalogAction, String> {
+    let label = entry_label(Kind::Actions, 0, Some(&input.name));
+    parse_action(&input_table(input), &label)
+}
+
+/// Write `input`'s keys into the entry `table`: a key the input sets keeps its
+/// place and comments in the file, a key it leaves unset is removed, and so is
+/// any key an action entry may not carry (it would make the catalog skip the
+/// entry the user just saved).
+fn write_entry(table: &mut toml_edit::Table, input: &CatalogActionInput) {
+    let wanted = input_table(input);
+    let stale: Vec<String> = table
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| !wanted.contains_key(key))
+        .collect();
+    for key in stale {
+        table.remove(&key);
+    }
+    for key in ACTION_KEYS {
+        let Some(value) = wanted.get(*key) else {
+            continue;
+        };
+        let mut value = match value {
+            toml::Value::String(s) => toml_edit::Value::from(s.as_str()),
+            toml::Value::Boolean(b) => toml_edit::Value::from(*b),
+            _ => continue,
+        };
+        match table.get_mut(key) {
+            Some(slot) => {
+                if let Some(old) = slot.as_value() {
+                    *value.decor_mut() = old.decor().clone();
+                }
+                *slot = toml_edit::Item::Value(value);
+            }
+            None => {
+                table.insert(key, toml_edit::Item::Value(value));
+            }
+        }
+    }
+}
+
+/// The `[catalog]` table of `doc`, made (with no header of its own) when the
+/// file has none. Refused when the file writes `catalog` some other way — an
+/// inline table or dotted keys — which this editor does not rewrite.
+fn catalog_table(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table, String> {
+    if !doc.contains_key("catalog") {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        doc.insert("catalog", toml_edit::Item::Table(table));
+    }
+    match doc.get_mut("catalog").and_then(|c| c.as_table_mut()) {
+        Some(table) if !table.is_dotted() => Ok(table),
+        _ => Err(
+            "the user config writes its catalog in a form this editor does not change (not a \
+             [catalog] table); edit the file by hand"
+                .to_string(),
+        ),
+    }
+}
+
+/// The user's `[[catalog.actions]]` entries; made empty when `create` and
+/// there are none. Refused when `catalog.actions` is written some other way.
+fn action_tables(
+    catalog: &mut toml_edit::Table,
+    create: bool,
+) -> Result<Option<&mut toml_edit::ArrayOfTables>, String> {
+    if !catalog.contains_key("actions") {
+        if !create {
+            return Ok(None);
+        }
+        catalog.insert(
+            "actions",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+    match catalog.get_mut("actions") {
+        Some(toml_edit::Item::ArrayOfTables(tables)) => Ok(Some(tables)),
+        _ => Err(
+            "the user config's catalog actions are not written as [[catalog.actions]] tables; \
+             edit the file by hand"
+                .to_string(),
+        ),
+    }
+}
+
+fn entry_name(table: &toml_edit::Table) -> Option<&str> {
+    table.get("name").and_then(|n| n.as_str())
+}
+
+/// Every user entry named `name` dropped, and `catalog.actions` with them when
+/// none is left.
+fn drop_user_entries(catalog: &mut toml_edit::Table, name: &str) -> Result<usize, String> {
+    let Some(tables) = action_tables(catalog, false)? else {
+        return Ok(0);
+    };
+    let before = tables.len();
+    tables.retain(|t| entry_name(t) != Some(name));
+    let dropped = before - tables.len();
+    if tables.is_empty() {
+        catalog.remove("actions");
+    }
+    Ok(dropped)
+}
+
+/// `name` added to (`hide`) or taken out of `catalog.remove`; the key goes when
+/// it is left empty. Refused when `catalog.remove` is not an array of names.
+fn set_removed(catalog: &mut toml_edit::Table, name: &str, hide: bool) -> Result<(), String> {
+    if !catalog.contains_key("remove") {
+        if !hide {
+            return Ok(());
+        }
+        catalog.insert("remove", toml_edit::value(toml_edit::Array::new()));
+    }
+    let Some(names) = catalog.get_mut("remove").and_then(|r| r.as_array_mut()) else {
+        return Err(
+            "the user config's catalog.remove is not an array of names; edit the file by hand"
+                .to_string(),
+        );
+    };
+    if names.iter().any(|n| n.as_str().is_none()) {
+        return Err(
+            "the user config's catalog.remove holds something other than names; edit the file \
+             by hand"
+                .to_string(),
+        );
+    }
+    if hide {
+        if !names.iter().any(|n| n.as_str() == Some(name)) {
+            names.push(name);
+        }
+    } else {
+        names.retain(|n| n.as_str() != Some(name));
+        if names.is_empty() {
+            catalog.remove("remove");
+        }
+    }
+    Ok(())
+}
+
+/// The user config's raw TOML (`None`: no file) with `edit` applied to its
+/// `[catalog]` actions — `[[catalog.actions]]` and `catalog.remove` — and
+/// nothing else changed: every other setting and table, the catalog's fields
+/// and comments are kept as written. `Err` with the reason, and nothing to
+/// write, when the edit is invalid (the catalog's own validation) or cannot
+/// apply, when the file is not valid TOML, or when the result would be larger
+/// than the catalog reader reads or would add a catalog problem.
 pub fn apply_action_edit(
-    _user_config_toml: Option<&str>,
-    _edit: &CatalogActionEdit,
+    user_config_toml: Option<&str>,
+    edit: &CatalogActionEdit,
 ) -> Result<String, String> {
-    unimplemented!("issue #2399: apply a card-action edit")
+    let mut doc = match user_config_toml {
+        None => toml_edit::DocumentMut::new(),
+        Some(raw) => raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            let message = e.message().to_string();
+            let first = message.lines().next().unwrap_or_default();
+            format!(
+                "the user config is not valid TOML ({}); fix it by hand first, because saving \
+                 would replace everything it holds",
+                truncate_chars(first, 200)
+            )
+        })?,
+    };
+    let before = resolve(user_config_toml);
+    let defaults = default_actions();
+    let is_default = |name: &str| defaults.iter().any(|d| d.name == name);
+    let catalog = catalog_table(&mut doc)?;
+    // The action the edit must leave in effect, checked after the write.
+    let mut expect: Option<CatalogAction> = None;
+    match edit {
+        CatalogActionEdit::Add { action } => {
+            let parsed = validated(action)?;
+            if is_default(&action.name) {
+                return Err(format!(
+                    "{} is a deck default; edit it instead of adding it",
+                    quoted_name(&action.name)
+                ));
+            }
+            let tables = action_tables(catalog, true)?.expect("made when missing");
+            if tables.iter().any(|t| entry_name(t) == Some(&action.name)) {
+                return Err(format!(
+                    "an action named {} already exists; edit it instead",
+                    quoted_name(&action.name)
+                ));
+            }
+            if before.actions.len() >= MAX_CATALOG_ACTIONS {
+                return Err(format!(
+                    "the catalog already holds {MAX_CATALOG_ACTIONS} actions, the most it can; \
+                     remove or hide one first"
+                ));
+            }
+            let mut table = toml_edit::Table::new();
+            write_entry(&mut table, action);
+            tables.push(table);
+            expect = Some(parsed);
+        }
+        CatalogActionEdit::Update { action } => {
+            let parsed = validated(action)?;
+            let default = is_default(&action.name);
+            if default {
+                // An edited default is in effect, so it is no longer hidden.
+                set_removed(catalog, &action.name, false)?;
+            }
+            let exists = action_tables(catalog, false)?
+                .is_some_and(|tables| tables.iter().any(|t| entry_name(t) == Some(&action.name)));
+            if exists {
+                update_entry(catalog, action)?;
+            } else if default {
+                let tables = action_tables(catalog, true)?.expect("made when missing");
+                let mut table = toml_edit::Table::new();
+                write_entry(&mut table, action);
+                tables.push(table);
+            } else {
+                return Err(format!(
+                    "no action named {} in your catalog to edit",
+                    quoted_name(&action.name)
+                ));
+            }
+            expect = Some(parsed);
+        }
+        CatalogActionEdit::Remove { name } => {
+            if is_default(name) {
+                return Err(format!(
+                    "{} is a deck default; hide it instead of removing it",
+                    quoted_name(name)
+                ));
+            }
+            if drop_user_entries(catalog, name)? == 0 {
+                return Err(format!(
+                    "no action named {} in your catalog to remove",
+                    quoted_name(name)
+                ));
+            }
+        }
+        CatalogActionEdit::Hide { name } => {
+            if !is_default(name) {
+                return Err(format!(
+                    "{} is not a deck default; only a deck default can be hidden (remove your \
+                     own action instead)",
+                    quoted_name(name)
+                ));
+            }
+            drop_user_entries(catalog, name)?;
+            set_removed(catalog, name, true)?;
+        }
+        CatalogActionEdit::Restore { name } => {
+            if !is_default(name) {
+                return Err(format!(
+                    "{} is not a deck default; only a deck default can be restored",
+                    quoted_name(name)
+                ));
+            }
+            drop_user_entries(catalog, name)?;
+            set_removed(catalog, name, false)?;
+        }
+    }
+    let saved = doc.to_string();
+    if saved.len() as u64 > MAX_USER_CONFIG_BYTES {
+        return Err(format!(
+            "the user config would be larger than {MAX_USER_CONFIG_BYTES} bytes, more than the \
+             deck reads"
+        ));
+    }
+    let after = resolve(Some(&saved));
+    let added: Vec<&String> = after
+        .errors
+        .iter()
+        .filter(|e| !before.errors.contains(e))
+        .collect();
+    if !added.is_empty() {
+        return Err(added
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
+    if let Some(expected) = expect
+        && after.action(&expected.name) != Some(&expected)
+    {
+        return Err(format!(
+            "the edit to {} would not take effect; edit the file by hand",
+            quoted_name(&expected.name)
+        ));
+    }
+    Ok(saved)
 }
 
-/// TDD stub (RED): read the user config at `path` and, with `edit`, apply it
-/// and replace the file atomically; answer the editable catalog afterwards. A
-/// file that cannot be read (not UTF-8, larger than the reader reads, not
-/// valid TOML) is refused and never written; a missing file is created by an
-/// edit; no edit (`None`) writes nothing.
+/// Replace the first user entry named `action.name` with `action`, in place.
+fn update_entry(catalog: &mut toml_edit::Table, action: &CatalogActionInput) -> Result<(), String> {
+    let tables = action_tables(catalog, false)?.expect("an entry was found");
+    let mut seen = false;
+    // A later entry of the same name is already ignored by the catalog (and
+    // reported); it goes, so the saved entry is the one in effect.
+    tables.retain(|t| {
+        if entry_name(t) != Some(&action.name) {
+            return true;
+        }
+        !std::mem::replace(&mut seen, true)
+    });
+    let table = tables
+        .iter_mut()
+        .find(|t| entry_name(t) == Some(&action.name))
+        .expect("an entry was found");
+    write_entry(table, action);
+    Ok(())
+}
+
+/// The user config at `path`: `None` when there is no file, the reason when
+/// it cannot be read as the catalog reader reads it (larger than
+/// [`MAX_USER_CONFIG_BYTES`], or not UTF-8).
+fn read_user_config(path: &std::path::Path) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_USER_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_USER_CONFIG_BYTES {
+        return Err(format!("it is larger than {MAX_USER_CONFIG_BYTES} bytes"));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "it is not UTF-8 text".to_string())
+}
+
+/// One edit of a user config at a time in this process, so two editors'
+/// read-change-write cycles never interleave.
+static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read the user config at `path` and, with `edit`, apply it
+/// ([`apply_action_edit`]) and replace the file atomically, by rename; answer
+/// the editable catalog afterwards, naming the file. A file that cannot be
+/// read — not UTF-8, larger than the catalog reader reads, not valid TOML — is
+/// refused for an edit and never written; a read (`None`) still answers, with
+/// the problem in `errors`. A missing file, and its folder, are created by an
+/// edit. The daemon passes its own user config's path; no path comes from a
+/// client.
 pub fn edit_user_catalog_at(
-    _path: &std::path::Path,
-    _edit: Option<&CatalogActionEdit>,
+    path: &std::path::Path,
+    edit: Option<&CatalogActionEdit>,
 ) -> Result<EditableCardCatalog, String> {
-    unimplemented!("issue #2399: edit the user config's card catalog")
+    let _one_at_a_time = EDIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let display = path.display().to_string();
+    let named = |mut catalog: EditableCardCatalog| {
+        catalog.user_config = Some(display.clone());
+        catalog
+    };
+    let raw = match read_user_config(path) {
+        Ok(raw) => raw,
+        Err(reason) => {
+            return match edit {
+                None => {
+                    let mut catalog = editable_catalog(None);
+                    catalog.errors.push(format!(
+                        "catalog: the user config {display} could not be read, so the deck \
+                         defaults apply: {reason}"
+                    ));
+                    Ok(named(catalog))
+                }
+                Some(_) => Err(format!(
+                    "the user config {display} could not be read ({reason}); fix it by hand \
+                     first, because saving would replace everything it holds"
+                )),
+            };
+        }
+    };
+    let Some(edit) = edit else {
+        return Ok(named(editable_catalog(raw.as_deref())));
+    };
+    let saved = apply_action_edit(raw.as_deref(), edit)?;
+    if raw.as_deref() != Some(saved.as_str()) {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("could not create the folder of the user config {display}: {e}")
+            })?;
+        }
+        crate::config::write_config_atomically(path, saved.as_bytes())
+            .map_err(|e| format!("could not write the user config {display}: {e}"))?;
+    }
+    Ok(named(editable_catalog(Some(&saved))))
 }
 
 /// The text block appended to a dispatched unit's task (both launch shapes)

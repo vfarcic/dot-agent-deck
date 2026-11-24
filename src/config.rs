@@ -937,7 +937,7 @@ fn nearest_config_folder_verdict(
 /// temp file it made and does exactly what `std::fs::write` did, without the
 /// protection. Any other failure (the write, the sync, a full disk) leaves the
 /// old file as it was and is reported.
-fn write_config_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_config_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_config_atomically_with(path, bytes, |file, bytes| {
         use std::io::Write as _;
         file.write_all(bytes)?;

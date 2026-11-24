@@ -1564,6 +1564,11 @@ pub struct AgentCardsAnswer {
     /// batch actions on these cards. `false` for an older daemon, which is
     /// never sent a batch ([`DaemonClient::invoke_card_action_batch`]).
     pub batch: bool,
+    /// Issue #2399 (PR #2491 scope extension): the daemon advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT`], so a client
+    /// may edit its card actions ([`DaemonClient::card_catalog_edit`]).
+    /// `false` for an older daemon, which is never sent the request.
+    pub catalog_edit: bool,
 }
 
 /// Issue #2418: the client side of the tree's gate. Against a daemon whose
@@ -1585,7 +1590,13 @@ pub fn tree_gate(
         }
     }
     let batch = capabilities.supports(crate::daemon_protocol::CAP_AGENT_CARDS_BATCH);
-    AgentCardsAnswer { list, tree, batch }
+    let catalog_edit = capabilities.supports(crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT);
+    AgentCardsAnswer {
+        list,
+        tree,
+        batch,
+        catalog_edit,
+    }
 }
 
 /// PRD #1790 stage 2 (verification finding A): an interrupted work request a
@@ -4707,12 +4718,31 @@ impl DaemonClient {
     /// advertised [`crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT`]**,
     /// answering [`GatedQuery::Unsupported`] without sending anything.
     ///
-    /// TDD stub (RED): not implemented yet.
+    /// As for [`Self::invoke_card_action_batch`], every failure from the first
+    /// byte of the request on is [`ClientError::Unanswered`]: an edit may have
+    /// been written whatever became of the reply.
     pub async fn card_catalog_edit(
         &self,
-        _edit: Option<crate::card_catalog::CatalogActionEdit>,
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
     ) -> Result<GatedQuery<crate::card_catalog::EditableCardCatalog>, ClientError> {
-        unimplemented!("issue #2399: the card-action editor's request")
+        let Some((mut rd, mut wr, _)) = self
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::CardCatalogEdit { edit })
+            .await
+            .map_err(|error| ClientError::Unanswered(error.to_string()))?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "card-catalog-edit failed".into()),
+            ));
+        }
+        resp.card_catalog_edit
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Unanswered("card-catalog-edit answered no catalog".into()))
     }
 
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
