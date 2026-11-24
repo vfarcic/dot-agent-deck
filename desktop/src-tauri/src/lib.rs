@@ -2055,8 +2055,8 @@ async fn interrupted_work_dismiss(
 
 /// PRD #1790 stage 3: restore the attempts `agents` of interrupted item `id`
 /// on deck `deck_id` with their conversations, or with `dry_run` ask what
-/// that would do. The daemon starts the agent. Sent with no pane claim; not
-/// gated on the experimental flag, which gates the webview's controls.
+/// that would do. The daemon starts the agent. Sent with no pane claim, and
+/// not behind the experimental flag (issue #2494).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn interrupted_work_restore(

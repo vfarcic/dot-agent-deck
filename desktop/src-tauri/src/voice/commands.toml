@@ -927,16 +927,15 @@ report      = "Showing the previous reports."
 asks_to     = "show the previous page of an interrupted item's reports"
 try_saying  = "previous reports"
 
-# PRD #1790 stage 3 — Restore in the Interrupted work dialog (behind the
-# experimental flag): brings an agent a restart stopped back with its
-# conversation, or starts it over in its folder without it. **Voice asks the
-# question only**: the dialog shows the restore question for the item the
-# words name, with its choices, and starting the agent waits for the
-# person's click or key on that question (PRD #802 D5) — Restore and
+# PRD #1790 stage 3 — Restore in the Interrupted work dialog: brings an
+# agent a restart stopped back with its conversation, or starts it over in
+# its folder without it. **Voice asks the question only**: the dialog shows
+# the restore question for the item the words name, with its choices, and
+# starting the agent waits for the person's click or key on that question
+# (PRD #802 D5) — Restore and
 # continue, Restore only and Start over in this worktree are registry
 # entries of their own (`restoreAndContinueInterrupted`,
-# `restoreOnlyInterrupted`, `startOverInterrupted`), with no row. With the
-# flag off the dialog refuses it and says so. `item` as
+# `restoreOnlyInterrupted`, `startOverInterrupted`), with no row. `item` as
 # `reclaim_interrupted`'s.
 [[commands]]
 id          = "restore_interrupted"

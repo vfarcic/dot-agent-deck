@@ -1332,8 +1332,8 @@ pub const CAP_INTERRUPTED_WORK: &str = "interrupted-work";
 /// connection that carries it named this and [`CAP_INTERRUPTED_WORK`], so no
 /// [`PROTOCOL_VERSION`] bump. Advertised on Unix only: a restore resumes an
 /// agent through the launch shim, which has no Windows form. Advertised
-/// whatever the experimental flag says: the flag gates the clients' surfaces,
-/// and nothing in the daemon reads it.
+/// whatever the experimental flag says: restore is not behind the flag in any
+/// client (issue #2494), and nothing in the daemon reads it.
 pub const CAP_RESTORE_AGENTS: &str = "restore-agents";
 
 /// Capability string for [`AttachRequest::AddressedMessage`] (issue #1947):

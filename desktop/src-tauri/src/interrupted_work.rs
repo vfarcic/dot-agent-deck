@@ -16,8 +16,8 @@
 //! PRD #1790 stage 3: restore and start-over are the daemon's — it starts the
 //! agent, as it does for the TUI and the CLI, so every client restores the
 //! same way. The shared client withholds both from a daemon that does not
-//! also advertise `restore-agents`. The experimental flag gates the
-//! webview's controls, not these: the flag is a presentation switch.
+//! also advertise `restore-agents`. Neither these nor the webview's
+//! controls for them are behind the experimental flag (issue #2494).
 
 use std::future::Future;
 use std::time::Duration;

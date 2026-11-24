@@ -48,8 +48,7 @@ export function fixtureInterruptedItems(): InterruptedItem[] {
 /**
  * PRD #1790 stage 3 — what `interrupted=restore` lists: a dispatched unit
  * whose Claude Code agent can be restored with its conversation, and a plain
- * Pi agent that can only start over. The same agent data whether or not the
- * experimental flag is on: the daemon lists it regardless.
+ * Pi agent that can only start over.
  */
 export function fixtureRestoreItems(): InterruptedItem[] {
   return [
