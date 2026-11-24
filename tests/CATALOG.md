@@ -17614,12 +17614,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** pressing Remove opens the confirmation with focus inside it and the editor behind it inert; Escape closes only the confirmation, lifts the fence, gives focus back to the Remove that opened it, and sends nothing (issue #2399 review 13).
 - **Does not assert:** a screen reader's announcement.
 
-##### desktop/agent-cards/075 — Voice chooses the editor's daemon, refreshes it and sets the form's icon and checkboxes.
+##### desktop/agent-cards/075 — Voice chooses the editor's daemon, refreshes it and sets the form's icon, checkboxes and Placement.
 
 - **Test:** vitest `desktop/agent-cards/075: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
 - **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
-- **Asserts:** "icon git merge" (a `filter_text`) sets the form's icon to `git-merge` and an unknown name is refused in words; "ask before sending" ticks the box and saying it again leaves it ticked, and each of the four checkbox rows sets its box as said; "refresh the card actions" reads the list again keeping the form; a `deck_ref` naming the daemon shown is accepted and one naming no daemon on the dashboard is refused in words; nothing is written; `chooseCardActionsDaemon`, `refreshCardActions`, `chooseCardActionIcon` and the four checkbox entries are `voice: true`, each with exactly one `commands.toml` row on `overview` with its parameters (issue #2399 review 12).
-- **Does not assert:** that the model picks these rows for the words (no phrase fixtures yet).
+- **Asserts:** "icon git merge" (a `filter_text`) sets the form's icon to `git-merge` and an unknown name is refused in words; "ask before sending" ticks the box and saying it again leaves it ticked, and each of the four checkbox rows sets its box as said; "only in the overlay" sets Placement to Only in the overlay, saying it again keeps it, and "show it on the card" sets it back; "refresh the card actions" reads the list again keeping the form; a `deck_ref` naming the daemon shown is accepted and one naming no daemon on the dashboard is refused in words; nothing is written; `chooseCardActionsDaemon`, `refreshCardActions`, `chooseCardActionIcon`, the four checkbox entries and the two Placement entries (`showCardActionOnCard`, `showCardActionOnlyInOverlay`) are `voice: true`, each with exactly one `commands.toml` row on `overview` with its parameters; `060` checks that every other editor control is a row or carries a written reason (issue #2399 review 12, re-review N4).
+- **Does not assert:** that the model picks these rows for the words: the `card-actions-editor-*` phrase fixtures do, against the real default backend (lane 2, `voice_desktop_phrases_001`).
 
 ##### desktop/agent-cards/076 — The card's action row at its fullest keeps the name and status readable.
 

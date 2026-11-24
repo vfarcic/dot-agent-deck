@@ -3243,3 +3243,28 @@ unavailable_hint = "the Offer on every card box is set in the Card actions edito
 report      = "Offer on every card is unticked. Press Save to keep it."
 asks_to     = "offer the card action I am editing only when agents suggest it"
 try_saying  = "only when agents suggest it"
+
+[[commands]]
+id          = "show_card_action_on_the_card"
+description = """In the Card actions editor's form, set Placement to Show on the card, so the action is an
+icon on each card that offers it. Use for show it on the card, put it on the card, as an icon on the
+card. It only sets the form's choice; nothing is saved until the user presses Save."""
+invoke      = "showCardActionOnCard"
+screens     = ["overview"]
+unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard"
+report      = "Placement is Show on the card. Press Save to keep it."
+asks_to     = "show the card action I am editing on the card"
+try_saying  = "show it on the card"
+
+[[commands]]
+id          = "show_card_action_only_in_the_overlay"
+description = """In the Card actions editor's form, set Placement to Only in the overlay, so the action
+draws no icon on the card and is listed only when the card is opened. Use for only in the overlay, not
+on the card, no icon on the card. It only sets the form's choice; nothing is saved until the user
+presses Save."""
+invoke      = "showCardActionOnlyInOverlay"
+screens     = ["overview"]
+unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard"
+report      = "Placement is Only in the overlay. Press Save to keep it."
+asks_to     = "show the card action I am editing only in the card's overlay"
+try_saying  = "only in the overlay"

@@ -153,6 +153,21 @@ screen = "overview"
 action = "offer_card_action_when_agents_choose"
 outcome = "dispatch"
 
+# Issue #2399 re-review N4: the form's Placement choice, one row per choice.
+[[fixtures]]
+name = "card-actions-editor-placement-on-the-card"
+utterance = "put it on the card as an icon"
+screen = "overview"
+action = "show_card_action_on_the_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-placement-only-in-the-overlay"
+utterance = "only show it in the overlay"
+screen = "overview"
+action = "show_card_action_only_in_the_overlay"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-agent-zoom"
 utterance = "zoom the tester"

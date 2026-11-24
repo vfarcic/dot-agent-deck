@@ -497,6 +497,8 @@ export function useCardActionsEditor({ runtime, daemons }: {
       return formValue((values) => ({ ...values, icon: name }));
     },
     setCardActionFlag: (flag, on) => formValue((values) => ({ ...values, [flag]: on })),
+    /* "Show on the card" keeps a file's `compact`, which shows on the card too. */
+    setCardActionPlacement: (placement) => formValue((values) => ({ ...values, placement: placement === "card" && values.placement === "compact" ? "compact" : placement })),
   };
 
   const setField = useCallback(<K extends keyof CardActionFormValues>(key: K, value: CardActionFormValues[K]) => {

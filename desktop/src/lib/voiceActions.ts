@@ -750,6 +750,8 @@ export type VoiceActionContext = {
   chooseCardActionIcon: (name: string) => string | undefined;
   /** Tick or untick one of the form's checkboxes — Ask before sending (`confirm`) or Offer on every card (`always`). Writes nothing. */
   setCardActionFlag: (flag: "confirm" | "always", on: boolean) => string | undefined;
+  /** Set the form's Placement: Show on the card (`card`, keeping a file's `compact`) or Only in the overlay (`detail`). Writes nothing. */
+  setCardActionPlacement: (placement: "card" | "detail") => string | undefined;
 };
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
@@ -1958,6 +1960,29 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* Issue #2399 re-review N4: the form's Placement choice, one entry per
+     choice, so saying one twice keeps it. The select dispatches the entry
+     for the choice picked. */
+  showCardActionOnCard: {
+    label: "Choose Show on the card as the Card actions form's Placement",
+    voice: true,
+    needs: ["setCardActionPlacement"],
+    run: (context: Pick<VoiceActionContext, "setCardActionPlacement"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionPlacement("card");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  showCardActionOnlyInOverlay: {
+    label: "Choose Only in the overlay as the Card actions form's Placement",
+    voice: true,
+    needs: ["setCardActionPlacement"],
+    run: (context: Pick<VoiceActionContext, "setCardActionPlacement"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionPlacement("detail");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   cancelCardActionForm: {
     label: "Close the Card actions editor's form without saving",
     no_voice: "the form's Cancel, which only closes the form; voice's `close` closes the editor it is in, and saying another action's name (`edit_card_action`, `add_card_action`) replaces the form",
@@ -2635,7 +2660,7 @@ export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "cl
 export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
 
 /** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
-export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag";
+export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag" | "setCardActionPlacement";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

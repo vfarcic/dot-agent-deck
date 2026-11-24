@@ -1350,12 +1350,6 @@ handler = "onClick"
 code = '() => { VOICE_ACTIONS.chooseCardActionIcon.run(controls, name); setPicking(false); }'
 reason = "One icon in the Card actions form's icon grid: dispatches the choice through the registry (`chooseCardActionIcon`, whose `choose_card_action_icon` row chooses an icon by its name) and then closes the grid, which is local to the form. Nothing is written until the form's Save."
 
-[[site]]
-file = "desktop/src/components/AgentCardActionsEditor.tsx"
-handler = "onChange"
-code = '(event) => setField("placement", event.target.value as CardActionPlacement)'
-reason = "The Card actions form's Placement choice: a field of the form, set by hand and written only by the form's Save, like the fields beside it."
-
 # --- desktop/src/components/AgentCardOverlay.tsx ---
 
 [[site]]

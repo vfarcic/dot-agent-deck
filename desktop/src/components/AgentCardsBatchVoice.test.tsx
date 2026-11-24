@@ -324,7 +324,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     // Every other control of the editor is reachable by voice through a row of its own, or says, in a reason someone can
     // disagree with, why it is not (CLAUDE.md rule 23): the presses that write the daemon's config, choosing the daemon,
     // choosing an icon, and closing the form or the editor.
-    for (const id of ["confirmRemoveCardAction", "saveCardAction", "hideCardAction", "restoreCardAction", "chooseCardActionsDaemon", "chooseCardActionIcon", "cancelCardActionForm", "closeCardActionsEditor"]) {
+    for (const id of ["confirmRemoveCardAction", "saveCardAction", "hideCardAction", "restoreCardAction", "chooseCardActionsDaemon", "chooseCardActionIcon", "showCardActionOnCard", "showCardActionOnlyInOverlay", "askBeforeSendingCardAction", "sendCardActionWithoutAsking", "offerCardActionOnEveryCard", "offerCardActionWhenAgentsChoose", "refreshCardActions", "cancelCardActionForm", "closeCardActionsEditor"]) {
       const entry = registry[id];
       expect(entry, `${id} is in the registry`).toBeDefined();
       if (entry?.voice) {
@@ -341,7 +341,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(registry.saveCardAction?.voice).not.toBe(true);
   });
 
-  /// Scenario: Open the editor and Ship it's form by voice, then say an icon's name ("icon git merge"), "ask before sending", "offer on every card", their opposites, "refresh the card actions" and a daemon's name. The form's icon becomes git-merge and an unknown icon name is refused in words; each checkbox follows what was said, whatever it was before; Refresh reads the list again and keeps the form; the editor's daemon is chosen by its name, and a daemon not on the dashboard is refused in words. Nothing is written, and each of these entries is a voice entry with exactly one row (issue #2399 review 12).
+  /// Scenario: Open the editor and Ship it's form by voice, then say an icon's name ("icon git merge"), "ask before sending", "offer on every card", "only in the overlay", their opposites, "refresh the card actions" and a daemon's name. The form's icon becomes git-merge and an unknown icon name is refused in words; each checkbox and the Placement choice follow what was said, whatever they were before; Refresh reads the list again and keeps the form; the editor's daemon is chosen by its name, and a daemon not on the dashboard is refused in words. Nothing is written, and each of these entries is a voice entry with exactly one row (issue #2399 review 12, re-review N4).
   it("desktop/agent-cards/075: voice chooses the editor's daemon, reads it again and sets the form's icon and checkboxes, writing nothing", async () => {
     const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };
     const readCardCatalog = vi.fn(async () => ({ actions: [ship], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
@@ -360,6 +360,8 @@ describe("batch card actions by voice (issue 2399 review)", () => {
         "send without asking": row("send_card_action_without_asking", "sendCardActionWithoutAsking"),
         "offer on every card": row("offer_card_action_on_every_card", "offerCardActionOnEveryCard"),
         "only when agents suggest it": row("offer_card_action_when_agents_choose", "offerCardActionWhenAgentsChoose"),
+        "only in the overlay": row("show_card_action_only_in_the_overlay", "showCardActionOnlyInOverlay"),
+        "show it on the card": row("show_card_action_on_the_card", "showCardActionOnCard"),
         "refresh the card actions": row("refresh_card_actions", "refreshCardActions"),
         "card actions of the local daemon": row("choose_card_actions_daemon", "chooseCardActionsDaemon", [deck(FIXTURE_DAEMON_ID, "Local daemon")]),
         "card actions of the moon": row("choose_card_actions_daemon", "chooseCardActionsDaemon", [deck("deck-not-on-the-dashboard", "moon")]),
@@ -388,6 +390,14 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(box("Offer on every card")).toBeChecked();
     await speak(run.voice, "only when agents suggest it");
     expect(box("Offer on every card")).not.toBeChecked();
+    const placement = () => within(editor).getByLabelText("Placement") as HTMLSelectElement;
+    expect(placement().value).toBe("card");
+    await speak(run.voice, "only in the overlay");
+    expect(placement().value).toBe("detail");
+    await speak(run.voice, "only in the overlay");
+    expect(placement().value, "saying it again keeps it").toBe("detail");
+    await speak(run.voice, "show it on the card");
+    expect(placement().value).toBe("card");
 
     const reads = readCardCatalog.mock.calls.length;
     await speak(run.voice, "refresh the card actions");
@@ -409,6 +419,8 @@ describe("batch card actions by voice (issue 2399 review)", () => {
       ["sendCardActionWithoutAsking", "send_card_action_without_asking", []],
       ["offerCardActionOnEveryCard", "offer_card_action_on_every_card", []],
       ["offerCardActionWhenAgentsChoose", "offer_card_action_when_agents_choose", []],
+      ["showCardActionOnCard", "show_card_action_on_the_card", []],
+      ["showCardActionOnlyInOverlay", "show_card_action_only_in_the_overlay", []],
     ];
     for (const [id, name, params] of rows) {
       expect(registry[id]?.voice, id).toBe(true);

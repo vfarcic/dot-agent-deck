@@ -2,7 +2,7 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { RefreshCw, X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
-import type { CardActionFormValues, CardActionPlacement, CardActionsEditor, CardActionsEditorView, CardActionsReread } from "../hooks/useCardActionsEditor";
+import type { CardActionFormValues, CardActionsEditor, CardActionsEditorView, CardActionsReread } from "../hooks/useCardActionsEditor";
 import { CardActionIcon, CARD_ICON_NAMES, cardIconName, GENERIC_CARD_ICON, searchCardIcons } from "../lib/cardIcons";
 import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
@@ -256,7 +256,7 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
       </div>
       <div className="card-actions-editor-field">
         <label htmlFor={id("placement")}>Placement</label>
-        <select id={id("placement")} value={values.placement === "detail" ? "detail" : "card"} aria-describedby={`${id("placement")}-hint`} onChange={(event) => setField("placement", event.target.value as CardActionPlacement)}>
+        <select id={id("placement")} value={values.placement === "detail" ? "detail" : "card"} aria-describedby={`${id("placement")}-hint`} onChange={(event) => VOICE_ACTIONS[event.target.value === "detail" ? "showCardActionOnlyInOverlay" : "showCardActionOnCard"].run(controls)}>
           {PLACEMENTS.map((placement) => <option key={placement.value} value={placement.value}>{placement.label}</option>)}
         </select>
         <small id={`${id("placement")}-hint`}>On the card, the action is an icon on each card that offers it (up to three per card); only in the overlay, it is listed when the card is opened, with no icon.</small>
