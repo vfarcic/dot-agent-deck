@@ -217,6 +217,13 @@ mod pin_lockstep;
 /// here under `python3`.
 #[cfg(test)]
 mod pr_review_verdict;
+/// PR #2491 audit K4: what `.claude/skills/pr-create/pr-screenshots.sh` lets
+/// into the Markdown it prints — control characters in alt text and a
+/// repository that is not `<owner>/<name>` are refused before the push. Tests
+/// only, and Unix only: the script is driven under `bash` against a local bare
+/// repository standing in for the remote.
+#[cfg(all(test, unix))]
+mod pr_screenshots;
 /// Issue #1591: where a PRD lives — its `prds/` file when one exists, else its
 /// issue body — is decided by `.claude/skills/prd-start/prd-source.sh`, and
 /// each PRD skill fork replaced its `dot-ai` mirror. Tests only, and Unix only:
@@ -262,13 +269,6 @@ mod release_workflow_wiring;
 #[cfg(test)]
 mod renovate_lock_file_maintenance;
 mod repo_state;
-/// PR #2491 audit K4: what `.claude/skills/pr-create/pr-screenshots.sh` lets
-/// into the Markdown it prints — control characters in alt text and a
-/// repository that is not `<owner>/<name>` are refused before the push. Tests
-/// only, and Unix only: the script is driven under `bash` against a local bare
-/// repository standing in for the remote.
-#[cfg(all(test, unix))]
-mod pr_screenshots;
 /// Issue #2081: which automated-review findings on a pull request nobody has
 /// answered, which `.claude/skills/pr-create/unanswered-findings.sh` decides
 /// from Qodo's and Greptile's comments and the PR's threads. Tests only, and

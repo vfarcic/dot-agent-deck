@@ -136,8 +136,12 @@ impl Sandbox {
     /// Whether anything reached the stand-in remote's `pr-screenshots` branch.
     fn pushed(&self) -> bool {
         let mut cmd = Command::new("git");
-        cmd.current_dir(self.root.join("remote.git"))
-            .args(["rev-parse", "--verify", "-q", "refs/heads/pr-screenshots"]);
+        cmd.current_dir(self.root.join("remote.git")).args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            "refs/heads/pr-screenshots",
+        ]);
         self.isolate(&mut cmd);
         cmd.output().expect("spawn git").status.success()
     }
@@ -168,7 +172,12 @@ fn pr_screenshots_001_alt_text_with_a_control_character_is_refused_before_the_pu
             Some("owner/repo"),
             &["2491", &format!("scene-desktop-light.png={alt}")],
         );
-        assert_eq!(out.status.code(), Some(2), "{alt:?} was accepted: {}", stderr(&out));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{alt:?} was accepted: {}",
+            stderr(&out)
+        );
         assert!(
             stderr(&out).contains("control character"),
             "{alt:?}: the refusal names it: {}",
@@ -202,8 +211,17 @@ fn pr_screenshots_002_a_repository_override_that_is_not_owner_and_name_is_refuse
             Some(repo),
             &["2491", "scene-desktop-light.png=Normal caption"],
         );
-        assert_eq!(out.status.code(), Some(2), "{repo:?} was accepted: {}", stderr(&out));
-        assert!(stderr(&out).contains("not an <owner>/<name>"), "{repo:?}: {}", stderr(&out));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{repo:?} was accepted: {}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("not an <owner>/<name>"),
+            "{repo:?}: {}",
+            stderr(&out)
+        );
         assert!(!sandbox.pushed(), "{repo:?}: nothing reaches the remote");
     }
 }
@@ -224,7 +242,11 @@ fn pr_screenshots_003_a_repository_read_from_the_remote_is_held_to_the_same_rule
         &["2491", "scene-desktop-light.png=Normal caption"],
     );
     assert_eq!(out.status.code(), Some(2), "accepted: {}", stderr(&out));
-    assert!(stderr(&out).contains("not an <owner>/<name>"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not an <owner>/<name>"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 /// Scenario: pass the light and dark images with plain alt text and a valid
