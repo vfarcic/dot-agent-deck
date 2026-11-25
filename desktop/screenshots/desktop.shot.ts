@@ -269,8 +269,8 @@ desktopScenario("agent-card-panel-narrow", async (page) => {
   await expect(pane.getByText("Contract review", { exact: true })).toBeInViewport({ ratio: 1 });
   await expect(pane.getByRole("button", { name: "Close agent", exact: true })).toBeInViewport({ ratio: 1 });
   await expect(pane.getByRole("button", { name: "Back to dashboard" })).toBeInViewport({ ratio: 1 });
-  // PR #2491 review J7: the terminal under the panel shows the agent at work.
-  await expectTerminalPainted(page, "Asked on the card: ship it behind a flag?");
+  // PR #2491 review J7: the terminal under the panel shows the agent at work (a line short enough not to wrap at this width).
+  await expectTerminalPainted(page, "One breaking change: the new status.");
 });
 
 // PR #2491 review L3 — tick every root of a pushed scene. The push gives the
