@@ -74,12 +74,16 @@ impl Palette {
     }
 
     /// A light terminal theme (PR #2491), in the spirit of One Light, the light
-    /// sibling of [`Palette::dark`]'s One Dark. The hues are darkened until
-    /// each, normal and bright, reads at 4.5:1 or more on the background, so a
-    /// status word the TUI colours is as legible as on a light terminal a user
-    /// would pick; ANSI white (7) and bright white (15) stay light, as they
-    /// are on such a terminal, which is why `src/palette.rs` uses neither for
-    /// text.
+    /// sibling of [`Palette::dark`]'s One Dark. Every one of the sixteen ANSI
+    /// colours, normal and bright, reads at 4.5:1 or more on the background,
+    /// so a status word the TUI colours is as legible as on a light terminal a
+    /// user would pick. That includes white (7) and bright white (15), which
+    /// are mapped to greys darker than the background rather than kept light:
+    /// the TUI draws text in both — the project-trust prompt's labels in white
+    /// and the commands it asks the user to approve in bright white
+    /// (`src/trust_prompt.rs`) — so bright white is the darker of the two
+    /// (14.5:1, against white's 5.7:1), as it is the brighter on the dark
+    /// theme, and a light image shows what that screen asks.
     pub fn light() -> Self {
         Self {
             foreground: (0x38, 0x3a, 0x42),
@@ -92,7 +96,7 @@ impl Palette {
                 (0x2f, 0x62, 0xd0),
                 (0xa0, 0x2b, 0xa0),
                 (0x0a, 0x7a, 0x8f),
-                (0x9e, 0xa0, 0xa6),
+                (0x61, 0x64, 0x6d),
                 (0x6b, 0x6e, 0x78),
                 (0xb3, 0x26, 0x1e),
                 (0x25, 0x6b, 0x29),
@@ -100,7 +104,7 @@ impl Palette {
                 (0x24, 0x49, 0xad),
                 (0x86, 0x22, 0x8a),
                 (0x08, 0x69, 0x7a),
-                (0xff, 0xff, 0xff),
+                (0x24, 0x26, 0x2c),
             ],
         }
     }
@@ -599,9 +603,12 @@ mod tests {
         );
         assert!(contrast(dark.background, (0, 0, 0)) < 1.6, "a dark ground");
         assert!(contrast(light.foreground, light.background) >= 7.0);
-        // Every colour the TUI may draw text in reads at 4.5:1 or more; ANSI
-        // white and bright white are light on a light terminal, as on any.
-        for idx in (0..16).filter(|i| *i != 7 && *i != 15) {
+        // All sixteen ANSI colours read at 4.5:1 or more, white (7) and bright
+        // white (15) included: the TUI draws text in both — the project-trust
+        // prompt's labels in white and its command values in bright white
+        // (`src/trust_prompt.rs`) — and a light image that hides them hides
+        // what the screen asks the user to approve (PR #2491 review).
+        for idx in 0..16 {
             let ratio = contrast(light.ansi[idx], light.background);
             assert!(
                 ratio >= 4.5,
