@@ -198,6 +198,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards-batch-texts-unseen",
+        description: "The same confirmation in a 1440 by 500 window, the two texts the agents wrote below the fold: Send disabled with \"Scroll to see all 3 texts\" and Show next text beside it, until each text has been in view (PR #2491 audit K1).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "agent-cards-batch-many-expanded",
         description: "The same confirmation with the skipped line pressed: the skipped agents listed, grouped by reason (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],

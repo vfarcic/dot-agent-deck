@@ -198,6 +198,28 @@ desktopScenario("agent-cards-select", async (page) => {
   await expect(page.getByTestId("agent-cards-batch-confirm")).toHaveCount(0);
 });
 
+// PR #2491 review J7 — the Card panel scenes are shots of an agent at work,
+// so they wait until its terminal has PAINTED its transcript: the DOM
+// renderer's row holding `line` is in the window, every one of its text runs
+// has a size, its text is drawn in a colour other than the terminal's
+// background, and two frames have passed since. The shot is refused
+// otherwise: a buffer that holds the text is not a picture that shows it.
+async function expectTerminalPainted(page: Page, line: string): Promise<void> {
+  const row = page.getByTestId("agent-pane-overlay").locator(".xterm-rows > div").filter({ hasText: line });
+  await expect(row, `the terminal has a row reading "${line}"`).toHaveCount(1);
+  await expect(row, "that row is in the window").toBeInViewport({ ratio: 1 });
+  await expect.poll(() => row.evaluate((node) => {
+    const terminal = node.closest(".xterm");
+    const background = terminal ? getComputedStyle(terminal.querySelector(".xterm-viewport") ?? terminal).backgroundColor : "";
+    const runs = [...node.querySelectorAll("span")].filter((span) => (span.textContent ?? "").trim() !== "");
+    const sized = runs.length > 0 && runs.every((span) => { const box = span.getBoundingClientRect(); return box.width > 0 && box.height > 0; });
+    const style = getComputedStyle(node);
+    const inked = runs.some((span) => getComputedStyle(span).color !== background);
+    return sized && inked && style.visibility !== "hidden" && Number(style.opacity) > 0;
+  }), `the terminal painted "${line}"`).toBe(true);
+  await page.evaluate(() => new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
+}
+
 // PR #2491 decision 2026-11-25 — a card opens its agent's pane with the Card
 // panel beside the terminal: Contract review's, opened from its card, whose
 // agent asks whether to ship behind a version flag. The panel shows the
@@ -231,6 +253,8 @@ desktopScenario("agent-card-panel", async (page) => {
   expect(await rows.evaluate((node) => (node.textContent ?? "").split("Compared v2 and v3 responses").length - 1)).toBe(1);
   await expect(page.getByTestId("agent-pane-overlay").locator(".agent-footer")).toContainText("storefront");
   await expect(page.getByTestId("agent-pane-overlay").locator(".agent-footer")).not.toContainText("Unavailable");
+  await expectTerminalPainted(page, "Compared v2 and v3 responses");
+  await expectTerminalPainted(page, "Asked on the card: ship it behind a flag?");
 });
 
 // The same pane in a phone-wide window: the Card panel between the pane's
@@ -245,7 +269,22 @@ desktopScenario("agent-card-panel-narrow", async (page) => {
   await expect(pane.getByText("Contract review", { exact: true })).toBeInViewport({ ratio: 1 });
   await expect(pane.getByRole("button", { name: "Close agent", exact: true })).toBeInViewport({ ratio: 1 });
   await expect(pane.getByRole("button", { name: "Back to dashboard" })).toBeInViewport({ ratio: 1 });
+  // PR #2491 review J7: the terminal under the panel shows the agent at work.
+  await expectTerminalPainted(page, "Asked on the card: ship it behind a flag?");
 });
+
+// PR #2491 review L3 — tick every root of a pushed scene. The push gives the
+// cards their checkboxes on React's next commit, so the helper waits for all
+// of them (at least one) before it enumerates them — `all()` does not wait,
+// and before that commit it finds none and ticks nothing — and confirms the
+// selection bar counts every card before any action is pressed.
+async function selectEveryRoot(page: Page, pushed: { roots: number; cards: number }): Promise<void> {
+  expect(pushed.roots, "the scene has a root to tick").toBeGreaterThan(0);
+  const boxes = page.locator("article[data-card-key][data-depth='0']").getByTestId("agent-card-select");
+  await expect(boxes).toHaveCount(pushed.roots);
+  for (const box of await boxes.all()) await box.check();
+  await expect(page.getByTestId("agent-cards-selection-count")).toHaveText(`${pushed.cards} selected`);
+}
 
 // PR #2491 decision 2026-11-25 — a batch over many agents: every root of the
 // `cards=tree` scene ticked, Go ahead offered by most agents, disabled on
@@ -257,8 +296,8 @@ async function openManyBatch(page: Page, distinctTexts = false): Promise<Locator
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await page.getByTestId("overview-mode-cards").click();
-  await page.evaluate((distinct) => {
-    type Entry = Record<string, unknown> & { name: string; agent_id: string; actions: unknown[] };
+  const pushed = await page.evaluate((distinct) => {
+    type Entry = Record<string, unknown> & { name: string; agent_id: string; actions: unknown[]; parent?: string };
     const hook = (window as unknown as { __dadFixtureCards: { snapshot(): { revision: number; batch?: boolean; entries: Entry[] }; push(next: unknown): void } }).__dadFixtureCards;
     const next = hook.snapshot();
     next.batch = true;
@@ -273,8 +312,9 @@ async function openManyBatch(page: Page, distinctTexts = false): Promise<Locator
     });
     next.revision += 1;
     hook.push(next);
+    return { roots: next.entries.filter((entry) => !entry.parent).length, cards: next.entries.length };
   }, distinctTexts);
-  for (const box of await page.locator("article[data-card-key][data-depth='0']").getByTestId("agent-card-select").all()) await box.check();
+  await selectEveryRoot(page, pushed);
   await page.getByTestId("agent-cards-batch-action-go-ahead").click();
   const dialog = page.getByTestId("agent-cards-batch-confirm");
   await expect(dialog).toHaveAttribute("data-stage", "review");
@@ -298,6 +338,19 @@ desktopScenario("agent-cards-batch-texts", async (page) => {
   await expect(dialog.getByTestId("agent-cards-batch-source")).toHaveText(["catalog", "agent says", "agent says"]);
   await expect(dialog.getByRole("heading", { level: 3 }).first()).toContainText("3 different texts");
   await expect(dialog.getByTestId("agent-cards-batch-more")).toHaveText(/^\+\d+ more$/);
+});
+
+// PR #2491 audit K1 — the same confirmation in a short window, the two texts
+// the agents wrote below the fold: Send waits, disabled, with the hint and
+// Show next text beside it, until each text has been in view.
+desktopScenario("agent-cards-batch-texts-unseen", async (page) => {
+  await page.setViewportSize({ width: 1440, height: 500 });
+  const dialog = await openManyBatch(page, true);
+  await expect(dialog.getByTestId("agent-cards-batch-prompt")).toHaveCount(3);
+  await expect(dialog.getByTestId("agent-cards-batch-prompt").nth(2)).not.toBeInViewport();
+  await expect(dialog.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await expect(dialog.getByTestId("agent-cards-batch-unseen")).toHaveText("Scroll to see all 3 texts");
+  await expect(dialog.getByRole("button", { name: "Show next text" })).toBeInViewport({ ratio: 1 });
 });
 
 desktopScenario("agent-cards-batch-many-expanded", async (page) => {
