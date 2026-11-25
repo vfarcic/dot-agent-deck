@@ -765,6 +765,49 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent("The Card actions editor opens over an agent's pane opened from the agent dashboard, not from the Daemons screen.");
   });
 
+  /// Scenario: With two daemons showing cards, open the first daemon's agent's pane and say an editor command that names no daemon ("open card actions", "add a card action", "edit the go ahead action" or "remove the go ahead action"). While it is still being worked out, go back to the dashboard and open the second daemon's agent's pane, leaving the selected daemon as it was. When the answer arrives, nothing opens: the app says the pane on screen changed, reads neither daemon's card actions and shows no form or confirmation over the second pane. Saying "open card actions on" the second daemon over that pane still opens its editor (PR #2491 review V1).
+  it.each([
+    ["open card actions", "open_card_actions_editor", "openCardActionsEditor", []],
+    ["add a card action", "add_card_action", "addCardAction", []],
+    ["edit the go ahead action", "edit_card_action", "editCardAction", [actionParam("Go ahead")]],
+    ["remove the go ahead action", "remove_card_action", "removeCardAction", [actionParam("Go ahead")]],
+  ] as const)("desktop/agent-cards/123: a nameless %s said over one pane is refused once another daemon's pane is on screen", async (said, action, invoke, params) => {
+    const readCardCatalog = vi.fn(async () => ({ actions: [], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
+    const editCardCatalog = vi.fn();
+    const farName = deckName(createFixtureFleet("fleet")[1].connection);
+    const deck = (value: string, label: string): VoiceResolvedParamDto => ({ name: "deck", kind: "deck_ref", spoken: label, value, label });
+    const declareVoiceScreen = vi.fn();
+    let release: ((answer: VoiceResultDto) => void) | undefined;
+    const resolveVoice = vi.fn((transcript: string) => transcript === said
+      ? new Promise<VoiceResultDto>((resolve) => { release = resolve; })
+      : Promise.resolve<VoiceResultDto>({ backend: "stub", resolveMs: 21, outcome: { kind: "dispatch", transcript, action: "open_card_actions_editor", invoke: "openCardActionsEditor", params: [deck(FIXTURE_REMOTE_DAEMON_ID, farName)], sentence: "Done." } }));
+    const run = setup((agents) => [cardFor(agents[0].id, "coder-card")], () => ({}), { extra: { readCardCatalog, editCardCatalog, resolveVoice, declareVoiceScreen }, remote: true });
+    await turnOnVoice();
+    fireEvent.click(document.querySelector<HTMLElement>(`article[data-card-key="${run.cards[0].key}"]`)!);
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-card-panel")).toBeInTheDocument();
+    const firstPane = screen.getByTestId("agent-pane-overlay").getAttribute("aria-label");
+
+    await speak(run.voice, said);
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+    expect(declareVoiceScreen.mock.calls.at(-1)?.[0], "said over the first daemon's pane").toBe("agent");
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select far-coder" }).closest("article")!);
+    expect(screen.getByTestId("agent-pane-overlay").getAttribute("aria-label"), "the second daemon's pane is on screen").not.toBe(firstPane);
+
+    await act(async () => { release!({ backend: "stub", resolveMs: 21, outcome: { kind: "dispatch", transcript: said, action, invoke, params: [...params], sentence: "Done." } }); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing ran — the pane on screen changed. Say it again.");
+    expect(readCardCatalog).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: /^Card actions: / })).toBeNull();
+    expect(screen.queryByLabelText("Name")).toBeNull();
+    expect(editCardCatalog).not.toHaveBeenCalled();
+
+    /* A daemon named in the utterance still wins over the pane it was said in. */
+    await speak(run.voice, "open card actions on the far daemon");
+    expect(screen.getByRole("dialog", { name: `Card actions: ${farName}` })).toBeInTheDocument();
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+  });
+
   /// Scenario: On the Table view with Needs you only off, say "only the ones that need me": the voice panel declares the dashboard's view and the filter as they stood (table, off), and the filter turns on. Say "show all cards": it declares table and on, and the filter turns off. Switch to the Cards view and say "only the ones that need me" again: it declares cards and off. That declaration is what tells the command model that "show all cards" turns the filter off while it is on (PR #2491, 2026-11-25).
   it("desktop/agent-cards/120: each utterance declares the dashboard's view and whether Needs you only is on", async () => {
     window.localStorage.setItem(MODE_KEY, "table");

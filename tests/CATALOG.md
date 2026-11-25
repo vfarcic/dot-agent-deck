@@ -17911,6 +17911,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** on the Cards view with no card, a lone daemon that does not report cards, and a mixed fleet whose card daemon has no cards, get "No agent has a card yet." followed by the daemon without cards named as in the scoped Needs you only note, and never "Every agent the daemon runs gets one."; when every daemon reports cards and none has one, that sentence is kept (PR #2491 review).
 - **Does not assert:** a real browser.
 
+##### desktop/agent-cards/123 — A nameless Card actions editor command said over one pane opens nothing once another daemon's pane is on screen.
+- **Test:** vitest `desktop/agent-cards/123: …` (four cases: open, add, edit, remove) in `desktop/src/components/AgentCardsBatchVoice.test.tsx`, through the real shell and voice panel with a held resolver.
+- **Layer:** desktop shell (jsdom) with synthetic resolved speech.
+- **Asserts:** with two daemons showing cards, "open card actions", "add a card action", "edit the go ahead action" or "remove the go ahead action" said over the first daemon's pane, with no daemon named, and answered only after the user went back to the dashboard and opened the second daemon's pane, is refused with "Nothing ran — the pane on screen changed. Say it again.", reads no daemon's card actions, and opens no editor, form or confirmation over the second pane; "open card actions on" the second daemon said there afterwards still opens its editor (PR #2491 review V1).
+- **Does not assert:** the model's pick without a credential; a Tauri webview.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

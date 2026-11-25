@@ -1288,6 +1288,17 @@ const INTERRUPTED_DIALOG_INVOKES: ReadonlySet<string> = new Set(Object.entries(V
 const IMPLICIT_PANE_INVOKES: ReadonlySet<string> = new Set(["confirmStopAgent", "confirmGenerateConfig", "scrollUp", "scrollDown", "scrollToTop", "scrollToBottom"]);
 
 /**
+ * PR #2491 review V1 — the Card actions editor rows that, said over an agent's
+ * pane without naming a daemon, open the editor of the PANE's daemon: the
+ * opening itself, and add, edit and remove, which open it when it is closed.
+ * {@link dispatchLost} holds each to the pane it was said over, so an answer
+ * that arrives after the user moved to another daemon's pane opens nothing
+ * there. A daemon named in the utterance (`deck_ref`) is not held: it names
+ * its own target.
+ */
+const EDITOR_PANE_INVOKES: ReadonlySet<string> = new Set(["openCardActionsEditor", "addCardAction", "editCardAction", "removeCardAction"]);
+
+/**
  * The gate for dispatching a resolved outcome: {@link contextLost}'s `answer`
  * touch, then its `agent` touch for every agent the outcome's params name —
  * so a stop resolved before a same-id replacement, or before the selected deck
@@ -1305,6 +1316,15 @@ function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly Voi
     if (incarnationsDiffer(was.pane.spawnedAtMs, now.pane.spawnedAtMs)) return { code: "replaced", why: "the agent in the pane was replaced" };
     const moved = contextLost(was, now, { agent: was.pane });
     if (moved) return moved;
+  }
+  /* PR #2491 review V1 — the editor's daemon is read from the pane on screen
+     when the answer is dispatched, so a pane other than the one it was said
+     over (or one that opened or closed since) refuses rather than opening
+     another daemon's editor. Only the pane's address counts: the editor is
+     bound to its daemon, not to the agent's process. */
+  if (invoke !== undefined && EDITOR_PANE_INVOKES.has(invoke) && was.screen === "agent" && !params.some((param) => param.kind === "deck_ref")) {
+    const samePane = was.pane === undefined ? now.pane === undefined : showsAgent(now.pane, was.pane);
+    if (!samePane) return { code: "pane", why: now.pane === undefined ? "the pane closed" : "the pane on screen changed" };
   }
   /* PRD #1790 stage 2 (auditor 2) — an action on the Interrupted work dialog
      acts on the dialog it was said to, as its deck, process, opening, items,
