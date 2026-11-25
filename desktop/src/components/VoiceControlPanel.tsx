@@ -1323,7 +1323,7 @@ function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly Voi
      another daemon's editor. Only the pane's address counts: the editor is
      bound to its daemon, not to the agent's process. */
   if (invoke !== undefined && EDITOR_PANE_INVOKES.has(invoke) && was.screen === "agent" && !params.some((param) => param.kind === "deck_ref")) {
-    const samePane = was.pane === undefined ? now.pane === undefined : showsAgent(now.pane, was.pane);
+    const samePane = was.pane === undefined ? now.pane === undefined : showsAgent(now.pane, { ...was.pane, incarnation: was.pane.incarnation });
     if (!samePane) return { code: "pane", why: now.pane === undefined ? "the pane closed" : "the pane on screen changed" };
   }
   /* PRD #1790 stage 2 (auditor 2) — an action on the Interrupted work dialog
