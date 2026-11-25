@@ -699,7 +699,7 @@ export function AgentTile({
                 title="Next agent that needs you (n)"
                 onMouseDown={(event) => event.stopPropagation()}
                 onClick={() => VOICE_ACTIONS.nextNeedsYouCard.run(cardHeader.controls)}
-              ><BellRing size={13} aria-hidden="true" /> Next needing you</button>
+              ><BellRing size={13} aria-hidden="true" /><span className="agent-pane-needs-you-words">Next needing you</span></button>
             </div>
           )}
           {/*

@@ -132,8 +132,10 @@ desktopScenario("agent-cards-action-hover", async (page) => {
   await openCardsTree(page);
   const merge = page.locator("[data-testid='agent-card-action-icon'][data-action='merge']");
   await merge.hover();
-  // Focus too: the capture's own options end a hover, and a focused icon keeps its tooltip shown.
+  // Focus too, the keyboard's way: the capture's own options end a hover, and a focused icon keeps its tooltip shown and shows its focus ring (PR #2491 v9 review).
+  await page.keyboard.press("Shift");
   await merge.focus();
+  expect(await merge.evaluate((node) => node.matches(":focus-visible"))).toBe(true);
   const tip = page.getByTestId("action-tip");
   await expect(tip).toBeVisible();
   await expect(tip).toContainText("Merge it");
@@ -191,19 +193,93 @@ desktopScenario("agent-cards-select", async (page) => {
   await expect(page.getByTestId("agent-cards-batch-confirm")).toHaveCount(0);
 });
 
-// The other way to start a batch: the orchestrator's own card, opened from
-// the Cards view, has a section named after it and the agents under it, with
-// a button per action, in the action group, that opens the same confirmation.
-desktopScenario("agent-cards-tree-batch", async (page) => {
-  await openBatchCards(page);
-  await page.getByRole("button", { name: /: show Plan \/ architecture's card$/ }).click();
-  const overlay = page.getByTestId("agent-card-overlay");
-  await expect(overlay.getByRole("heading", { name: "Plan / architecture", exact: true })).toBeVisible();
-  const batch = overlay.getByTestId("agent-card-batch");
-  await expect(batch.getByRole("heading")).toHaveText("Plan / architecture and the 2 agents under it");
-  await batch.scrollIntoViewIfNeeded();
-  await expect(batch).toBeInViewport({ ratio: 1 });
-  await expectBatchIcons(batch, ["Go ahead", "Close", "Merge it"]);
+// PR #2491 decision 2026-11-25 — a card opens its agent's pane with the Card
+// panel beside the terminal: Contract review's, opened from its card, whose
+// agent asks whether to ship behind a version flag. The panel shows the
+// deck-checked status and pull request, the agent's summary, why it needs you
+// and its question with its two answers, and its actions as icons.
+async function openContractReviewPanel(page: Page): Promise<Locator> {
+  await openCardsTree(page);
+  await page.locator("article[data-card-key]").filter({ hasText: "Contract review" }).getByTestId("agent-card-details").click();
+  const pane = page.getByTestId("agent-pane-overlay");
+  await expect(pane).toBeVisible();
+  const panel = pane.getByTestId("agent-card-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText("Ship the change behind a version flag?")).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Yes, behind a flag" })).toBeVisible();
+  await expect(pane.getByTestId("agent-pane-card-toggle")).toHaveAttribute("aria-pressed", "true");
+  return panel;
+}
+
+desktopScenario("agent-card-panel", async (page) => {
+  const panel = await openContractReviewPanel(page);
+  await expect(panel.getByTestId("agent-card-panel-refs")).toBeVisible();
+  // The panel scrolls on its own: at its end, the question and the action icons are both in view.
+  await panel.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await expect(panel.getByTestId("action-icon-group")).toBeInViewport({ ratio: 1 });
+  await expect(panel.getByRole("button", { name: "Yes, behind a flag" })).toBeInViewport({ ratio: 1 });
+  await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
+});
+
+// The same pane in a phone-wide window: the Card panel between the pane's
+// header and the terminal, at a fixed height that scrolls.
+desktopScenario("agent-card-panel-narrow", async (page) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  const panel = await openContractReviewPanel(page);
+  const [panelBox, terminalBox] = [await panel.boundingBox(), await page.getByTestId("agent-pane-overlay").locator(".agent-panel").boundingBox()];
+  expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(terminalBox!.y + 1);
+  // The header keeps the agent's name and Close agent in the window.
+  const pane = page.getByTestId("agent-pane-overlay");
+  await expect(pane.getByText("Contract review", { exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(pane.getByRole("button", { name: "Close agent", exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(pane.getByRole("button", { name: "Back to dashboard" })).toBeInViewport({ ratio: 1 });
+});
+
+// PR #2491 decision 2026-11-25 — a batch over many agents: every root of the
+// `cards=tree` scene ticked, Go ahead offered by most agents, disabled on
+// stopped ones and not offered by the rest. The skipped agents fold into one
+// line counting them by reason, and the included names past the first few
+// behind "+N more".
+async function openManyBatch(page: Page): Promise<Locator> {
+  await page.goto("/?fixture=1&state=docs&cards=tree");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByTestId("overview-mode-cards").click();
+  await page.evaluate(() => {
+    type Entry = Record<string, unknown> & { name: string; agent_id: string; actions: unknown[] };
+    const hook = (window as unknown as { __dadFixtureCards: { snapshot(): { revision: number; batch?: boolean; entries: Entry[] }; push(next: unknown): void } }).__dadFixtureCards;
+    const next = hook.snapshot();
+    next.batch = true;
+    next.entries.forEach((entry, at) => {
+      if (at % 5 === 3) return;
+      const stopped = at % 5 === 1;
+      entry.actions = [{ id: "go-ahead", label: "Go ahead", kind: "prompt", prompt: "Go ahead.", prompt_source: "catalog", text_input: false, confirm: false, confirm_detail: null, icon: "play",
+        placement: "card", custom: false, source: "catalog", enabled: !stopped, disabled_reason: stopped ? "agent_stopped" : null, last_delivery: null, token: `tok-many-${entry.agent_id}` }, ...entry.actions];
+    });
+    next.revision += 1;
+    hook.push(next);
+  });
+  for (const box of await page.locator("article[data-card-key][data-depth='0']").getByTestId("agent-card-select").all()) await box.check();
+  await page.getByTestId("agent-cards-batch-action-go-ahead").click();
+  const dialog = page.getByTestId("agent-cards-batch-confirm");
+  await expect(dialog).toHaveAttribute("data-stage", "review");
+  await expect(dialog.getByTestId("agent-cards-batch-skipped-toggle")).toHaveText(/^\d+ skipped: (?=.*\d+ don't offer Go ahead)(?=.*\d+ aren't running)/);
+  return dialog;
+}
+
+desktopScenario("agent-cards-batch-many", async (page) => {
+  const dialog = await openManyBatch(page);
+  await expect(dialog.getByTestId("agent-cards-batch-skipped-toggle")).toHaveAttribute("aria-expanded", "false");
+  await expect(dialog.getByTestId("agent-cards-batch-skipped-group")).toHaveCount(0);
+});
+
+desktopScenario("agent-cards-batch-many-expanded", async (page) => {
+  const dialog = await openManyBatch(page);
+  await dialog.getByTestId("agent-cards-batch-skipped-toggle").click();
+  await expect(dialog.getByTestId("agent-cards-batch-skipped-group")).toHaveCount(2);
+  // The dialog's list scrolls: the skipped line at its top, so both reasons' groups are in view.
+  await dialog.getByTestId("agent-cards-batch-skipped-toggle").evaluate((node) => node.scrollIntoView({ block: "start" }));
+  await expect(dialog.getByTestId("agent-cards-batch-skipped-group").nth(1).getByRole("heading")).toBeInViewport();
 });
 
 desktopScenario("agent-cards-batch", async (page) => {
@@ -213,7 +289,7 @@ desktopScenario("agent-cards-batch", async (page) => {
   // Decision 2026-11-24: the text all three get is quoted once, above the three of them.
   await expect(dialog.getByTestId("agent-cards-batch-prompt")).toHaveText(["Go ahead."]);
   await expect(dialog.getByTestId("agent-cards-batch-group")).toHaveCount(1);
-  await expect(dialog.locator(".agent-cards-batch-entry.is-skipped")).toContainText("User-path verification's card does not offer this action");
+  await expect(dialog.getByTestId("agent-cards-batch-skipped-toggle")).toHaveText("1 skipped: 1 doesn't offer Go ahead");
   await expect(dialog.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
 });
 

@@ -173,13 +173,28 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
-        name: "agent-cards-tree-batch",
-        description: "An orchestrator's card opened from the desktop Cards view, at its section that sends one action to it and the two agents under it (issue #2399).",
+        name: "agent-card-panel",
+        description: "An agent's pane opened from its card in the desktop Cards view, with the Card panel beside the terminal: the deck-checked status and pull request, the agent's summary, why it needs you, its question with two answers, and its action icons (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-card-panel-narrow",
+        description: "The same agent pane in a 375-pixel window: the Card panel between the pane's header and the terminal, at a fixed height that scrolls (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],
     },
     Scenario {
         name: "agent-cards-batch",
         description: "The desktop Cards view's batch confirmation of Go ahead for four selected agents: three included, each with the exact text it gets, and one skipped with its reason (issue #2399).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-many",
+        description: "A batch confirmation over every agent of a large tree: the included agents' first names and +N more, and the skipped agents folded into one line counting them by reason (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-many-expanded",
+        description: "The same confirmation with the skipped line pressed: the skipped agents listed, grouped by reason (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],
     },
     Scenario {

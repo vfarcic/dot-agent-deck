@@ -2322,6 +2322,11 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-pane-card-toggle:hover, .agent-pane-needs-you:hover { border-color: var(--teal); background: var(--teal-soft); }
 .agent-pane-card-toggle:focus-visible, .agent-pane-needs-you:focus-visible, .agent-pane-control:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
 .agent-pane-card-toggle.is-on { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); }
+/* In the pane, the header's identity keeps its line and its controls wrap onto the next one when the window is narrow, rather than pushing the name or Close agent out of the pane; under 640 px Next needing you keeps its bell, its words staying its accessible name. */
+[data-presentation="overlay"] .agent-header { flex-wrap: wrap; row-gap: 6px; column-gap: 8px; }
+[data-presentation="overlay"] .agent-identity { flex: 1 1 220px; }
+[data-presentation="overlay"] .agent-header-actions { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; row-gap: 4px; max-width: 100%; }
+@media (max-width: 640px) { .agent-pane-needs-you .agent-pane-needs-you-words { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; } }
 .agent-card-section { display: grid; gap: 6px; }
 .agent-card-section h3 { margin: 0; font-size: var(--text-base); }
 .agent-card-section p { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }

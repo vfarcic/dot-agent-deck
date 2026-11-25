@@ -991,7 +991,7 @@ export function docsAgentCards(): AgentCardsSnapshot {
 }
 
 /*
- * Issue #2399 — the `agent-cards-select`, `agent-cards-tree-batch`,
+ * Issue #2399 — the `agent-cards-select`, `agent-card-panel`,
  * `agent-cards-batch` and `agent-cards-batch-results` docs scenes
  * (`/?fixture=1&state=docs&cards=batch`): the `agent-cards` scene's cards from
  * a daemon that does batch actions, with the deck's default Go ahead

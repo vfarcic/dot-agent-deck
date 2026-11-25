@@ -121,7 +121,7 @@ for (const width of [375, 1440] as const) {
   test.describe(`desktop/agent-cards/097 — a card opens its agent's pane with the Card panel at ${width}px`, () => {
     test.use({ viewport: { width, height: 900 } });
 
-    /// Scenario: At this width, click the bench card's body. Bench's pane opens with its Card panel, on the terminal's right at 1440 px, about 320 px wide, and between the pane's header and the terminal at 375 px with a capped height that scrolls; nothing scrolls sideways. The card then changes — a new summary, coming to need you — and neither the panel nor the terminal's size moves; the header's Card button hides the panel, giving the terminal its room, and shows it again.
+    /// Scenario: At this width, click the bench card's body. Bench's pane opens with its Card panel and a header whose name, Card, moves and Close agent all stay in the window, on the terminal's right at 1440 px, about 320 px wide, and between the pane's header and the terminal at 375 px with a capped height that scrolls; nothing scrolls sideways. The card then changes — a new summary, coming to need you — and neither the panel nor the terminal's size moves; the header's Card button hides the panel, giving the terminal its room, and shows it again.
     test("the Card panel sits beside or above the terminal, stays put on updates, and the Card button toggles it", async ({ page }) => {
       await openTree(page);
       await (await cardNamed(page, "bench")).getByTestId("agent-card-details").click();
@@ -145,6 +145,10 @@ for (const width of [375, 1440] as const) {
         expect(await panel.evaluate((node) => getComputedStyle(node).overflowY)).toBe("auto");
         expect(p.width, "the panel spans the pane").toBeGreaterThan(t.width - 2);
       }
+      // The header's controls wrap rather than push the agent's name or Close agent out of the pane.
+      await expect(header.getByText("bench", { exact: true }).first()).toBeInViewport({ ratio: 1 });
+      for (const name of ["Close agent", "Back to dashboard", "Previous agent", "Next agent"]) await expect(pane.getByRole("button", { name, exact: true })).toBeInViewport({ ratio: 1 });
+      await expect(pane.getByTestId("agent-pane-next-needs-you")).toBeInViewport({ ratio: 1 });
       await expectNoSidewaysScroll(page);
 
       // The card changes while the pane is shown: nothing opens, closes or resizes.
