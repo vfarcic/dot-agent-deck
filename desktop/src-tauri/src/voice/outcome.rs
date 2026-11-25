@@ -6698,7 +6698,7 @@ pub enum ChoiceMatch {
 
 /// Resolve a spoken mode against the Mode chips the New agent form OFFERS
 /// (PRD #1223) — never a list of modes this crate knows, because the row varies
-/// by the deck's capabilities, its experimental flag and whether the directory
+/// by the deck's capabilities and whether the directory
 /// is a project, and a chip that is not offered must be refused.
 ///
 /// A chip answers to its label with the punctuation spoken as a space
@@ -6730,7 +6730,7 @@ pub(super) fn mode_names(choice: &VoiceChoice) -> Vec<String> {
 /// name the withheld chip — resolved over offered and withheld together, a
 /// withheld winner is refused. Or the model may have answered with the
 /// nearest OFFERED chip: measured on `gpt-5-mini`, "set the mode to schedule
-/// issues" on a deck with its flag off came back as `schedule` three runs in a
+/// issues" on a deck that withheld that chip came back as `schedule` three runs in a
 /// row, whatever the row's description said. So the TRANSCRIPT is checked too:
 /// when it contains a withheld chip's words, and the chip the answer resolved
 /// to is a strict part of that withheld one, the user asked for the withheld
@@ -7045,8 +7045,8 @@ const CHOICE_FILLER: [&str; 10] = [
 ///
 /// The general word-subset rule accepts a name whose words are all in the
 /// reference, so "the tester" reaches `tester`. Over a closed set that varies
-/// by deck that rule is wrong in exactly the case that matters: on a deck whose
-/// experimental flag is off there is no `schedule: issues` chip, and "schedule
+/// by deck that rule is wrong in exactly the case that matters: on a deck that
+/// cannot compose it there is no `schedule: issues` chip, and "schedule
 /// issues" is a word-superset of the `schedule` chip that IS there — so the
 /// user who asked for the one chip that is not offered would silently get the
 /// other one. So the reference may exceed a name only by [`CHOICE_FILLER`]
@@ -11779,8 +11779,9 @@ mod tests {
         }
     }
 
-    /// A form on a project directory of a deck whose flag is off: no
-    /// `schedule: issues` chip, one orchestration, and the deck's registry.
+    /// A form on a project directory of a deck that cannot compose the
+    /// issue-dispatch seed: no `schedule: issues` chip, one orchestration, and
+    /// the deck's registry.
     fn new_agent_form() -> VoiceNewAgent {
         VoiceNewAgent {
             form: Some(crate::voice::VoiceNewAgentForm {
@@ -12010,8 +12011,8 @@ mod tests {
 
     #[tokio::test]
     async fn voice_outcome_choose_mode_refuses_a_chip_the_form_does_not_offer() {
-        // `schedule: issues` is shown only when the deck's experimental flag
-        // is on; this form's deck has it off, so the chip is not there.
+        // `schedule: issues` is shown only when the deck can compose it; this
+        // form's deck cannot, so the chip is not there.
         let resolver = StubResolver::new().answering(
             "mode schedule issues",
             IntentAnswer::new("choose_mode").with_param("mode", "schedule issues"),

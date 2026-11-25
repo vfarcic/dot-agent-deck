@@ -1951,10 +1951,10 @@ try_saying  = "open it in the browser"
 # **Each resolves against what the form OFFERS, as the dialog declared it**
 # (`VoiceNewAgentForm`), never against a list this table knows. The Mode row
 # varies by the deck's capabilities (the authoring chips need `authoring-kind`,
-# orchestration chips need `prepare-workflow`), the deck's experimental flag
-# (`schedule: issues`) and whether the directory is a project; the agents are
+# orchestration chips need `prepare-workflow`, and each authoring chip needs the
+# deck to list its kind) and whether the directory is a project; the agents are
 # the deck's own registry, or the desktop's fallback copy. So "mode
-# schedule issues" on a deck whose flag is off is refused as a chip that is not
+# schedule issues" on a deck that does not list that kind is refused as a chip that is not
 # offered — the same `ParamUnresolved` a directory not on screen gets — rather
 # than resolved against a chip nobody can see.
 #

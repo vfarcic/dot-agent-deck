@@ -27,7 +27,7 @@ import type { DeckDirectoryListing, NewAgentOptions } from "./types";
  * the user submitted, answered after the dialog that submitted it is gone.
  */
 const HOME: DeckDirectoryListing = { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false };
-const OPTIONS: NewAgentOptions = { kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand: "claude" };
+const OPTIONS: NewAgentOptions = { kind: "deck", agents: [], authoringKinds: [], lastCommand: "claude" };
 
 const { bridge } = vi.hoisted(() => ({
   bridge: {

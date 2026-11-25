@@ -6,7 +6,7 @@ import { AgentOverview } from "./AgentOverview";
 import { DRAFT_RESTORED } from "./NewAgentDialog";
 
 const HOME: DeckDirectoryListing = { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false };
-const OPTIONS: NewAgentOptions = { kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand: "claude" };
+const OPTIONS: NewAgentOptions = { kind: "deck", agents: [], authoringKinds: [], lastCommand: "claude" };
 
 /**
  * A runtime carrying the New agent flow's two queries. `runtime.fleet` is the

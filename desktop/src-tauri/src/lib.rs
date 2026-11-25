@@ -2573,8 +2573,10 @@ async fn generate_config_on(
 const LISTING_OPTIONS_UNSUPPORTED: &str = "This daemon cannot show hidden or symlinked directories, or filter a listing past its limit. Upgrade the daemon to use them.";
 
 /// PRD #1223 M4: what the New agent form needs to know about the deck
-/// `deck_id` names — its default command, its agent registry, its experimental
-/// flag, the authoring kinds it can compose — plus that deck's last command.
+/// `deck_id` names — its default command, its agent registry, the authoring
+/// kinds it can compose — plus that deck's last command. The deck's
+/// experimental flag, which its answer still carries, is not passed on: the one
+/// surface that read it, the `schedule: issues` chip, graduated (issue #193).
 ///
 /// The last command comes from the deck itself when it keeps one (issue #1540,
 /// [`LastCommandKeeper::Daemon`]), so the TUI's form and this dialog offer the
@@ -2700,7 +2702,6 @@ async fn new_agent_options_on(
                     DesktopAgentOption::new(agent.id, &agent.display_name, agent.default_command)
                 })
                 .collect(),
-            experimental: options.experimental,
             authoring_kinds: options.authoring_kinds,
             last_command,
         },

@@ -613,11 +613,10 @@ impl DirPickerState {
 /// [`schedule_authoring_seed_prompt`](crate::authoring_seeds::schedule_authoring_seed_prompt).
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
-/// PRD #120: display name of the flag-gated issue-dispatch authoring option in
-/// the new-pane Mode cycler — distinct from the plain `schedule` option. It is
-/// appended AFTER `schedule` and shown only when
-/// [`crate::features::show_issue_dispatch_authoring`] is true. Selecting it
-/// spawns a throwaway authoring agent seeded with
+/// PRD #120: display name of the issue-dispatch authoring option in the
+/// new-pane Mode cycler — distinct from the plain `schedule` option. It is
+/// appended AFTER `schedule` (issue #193 graduated it from the experimental
+/// flag, so every `Ctrl+n` form offers it). Selecting it spawns a throwaway authoring agent seeded with
 /// [`issue_dispatch_authoring_seed_prompt`](crate::authoring_seeds::issue_dispatch_authoring_seed_prompt), which calls `schedule add --repo …`.
 const ISSUE_DISPATCH_MODE_NAME: &str = "schedule: issues";
 
@@ -667,7 +666,7 @@ const DISPATCHER_MODE_NAME: &str = "dispatcher";
 enum BuiltinOption {
     /// PRD #127: author a scheduled task.
     Schedule,
-    /// PRD #120: author an issue-dispatch scheduled task (experimental-gated).
+    /// PRD #120: author an issue-dispatch scheduled task.
     IssueDispatch,
     /// PRD #220: an agent that knows the `dispatch` verb.
     Dispatcher,
@@ -1164,13 +1163,8 @@ struct NewPaneFormState {
     command: String,
     // Mode-row selection fields. Issue #1199: the row is `No mode`, then one
     // chip per orchestration, then the built-in options ([`BuiltinOption`]) —
-    // `schedule`, the flag-gated `schedule: issues`, and `dispatcher`.
+    // `schedule`, `schedule: issues`, and `dispatcher`.
     orchestrations: Vec<OrchestrationConfig>,
-    /// PRD #120: snapshot of [`crate::features::show_issue_dispatch_authoring`]
-    /// taken at form-construction time (the input seam). When true the cycler
-    /// offers the `schedule: issues` option after `schedule`; when false it is
-    /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
-    show_issue_dispatch: bool,
     /// PRD #220: when true the cycler offers the `dispatcher` option after
     /// `schedule: issues`. True for the ordinary `Ctrl+n` form (the feature has
     /// graduated out of the experimental flag); false only for the mode-locked
@@ -1261,10 +1255,6 @@ impl NewPaneFormState {
             name,
             command,
             orchestrations,
-            // PRD #120: gate at the input seam (CLAUDE.md #9) — snapshot the
-            // render wrapper once at construction so the count/name/cycler-cap
-            // all observe one consistent value.
-            show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
             // PRD #220: GRADUATED — the `dispatcher` option is offered to everyone.
             // It shipped behind `features::show_dispatcher()`; that wrapper is gone
             // and this branch is inlined (CLAUDE.md #9). The field itself stays,
@@ -1449,10 +1439,6 @@ impl NewPaneFormState {
             name: SCHEDULE_MODE_NAME.to_string(),
             command,
             orchestrations: Vec::new(),
-            // PRD #120: the manager's mode-locked form is plain-schedule authoring
-            // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
-            // the locked form hides the cycler entirely, so it never appears here.
-            show_issue_dispatch: false,
             show_dispatcher: false,
             selection_index: 0,
             has_mode_field: true,
@@ -1485,9 +1471,8 @@ impl NewPaneFormState {
         1 + self.orchestrations.len()
     }
 
-    /// PRD #120: cycler index of the flag-gated `schedule: issues` option —
-    /// appended directly after `schedule`. Only meaningful when
-    /// `show_issue_dispatch` is true.
+    /// PRD #120: cycler index of the `schedule: issues` option — appended
+    /// directly after `schedule`.
     fn issue_dispatch_index(&self) -> usize {
         self.schedule_index() + 1
     }
@@ -1495,7 +1480,7 @@ impl NewPaneFormState {
     /// PRD #220: cycler index of the dispatcher option — appended after
     /// `schedule: issues`. Only meaningful when `show_dispatcher` is true.
     fn dispatcher_index(&self) -> usize {
-        self.issue_dispatch_index() + if self.show_issue_dispatch { 1 } else { 0 }
+        self.issue_dispatch_index() + 1
     }
 
     /// Whether the built-in "schedule" authoring option is currently selected.
@@ -1503,9 +1488,9 @@ impl NewPaneFormState {
         self.selection_index == self.schedule_index()
     }
 
-    /// PRD #120: whether the flag-gated `schedule: issues` option is selected.
+    /// PRD #120: whether the `schedule: issues` option is selected.
     fn is_issue_dispatch_selected(&self) -> bool {
-        self.show_issue_dispatch && self.selection_index == self.issue_dispatch_index()
+        self.selection_index == self.issue_dispatch_index()
     }
 
     /// PRD #220: whether the dispatcher option is selected.
@@ -1530,12 +1515,9 @@ impl NewPaneFormState {
 
     fn mode_option_count(&self) -> usize {
         // +1 for the built-in "schedule" authoring option appended at the end,
-        // +1 more for the flag-gated "schedule: issues" option when shown,
+        // +1 more for the "schedule: issues" option,
         // +1 more for the dispatcher option (PRD #220).
-        1 + self.orchestrations.len()
-            + 1
-            + if self.show_issue_dispatch { 1 } else { 0 }
-            + if self.show_dispatcher { 1 } else { 0 }
+        1 + self.orchestrations.len() + 1 + 1 + if self.show_dispatcher { 1 } else { 0 }
     }
 
     fn select_next_mode(&mut self) {
@@ -1592,8 +1574,8 @@ impl NewPaneFormState {
             } else {
                 format!("Orch: {name}")
             }
-        } else if self.show_issue_dispatch && idx == self.issue_dispatch_index() {
-            // PRD #120: the flag-gated issue-dispatch authoring option.
+        } else if idx == self.issue_dispatch_index() {
+            // PRD #120: the issue-dispatch authoring option.
             ISSUE_DISPATCH_MODE_NAME.to_string()
         } else if self.show_dispatcher && idx == self.dispatcher_index() {
             // PRD #220: the dispatcher mode.
@@ -43596,10 +43578,11 @@ mod tests {
         // PRD #127 M3.2: + the built-in "schedule" authoring option.
         // PRD #220: + the built-in "dispatcher" option, which graduated out of the
         // experimental flag and is now offered on every `Ctrl+n` form.
-        assert_eq!(f.mode_option_count(), 4); // "No mode" + 1 orch + "schedule" + "dispatcher"
+        // Issue #193: + "schedule: issues", graduated the same way.
+        assert_eq!(f.mode_option_count(), 5); // "No mode" + 1 orch + "schedule" + "schedule: issues" + "dispatcher"
 
         let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
-        assert_eq!(f.mode_option_count(), 3); // "No mode" + "schedule" + "dispatcher"
+        assert_eq!(f.mode_option_count(), 4); // "No mode" + "schedule" + "schedule: issues" + "dispatcher"
     }
 
     /// Issue #1199: the Mode row's built-in options carry their own chip names
@@ -43670,8 +43653,9 @@ mod tests {
             vec![make_orchestration("tdd")],
         );
         // 0=No mode, 1=tdd, 2=schedule (PRD #127 M3.2 built-in),
-        // 3=dispatcher (PRD #220, graduated out of the experimental flag).
-        assert_eq!(f.mode_option_count(), 4);
+        // 3=schedule: issues (issue #193), 4=dispatcher (PRD #220); both
+        // graduated out of the experimental flag.
+        assert_eq!(f.mode_option_count(), 5);
 
         // Can't go below 0
         f.select_previous_mode();
@@ -43687,14 +43671,21 @@ mod tests {
         assert!(f.is_schedule_selected());
         assert!(f.selected_orchestration().is_none());
 
-        // PRD #220: index 3 is the built-in "dispatcher" option, now the LAST slot.
+        // Issue #193: index 3 is the built-in "schedule: issues" option.
         f.select_next_mode();
         assert_eq!(f.selection_index, 3);
+        assert!(f.is_issue_dispatch_selected());
+        assert_eq!(f.selected_builtin(), Some(BuiltinOption::IssueDispatch));
+        assert_eq!(f.mode_option_name(3), ISSUE_DISPATCH_MODE_NAME);
+
+        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot.
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 4);
         assert!(f.is_dispatcher_selected());
 
         // Can't go past last (dispatcher)
         f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
+        assert_eq!(f.selection_index, 4);
     }
 
     // PRD #127 M3.2: with the built-in "schedule" authoring option, the Mode
@@ -43967,8 +43958,6 @@ mod tests {
             String::new(),
             vec![make_orchestration("a")],
         );
-        // Both experimental options on, independent of the ambient env flag.
-        f.show_issue_dispatch = true;
         f.show_dispatcher = true;
 
         // "No mode" + 1 orchestration + schedule + schedule: issues + dispatcher.
@@ -44009,7 +43998,6 @@ mod tests {
             String::new(),
             vec![],
         );
-        f.show_issue_dispatch = true;
         f.show_dispatcher = true;
         f.selection_index = f.dispatcher_index();
         assert!(
@@ -44203,7 +44191,6 @@ mod tests {
     fn each_authoring_option_seeds_the_text_the_daemon_composes_for_its_kind() {
         let dir = PathBuf::from("/tmp/picked repo");
         let mut form = NewPaneFormState::new(dir.clone(), String::new(), String::new(), vec![]);
-        form.show_issue_dispatch = true;
         form.show_dispatcher = true;
         let cases = [
             (form.schedule_index(), AuthoringKind::Schedule),
@@ -44235,7 +44222,6 @@ mod tests {
     fn each_authoring_option_names_its_kind_to_the_daemon() {
         let dir = PathBuf::from("/tmp/picked repo");
         let mut form = NewPaneFormState::new(dir, String::new(), String::new(), vec![]);
-        form.show_issue_dispatch = true;
         form.show_dispatcher = true;
         for (selection_index, kind) in [
             (form.schedule_index(), AuthoringKind::Schedule),
@@ -44530,9 +44516,9 @@ mod tests {
             String::new(),
             vec![make_orchestration("review")],
         );
-        // 0=No mode, 1=review, 2=schedule, 3=dispatcher.
+        // 0=No mode, 1=review, 2=schedule, 3=schedule: issues, 4=dispatcher.
         assert_eq!(f.schedule_index(), 2);
-        assert_eq!(f.mode_option_count(), 4);
+        assert_eq!(f.mode_option_count(), 5);
 
         // PRD #220: `schedule` is no longer the LAST slot — the graduated
         // `dispatcher` option now sits after it, so cycling to the cap lands

@@ -108,7 +108,7 @@ function runtime(voice: ReturnType<typeof microphone>, crowded = false) {
       entries: path ? [] : NAMES.map((name) => ({ path: `${HOME}/${name}`, displayName: name, isProject: false })),
       truncated: false,
     })),
-    newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] })),
+    newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: ["schedule", "schedule-issues", "dispatcher"] })),
     getSettings: vi.fn(async () => ({ settings: structuredClone(DEFAULT_DESKTOP_SETTINGS), path: undefined })),
     saveSettings: vi.fn(async () => structuredClone(DEFAULT_DESKTOP_SETTINGS)),
     setZoom: vi.fn(async (level: number) => level),

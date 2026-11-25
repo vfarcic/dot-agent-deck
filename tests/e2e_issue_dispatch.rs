@@ -23,14 +23,13 @@
 //! worktree. Each test asserts that observable end-state — clone present,
 //! worktree created, per-issue agent(s) rooted in it — across the seam above.
 //!
-//! PRD #120 FINAL DECISION: the `experimental` flag gates only the CREATION UX
-//! (the new-pane `schedule: issues` option and the issue-dispatch authoring
-//! form), NOT the dispatch BEHAVIOR. A configured `issue_dispatch` task fires
-//! regardless of the flag, so these daemon-spawn envs carry no
-//! `DOT_AGENT_DECK_EXPERIMENTAL`. (The former `dispatch/010`, which asserted the
-//! flow stayed inert with the flag off, was removed when the behavior gate went
-//! away.) Flag-gated creation UX is covered by the `scheduler/cli`,
-//! `new-pane/issue-dispatch`, and `scheduler/manager` catalog families.
+//! The `experimental` flag gates nothing here: a configured `issue_dispatch`
+//! task fires regardless of it (PRD #120), and the creation UX it once gated —
+//! the new-pane `schedule: issues` option — graduated in issue #193. So these
+//! daemon-spawn envs carry no `DOT_AGENT_DECK_EXPERIMENTAL`. (The former
+//! `dispatch/010`, which asserted the flow stayed inert with the flag off, was
+//! removed when the behavior gate went away.) The creation UX is covered by the
+//! `scheduler/cli`, `prompt/new-pane`, and `scheduler/form` catalog families.
 
 dot_agent_deck_test_harness::link!();
 

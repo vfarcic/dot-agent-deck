@@ -1051,7 +1051,7 @@ describe("PRD #1401 — what close closes with the pull request browser open", (
     const { host } = fakeHost();
     const voice = renderAt(host, { kind: "overview" }, {
       listDirectories: vi.fn(async (_deckId: string, path?: string) => ({ kind: "listing" as const, path: path ?? "/tmp", displayPath: path ?? "/tmp", parent: "/", entries: [], truncated: false })),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: [] })),
     } as Partial<DeckRuntimeState>);
     act(() => voice.deliver({ kind: "dispatch", transcript: "open the PR for Coder 7", action: "open_pr", invoke: "openPullRequest", params: [{ name: "agent", kind: "agent_ref", spoken: "Coder 7", value: "7", label: "Coder 7" }], sentence: "Opening the pull request." }));
     await say(voice, 1);

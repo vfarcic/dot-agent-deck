@@ -668,7 +668,6 @@ export type NewAgentOptions =
      */
     defaultDir?: string;
     agents: NewAgentOption[];
-    experimental: boolean;
     authoringKinds: string[];
     lastCommand?: string;
   }
@@ -679,8 +678,7 @@ export type NewAgentOptions =
  * `desktop_features` reply, one field per `features::show_desktop_*` wrapper in
  * the root crate.
  *
- * It is the DESKTOP process's flag and belongs to the app, not to a deck — do
- * not confuse it with {@link NewAgentOptions}' per-deck `experimental`. All
+ * It is the DESKTOP process's flag and belongs to the app, not to a deck. All
  * `false` is the shipped default. The agent overview, the agent overlay and
  * Settings have no field because they are never gated.
  */

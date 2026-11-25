@@ -123,8 +123,6 @@ Some desktop surfaces are hidden unless the `experimental` flag is on, and these
 
 **How the desktop app reads the flag.** From its own environment, once, when it starts: set `DOT_AGENT_DECK_EXPERIMENTAL=1` in the environment the app is launched from, or set `DOT_AGENT_DECK_FEATURES_CONFIG` to the path of a `.dot-agent-deck.toml` whose `[features]` table sets `experimental = true`. When both are set, `DOT_AGENT_DECK_EXPERIMENTAL` wins. Unlike the TUI and the daemon, the desktop app does not look for a `.dot-agent-deck.toml` in any directory, and it does not notice a change until it is restarted. An app launched from the macOS Dock or Finder, or from a Linux desktop menu, does not inherit variables exported in your shell profile; on Linux, start it from a terminal instead: `DOT_AGENT_DECK_EXPERIMENTAL=1 dot-agent-deck-desktop`.
 
-One flag reaches the desktop app from the daemon instead: the **schedule: issues** chip in **New agent** appears only when the **daemon** you are creating the agent on has `experimental` on, as the TUI's does.
-
 ## When something goes wrong
 
 - **Nothing on the Dashboard, or a daemon section with a title instead of agents:** see [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there).
