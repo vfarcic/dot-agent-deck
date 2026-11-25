@@ -659,6 +659,81 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     );
 }
 
+/// A model the provider no longer serves. Claude Code starts on it when it is
+/// given on the command line (it refuses it from `/model`), and every turn run
+/// on it ends on the provider's error, which Claude Code reports with
+/// `StopFailure` instead of `Stop` (`scheduler/idle-worker/032` uses it too).
+const RETIRED_CLAUDE_MODEL: &str = "claude-3-7-sonnet-20250219";
+
+/// The card status `record()` reports, lowercased.
+fn live_status(claude: &Claude) -> String {
+    claude.record()["live"]["status"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// How many times message `id` has been handed to the agent.
+fn deliveries(claude: &Claude, id: &str) -> u64 {
+    claude.listing()["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["id"] == id)
+        .and_then(|m| m["deliveries"].as_u64())
+        .unwrap_or(0)
+}
+
+/// Scenario: Run interactive Claude Code idle in its deck pane on a model the provider rejects, so every turn ends on the provider's error, as a turn does when the API is overloaded. Post a task without typing into the pane: Claude Code's own wake hands it over and the turn fails, so the card reads Error (the control: an idle pane is woken). Then post a second task, still typing nothing: it must be handed to Claude Code too, so that a pane whose last turn ended on an API error is still woken for the next message (issue #2385).
+#[spec("inbox/claude/058")]
+#[test]
+#[cfg(target_os = "linux")]
+fn claude_058_live_a_turn_ended_by_an_api_error_still_wakes_for_the_next_message() {
+    skip_unless!(common::check_claude_available());
+    let claude = Claude::launch(&common::capability_export_command(&format!(
+        "exec claude --model {RETIRED_CLAUDE_MODEL} --permission-mode {CLAUDE_PERMISSION_MODE} \
+         --allowedTools Bash Read Write"
+    )));
+
+    // Control: an idle pane is woken, and the turn ends on the provider's error.
+    let first = claude.post(&claude.directive("api-error-first-5b1e07.txt"));
+    assert!(
+        common::wait_until(budget(), || deliveries(&claude, &first) >= 1
+            && live_status(&claude) == "error"),
+        "the first task must be handed over and its turn end on the provider's error; {}",
+        claude.evidence()
+    );
+    eprintln!(
+        "after the failed turn: status={} armed={} first_deliveries={}",
+        live_status(&claude),
+        claude.listing()["armed"],
+        deliveries(&claude, &first)
+    );
+
+    // The user's symptom: the next message must still reach the agent.
+    let next = claude.post(&claude.directive("api-error-next-5b1e07.txt"));
+    assert!(
+        common::wait_until(budget(), || deliveries(&claude, &next) >= 1),
+        "a pane whose last turn ended on an API error must still be woken for the next \
+         message, but it was never handed over (status {}, armed {}); {}",
+        live_status(&claude),
+        claude.listing()["armed"],
+        claude.evidence()
+    );
+    common::wait_until(budget(), || !claude.witnessed(&next).is_empty());
+    let witnessed = claude.witnessed(&next);
+    eprintln!(
+        "transcript entries witnessed for {next}: {witnessed:?}\nPane:\n{}",
+        claude.pane_grid()
+    );
+    assert!(
+        !witnessed.is_empty(),
+        "Claude Code's transcript must show it took the next message; lines naming it:\n{}\n{}",
+        claude.transcript_lines(&next).join("\n"),
+        claude.evidence()
+    );
+}
+
 /// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's waiter, and post a directive task naming a sentinel (SKIP when the deck's Claude Code facts are not Go). The doorbell rings and that prompt is blocked, so Claude runs no turn and puts the line back in its input box; the card must read Idle again with the doorbell held as awaiting a prompt. Pressing Enter in the pane sends the line, Haiku writes the sentinel once, and the task is acknowledged with two deliveries.
 #[spec("inbox/claude/053")]
 #[test]

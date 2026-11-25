@@ -65,7 +65,7 @@ fn component_for(agent: &str) -> InboxComponent {
 
 /// The hook JSON on stdin, read in the background and abandoned if the hook
 /// runner never closes it.
-fn read_hook_session() -> Option<InboxWaitSession> {
+fn read_hook_json() -> Option<serde_json::Value> {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         return None;
@@ -79,12 +79,31 @@ fn read_hook_session() -> Option<InboxWaitSession> {
         let _ = tx.send(text);
     });
     let text = rx.recv_timeout(HOOK_STDIN_WAIT).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The session a hook's JSON names, for the wait request.
+fn hook_session(value: &serde_json::Value) -> InboxWaitSession {
     let field = |name: &str| value.get(name).and_then(|v| v.as_str()).map(str::to_string);
-    Some(InboxWaitSession {
+    InboxWaitSession {
         source: field("source"),
         session_id: field("session_id"),
-    })
+    }
+}
+
+/// Issue #2385: whether the hook that started this waiter is a Claude Code
+/// `StopFailure` for a usage or credit limit. The provider will refuse the
+/// agent's next turn too, so no waiter arms: its messages wait, as they do
+/// for a Blocked card, until the agent works again and its next turn end
+/// arms one. Any other failure (an overloaded or erroring API) arms a waiter
+/// as a turn that ends normally does, so the next message still wakes it.
+fn turn_ended_blocked(value: &serde_json::Value) -> bool {
+    let field = |name: &str| value.get(name).and_then(|v| v.as_str());
+    field("hook_event_name") == Some("StopFailure")
+        && matches!(
+            crate::hook::claude_stop_failure_outcome(field("error"), field("transcript_path")),
+            crate::quota_signals::FailureOutcome::Blocked { .. }
+        )
 }
 
 fn parent_pid() -> Option<u32> {
@@ -154,7 +173,11 @@ pub fn wait(agent: &str, stream: bool, receipt: Receipt) -> ExitCode {
     if identity.token.is_none() {
         return not_in_deck;
     }
-    let session = if stream { None } else { read_hook_session() };
+    let hook = if stream { None } else { read_hook_json() };
+    if hook.as_ref().is_some_and(turn_ended_blocked) {
+        return ExitCode::SUCCESS;
+    }
+    let session = hook.as_ref().map(hook_session);
     // PRD #1666 part 2: the once-waiter asks the deck whether it serves
     // receipts, on the connection its wait then takes.
     let question = if stream {
@@ -1219,6 +1242,70 @@ mod tests {
         assert!(unserved_stream(true, Receipt::default()));
         assert!(!unserved_stream(true, receipts));
         assert!(!unserved_stream(false, Receipt::default()));
+    }
+
+    /// Issue #2385: a Claude Code turn that ends on an API error arms a
+    /// waiter as a normal turn end does, so the next message still wakes it;
+    /// only a usage or credit limit, which the provider will refuse again,
+    /// arms none.
+    #[test]
+    fn only_a_turn_ended_by_a_usage_limit_arms_no_waiter() {
+        let hook = |event: &str, error: Option<&str>, transcript: Option<&str>| {
+            serde_json::json!({
+                "hook_event_name": event,
+                "session_id": "s",
+                "error": error,
+                "transcript_path": transcript,
+            })
+        };
+        assert!(!turn_ended_blocked(&hook("Stop", None, None)));
+        assert!(!turn_ended_blocked(&hook("SessionStart", None, None)));
+        assert!(!turn_ended_blocked(&hook(
+            "StopFailure",
+            Some("server_error"),
+            None
+        )));
+        assert!(!turn_ended_blocked(&hook(
+            "StopFailure",
+            Some("unknown"),
+            None
+        )));
+        // A 429 with no record to read is a transient capacity refusal.
+        assert!(!turn_ended_blocked(&hook(
+            "StopFailure",
+            Some("rate_limit"),
+            None
+        )));
+        assert!(turn_ended_blocked(&hook(
+            "StopFailure",
+            Some("billing_error"),
+            None
+        )));
+
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = |name: &str, record: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("{record}\n")).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        let limit = transcript(
+            "limit.jsonl",
+            r#"{"type":"assistant","isSidechain":false,"error":"rate_limit","isApiErrorMessage":true,"quotaLimits":{"status":"rejected","resetsAt":1790409000}}"#,
+        );
+        assert!(turn_ended_blocked(&hook(
+            "StopFailure",
+            Some("rate_limit"),
+            Some(&limit)
+        )));
+        let transient = transcript(
+            "transient.jsonl",
+            r#"{"type":"assistant","isSidechain":false,"error":"rate_limit","isApiErrorMessage":true,"apiErrorIsTransient":true}"#,
+        );
+        assert!(!turn_ended_blocked(&hook(
+            "StopFailure",
+            Some("rate_limit"),
+            Some(&transient)
+        )));
     }
 
     /// A writer that refuses everything, as a closed stdout does.

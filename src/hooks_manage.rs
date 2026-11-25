@@ -117,6 +117,9 @@ pub struct ClaudeHookGates {
     pub post_tool_use_failure: bool,
     /// The native inbox waiter (PRD #1666, [`CLAUDE_ASYNC_REWAKE_MIN`]).
     pub async_rewake: bool,
+    /// The native inbox waiter on `StopFailure` too (issue #2385,
+    /// [`CLAUDE_STOP_FAILURE_REWAKE_MIN`]).
+    pub stop_failure_rewake: bool,
 }
 
 impl ClaudeHookGates {
@@ -129,6 +132,7 @@ impl ClaudeHookGates {
             post_tool_use_failure: version
                 .is_some_and(|v| v >= POST_TOOL_USE_FAILURE_MIN_CLAUDE_VERSION),
             async_rewake: version.is_some_and(|v| v >= CLAUDE_ASYNC_REWAKE_MIN),
+            stop_failure_rewake: version.is_some_and(|v| v >= CLAUDE_STOP_FAILURE_REWAKE_MIN),
         }
     }
 
@@ -174,6 +178,17 @@ pub(crate) const CLAUDE_VERSION_PROBE_TIMEOUT: std::time::Duration =
 /// measurement. The waiter's `rewakeMessage` / `rewakeSummary` keys ride the
 /// same gate; they are `@internal` in Claude Code ([`WAITER_REWAKE_MESSAGE`]).
 pub const CLAUDE_ASYNC_REWAKE_MIN: (u64, u64, u64) = (2, 1, 296);
+
+/// Issue #2385: the first Claude Code release the deck writes its native inbox
+/// waiter on `StopFailure` for, so that a turn an API error ended still
+/// leaves the session woken by its next message.
+///
+/// **Measured, not a known minimum**, like [`CLAUDE_ASYNC_REWAKE_MIN`]: the
+/// lane-2 test `inbox/claude/058` passed on 2.1.328, 2.1.330 and 2.1.332 (a
+/// waiter started by `StopFailure` that exits 2 wakes the session, and its
+/// transcript shows the message). Below it a turn that fails leaves no waiter,
+/// as before.
+pub const CLAUDE_STOP_FAILURE_REWAKE_MIN: (u64, u64, u64) = (2, 1, 328);
 
 /// PRD #1666 S6: the text Claude Code puts ahead of a waiter's message when it
 /// wakes the session, in place of its default `Stop hook blocking error from
@@ -244,8 +259,12 @@ fn settings_have_waiter(text: &str) -> bool {
         .any(|command| command.trim_end().ends_with(WAITER_COMMAND_SUFFIX))
 }
 
-/// The hook types that carry a waiter beside their status handler.
-const WAITER_HOOK_TYPES: &[&str] = &["SessionStart", "Stop"];
+/// The hook types that carry a waiter beside their status handler: every
+/// turn end, including one an API error ended (issue #2385). `StopFailure` is
+/// written only for a Claude Code that accepts it, so its waiter is too. The
+/// waiter itself declines to arm after a usage or credit limit
+/// (`crate::inbox_cli`).
+const WAITER_HOOK_TYPES: &[&str] = &["SessionStart", "Stop", STOP_FAILURE_HOOK];
 
 /// The waiter's hook `timeout`, in seconds: one day. Claude Code's 600 s
 /// default kills an idle waiter silently (spike §e); 86,400 s was observed
@@ -579,6 +598,7 @@ fn hook_types_all() -> Vec<&'static str> {
         permission_request: true,
         post_tool_use_failure: true,
         async_rewake: true,
+        stop_failure_rewake: true,
     })
 }
 
@@ -1172,7 +1192,9 @@ fn install_impl_in(
     for &hook_type in &hook_types {
         let rules = ensure_hook_array(hooks_obj, hook_type);
         let before = rules.clone();
-        let waiter_here = gates.async_rewake && WAITER_HOOK_TYPES.contains(&hook_type);
+        let waiter_here = gates.async_rewake
+            && WAITER_HOOK_TYPES.contains(&hook_type)
+            && (hook_type != STOP_FAILURE_HOOK || gates.stop_failure_rewake);
         let deck_commands_before = rule_command_strs(rules)
             .into_iter()
             .filter(|cmd| deck_owned(cmd))
@@ -2409,6 +2431,7 @@ mod tests {
                 permission_request: true,
                 post_tool_use_failure: true,
                 async_rewake: false,
+                stop_failure_rewake: false,
             }
         );
         assert_eq!(
@@ -2418,6 +2441,7 @@ mod tests {
                 permission_request: false,
                 post_tool_use_failure: true,
                 async_rewake: false,
+                stop_failure_rewake: false,
             }
         );
         assert_eq!(
@@ -2515,10 +2539,11 @@ mod tests {
     #[test]
     fn install_rewrites_the_prompt_hook_and_the_waiters_as_one_unit() {
         let gates = ClaudeHookGates {
-            stop_failure: false,
+            stop_failure: true,
             permission_request: false,
             post_tool_use_failure: false,
             async_rewake: true,
+            stop_failure_rewake: true,
         };
         let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
         let new = crate::test_paths::abs("/opt/new/dot-agent-deck");
@@ -2551,16 +2576,59 @@ mod tests {
         }
     }
 
+    /// Issue #2385: from [`CLAUDE_STOP_FAILURE_REWAKE_MIN`] the `StopFailure`
+    /// rule carries the waiter beside its status handler, so a turn an API
+    /// error ended still leaves the session woken by its next message; below
+    /// it the rule holds the status handler alone, and reinstalling on an
+    /// older Claude Code takes a waiter written earlier back out.
+    #[test]
+    fn the_stop_failure_waiter_is_gated_on_its_measured_release() {
+        let binary = crate::test_paths::abs("/opt/deck/dot-agent-deck");
+        let stop_failure_commands = |settings: &Value| -> Vec<String> {
+            settings["hooks"][STOP_FAILURE_HOOK]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|rule| rule["hooks"].as_array().cloned().unwrap_or_default())
+                .filter_map(|handler| handler["command"].as_str().map(str::to_string))
+                .collect()
+        };
+        let (major, minor, patch) = CLAUDE_STOP_FAILURE_REWAKE_MIN;
+        let older = ClaudeHookGates::for_version(Some((major, minor, patch - 1)));
+        let measured = ClaudeHookGates::for_version(Some(CLAUDE_STOP_FAILURE_REWAKE_MIN));
+        assert!(older.stop_failure && older.async_rewake && !older.stop_failure_rewake);
+        assert!(measured.stop_failure_rewake);
+
+        let mut settings = serde_json::json!({});
+        install_impl_gated(&mut settings, &binary, measured);
+        let status = hook_command(&binary);
+        assert_eq!(
+            stop_failure_commands(&settings),
+            [status.clone(), waiter_command_for(&status)]
+        );
+        install_impl_gated(&mut settings, &binary, older);
+        assert_eq!(
+            stop_failure_commands(&settings),
+            std::slice::from_ref(&status)
+        );
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][1]["command"],
+            waiter_command_for(&status),
+            "the Stop waiter stays"
+        );
+    }
+
     /// A waiter added beside a status handler the deck shares with a user's
     /// hook goes into that shared rule, never into a rule of the user's own
     /// that holds no deck handler.
     #[test]
     fn a_new_waiter_joins_the_rule_holding_the_status_handler() {
         let gates = ClaudeHookGates {
-            stop_failure: false,
+            stop_failure: true,
             permission_request: false,
             post_tool_use_failure: false,
             async_rewake: true,
+            stop_failure_rewake: true,
         };
         let binary = crate::test_paths::abs("/opt/deck/dot-agent-deck");
         let status = hook_command(&binary);
