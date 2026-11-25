@@ -10,7 +10,7 @@ import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
 import { CARD_ACTION_FORM_OPENED, CARD_ACTION_REMOVAL_ASKED, VOICE_ACTIONS } from "../lib/voiceActions";
 import type { AgentCardAction, AgentCardEntry, CardBatchOutcome, DeckRuntimeState, DeckView } from "../types";
-import { VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
+import { VOICE_CHAIN_SETTLE_MS, VOICE_STATUS_POLL_MS } from "./VoiceControlPanel";
 import { agentKey } from "./AgentOverview";
 
 /*
@@ -667,6 +667,45 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     const editor = screen.getByRole("dialog", { name: `Card actions: ${farName}` });
     expect(editor).toBeInTheDocument();
     expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
+
+    await speak(run.voice, "open card actions on the local daemon");
+    expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: `Card actions: ${localName}` })).toBeInTheDocument();
+    expect(readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID);
+  });
+
+  /// Scenario: With two daemons showing cards, say "open card actions and add a card action" without naming a daemon. The chain stops at its first step on a "Which daemon?" choice listing both daemons, and no editor opens and no form appears on a guessed daemon. Choosing the second daemon opens its Card actions editor and the chain goes on with its next step there, opening the empty form. Afterwards "open card actions on the local daemon" opens that editor at once, with no choice left over from the chain (PR #2491, Qodo 12).
+  it("desktop/agent-cards/115: a chained open card actions with several daemons asks which daemon, and goes on with the chosen one", async () => {
+    const readCardCatalog = vi.fn(async () => ({ actions: [], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
+    const [local, far] = createFixtureFleet("fleet");
+    const localName = deckName(local.connection);
+    const farName = deckName(far.connection);
+    const said = "open card actions and add a card action";
+    type ChainStep = Extract<VoiceResultDto["outcome"], { kind: "chain" }>["steps"][number];
+    const steps: ChainStep[] = [
+      { said: "open card actions", action: "open_card_actions_editor", invoke: "openCardActionsEditor", params: [], sentence: "Opening the Card actions editor.", screen: "overview" },
+      { said: "add a card action", action: "add_card_action", invoke: "addCardAction", params: [], sentence: "Adding a card action.", screen: "overview" },
+    ];
+    const resolveVoice = vi.fn(async (transcript: string): Promise<VoiceResultDto> => transcript === said
+      ? { backend: "stub", resolveMs: 21, outcome: { kind: "chain", transcript, steps, sentence: "Opening the Card actions editor, then adding a card action." } }
+      : transcript === "open card actions on the local daemon"
+        ? { backend: "stub", resolveMs: 21, outcome: { kind: "dispatch", transcript, action: "open_card_actions_editor", invoke: "openCardActionsEditor", params: [{ name: "deck", kind: "deck_ref", spoken: localName, value: FIXTURE_DAEMON_ID, label: localName }], sentence: "Done." } }
+        : { backend: "stub", resolveMs: 21, outcome: { kind: "no_match", transcript, sentence: "No match." } });
+    const run = setup((agents) => [cardFor(agents[0].id, "coder-card")], () => ({}), { extra: { readCardCatalog, editCardCatalog: vi.fn(), resolveVoice }, remote: true });
+    await turnOnVoice();
+    await speak(run.voice, said);
+    const choice = screen.getByRole("dialog", { name: "Which daemon?" });
+    expect(within(choice).getByRole("button", { name: new RegExp(localName) })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /^Card actions: / }), "no editor opens on a guessed daemon").toBeNull();
+    expect(readCardCatalog).not.toHaveBeenCalled();
+
+    await act(async () => { fireEvent.click(within(choice).getByRole("button", { name: new RegExp(farName) })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
+    expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
+    const editor = screen.getByRole("dialog", { name: `Card actions: ${farName}` });
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    expect((within(editor).getByLabelText("Name") as HTMLInputElement).value, "the chain went on with its next step in the chosen daemon's editor").toBe("");
     await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
 
     await speak(run.voice, "open card actions on the local daemon");

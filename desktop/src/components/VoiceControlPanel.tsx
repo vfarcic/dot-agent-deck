@@ -3234,9 +3234,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * ({@link askVoiceChoice}) as a `param_ambiguous` tie of the row it was
    * dispatching, so the choice, its answers and its gates are the ones a name
    * that fits several agents gets. `false` when no choice can be offered,
-   * which leaves the refusal already reported.
+   * which leaves the refusal already reported. With `chain`, the dispatch was
+   * a chain's step: the chain pauses on the choice, and its answer goes on
+   * with the steps after it (Qodo 12 on PR #2491).
    */
-  const offerAsked = useCallback((answer: VoiceResultDto, outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, asked: VoiceChoiceAsk, declared: VoiceContext) => {
+  const offerAsked = useCallback((answer: VoiceResultDto, outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, asked: VoiceChoiceAsk, declared: VoiceContext, chain?: VoiceChainPause) => {
     if (outcome.invoke === undefined) return false;
     const candidates: VoiceResolvedParamDto[] = asked.candidates.map((candidate) => ({ name: asked.param, kind: asked.kind, spoken: "", value: candidate.value, label: candidate.label, names: [candidate.label] }));
     const tie: VoiceResultDto = {
@@ -3254,7 +3256,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         sentence: asked.sentence,
       },
     };
-    if (!offerChoice(tie, declared)) return false;
+    if (!offerChoice(tie, declared, chain)) return false;
     setResult(tie);
     return true;
   }, [offerChoice]);
@@ -3281,7 +3283,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     setResult({ outcome, resolveMs: null, backend: NUMBERS_BACKEND });
     refusedRef.current = false;
+    choiceAsked.current = undefined;
     const dispatched = dispatchDeclared(outcome, declared);
+    /* An entry names what it runs on, so nothing it dispatches is offered as a choice; an ask is not left behind. */
+    choiceAsked.current = undefined;
     if (refusedRef.current) setResult(undefined);
     else if (!dispatched) setProblem(NOTHING_DISPATCHED);
     else if (dispatched.undo) setUndo({ run: dispatched.undo });
@@ -3486,7 +3491,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     setResult({ outcome, resolveMs: null, backend: offer.backend });
     refusedRef.current = false;
     refusalRef.current = undefined;
+    choiceAsked.current = undefined;
     const dispatched = dispatchDeclared(outcome, offer.declared);
+    /* The answer to a choice carries what was chosen; an ask is not offered again, nor left behind. */
+    choiceAsked.current = undefined;
     if (paused) {
       if (refusedRef.current) {
         setResult(undefined);
@@ -3662,10 +3670,17 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       refusedRef.current = false;
       refusalRef.current = undefined;
-      const dispatched = dispatchDeclaredRef.current(
-        { kind: "dispatch", transcript: chain.transcript, action: step.action, invoke: step.invoke, params: step.params, sentence: step.sentence },
-        index === 0 ? declared : { ...now, deck: judgedOn.deck, incarnations: declared.incarnations },
-      );
+      choiceAsked.current = undefined;
+      const outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }> = { kind: "dispatch", transcript: chain.transcript, action: step.action, invoke: step.invoke, params: step.params, sentence: step.sentence };
+      const dispatched = dispatchDeclaredRef.current(outcome, index === 0 ? declared : { ...now, deck: judgedOn.deck, incarnations: declared.incarnations });
+      const asked = choiceAsked.current as VoiceChoiceAsk | undefined;
+      choiceAsked.current = undefined;
+      /* Qodo 12 on PR #2491 — the step asked which one ("open card actions"
+         with several daemons): the chain pauses on that numbered choice, as on
+         a step that matched several things, and nothing after it runs on a
+         guess. Its answer goes on from the next step (`dispatchChoice`); a
+         choice that cannot be offered stops the chain on the refusal. */
+      if (asked && offerAsked({ outcome, resolveMs: null, backend }, outcome, asked, judgedOn, { ...progress, index, chain, declared, backend })) return;
       if (refusedRef.current) {
         stop(index, refusalRef.current ?? "it was refused");
         return;
@@ -3684,7 +3699,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (from) setResult({ outcome: { ...chain, sentence: `${progress.reports.map((report, at) => at === 0 ? report.replace(/\.$/u, "") : report.charAt(0).toLowerCase() + report.slice(1).replace(/\.$/u, "")).join(", then ")}.` }, resolveMs: null, backend });
     const undos = progress.undos;
     if (progress.reversible && undos.length === chain.steps.length) setUndo({ run: () => { for (const undo of [...undos].reverse()) undo(); } });
-  }, [current, offerChoice, setProblem]);
+  }, [current, offerAsked, offerChoice, setProblem]);
   useEffect(() => { runChainRef.current = runChain; }, [runChain]);
 
   const resolveOne = useCallback(async (utterance: string, ours: () => boolean, alone?: string) => {
