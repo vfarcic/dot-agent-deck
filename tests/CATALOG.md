@@ -17778,6 +17778,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** in the light and the dark theme, an action icon on a card, in the selection bar and in the Card panel is drawn differently under the pointer than at rest (background or outline shadow), has an outline at least 2 px wide under keyboard focus (`:focus-visible`), and its tooltip, by pointer and by keyboard, sits within a few pixels of the icon's bottom or top edge, starting over it (PR #2491 v9 review).
 - **Does not assert:** contrast ratios of the marks.
 
+##### desktop/agent-cards/101 — A spoken label more than one button shares is refused, never read as a different button.
+- **Test:** vitest `desktop/agent-cards/101: …` in `desktop/src/lib/agentCards.test.ts` (the matcher) and `desktop/src/components/AgentCardsVoice.test.tsx` (two cases, through the real shell's voice dispatch).
+- **Layer:** pure function, then desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam.
+- **Asserts:** `spokenLabelMatch` answers `found`, `none` or `ambiguous`; two buttons labelled "Send report" beside one labelled "Report" make "send report" ambiguous, not Report; a partial label two buttons share ("deploy", "press deploy") is ambiguous; "answer it" still finds the button labelled "Answer it", and "press deploy staging" still finds Deploy staging once the phrase as said matches nothing; spoken, each ambiguous label is refused with "…'s card has more than one action called …, so nothing was sent.", no review opens and nothing is sent (PR #2491 review J3, audit K2).
+- **Does not assert:** the batch routes' ambiguity sentence, beyond sharing the matcher.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

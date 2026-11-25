@@ -212,32 +212,51 @@ export function linkOf(type: string, value: unknown): string | undefined {
 }
 
 /**
+ * What a spoken label names on a card (PR #2491 review J3, audit K2): one
+ * action, none, or more than one — an ambiguous label is refused, never read
+ * as "none" and retried as something else.
+ */
+export type SpokenLabelMatch =
+  | { outcome: "found"; action: AgentCardAction }
+  | { outcome: "none" }
+  | { outcome: "ambiguous"; count: number };
+
+/**
  * The action a spoken label names on `entry`: an action's label, or a question
  * option's label (its action is `question/<q>/<o>`). Matched ignoring case and
- * surrounding punctuation; `undefined` when none or more than one matches.
+ * surrounding punctuation. The command model gives back "answer main" for
+ * "answer main to the coder" — the verb the user said, then the button's
+ * words — so the phrase is tried again without a leading `answer`, `press`,
+ * `send` or `say`, but only when it named nothing as said: a label that
+ * starts with the verb itself is found whole, and one several buttons share
+ * stays ambiguous.
  */
-export function actionBySpokenLabel(entry: AgentCardEntry, spoken: string): AgentCardAction | undefined {
+export function spokenLabelMatch(entry: AgentCardEntry, spoken: string): SpokenLabelMatch {
   const norm = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
   const wanted = norm(spoken);
-  if (!wanted) return undefined;
-  const found = matchSpokenLabel(entry, wanted, norm);
-  if (found !== undefined) return found;
-  /* PR #2491 voice fixtures: for "answer main to the coder" the command model
-     gives back "answer main" — the verb the user said, then the button's
-     words. A label that itself starts with the verb matched above. */
+  if (!wanted) return { outcome: "none" };
+  const said = matchSpokenLabel(entry, wanted, norm);
+  if (said.outcome !== "none") return said;
   const bare = wanted.replace(/^(answer|press|send|say)\s+/, "");
-  return bare !== wanted && bare ? matchSpokenLabel(entry, bare, norm) : undefined;
+  return bare !== wanted && bare ? matchSpokenLabel(entry, bare, norm) : said;
 }
 
-function matchSpokenLabel(entry: AgentCardEntry, wanted: string, norm: (value: string) => string): AgentCardAction | undefined {
+/** {@link spokenLabelMatch}'s action when it found exactly one; `undefined` for none and for an ambiguous label. */
+export function actionBySpokenLabel(entry: AgentCardEntry, spoken: string): AgentCardAction | undefined {
+  const match = spokenLabelMatch(entry, spoken);
+  return match.outcome === "found" ? match.action : undefined;
+}
+
+function matchSpokenLabel(entry: AgentCardEntry, wanted: string, norm: (value: string) => string): SpokenLabelMatch {
   const optionLabels = new Map<string, string>();
   for (const question of entry.questions) for (const option of question.options) optionLabels.set(option.action_id, option.label);
   const labelOf = (action: AgentCardAction) => optionLabels.get(action.id) ?? action.label;
-  const exact = entry.actions.filter((action) => norm(labelOf(action)) === wanted || norm(action.id) === wanted);
-  if (exact.length === 1) return exact[0];
-  if (exact.length > 1) return undefined;
-  const partial = entry.actions.filter((action) => norm(labelOf(action)).includes(wanted));
-  return partial.length === 1 ? partial[0] : undefined;
+  const pick = (found: AgentCardAction[]): SpokenLabelMatch | undefined => (
+    found.length === 1 ? { outcome: "found", action: found[0] } : found.length > 1 ? { outcome: "ambiguous", count: found.length } : undefined
+  );
+  return pick(entry.actions.filter((action) => norm(labelOf(action)) === wanted || norm(action.id) === wanted))
+    ?? pick(entry.actions.filter((action) => norm(labelOf(action)).includes(wanted)))
+    ?? { outcome: "none" };
 }
 
 /** The label an action shows: a question option's own label, else the action's. */

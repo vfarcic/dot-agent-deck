@@ -392,6 +392,29 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ deckId: "deck-build", agentId }), "go-ahead", expect.objectContaining({ requestId: expect.any(String) }));
   });
 
+  /// Scenario: the voice card agent's card has two buttons labelled "Send report" and a catalog button labelled "Report"; say "send report", then "send" with a partial label two buttons share. Each is refused out loud as naming more than one button, and nothing is sent or opened for review.
+  it.each([
+    { said: "send report", label: "send report" },
+    { said: "press deploy", label: "press deploy" },
+  ])("desktop/agent-cards/101: a spoken label more than one button shares is refused out loud ($said)", async ({ said, label }) => {
+    const agentId = createFixtureSnapshot("connected").agents[0].id;
+    const twin = (agents: { id: string }[]) => {
+      const base = cardFor(agents[0].id, "voice-card-agent");
+      return [{ ...base, questions: [], actions: [
+        action("first", { label: "Send report", prompt: "Send the report.", custom: true, source: "agent", prompt_source: "agent" }),
+        action("second", { label: "Send report", prompt: "Send the other report.", custom: true, source: "agent", prompt_source: "agent" }),
+        action("report", { label: "Report", prompt: "Report your status." }),
+        action("deploy-a", { label: "Deploy staging", prompt: "Deploy staging." }),
+        action("deploy-b", { label: "Deploy production", prompt: "Deploy production." }),
+      ] }];
+    };
+    const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, label, said), { entries: twin });
+    await speak(resolveVoice);
+    expect(await screen.findByText(`voice-card-agent's card has more than one action called "${label}", so nothing was sent.`)).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
+    expect(invokeCardAction).not.toHaveBeenCalled();
+  });
+
   /// Scenario: say "press re-run tests on the voice card agent's card", an action whose text the agent wrote. The single-action review opens showing that exact text, the voice row says why, and nothing is sent until Send is pressed, which sends it once.
   it("desktop/agent-cards/008: a spoken action the agent wrote opens its review and sends nothing", async () => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;

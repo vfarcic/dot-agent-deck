@@ -1363,4 +1363,3 @@ file = "desktop/src/components/AgentCardBatchDialog.tsx"
 handler = "onClick"
 code = "() => setSkippedOpen((open) => !open)"
 reason = "The batch confirmation's skipped line: lists the skipped agents grouped by reason where the line counts them by reason. It changes what the open dialog shows and acts on nothing; the line itself says how many were skipped and why, and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) and is sent only by hand."
-

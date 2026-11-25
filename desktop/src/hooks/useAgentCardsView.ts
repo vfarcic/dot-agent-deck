@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
+import { cardTarget, spokenLabelMatch, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
 import { boundOpenCards, cardTree, openableReference, pathTo, pruneOpenCards, readOpenCards, writeOpenCards } from "../lib/agentCardsTree";
 import { newCardRequestId } from "../lib/bridge";
 import type { CardReferenceTarget } from "../lib/prBrowser";
@@ -20,6 +20,24 @@ const NO_CARD_NEEDS_YOU = "No other agent needs you right now.";
 const NO_CARDS = "There are no agents with cards to move between.";
 /** …when voice named an action whose text the agent wrote: it opens for review instead of sending. */
 const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so it is shown for you to read first: press Send to send it.`;
+
+/** …when a spoken label names more than one of a card's buttons (PR #2491 review J3, audit K2). */
+const ambiguousLabel = (name: string, label: string) => `${name}'s card has more than one action called "${displayText(label, DISPLAY_LIMITS.name)}", so nothing was sent.`;
+
+/**
+ * The batch action a spoken label names: the first card, in order, whose
+ * buttons it names gives it; a card on which it names more than one button
+ * makes it `ambiguous`, refused rather than read as another card's.
+ */
+function spokenChoice(cards: readonly PlacedCard[], choices: readonly CardBatchChoice[], label: string): CardBatchChoice | "ambiguous" | undefined {
+  for (const each of cards) {
+    const spoken = spokenLabelMatch(each.entry, label);
+    if (spoken.outcome === "ambiguous") return "ambiguous";
+    const choice = spoken.outcome === "found" ? choices.find((candidate) => candidate.id === spoken.action.id) : undefined;
+    if (choice) return choice;
+  }
+  return undefined;
+}
 
 /** …when voice asks for a card's tree on a card with nothing under it. */
 const nothingUnder = (name: string) => `${name} has no cards under it.`;
@@ -487,9 +505,11 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
       const card = find(ref);
       if (!card) return CARD_GONE;
       const name = displayText(card.entry.name, DISPLAY_LIMITS.name);
+      const spoken = wanted.actionId === undefined ? spokenLabelMatch(card.entry, wanted.label ?? "") : undefined;
+      if (spoken?.outcome === "ambiguous") return ambiguousLabel(name, wanted.label ?? "");
       const action = wanted.actionId !== undefined
         ? card.entry.actions.find((candidate) => candidate.id === wanted.actionId)
-        : actionBySpokenLabel(card.entry, wanted.label ?? "");
+        : spoken?.outcome === "found" ? spoken.action : undefined;
       if (!action) return wanted.label !== undefined ? `${name}'s card has no single action called "${displayText(wanted.label, DISPLAY_LIMITS.name)}", so nothing was sent.` : CARD_GONE;
       setRowMenu(undefined);
       if (!action.enabled) return `${displayText(action.label, DISPLAY_LIMITS.name)} is disabled: ${disabledReasonSentence(action.disabled_reason)}.`;
@@ -544,11 +564,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
       const choices = batchChoices(cards);
       let choice = wanted.actionId !== undefined ? choices.find((candidate) => candidate.id === wanted.actionId) : undefined;
       if (wanted.actionId === undefined && wanted.label !== undefined) {
-        for (const each of cards) {
-          const spoken = actionBySpokenLabel(each.entry, wanted.label);
-          choice = spoken ? choices.find((candidate) => candidate.id === spoken.id) : undefined;
-          if (choice) break;
-        }
+        const spoken = spokenChoice(cards, choices, wanted.label);
+        if (spoken === "ambiguous") return ambiguousLabel(name, wanted.label);
+        choice = spoken;
       }
       if (!choice) return wanted.label !== undefined ? `Neither ${name} nor any card under it has an action called "${displayText(wanted.label, DISPLAY_LIMITS.name)}", so nothing was sent.` : CARD_GONE;
       return startBatch(cards, choice.id, choice.label, subtreeScope(card, cards));
@@ -588,11 +606,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
       let choice = wanted.actionId !== undefined ? choices.find((candidate) => candidate.id === wanted.actionId) : undefined;
       /* A spoken label is matched the way a single card's is, against each selected card's own buttons. */
       if (wanted.actionId === undefined && wanted.label !== undefined) {
-        for (const each of cards) {
-          const spoken = actionBySpokenLabel(each.entry, wanted.label);
-          choice = spoken ? choices.find((candidate) => candidate.id === spoken.id) : undefined;
-          if (choice) break;
-        }
+        const spoken = spokenChoice(cards, choices, wanted.label);
+        if (spoken === "ambiguous") return `A selected card has more than one action called "${displayText(wanted.label, DISPLAY_LIMITS.name)}", so nothing was sent.`;
+        choice = spoken;
         if (!choice) return `None of the selected cards has an action called "${displayText(wanted.label, DISPLAY_LIMITS.name)}", so nothing was sent.`;
       }
       if (!choice) return "None of the selected cards offers that action any more, so nothing was sent.";

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentCardEntry, AgentCardsSnapshot } from "../types";
-import { acceptCardsSnapshot, actionBySpokenLabel, deliverySentence, exactTextSegments, exactTextString, placedCardKey, primaryNeedsReview, promptPreview, pruneCardResults, reconcileCards, type CardResults, type PlacedCard } from "./agentCards";
+import { acceptCardsSnapshot, actionBySpokenLabel, spokenLabelMatch, deliverySentence, exactTextSegments, exactTextString, placedCardKey, primaryNeedsReview, promptPreview, pruneCardResults, reconcileCards, type CardResults, type PlacedCard } from "./agentCards";
 
 /*
  * PRD #2374 review round 1 — the pure halves of the cards' safety fixes: the
@@ -147,5 +147,24 @@ describe("actionBySpokenLabel (PR #2491 voice fixtures)", () => {
     expect(actionBySpokenLabel(card, "answer it")?.id).toBe("answer-it");
     expect(actionBySpokenLabel(card, "main")?.id).toBe("question/base/main");
     expect(actionBySpokenLabel(card, "answer deploy")).toBeUndefined();
+  });
+  /* desktop/agent-cards/101 (J3, K2): a label two buttons share is refused,
+     never turned into a third button by dropping the verb. */
+  it("desktop/agent-cards/101: tells found, none and ambiguous apart, and never strips the verb off an ambiguous label", () => {
+    const twin = {
+      actions: [action("first", "Send report"), action("second", "Send report"), action("report", "Report"), action("answer-it", "Answer it"), action("deploy-a", "Deploy staging"), action("deploy-b", "Deploy production")],
+      questions: [],
+    } as unknown as AgentCardEntry;
+    // Duplicate exact labels: ambiguous, and "Report" is not what was said.
+    expect(spokenLabelMatch(twin, "send report")).toEqual({ outcome: "ambiguous", count: 2 });
+    expect(actionBySpokenLabel(twin, "send report")).toBeUndefined();
+    // An ambiguous partial match is refused too, verb or not.
+    expect(spokenLabelMatch(twin, "deploy")).toEqual({ outcome: "ambiguous", count: 2 });
+    expect(spokenLabelMatch(twin, "press deploy")).toEqual({ outcome: "ambiguous", count: 2 });
+    // The unique label that starts with a verb is still found whole.
+    expect(spokenLabelMatch(twin, "answer it")).toEqual({ outcome: "found", action: expect.objectContaining({ id: "answer-it" }) });
+    // A verb in front of a unique label is still found once the plain phrase matches nothing.
+    expect(spokenLabelMatch(twin, "press deploy staging")).toEqual({ outcome: "found", action: expect.objectContaining({ id: "deploy-a" }) });
+    expect(spokenLabelMatch(twin, "say nothing like it")).toEqual({ outcome: "none" });
   });
 });
