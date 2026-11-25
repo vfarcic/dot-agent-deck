@@ -2275,6 +2275,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .card-source { display: inline-block; margin-right: 4px; padding: 0 4px; border-radius: 3px; font-size: var(--text-xs); font-weight: 600; vertical-align: 1px; }
 .card-source.is-agent { color: var(--muted); border: 1px dashed var(--line-strong); }
 .card-source.is-deck { color: var(--teal); background: var(--teal-soft); }
+.card-source.is-catalog { color: var(--muted); border: 1px solid var(--line); }
+.agent-cards-batch-text-source { margin: 0; }
 .card-custom { margin-left: 5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 3px; color: var(--faint); font-size: var(--text-xs); font-weight: 500; }
 .agent-card-fields { margin: 0; display: grid; gap: 4px; font-size: var(--text-sm); }
 .agent-card-field { display: grid; grid-template-columns: minmax(80px, 35%) minmax(0, 1fr); gap: 8px; }

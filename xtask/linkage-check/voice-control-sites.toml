@@ -1355,8 +1355,8 @@ reason = "One icon in the Card actions form's icon grid: dispatches the choice t
 [[site]]
 file = "desktop/src/components/AgentCardBatchDialog.tsx"
 handler = "onClick"
-code = "() => setIncludedOpen((open) => !open)"
-reason = "The batch confirmation's +N more: lists every included agent's name where the dialog shows the first few. It changes what the open dialog shows and acts on nothing; the dialog already counts the agents in words, and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) and is sent only by hand."
+code = "() => toggleGroup(groupKey)"
+reason = "The batch confirmation's +N more, one per text group: lists every name in that group where the dialog shows the first few, while every distinct text stays quoted (PR #2491 audit K1). It changes what the open dialog shows and acts on nothing; the dialog already counts the agents in words, and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) and is sent only by hand."
 
 [[site]]
 file = "desktop/src/components/AgentCardBatchDialog.tsx"

@@ -113,20 +113,22 @@ function sameText(rows: readonly BatchRow[]): BatchRow[][] {
 }
 
 /**
- * The included groups as the confirmation lists them: every name, or, folded,
- * only the first {@link INCLUDED_SHOWN} names across the groups in order. A
- * group whose names are all folded is not drawn; one partly folded keeps its
- * quotation and lists its first names.
+ * PR #2491 audit K1 — the names one text group lists: every name, or, folded,
+ * only the first {@link INCLUDED_SHOWN}. Folding hides names and nothing else:
+ * every distinct text a batch sends is quoted, whatever the list's length.
  */
-function foldIncluded(groups: readonly BatchRow[][], folded: boolean): { rows: BatchRow[]; shown: BatchRow[] }[] {
-  if (!folded) return groups.map((rows) => ({ rows, shown: rows }));
-  let left = INCLUDED_SHOWN;
-  return groups.flatMap((rows) => {
-    if (left <= 0) return [];
-    const shown = rows.slice(0, left);
-    left -= shown.length;
-    return [{ rows, shown }];
-  });
+function foldNames(rows: readonly BatchRow[], open: boolean): readonly BatchRow[] {
+  return rows.length > INCLUDED_FOLD_AFTER && !open ? rows.slice(0, INCLUDED_SHOWN) : rows;
+}
+
+/**
+ * Who wrote a group's text, marked on its quotation: `agent says` when any of
+ * its agents' copy is the agent's, else the catalog's (PR #2491 audit K1).
+ */
+function GroupSource({ rows }: { rows: readonly BatchRow[] }) {
+  return rows.some((row) => row.entry.prompt_source === "agent")
+    ? <span className="card-source is-agent" data-testid="agent-cards-batch-source" title="Written by the agent; the deck did not check it">agent says</span>
+    : <span className="card-source is-catalog" data-testid="agent-cards-batch-source" title="From your catalog">catalog</span>;
 }
 
 /** What an action with no text does to the agents of one group. */
@@ -137,12 +139,12 @@ function closeWords(kind: string | undefined, label: string, several: boolean): 
 }
 
 /**
- * PR #2491 decision 2026-11-25 — how many included agents' names the
- * confirmation lists before the rest fold behind a "+N more": the list stays
- * readable with hundreds of agents, and a press shows every one.
+ * PR #2491 decision 2026-11-25 — how many names one text group lists before
+ * the rest fold behind its own "+N more": the list stays readable with
+ * hundreds of agents, and a press shows every one. Texts never fold (audit K1).
  */
 export const INCLUDED_SHOWN = 8;
-/** Past this many included agents, the names past {@link INCLUDED_SHOWN} fold. */
+/** Past this many agents in one text group, its names past {@link INCLUDED_SHOWN} fold. */
 const INCLUDED_FOLD_AFTER = 10;
 
 /**
@@ -206,12 +208,19 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
   /* The two disclosures (PR #2491 decision 2026-11-25): the skipped agents' list and the included names past the first few. */
   // voice-registry-exempt: whether the confirmation lists every skipped agent, a disclosure of what the open dialog already counts
   const [skippedOpen, setSkippedOpen] = useState(false);
-  // voice-registry-exempt: whether the confirmation lists every included agent's name, a disclosure of what the open dialog already counts
-  const [includedOpen, setIncludedOpen] = useState(false);
+  // voice-registry-exempt: which text groups list every included agent's name, a disclosure of what the open dialog already counts
+  const [openGroups, setOpenGroups] = useState<ReadonlySet<string>>(() => new Set());
   const skippedListId = useId();
   const includedListId = useId();
   const previewed = rowsOf(view.groups);
   const included = previewed.filter((row) => row.entry.outcome === "included");
+  const textGroups = sameText(included);
+  const distinctTexts = textGroups.filter(([first]) => first.entry.prompt !== undefined && first.entry.prompt !== null).length;
+  const toggleGroup = (groupKey: string) => setOpenGroups((current) => {
+    const next = new Set(current);
+    if (!next.delete(groupKey)) next.add(groupKey);
+    return next;
+  });
   const skipped = previewed.filter((row) => row.entry.outcome !== "included");
   const names = new Map(previewed.flatMap((row) => (row.entry.name ? [[rowKey(row), row.entry.name] as const] : [])));
   const kinds = new Map(previewed.flatMap((row) => (row.entry.kind ? [[rowKey(row), row.entry.kind] as const] : [])));
@@ -258,19 +267,24 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
           {view.error && <p className="agent-cards-batch-error" role="alert">Nothing was sent: {displayText(view.error, DISPLAY_LIMITS.message)}</p>}
           {!done && view.stage !== "previewing" && !view.error && (
             <>
-              <h3>{included.length === 0 ? "No agent gets this action" : `Sends to ${included.length} ${included.length === 1 ? "agent" : "agents"}`}</h3>
+              <h3>{included.length === 0 ? "No agent gets this action" : `Sends to ${included.length} ${included.length === 1 ? "agent" : "agents"}${distinctTexts > 1 ? `: ${distinctTexts} different texts` : ""}`}</h3>
               {included.length > 0 && (
                 <ul className="agent-cards-batch-list" id={includedListId}>
-                  {foldIncluded(sameText(included), included.length > INCLUDED_FOLD_AFTER && !includedOpen).map(({ rows: group, shown: listed }) => {
+                  {textGroups.map((group, index) => {
                     const [first] = group;
+                    const groupKey = rowKey(first);
+                    const listId = `${includedListId}-${index}`;
+                    const open = openGroups.has(groupKey);
+                    const listed = foldNames(group, open);
+                    /* Every distinct text is quoted with who wrote it, however long the list (audit K1). */
                     const what = (several: boolean) => (first.entry.prompt
-                      ? <><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt"><ExactText text={first.entry.prompt} /></blockquote><ExactTextNote text={first.entry.prompt} /></>
+                      ? <><p className="agent-cards-batch-text-source"><GroupSource rows={group} /></p><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt"><ExactText text={first.entry.prompt} /></blockquote><ExactTextNote text={first.entry.prompt} /></>
                       : <p className="agent-cards-batch-what">{closeWords(first.entry.kind, label, several)}</p>);
                     const badge = (row: BatchRow) => row.entry.prompt_source === "agent" && <SourceBadge source="agent" />;
                     /* One agent: its row holds the text, as it always did. */
                     if (group.length === 1) {
                       return (
-                        <li key={rowKey(first)} className="agent-cards-batch-group" data-testid="agent-cards-batch-group">
+                        <li key={groupKey} className="agent-cards-batch-group" data-testid="agent-cards-batch-group">
                           <div className="agent-cards-batch-entry is-included" data-testid="agent-cards-batch-entry">
                             {who(first, badge(first))}
                             {what(false)}
@@ -278,27 +292,27 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
                         </li>
                       );
                     }
-                    /* Several agents get the same text: it is quoted once, then the agents that get it. */
+                    /* Several agents get the same text: it is quoted once, then the agents that get it, folded past the first few. */
                     return (
-                      <li key={rowKey(first)} className="agent-cards-batch-group is-shared" data-testid="agent-cards-batch-group">
+                      <li key={groupKey} className="agent-cards-batch-group is-shared" data-testid="agent-cards-batch-group">
                         {what(true)}
                         <p className="agent-cards-batch-gets">{first.entry.prompt ? `Each of these ${group.length} agents gets exactly this text:` : `For each of these ${group.length} agents:`}</p>
-                        <ul className="agent-cards-batch-list">
+                        <ul className="agent-cards-batch-list" id={listId}>
                           {listed.map((row) => (
                             <li key={rowKey(row)} className="agent-cards-batch-entry is-included" data-testid="agent-cards-batch-entry">
                               {who(row, badge(row))}
                             </li>
                           ))}
                         </ul>
+                        {group.length > INCLUDED_FOLD_AFTER && (
+                          <button type="button" className="agent-cards-batch-more" data-testid="agent-cards-batch-more" aria-expanded={open} aria-controls={listId} onClick={() => toggleGroup(groupKey)}>
+                            {open ? "Show fewer" : `+${group.length - INCLUDED_SHOWN} more`}
+                          </button>
+                        )}
                       </li>
                     );
                   })}
                 </ul>
-              )}
-              {included.length > INCLUDED_FOLD_AFTER && (
-                <button type="button" className="agent-cards-batch-more" data-testid="agent-cards-batch-more" aria-expanded={includedOpen} aria-controls={includedListId} onClick={() => setIncludedOpen((open) => !open)}>
-                  {includedOpen ? "Show fewer" : `+${included.length - INCLUDED_SHOWN} more`}
-                </button>
               )}
               {skipped.length > 0 && (
                 <section className="agent-cards-batch-skipped" aria-label="Skipped agents">

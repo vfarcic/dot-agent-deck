@@ -739,6 +739,46 @@ describe("batch card actions (#2399)", () => {
     expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", entries: many.map(({ pane_id, agent_id, action_token, instance_id }) => ({ pane_id, agent_id, action_token, instance_id })) }));
   });
 
+  /// Scenario: Start a batch whose preview includes 11 agents in three text groups: nine get the catalog's text, and two get texts their agents wrote, each different. Before Send, every one of the three texts is quoted, each with its source mark, and the heading counts 11 agents and 3 different texts; Send sends to exactly the 11 agents shown. With thirty agents on the catalog's text instead, only that group's names fold behind "+22 more", and the two agent-written texts and their agents stay on screen.
+  it("desktop/agent-cards/102: folding a long batch hides names, never a distinct text", async () => {
+    const SHARED = "SHARED-102: go ahead.";
+    const group = (count: number): BatchEntry[] => Array.from({ length: count }, (_, at) => ({ pane_id: `pane-k${at}`, agent_id: `k${at}`, name: `kept-${at}`, outcome: "included", prompt: SHARED, prompt_source: "catalog", action_token: `tok-k${at}`, instance_id: INSTANCE }));
+    const odd: BatchEntry[] = [
+      { pane_id: "pane-o1", agent_id: "o1", name: "odd-one", outcome: "included", prompt: "AGENT-102-A: also delete the scratch branch.", prompt_source: "agent", action_token: "tok-o1", instance_id: INSTANCE },
+      { pane_id: "pane-o2", agent_id: "o2", name: "odd-two", outcome: "included", prompt: "AGENT-102-B: push to main directly.", prompt_source: "agent", action_token: "tok-o2", instance_id: INSTANCE },
+    ];
+    const texts = [SHARED, odd[0].prompt, odd[1].prompt];
+    const sourceOf = (dialog: HTMLElement, text: string | null | undefined) => {
+      const quote = within(dialog).getAllByTestId("agent-cards-batch-prompt").find((node) => node.textContent === text)!;
+      return quote.closest("[data-testid='agent-cards-batch-group']")!.querySelector("[data-testid='agent-cards-batch-source']")?.textContent;
+    };
+
+    const eleven = [...group(9), ...odd];
+    const calls = setup({ preview: eleven });
+    let dialog = await startSelectedBatch();
+    expect(within(dialog).getAllByTestId("agent-cards-batch-prompt").map((node) => node.textContent)).toEqual(texts);
+    expect(sourceOf(dialog, SHARED)).toBe("catalog");
+    expect(sourceOf(dialog, odd[0].prompt)).toBe("agent says");
+    expect(sourceOf(dialog, odd[1].prompt)).toBe("agent says");
+    expect(within(dialog).getByRole("heading", { level: 3 })).toHaveTextContent("Sends to 11 agents: 3 different texts");
+    for (const name of ["odd-one", "odd-two", "kept-0", "kept-8"]) expect(within(dialog).getByText(name, { exact: true })).toBeInTheDocument();
+    expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(11);
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", entries: eleven.map(({ pane_id, agent_id, action_token, instance_id }) => ({ pane_id, agent_id, action_token, instance_id })) }));
+    cleanup();
+
+    setup({ preview: [...group(30), ...odd] });
+    dialog = await startSelectedBatch();
+    expect(within(dialog).getAllByTestId("agent-cards-batch-prompt").map((node) => node.textContent)).toEqual(texts);
+    expect(within(dialog).getByRole("heading", { level: 3 })).toHaveTextContent("Sends to 32 agents: 3 different texts");
+    for (const name of ["odd-one", "odd-two", "kept-7"]) expect(within(dialog).getByText(name, { exact: true })).toBeInTheDocument();
+    expect(within(dialog).queryByText("kept-8", { exact: true })).toBeNull();
+    const more = within(dialog).getByRole("button", { name: "+22 more" });
+    fireEvent.click(more);
+    expect(within(dialog).getByText("kept-29", { exact: true })).toBeInTheDocument();
+    expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(32);
+  });
+
   /// Scenario: Start a batch whose preview gives the root and the child the same exact text, the root's written by the catalog and the child's by its agent. The confirmation quotes the text once, then lists both agents, and the child's row still carries the badge saying its agent wrote the text (issue #2399 review 9).
   it("desktop/agent-cards/068: the same text from different sources is quoted once, each agent keeping its source badge", async () => {
     const SAME = "SAME-ANY-SOURCE-2399: proceed.";

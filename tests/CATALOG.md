@@ -17737,7 +17737,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/093: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed batch bridge.
-- **Asserts:** with 30 included agents sharing one text, the text is quoted once and at most 10 names are listed with a collapsed "+N more" button counting the rest; pressing it lists all 30; Send executes all 30 previewed entries (PR #2491 decision 2026-11-25).
+- **Asserts:** with 30 included agents sharing one text, the text is quoted once and at most 10 names are listed with a collapsed "+N more" button under that text counting the rest; pressing it lists all 30; Send executes all 30 previewed entries (PR #2491 decision 2026-11-25).
 - **Does not assert:** how many names show before the fold beyond "at most 10".
 
 ##### desktop/agent-cards/094 — In an agent's pane, voice works the Card panel and moves between agents.
@@ -17789,6 +17789,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop shell (jsdom), real `DeckShell` with a stand-in terminal.
 - **Asserts:** a card's `url`, `pull_request` and `issue` fields holding `https://` addresses the agent chose show in the Card panel's Fields as text, with no `<a>` anywhere in the fields and none pointing at the agent's address (PR #2491 audit K3).
 - **Does not assert:** that the deck-checked reference badges still open their pages (`025`, `018`).
+
+##### desktop/agent-cards/102 — Folding a long batch hides names, never a distinct text.
+- **Test:** vitest `desktop/agent-cards/102: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed batch bridge.
+- **Asserts:** with 11 included agents in three text groups (nine on the catalog's text, two on different texts their agents wrote), all three texts are quoted before Send, the catalog's marked `catalog` and each agent's `agent says`, the heading reads "Sends to 11 agents: 3 different texts", all 11 names are listed, and Send executes exactly those 11 previewed entries; with 30 on the catalog's text instead, all three texts stay quoted, that group alone lists 8 names and "+22 more", the two agent-written agents stay listed, and pressing it lists all 32 (PR #2491 audit K1).
+- **Does not assert:** the dialog's layout at narrow widths (`033`).
 
 ## Desktop native driver scenarios
 
