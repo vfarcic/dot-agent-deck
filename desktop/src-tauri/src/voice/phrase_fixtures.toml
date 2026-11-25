@@ -295,6 +295,39 @@ action = "filter_needs_you_cards"
 outcome = "dispatch"
 resolved_needs_you = "off"
 
+# PR #2491 review T2: the user docs give "turn off needs you only" as a way
+# back to every agent while Needs you only is on, in either view.
+[[fixtures]]
+name = "needs-you-only-off-turn-off-needs-you-only"
+utterance = "turn off needs you only"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-turn-off-needs-you-only-on-cards"
+utterance = "turn off needs you only"
+screen = "overview"
+dashboard_view = "cards"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+# The user docs say "show everything" turns Needs you only off while it is on.
+[[fixtures]]
+name = "needs-you-only-off-show-everything"
+utterance = "show everything"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
 # The words the rows above do not take keep their own rows while Needs you only
 # is on: "clear the filter" still clears the dashboard's filter, and a view
 # named without "all" still switches views. ("Show everything" said while Needs
