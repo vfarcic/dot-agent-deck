@@ -2370,7 +2370,10 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .overview-card-menu-button { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-card-menu-button:hover, .overview-card-menu-button:focus-visible, .overview-card-menu-button[aria-expanded="true"] { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
 .overview-card-menu-list { position: absolute; z-index: 20; top: 24px; right: 0; min-width: 160px; padding: 4px; display: grid; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--paper-strong); box-shadow: 0 10px 30px rgb(var(--scrim-rgb) / .2); }
-.overview-card-menu-list button { padding: 6px 8px; border: 0; border-radius: 4px; color: var(--ink); background: transparent; font-size: var(--text-sm); text-align: left; cursor: pointer; }
+/* PR #2491 — a ⋯ menu stays inside the window: MoreMenu places it (placeMenu) and caps its width to the window, and a long item ellipsizes, its whole text on hover. */
+.overview-card-menu-list { max-width: calc(100vw - 16px); grid-template-columns: minmax(0, 1fr); }
+.more-menu-label { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overview-card-menu-list button { min-width: 0; padding: 6px 8px; border: 0; border-radius: 4px; color: var(--ink); background: transparent; font-size: var(--text-sm); text-align: left; cursor: pointer; }
 .overview-card-menu-list button:hover, .overview-card-menu-list button:focus-visible { background: var(--teal-soft); }
 .overview-card-menu-list button:disabled { color: var(--faint); cursor: default; }
 .overview-card-menu-list button:focus { outline: none; background: var(--teal-soft); }
