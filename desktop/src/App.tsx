@@ -381,6 +381,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * settings state instead of taking this one would re-create the bug.
    */
   const settings = useDesktopSettings(runtime);
+  useAppliedAppearance(settings);
   /* Issue #2075 — one OS notification per question left unanswered for the
      `[questions] notify` minutes, for every deck in the fleet, on every
      screen: which is why it is mounted here beside the settings it reads. */
@@ -1989,6 +1990,7 @@ function AgentPaneFrame({ open, offPage, onOpen, onClose, stopContext, generateC
  */
 export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
   const settings = useDesktopSettings(props.runtime);
+  useAppliedAppearance(settings);
   // Issue #1197: the rail and the Settings sheet are the shell's, so a deck
   // rendered on its own carries the same pair {@link DeckShell} does.
   const { open, setOverlay, closeOverlays, deck } = useShellOverlays("deck");
@@ -2011,6 +2013,33 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
 }
 
 /** A deck tile's identity: its deck, agent id and the daemon process that listed it. */
+/**
+ * PRD #743: the Appearance choice, put on the document root on LOAD as well as
+ * on change. One effect keyed on the stored value means the panel only has to
+ * save — the change is optimistic in `useDesktopSettings`, so this runs on the
+ * click rather than after the disk write, and there is no restart and no second
+ * path that could disagree with this one.
+ *
+ * Called by the shell that owns the settings instance (`DeckShell`, and
+ * `ControlDeck` for a deck rendered on its own), not by a screen: it lived in
+ * `DeckSurface` until PR #2491, so on the Dashboard — the screen the app opens
+ * on since #1307, with the deck behind the experimental flag — a choice made in
+ * Settings applied only at the next launch.
+ */
+function useAppliedAppearance(settings: DesktopSettingsState): void {
+  useEffect(() => {
+    // Issue #845: NOT before the mode is one somebody chose. Until then
+    // `settings` holds the unread placeholder — mode "system" — and applying
+    // System is `removeAttribute`, which would erase the attribute the Rust
+    // side put on the root before this bundle ran (`pre_paint_script` in
+    // `src-tauri/src/appearance.rs`) and flash the OS palette on the way to a
+    // value it already had. `chosen` rather than `loaded`, because a choice
+    // made before the read resolves must still apply on the click.
+    if (!settings.chosen) return;
+    applyAppearance(settings.settings.appearance.mode);
+  }, [settings.chosen, settings.settings.appearance.mode]);
+}
+
 function tileKey(agent: { daemonId: string; id: string; incarnation?: string }): string {
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
@@ -2257,23 +2286,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
   orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
   const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
-
-  // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
-  // keyed on the stored value means the panel only has to save — the change
-  // is optimistic in `useDesktopSettings`, so this runs on the click rather
-  // than after the disk write, and there is no restart and no second path
-  // that could disagree with this one.
-  useEffect(() => {
-    // Issue #845: NOT before the mode is one somebody chose. Until then
-    // `settings` holds the unread placeholder — mode "system" — and applying
-    // System is `removeAttribute`, which would erase the attribute the Rust
-    // side put on the root before this bundle ran (`pre_paint_script` in
-    // `src-tauri/src/appearance.rs`) and flash the OS palette on the way to a
-    // value it already had. `chosen` rather than `loaded`, because a choice
-    // made before the read resolves must still apply on the click.
-    if (!settings.chosen) return;
-    applyAppearance(settings.settings.appearance.mode);
-  }, [settings.chosen, settings.settings.appearance.mode]);
 
   useEffect(() => {
     if (!selectedAgentId || !snapshot.agents.some((agent) => agent.id === selectedAgentId)) {
