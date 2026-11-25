@@ -44,6 +44,7 @@ expression: buf
    │  i                  deck messages: retry or cancel                                                  │    
    │  o                  open pull request                                                               │    
    │  u / ctrl+u         upgrade (update badge)                                                          │    
+   │  u                  upgrade all daemons                                                             │    
    │  a / c              restart notice: list / dismiss                                                  │    
    │  i / x              interrupted work: list / hide                                                   │    
    │  pageup / pagedown  scroll focused pane                                                             │    

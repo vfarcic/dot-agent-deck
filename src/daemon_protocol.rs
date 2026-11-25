@@ -4991,7 +4991,7 @@ impl AttachResponse {
             // compile time like `build_version`, so it rides every hello
             // reply — including the static `daemon hello` CLI probe. Additive
             // and optional; a future option B classifies on this field.
-            daemon_version: Some(env!("DAD_VERSION").to_string()),
+            daemon_version: Some(crate::build_id::local_daemon_version()),
             // Issue #801: the contract signal rides every hello reply, including
             // the static `daemon hello` CLI probe — a compile-time constant with
             // no registry to consult, exactly like the two fields above it.

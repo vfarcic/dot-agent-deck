@@ -373,6 +373,10 @@ pub enum UiMode {
     /// (default `u`) or a click on the footer's update badge. Its state lives
     /// in `UiState::upgrade_dialog`.
     Upgrade,
+    /// Issue #1600: the Upgrade all daemons dialog, opened by the
+    /// `upgrade_all_daemons` key (default `U`). Its state lives in
+    /// `UiState::upgrade_all`.
+    UpgradeAll,
     /// PRD #1666 §6.4: the picker of the selected card's deck messages that
     /// wait on the user's Retry or Cancel, opened by the `inbox_attention` key
     /// (default `i`). Its state lives in `UiState::inbox_attention`.
@@ -2190,6 +2194,12 @@ struct UiState {
     /// if `Ctrl+C` took the deck to the quit dialog, so the upgrade key
     /// reopens it on the same run.
     upgrade_dialog: Option<crate::upgrade_dialog::UpgradeDialog>,
+    /// Issue #1600: the open Upgrade all daemons dialog and the work behind
+    /// it. Kept while its upgrades run, so the key reopens the same run.
+    upgrade_all: Option<(
+        crate::upgrade_all_dialog::UpgradeAllDialog,
+        crate::upgrade_all_dialog::Job,
+    )>,
     /// Issue #1635: the upgrade that put this TUI's own copy's newer build on
     /// disk, kept until the TUI restarts: that copy is no longer offered, and
     /// the badge says to restart when nothing else is behind.
@@ -2800,6 +2810,7 @@ impl UiState {
             question_notified: HashSet::new(),
             upgrade_check: None,
             upgrade_dialog: None,
+            upgrade_all: None,
             upgrade_installed: None,
             upgrade_results: None,
             upgrade_recheck: false,
@@ -5984,6 +5995,10 @@ pub enum Action {
     /// Issue #1635: a click on one of the upgrade dialog's buttons — mouse
     /// parity for its keys.
     UpgradeChoose(crate::upgrade_dialog::UpgradeChoice),
+    /// Issue #1600: open the Upgrade all daemons dialog (default `U`).
+    OpenUpgradeAll,
+    /// Issue #1600: a click on one of its buttons — mouse parity for its keys.
+    UpgradeAllChoose(crate::upgrade_all_dialog::Choice),
     /// PRD #127 finding #4: the manager dialog's `[Add]` button — mouse parity
     /// for the `a` key. Closes the dialog and spawns the seeded authoring agent
     /// with a blank context (same outcome as pressing `a`).
@@ -8187,6 +8202,115 @@ fn apply_upgrade_effect(ui: &mut UiState, effect: crate::upgrade_dialog::Effect)
 fn sync_upgrade_state(ui: &mut UiState, snapshot: &AppState, state: &SharedState) {
     ui.upgrade_check = snapshot.upgrade_check.clone();
     drain_upgrade_results(ui, state);
+    drain_upgrade_all(ui);
+}
+
+/// Issue #1600: open the Upgrade all daemons dialog, which starts checking
+/// every remote deck on the deck list at once. A dialog kept because its
+/// batch is still running is reopened instead.
+fn open_upgrade_all_dialog(ui: &mut UiState) {
+    if ui.upgrade_all.is_some() {
+        ui.mode = UiMode::UpgradeAll;
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let job = crate::upgrade_all_dialog::Job::check(&handle);
+            ui.upgrade_all = Some((crate::upgrade_all_dialog::UpgradeAllDialog::new(), job));
+            ui.mode = UiMode::UpgradeAll;
+        }
+        Err(e) => {
+            ui.status_message = Some((
+                format!("Upgrade all daemons could not start: {e}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+}
+
+/// Issue #1600: the dialog owns the keyboard while it is open.
+fn handle_upgrade_all_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    match ui.upgrade_all.as_mut() {
+        Some((dialog, _)) => {
+            let effect = dialog.handle_key(key);
+            apply_upgrade_all_effect(ui, effect);
+        }
+        None => ui.mode = UiMode::Normal,
+    }
+    Action::Continue
+}
+
+/// Issue #1600: close the dialog. An open question is answered Keep current
+/// daemon, the answer every way out gives.
+fn close_upgrade_all(ui: &mut UiState) {
+    if let Some((_, mut job)) = ui.upgrade_all.take() {
+        job.answer(crate::daemon_upgrade::RestartChoice::KeepCurrent);
+    }
+}
+
+/// Issue #1600: act on what a key or a click did in the dialog.
+fn apply_upgrade_all_effect(ui: &mut UiState, effect: crate::upgrade_all_dialog::Effect) {
+    use crate::upgrade_all_dialog::Effect;
+    match effect {
+        Effect::None => {}
+        Effect::Close => {
+            close_upgrade_all(ui);
+            ui.mode = UiMode::Normal;
+        }
+        Effect::Start => {
+            if let (Some((_, job)), Ok(handle)) = (
+                ui.upgrade_all.as_mut(),
+                tokio::runtime::Handle::try_current(),
+            ) {
+                job.run(&handle);
+            }
+        }
+        Effect::Stop => {
+            if let Some((_, job)) = ui.upgrade_all.as_ref() {
+                job.stop();
+            }
+        }
+        Effect::Answer(choice) => {
+            if let Some((_, job)) = ui.upgrade_all.as_mut() {
+                job.answer(choice);
+            }
+        }
+    }
+}
+
+/// Issue #1600: hand what the check and the run reported to the dialog, once
+/// a frame. While the dialog is not on screen, a question brings it back in
+/// command mode, so a daemon does not wait on an answer nobody can see; in any
+/// other mode, where keys belong to something else, the status bar says what
+/// is waiting, as it does when the batch finishes.
+fn drain_upgrade_all(ui: &mut UiState) {
+    let Some((dialog, job)) = ui.upgrade_all.as_mut() else {
+        return;
+    };
+    let was_asking = asking(dialog);
+    let was_done = matches!(dialog.phase(), crate::upgrade_all_dialog::Phase::Done(_));
+    job.poll(dialog);
+    let now_asking = !was_asking && asking(dialog);
+    let now_done = !was_done && matches!(dialog.phase(), crate::upgrade_all_dialog::Phase::Done(_));
+    if ui.mode == UiMode::UpgradeAll || !(now_asking || now_done) {
+        return;
+    }
+    if now_asking && ui.mode == UiMode::Normal {
+        ui.mode = UiMode::UpgradeAll;
+        return;
+    }
+    let key = display_notation(&ui.keybindings, KbAction::UpgradeAllDaemons);
+    let message = if now_asking {
+        format!("Upgrade all daemons is waiting for your answer. Press {key} to see it.")
+    } else {
+        format!("Upgrade all daemons finished. Press {key} to see the results.")
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// Whether a daemon in the batch is waiting on the dialog's answer.
+fn asking(dialog: &crate::upgrade_all_dialog::UpgradeAllDialog) -> bool {
+    matches!(dialog.phase(), crate::upgrade_all_dialog::Phase::Running(run) if run.question.is_some())
 }
 
 /// Issue #1635: what `Effect::Run(index)` upgrades: the plan the open dialog
@@ -9878,6 +10002,11 @@ fn handle_normal_key(
     if pressed(KbAction::OpenUpgrade) {
         return Action::OpenUpgrade;
     }
+    // Issue #1600: check every remote deck and upgrade the older ones
+    // (default `U`).
+    if kb.matches(KbAction::UpgradeAllDaemons, &key) {
+        return Action::OpenUpgradeAll;
+    }
     // PRD #385 M5: copy mode on the focused pane (default `v`). The
     // dispatcher resolves the pane and does nothing when none is focused.
     if kb.matches(KbAction::CopyMode, &key) {
@@ -11187,6 +11316,7 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     // the user was about to type into: no key may act behind it.
     if mode == UiMode::CloseConfirm
         || mode == UiMode::Upgrade
+        || mode == UiMode::UpgradeAll
         || mode == UiMode::TrustPrompt
         || mode == UiMode::AntigravityNotice
     {
@@ -11536,6 +11666,8 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             // Issue #1635: the upgrade dialog's buttons live in
             // `modal_button_rects` too.
             | UiMode::Upgrade
+            // Issue #1600: and so do Upgrade all daemons'.
+            | UiMode::UpgradeAll
             // PRD #1885: the trust prompt's approve and cancel labels live in
             // `modal_button_rects` once a frame shows them; a click anywhere
             // else is consumed rather than reaching what is behind it.
@@ -11577,6 +11709,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::ScheduledTasks
         // Issue #1635: the upgrade dialog is a topmost modal.
         | UiMode::Upgrade
+        // Issue #1600: so is Upgrade all daemons.
+        | UiMode::UpgradeAll
         // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
         | UiMode::InboxAttention
         // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
@@ -13440,6 +13574,13 @@ fn dispatch_action(
             }
         }
         Action::OpenUpgrade => open_upgrade_dialog(ui),
+        Action::OpenUpgradeAll => open_upgrade_all_dialog(ui),
+        Action::UpgradeAllChoose(choice) => {
+            if let Some((dialog, _)) = ui.upgrade_all.as_mut() {
+                let effect = dialog.choose(choice);
+                apply_upgrade_all_effect(ui, effect);
+            }
+        }
         Action::UpgradeChoose(choice) => {
             if let Some(dialog) = ui.upgrade_dialog.as_mut() {
                 let effect = dialog.choose(choice);
@@ -15191,6 +15332,20 @@ fn handle_key_event(
                 Action::Continue
             }
             UiMode::Upgrade => handle_upgrade_key(key, ui),
+            // Issue #1600: `Ctrl+C` keeps its safety net here too. A running
+            // batch's dialog is kept, so its key reopens the same run.
+            UiMode::UpgradeAll if is_ctrl_c => {
+                if !ui
+                    .upgrade_all
+                    .as_ref()
+                    .is_some_and(|(dialog, _)| dialog.is_running())
+                {
+                    close_upgrade_all(ui);
+                }
+                open_quit_confirm(ui, false);
+                Action::Continue
+            }
+            UiMode::UpgradeAll => handle_upgrade_all_key(key, ui),
             // Resolved before the shortcuts above, so never reached here.
             UiMode::CopyMode => Action::Continue,
             // PRD #1885: `Ctrl+C` keeps its PRD #40 safety net; leaving for
@@ -20213,6 +20368,14 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             .map(|(choice, rect)| (Action::UpgradeChoose(choice), rect))
             .collect();
     }
+    if ui.mode == UiMode::UpgradeAll
+        && let Some((dialog, _)) = ui.upgrade_all.as_mut()
+    {
+        ui.modal_button_rects = crate::upgrade_all_dialog::render(frame, area, dialog)
+            .into_iter()
+            .map(|(choice, rect)| (Action::UpgradeAllChoose(choice), rect))
+            .collect();
+    }
     if ui.mode == UiMode::TrustPrompt
         && let Some(prompt) = ui.trust_prompt.as_mut()
     {
@@ -23539,6 +23702,8 @@ fn render_help_overlay(
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
         help_key_line(&lettered(KbAction::OpenUpgrade), "Upgrade (update badge)"),
+        // Issue #1600: every remote deck's daemon that is older than this TUI.
+        help_key_line(&n(KbAction::UpgradeAllDaemons), "Upgrade all daemons"),
         // PRD #1666 part 2 (G-fix7d): while the footer shows the restart
         // notice.
         help_key_line(
@@ -38119,6 +38284,33 @@ mod tests {
         ));
     }
 
+    /// Issue #1600: `U` opens Upgrade all daemons and `u` still opens the
+    /// update badge's Upgrade, so the capital does not shadow the letter.
+    #[test]
+    fn capital_u_opens_upgrade_all_daemons_and_u_still_opens_upgrade() {
+        let press = |code: KeyCode, mods: KeyModifiers| {
+            handle_normal_key(
+                KeyEvent::new(code, mods),
+                &mut default_ui(),
+                1,
+                Some(SessionStatus::Idle),
+                &KeybindingConfig::default(),
+            )
+        };
+        assert!(matches!(
+            press(KeyCode::Char('U'), KeyModifiers::SHIFT),
+            Action::OpenUpgradeAll
+        ));
+        assert!(matches!(
+            press(KeyCode::Char('U'), KeyModifiers::NONE),
+            Action::OpenUpgradeAll
+        ));
+        assert!(matches!(
+            press(KeyCode::Char('u'), KeyModifiers::NONE),
+            Action::OpenUpgrade
+        ));
+    }
+
     /// Scenario: In command mode, press `Ctrl+r`, `Ctrl+g`, `Ctrl+s`,
     /// `Ctrl+m` and `Ctrl+u` with a card selected: each does what its plain
     /// letter does — rename, generate config, the Schedules manager, the host
@@ -47338,6 +47530,7 @@ mod tests {
             | UiMode::CloseConfirm
             | UiMode::HostMetrics
             | UiMode::Upgrade
+            | UiMode::UpgradeAll
             | UiMode::InboxAttention
             | UiMode::RestartNotice
             | UiMode::CopyMode
@@ -47366,6 +47559,7 @@ mod tests {
             UiMode::CloseConfirm,
             UiMode::HostMetrics,
             UiMode::Upgrade,
+            UiMode::UpgradeAll,
             UiMode::InboxAttention,
             UiMode::RestartNotice,
             UiMode::CopyMode,

@@ -39,3 +39,21 @@ pub fn local_build_id() -> String {
     }
     env!("DAD_BUILD_ID").to_string()
 }
+
+/// The release version a daemon advertises as its `Hello`'s `daemon_version`.
+///
+/// `env!("DAD_VERSION")` in production; the value of
+/// `DOT_AGENT_DECK_DAEMON_VERSION_OVERRIDE` when set under
+/// `cfg(any(test, debug_assertions))`, exactly like [`local_build_id`]'s
+/// override and compiled out of release builds the same way. It lets the
+/// e2e fixture of `remote upgrade --all` (issue #1600) run a daemon that
+/// reports an older release than the client, which the batch's check reads to
+/// decide whether to upgrade it; the fixture's successor clears it, so the
+/// restarted daemon reports the version actually installed.
+pub fn local_daemon_version() -> String {
+    #[cfg(any(test, debug_assertions))]
+    if let Ok(v) = std::env::var("DOT_AGENT_DECK_DAEMON_VERSION_OVERRIDE") {
+        return v;
+    }
+    env!("DAD_VERSION").to_string()
+}
