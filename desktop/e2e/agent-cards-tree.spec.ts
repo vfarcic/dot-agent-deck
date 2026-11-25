@@ -499,21 +499,27 @@ for (const width of [375, 1440] as const) {
     test.use({ viewport: { width, height: 900 } });
 
     /**
-     * Scenario: the bench agent has stopped, and its card reports two pull
-     * requests, a stale issue and one GitHub does not find. The card shows the
-     * badges that fit its line whole and a "+N" for the rest; pressing it
-     * opens bench's pane with its Card panel at a list of all four with their
-     * states, and an issue past the card's line opens from there in the app's
-     * browser, in front of the pane and usable, until the daemon stops
-     * listing bench's card.
+     * Scenario: the bench agent has stopped and is gone from the daemon's list
+     * of agents, and the deck keeps its card, which reports two pull requests,
+     * a stale issue and one GitHub does not find. The card shows the badges
+     * that fit its line whole and a "+N" for the rest; pressing it from the
+     * keyboard opens bench's read-only pane, which says its terminal is gone
+     * and offers no Close agent, with its Card panel at a list of all four with
+     * their states and the keyboard on that list; a later card update does not
+     * take the keyboard back. An issue past the card's line opens from there
+     * in the app's browser, in front of the pane and usable, until the daemon
+     * stops listing bench's card.
      */
     test("a +N control opens the Card panel at every reference, and one past the line opens from there", async ({ page }) => {
       await openCardsTree(page);
       const before = await rootBoxes(page);
       await pushCards(page, `
         const bench = byName("bench");
-        // Bench's agent has stopped: the deck keeps its card.
+        // Bench's agent has stopped and is gone from the daemon's list of agents
+        // (PR #2491 review J1): the deck keeps its card, under an agent id the
+        // fleet does not list.
         bench.status = "stopped";
+        bench.agent_id = "bench-ended";
         const pr = (n, field) => ({ field, kind: "pull_request", claim: "#" + n, repo: "vfarcic/dot-agent-deck", number: n, url: "https://github.com/vfarcic/dot-agent-deck/pull/" + n,
           result: { status: "checked", state: "merged", ci: { state: "failing", passing: 3, failing: 1, pending: 0, skipped: 0 }, review: "approved", title: "Pull request " + n, checked_at: "2026-11-20T10:00:00Z", stale: false } });
         bench.checked_refs = [pr(24180, "pull-request"), pr(24181, "pr-two"),
@@ -551,9 +557,23 @@ for (const width of [375, 1440] as const) {
       // The count is a real control: from the keyboard, it opens bench's pane with its Card panel at its references.
       await more.focus();
       await page.keyboard.press("Enter");
+      // Bench's agent is gone, so its pane is the card's alone: no terminal and no Close agent.
+      const ended = page.getByTestId("ended-card-pane");
+      await expect(ended).toBeVisible();
+      await expect(ended.getByTestId("terminal-ended")).toHaveText("bench has ended, and its terminal is gone.");
+      await expect(ended.getByRole("button", { name: /Close agent/ })).toHaveCount(0);
+      await expect(ended.locator(".xterm")).toHaveCount(0);
       const panel = page.getByTestId("agent-card-panel");
       const section = panel.getByTestId("agent-card-panel-refs");
       await expect(section).toBeInViewport();
+      // The keyboard is on the references the count asked for (J6), so the next Tab continues into them.
+      await expect(section).toBeFocused();
+      // A card update afterwards does not take the keyboard back to them.
+      await ended.getByRole("button", { name: "Next agent" }).focus();
+      await pushCards(page, `byName("bench").updated_at = "2026-11-20T10:30:00Z";`);
+      await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+      await expect(ended.getByRole("button", { name: "Next agent" })).toBeFocused();
+      await expect(section).not.toBeFocused();
       const items = section.getByTestId("agent-card-panel-ref");
       await expect(items).toHaveCount(4);
       await expect(items.nth(0).getByTestId("agent-card-panel-ref-checked")).toHaveText("Pull request #24180: merged, approved; CI: 1 failing, 3 passing");

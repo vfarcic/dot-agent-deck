@@ -503,6 +503,12 @@ code = "onOpen"
 reason = "The tile's expand button: forwards `onOpen`, which DeckSurface wires to VOICE_ACTIONS.openAgent (`open_agent`)."
 
 [[site]]
+file = "desktop/src/components/EndedCardPane.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "The ended pane's Back to dashboard (PR #2491 review J1): forwards `onClose`, which DeckShell wires to VOICE_ACTIONS.closeAgentView (`close`), as the agent pane's own does."
+
+[[site]]
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
 code = "onClose"

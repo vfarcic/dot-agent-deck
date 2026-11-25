@@ -3366,6 +3366,8 @@ class FixtureDeckBridge implements DeckBridge {
    * follow a live update; the preview itself never changes them.
    */
   private treeCards?: AgentCardsSnapshot;
+  /** The tree scene's deck as it was before a browser test took it offline, kept to bring back. */
+  private offlineDeck?: DeckSnapshot;
   private cardListeners = new Set<(snapshot: AgentCardsSnapshot) => void>();
   private sceneCards(): AgentCardsSnapshot | null {
     const scene = new URLSearchParams(window.location.search).get("cards");
@@ -3379,7 +3381,21 @@ class FixtureDeckBridge implements DeckBridge {
         this.treeCards = next;
         for (const listener of this.cardListeners) listener(next);
       };
-      (window as Window & { __dadFixtureCards?: unknown }).__dadFixtureCards = { snapshot: () => structuredClone(this.treeCards), push };
+      /* PR #2491 review J2: `connected(false)` makes the scene's deck stop
+         answering, as a daemon that went away does (no agents, and the
+         runtime drops its cards); `connected(true)` brings it back, and the
+         runtime reads its cards again. */
+      const connected = (online: boolean) => {
+        if (online && this.offlineDeck) {
+          this.snapshot = this.offlineDeck;
+          this.offlineDeck = undefined;
+        } else if (!online && !this.offlineDeck) {
+          this.offlineDeck = this.snapshot;
+          this.snapshot = { ...structuredClone(this.snapshot), connection: { ...this.snapshot.connection, status: "disconnected", message: "The fixture daemon stopped answering." }, agents: [] };
+        }
+        this.emitSnapshot();
+      };
+      (window as Window & { __dadFixtureCards?: unknown }).__dadFixtureCards = { snapshot: () => structuredClone(this.treeCards), push, connected };
     }
     return this.treeCards;
   }

@@ -20,7 +20,9 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  *   nothing (099);
  * - every action icon, on a card, in the selection bar and in the panel, shows
  *   a mark under the pointer and a ring under the keyboard in both themes, and
- *   its tooltip sits just below or above it (100).
+ *   its tooltip sits just below or above it (100);
+ * - an open panel keeps its place while the agent's daemon stops answering and
+ *   comes back, and the terminal's box never moves (105).
  */
 
 const TOLERANCE = 1;
@@ -174,13 +176,60 @@ for (const width of [375, 1440] as const) {
   });
 }
 
+for (const width of [375, 1440] as const) {
+  test.describe(`desktop/agent-cards/105 — a disconnect keeps the open Card panel's place at ${width}px`, () => {
+    test.use({ viewport: { width, height: 900 } });
+
+    /// Scenario: At this width, open bench's pane from its card, so its Card panel is open, then let bench's daemon stop answering and answer again. While it does not answer, the panel keeps its place and size and says the card is not available right now, with none of its actions; at 1440 px the terminal's box does not move or change size, and at 375 px, where the header is a row shorter without the live agent's controls, the terminal keeps its width. When the daemon answers again, the panel shows bench's card and the terminal's box is exactly as it was.
+    test("the panel keeps its place through a disconnect and a reconnect, and the terminal is never resized", async ({ page }) => {
+      await openTree(page);
+      const bench = await keyOf(page, "bench");
+      await (await cardNamed(page, "bench")).getByTestId("agent-card-details").click();
+      const pane = page.getByTestId("agent-pane-overlay");
+      const panel = pane.getByTestId("agent-card-panel");
+      await expect(panel).toHaveAttribute("data-card-key", bench);
+      const terminal = pane.locator(".agent-panel");
+      const [p, t] = [await box(panel), await box(terminal)];
+      /* `whole`: the terminal's and the panel's boxes are exactly as they
+         were. Otherwise only their sizes across the pane: at 375 px the
+         header is a row shorter while the daemon is not answering (it
+         withholds Generate config and Close agent, with no terminal attached
+         to resize), so everything under it moves up together. */
+      const same = async (what: string, whole: boolean) => {
+        const [panelNow, terminalNow] = [await box(panel), await box(terminal)];
+        const sides = whole ? (["x", "y", "width", "height"] as const) : (["x", "width"] as const);
+        for (const side of sides) {
+          expect(Math.abs(terminalNow[side] - t[side]), `${what}: the terminal's ${side}`).toBeLessThanOrEqual(TOLERANCE);
+          expect(Math.abs(panelNow[side] - p[side]), `${what}: the panel's ${side}`).toBeLessThanOrEqual(TOLERANCE);
+        }
+        expect(Math.abs(panelNow.height - p.height), `${what}: the panel's height`).toBeLessThanOrEqual(TOLERANCE);
+      };
+      const connected = (online: boolean) => page.evaluate((value) => (window as unknown as { __dadFixtureCards: { connected(online: boolean): void } }).__dadFixtureCards.connected(value), online);
+
+      await connected(false);
+      await expect(panel.getByTestId("agent-card-gone")).toHaveText("This card is not available right now.");
+      await expect(panel.getByTestId("agent-card-action-icon")).toHaveCount(0);
+      await expect(pane.getByTestId("agent-pane-card-toggle")).toHaveAttribute("aria-pressed", "true");
+      await same("disconnected", width === 1440);
+
+      await connected(true);
+      await expect(panel).toHaveAttribute("data-card-key", bench);
+      await expect(panel.getByTestId("agent-card-gone")).toHaveCount(0);
+      await same("reconnected", true);
+      await expectNoSidewaysScroll(page);
+    });
+  });
+}
+
 test.describe("desktop/agent-cards/098 — the pane's header moves between agents", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
 
-  /// Scenario: Open bench's pane from its card. Next agent shows another agent's pane and card, Previous agent comes back to bench, and Next needing you lands on an agent whose card needs you. With the keyboard on the header, `]` and `[` do the same; with the keyboard in the terminal, typing `]`, `[` and `n` reaches the agent and moves nothing.
+  /// Scenario: With the Card panel last chosen open, open bench's pane from its card. Next agent shows another agent's pane and card, Previous agent comes back to bench, and Next needing you lands on an agent whose card needs you. With the keyboard on the header, `]` and `[` do the same; with the keyboard in the terminal, typing `]`, `[` and `n` reaches the agent and moves nothing.
   test("previous, next and Next needing you, by button and by key, and the keys stay the agent's in its terminal", async ({ page }) => {
     await captureTerminals(page);
     await openTree(page);
+    // The user's own choice is open, so each move shows that agent's card (PR #2491 review J5: a move uses the choice, not the panel a card forced open).
+    await page.evaluate(() => window.localStorage.setItem("dot-agent-deck.agent-pane.card-panel", "open"));
     await pushCards(page, `byName("docs-site").needs_you = true; byName("docs-site").needs_you_reasons = ["question"];`);
     const bench = await keyOf(page, "bench");
     await (await cardNamed(page, "bench")).getByTestId("agent-card-details").click();

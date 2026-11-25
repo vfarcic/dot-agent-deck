@@ -370,7 +370,7 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     expect(within(panel()).getByTestId("agent-card-action-result")).toHaveTextContent("Use main");
   });
 
-  /// Scenario: open alpha's agent from its card, then move with the pane's previous, next and Next needing you. It walks the daemon's display order (wrapping), Next needing you lands only on daemon-marked agents, each move opens that agent's pane with its Card panel showing its actions as icons with their full prompt in the hover, why it needs you, and the agent-says / deck-checked labels; a new list re-renders the shown card in place, and a list without its agent says the dashboard has no card for it while the moves still work.
+  /// Scenario: open alpha's agent from its card, then move with the pane's previous, next and Next needing you. It walks the daemon's display order (wrapping), Next needing you lands only on daemon-marked agents, each move opens that agent's pane with its Card panel showing its actions as icons with their full prompt in the hover, why it needs you, and the agent-says / deck-checked labels; a new list re-renders the shown card in place, and a list without its agent says the card is not available right now while the moves still work.
   it("desktop/agent-cards/004: the pane moves between agents in display order, its Card panel updates live, and survives its agent closing", () => {
     const live = runtime();
     const view = cardsView(live);
@@ -416,7 +416,7 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
 
     // The shown agent is gone from the list.
     view.rerender(<OverviewWithCardPane runtime={{ ...live, agentCards: { [FIXTURE_DAEMON_ID]: snapshot([ALPHA, MIKE, BRAVO, YANKEE], 10) } }} onNavigate={vi.fn()} />);
-    expect(screen.getByTestId("agent-card-gone").textContent).toContain("no card");
+    expect(screen.getByTestId("agent-card-gone").textContent).toContain("This card is not available right now.");
     fireEvent.click(screen.getByRole("button", { name: "Next agent" }));
     expect(panel().getAttribute("data-card-key")).toBe(ALPHA.key);
   });

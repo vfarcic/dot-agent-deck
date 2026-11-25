@@ -43,12 +43,24 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
 }) {
   const entry = card?.entry;
   const shownName = entry ? displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id) : displayText(name, DISPLAY_LIMITS.name);
-  /* Opened from a card's `+N`: the references are scrolled into view, once. */
+  /* Opened from a card's `+N`: the references are scrolled into view and
+     take the keyboard, once per navigation that asked for them, so the next
+     Tab continues into the list and a screen reader lands there (PR #2491
+     review J6). `preventScroll` keeps the scroll just made; a card update
+     re-renders with the same section and key, so it never takes focus. */
   const refsSection = useRef<HTMLElement>(null);
   const cardKey = card ? `${card.deckId}\u0000${card.entry.key}` : undefined;
+  const hasRefs = (tree ? entry?.checked_refs?.length ?? 0 : 0) > 0;
+  const handedOff = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (section === "references") refsSection.current?.scrollIntoView?.({ block: "start" });
-  }, [section, cardKey]);
+    if (section !== "references") handedOff.current = undefined;
+    if (section !== "references" || !hasRefs || cardKey === undefined || handedOff.current === cardKey) return;
+    const node = refsSection.current;
+    if (!node) return;
+    handedOff.current = cardKey;
+    node.scrollIntoView?.({ block: "start" });
+    node.focus({ preventScroll: true });
+  }, [section, cardKey, hasRefs]);
   const checkedRefs = tree ? entry?.checked_refs ?? [] : [];
   const pullRequest = entry?.facts.pull_request as { number?: number; title?: string; state?: string } | null | undefined;
   const icons = entry ? panelIconActions(entry) : [];
@@ -58,7 +70,8 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
     <aside className="agent-card-panel" aria-label={`${shownName}'s card`} data-testid="agent-card-panel" data-card-key={entry?.key}>
       <h2 className="agent-card-panel-title">Card</h2>
       {notice && <p className="agent-card-panel-notice" role="status" data-testid="agent-card-panel-notice">{displayText(notice, DISPLAY_LIMITS.message)}</p>}
-      {!entry && <p className="agent-card-gone" role="status" data-testid="agent-card-gone">The dashboard has no card for {shownName}.</p>}
+      {/* PR #2491 review J2: the card is gone or its daemon is not answering; the panel keeps its place and offers none of its actions. */}
+      {!entry && <p className="agent-card-gone" role="status" data-testid="agent-card-gone">This card is not available right now.</p>}
       {entry && card && (
         <>
           <section className="agent-card-section agent-card-panel-part" aria-label="Checked by the deck" data-testid="agent-card-panel-deck">

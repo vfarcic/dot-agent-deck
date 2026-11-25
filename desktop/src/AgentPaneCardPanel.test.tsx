@@ -5,7 +5,7 @@ import { approvedProjectTrust } from "./test/projectTrust";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
 import { CARD_PANEL_STORAGE_KEY } from "./lib/paneCards";
-import type { AgentCardAction, AgentCardEntry, DeckActionResult, DeckRuntimeState } from "./types";
+import type { AgentCardAction, AgentCardEntry, DeckActionResult, DeckRuntimeState, EndedRole } from "./types";
 
 /* The terminal is a focusable stand-in inside the pane's terminal box, so the
    keys can be pressed with the keyboard in it. */
@@ -53,24 +53,32 @@ function settingsStore() {
   };
 }
 
+/** How the deck looks in one render: connected (the default) or not answering, and extra fields of its snapshot. */
+type DeckState = { connected?: boolean; endedRoles?: EndedRole[]; tree?: boolean };
+
 /** The real shell on the dashboard, with a card for each of the fixture deck's first three agents; the third needs you. */
-function renderShell() {
+function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {}) {
   const base = createFixtureSnapshot("connected");
-  const snapshot = { ...base, connection: { ...base.connection, incarnation: INSTANCE }, agents: base.agents.map((agent) => ({ ...agent, incarnation: INSTANCE })) };
-  const [first, second, third] = snapshot.agents;
-  const entries = [cardFor(first.id, "first-card"), cardFor(second.id, "second-card"), cardFor(third.id, "third-card", { needs_you: true, needs_you_reasons: ["question"] })];
+  const live = { ...base, connection: { ...base.connection, incarnation: INSTANCE }, agents: base.agents.map((agent) => ({ ...agent, incarnation: INSTANCE })) };
+  const [first, second, third] = live.agents;
+  const entries = [cardFor(first.id, "first-card"), cardFor(second.id, "second-card"), cardFor(third.id, "third-card", { needs_you: true, needs_you_reasons: ["question"] }), ...(initial.extra ?? [])];
   const settings = settingsStore();
-  const runtime = (cards: AgentCardEntry[], revision: number) => ({
+  const resizeTerminal = vi.fn(async () => undefined);
+  /* A deck that stops answering lists no agents and no cards, as the daemon's disconnected snapshot does. */
+  const snapshotOf = (deck: DeckState) => (deck.connected === false
+    ? { ...live, connection: { ...live.connection, status: "disconnected" as const, message: "The daemon stopped answering." }, agents: [], endedRoles: deck.endedRoles }
+    : { ...live, endedRoles: deck.endedRoles });
+  const runtime = (cards: AgentCardEntry[], revision: number, deck: DeckState = initial.deck ?? {}) => ({
     mode: "fixture",
     desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
-    snapshot,
-    fleet: [snapshot],
+    snapshot: snapshotOf(deck),
+    fleet: [snapshotOf(deck)],
     terminalData: {},
     clearError: vi.fn(),
     ...approvedProjectTrust(),
     runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
-    resizeTerminal: vi.fn(async () => undefined),
+    resizeTerminal,
     setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
     listProjects: vi.fn(async () => ({ projects: [] })),
@@ -78,14 +86,15 @@ function renderShell() {
     setZoom: vi.fn(async (level: number) => level),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
-    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision, entries: cards, catalogErrors: [] } },
+    agentCards: deck.connected === false ? {} : { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision, entries: cards, catalogErrors: [], ...(deck.tree ? { tree: true } : {}) } },
     invokeCardAction: vi.fn(async (_target: unknown, _actionId: string, options?: { requestId?: string }) => ({ request_id: options?.requestId ?? "r", outcome: "sent" as const, message_id: "m-pane-1" })),
   }) as unknown as DeckRuntimeState;
   const view = render(createElement(DeckShell, { runtime: runtime(entries, 1), initialView: { kind: "overview" } }));
   return {
     agents: [first, second, third],
     entries,
-    update: (cards: AgentCardEntry[], revision: number) => view.rerender(createElement(DeckShell, { runtime: runtime(cards, revision), initialView: { kind: "overview" } })),
+    resizeTerminal,
+    update: (cards: AgentCardEntry[], revision: number, deck?: DeckState) => view.rerender(createElement(DeckShell, { runtime: runtime(cards, revision, deck), initialView: { kind: "overview" } })),
   };
 }
 
@@ -166,9 +175,11 @@ describe("the agent pane's Card panel (PR #2491 decision 2026-11-25)", () => {
     }
   });
 
-  /// Scenario: Open the first agent from its card and use the header: Next agent opens the second agent's pane, Previous agent the first's, Next needing you the third's, which needs you, each with its Card panel as the user had it. With the keyboard outside the terminal, `]`, `[` and `n` do the same; with the keyboard in the terminal, they are the user's typing and move nothing.
+  /// Scenario: With the Card panel last chosen open, open the first agent from its card and use the header: Next agent opens the second agent's pane, Previous agent the first's, Next needing you the third's, which needs you, each with its Card panel as the user chose. With the keyboard outside the terminal, `]`, `[` and `n` do the same; with the keyboard in the terminal, they are the user's typing and move nothing.
   it("desktop/agent-cards/096: the pane header moves between agents in the dashboard's order, and its keys stay out of the terminal", () => {
     window.localStorage.setItem(MODE_KEY, "cards");
+    // The user's own choice is open, so each move shows that agent's card (J5: a move uses the choice, not the panel a card forced open).
+    window.localStorage.setItem(CARD_PANEL_STORAGE_KEY, "open");
     const shell = renderShell();
     const [first, second, third] = shell.agents;
     fireEvent.click(card(shell.entries[0]));
@@ -199,6 +210,92 @@ describe("the agent pane's Card panel (PR #2491 decision 2026-11-25)", () => {
     expect(shown()).toBe(shell.entries[2].key);
     expect(within(pane()).getByTestId(`terminal-${third.id}`)).toBe(terminal);
     expect(first.id).not.toBe(third.id);
+  });
+
+  /// Scenario: With the Card panel last chosen closed, open the agent that needs you from its table row (its panel opens), then press Next agent to an agent that does not: its panel is closed, as chosen, not open because the needy one forced it. The same from a pane opened from its card: Next agent to an agent that does not need you shows it closed. Choosing open with the Card button, then moving, keeps it open.
+  it("desktop/agent-cards/095: a move between agents uses the user's choice, not a panel the last agent forced open", () => {
+    window.localStorage.setItem(CARD_PANEL_STORAGE_KEY, "closed");
+    const shell = renderShell();
+    const [first, second, third] = shell.agents;
+    const next = () => fireEvent.click(within(pane()).getByRole("button", { name: "Next agent" }));
+    const previous = () => fireEvent.click(within(pane()).getByRole("button", { name: "Previous agent" }));
+    // The needy third agent forces its panel open; Next agent (wrapping) reaches the first, which does not need you.
+    openRow(third.id);
+    expect(panel()?.getAttribute("data-card-key")).toBe(shell.entries[2].key);
+    next();
+    expect(within(pane()).getByTestId(`terminal-${first.id}`)).toBeInTheDocument();
+    expect(panel()).toBeNull();
+    expect(toggle()).toHaveAttribute("aria-pressed", "false");
+    back();
+    // Opened from its card, the first agent's panel is open; Next agent to the second shows it closed.
+    fireEvent.click(screen.getByRole("radio", { name: "Cards" }));
+    fireEvent.click(card(shell.entries[0]));
+    expect(panel()?.getAttribute("data-card-key")).toBe(shell.entries[0].key);
+    next();
+    expect(within(pane()).getByTestId(`terminal-${second.id}`)).toBeInTheDocument();
+    expect(panel()).toBeNull();
+    // The user's own choice travels: open it here, and the move back keeps it open.
+    fireEvent.click(toggle());
+    expect(window.localStorage.getItem(CARD_PANEL_STORAGE_KEY)).toBe("open");
+    previous();
+    expect(panel()?.getAttribute("data-card-key")).toBe(shell.entries[0].key);
+  });
+
+  /// Scenario: A card the deck keeps for an orchestration role that has exited: its agent is not in the daemon's list of agents any more, its status is stopped, and its actions are disabled because the agent is not running. Click the card. A read-only pane opens: its header names the agent with its last status and offers no Close agent; the Card panel is open with why the role exited, its last output, its pull requests and issues and its report; the terminal area says in one sentence that the agent has ended and its terminal is gone, and no terminal is attached. Next agent moves on from it, and Previous agent comes back.
+  it("desktop/agent-cards/104: a kept card whose agent is gone opens a read-only pane with its Card panel", () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const goneId = "gone-104";
+    const ended = cardFor(goneId, "ended-role", {
+      status: "stopped",
+      report: { source: "agent", status: "failed", summary: "Stopped after the tests failed", published_at: "2026-11-25T00:00:00Z", revision: 2 },
+      actions: [action("go-ahead", { label: "Go ahead", prompt: "Go ahead.", enabled: false, disabled_reason: "agent_stopped" })],
+      checked_refs: [{ field: "pull-request", kind: "pull_request", claim: "#24180", repo: "vfarcic/dot-agent-deck", number: 24180, url: "https://github.com/vfarcic/dot-agent-deck/pull/24180", result: { status: "checked", state: "open", checked_at: "2026-11-25T00:00:00Z", stale: false } }],
+    } as Partial<AgentCardEntry>);
+    const endedRoles: EndedRole[] = [{ paneId: ended.pane_id, agentId: goneId, roleIndex: 1, roleName: "coder", orchestrationName: "build", reason: "exited with status 1", headline: "coder exited", lastOutput: ["error: 3 tests failed"] }];
+    const shell = renderShell({ extra: [ended], deck: { endedRoles, tree: true } });
+    expect(shell.agents.some((agent) => agent.id === goneId)).toBe(false);
+    fireEvent.click(card(ended));
+    const shown = pane();
+    expect(within(shown).getByRole("heading", { name: "ended-role" })).toBeInTheDocument();
+    expect(within(shown).getByTestId("ended-pane-status")).toHaveTextContent(/^last seen: stopped$/i);
+    expect(within(shown).queryByRole("button", { name: /Close agent/ })).toBeNull();
+    expect(within(shown).queryByTestId(`terminal-${goneId}`)).toBeNull();
+    expect(within(shown).getByTestId("terminal-ended")).toHaveTextContent("ended-role has ended, and its terminal is gone.");
+    expect(shown.querySelector("[data-terminal-state]")?.getAttribute("data-terminal-state")).toBe("ended");
+    const opened = panel()!;
+    expect(opened.getAttribute("data-card-key")).toBe(ended.key);
+    expect(within(opened).getByTestId("agent-card-panel-ended")).toHaveTextContent("exited with status 1");
+    expect(within(opened).getByTestId("agent-card-panel-ended")).toHaveTextContent("error: 3 tests failed");
+    expect(within(opened).getAllByTestId("agent-card-panel-ref")).toHaveLength(1);
+    expect(within(opened).getByText("Stopped after the tests failed")).toBeInTheDocument();
+    // Its actions need a live agent: as on the card, the daemon disabled them.
+    expect(within(opened).getByRole("button", { name: "Go ahead" })).toHaveAttribute("aria-disabled", "true");
+    // The moves still work from it.
+    fireEvent.click(within(shown).getByRole("button", { name: "Next agent" }));
+    expect(within(pane()).getByTestId(`terminal-${shell.agents[0].id}`)).toBeInTheDocument();
+    fireEvent.click(within(pane()).getByRole("button", { name: "Previous agent" }));
+    expect(within(pane()).getByTestId("terminal-ended")).toBeInTheDocument();
+  });
+
+  /// Scenario: Open the first agent from its card, so its Card panel is open, then let its daemon stop answering, and answer again. While it does not answer, the pane keeps the panel's place, which says the card is not available right now and offers none of its actions, and the terminal is never resized; when the daemon answers again, the panel shows the card again in the same place.
+  it("desktop/agent-cards/105: a disconnect keeps the open Card panel's place and says the card is not available", () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const shell = renderShell();
+    fireEvent.click(card(shell.entries[0]));
+    const before = panel();
+    expect(before?.getAttribute("data-card-key")).toBe(shell.entries[0].key);
+    const resized = shell.resizeTerminal.mock.calls.length;
+    shell.update(shell.entries, 2, { connected: false });
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(panel()).not.toBeNull();
+    expect(within(panel()!).getByTestId("agent-card-gone")).toHaveTextContent("This card is not available right now.");
+    expect(within(panel()!).queryByTestId("agent-card-panel-actions")).toBeNull();
+    expect(within(panel()!).queryByRole("button")).toBeNull();
+    expect(toggle()).toHaveAttribute("aria-pressed", "true");
+    shell.update(shell.entries, 3);
+    expect(panel()?.getAttribute("data-card-key")).toBe(shell.entries[0].key);
+    expect(within(panel()!).getByText("first-card is working")).toBeInTheDocument();
+    expect(shell.resizeTerminal.mock.calls.length).toBe(resized);
   });
 
   /// Scenario: An agent reports a `url`, a `pull_request` and an `issue` field, each an `https://` address it chose, and the user opens its pane from its card. The Card panel shows each address as plain text the user can select and copy, not as a link.

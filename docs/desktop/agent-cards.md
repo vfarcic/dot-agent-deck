@@ -114,14 +114,18 @@ Under them, **Actions** holds an icon for every action the agent offers, the sam
 
 **Pull requests and issues** lists every pull request and issue the agent reported, in the order of its fields. Each one has its badge, which opens it as on the card, what the deck found (for example `Issue #3: closed`, or a pull request's state, review and CI) with its title on GitHub, every label of an issue, when the deck checked it, that the check may be out of date, that it is still to be checked, or why it cannot be checked, and what the agent wrote, marked **agent says**.
 
+A card's **+N** opens the panel at this list, with the keyboard on it, so `Tab` continues into it.
+
 When the panel opens:
 
 - It is open when you opened the pane from the agent's card (the card itself, its **+N**, **Show card**, or saying "show the coder's card"), or when the agent needs you.
-- Otherwise it is as you last left it: the pane's **Card** button, in its header, opens and closes it, and the app remembers your choice in this window's storage.
+- Otherwise it is as you last chose: the pane's **Card** button, in its header, opens and closes it, and the app remembers your choice in this window's storage. A panel that opened because you came from a card or the agent needs you is not a choice you made, so the next agent you move to shows its panel as you last chose.
 - It never opens or closes by itself while the pane is shown, even when the agent comes to need you or its card changes: its width is taken from the terminal, which the agent sees as a change of size, so only you change it.
-- The panel updates while you look at it: when the agent publishes a new report or a message is delivered, you see it straight away. If the dashboard no longer lists the agent's card, the panel says so.
+- The panel updates while you look at it: when the agent publishes a new report or a message is delivered, you see it straight away. If the agent's card goes, or its daemon stops answering, the panel stays where it is and says the card is not available right now, with none of its actions; it shows the card again when the daemon answers.
 
-The pane's header also moves between agents, in the tree's order, each agent coming after the one that started it, cards inside a closed tree included: the arrows **Previous agent** and **Next agent** open the previous and next agent's pane, and **Next needing you** the next agent that needs you. With the keyboard anywhere in the pane but its terminal, `[`, `]` and `n` do the same; in the terminal, they are typed to the agent as usual. Moving keeps the Card panel as you have it, and opens it for an agent that needs you. `Escape` or **Back to dashboard** leaves the pane.
+A card the deck keeps after its agent has gone, such as an orchestration role that exited, opens a pane of its own. Its header names the agent with the status it last had, and offers the moves between agents and **Back to dashboard** but no **Close agent**. Where the terminal would be, one sentence says the agent has ended and its terminal is gone. The Card panel is open, with why the role exited, its last output, its pull requests and issues and its report; its actions are disabled, as on its card, because there is no agent to send them to.
+
+The pane's header also moves between agents, in the tree's order, each agent coming after the one that started it, cards inside a closed tree included: the arrows **Previous agent** and **Next agent** open the previous and next agent's pane, and **Next needing you** the next agent that needs you. With the keyboard anywhere in the pane but its terminal, `[`, `]` and `n` do the same; in the terminal, they are typed to the agent as usual. Moving shows the next agent's Card panel as you last chose it, and opens it for an agent that needs you. `Escape` or **Back to dashboard** leaves the pane.
 
 The panel is in the desktop app only. A daemon from a release before cards were added has no cards, and its agents' panes have no **Card** button.
 

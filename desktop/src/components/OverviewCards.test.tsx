@@ -210,7 +210,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(live.invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId: "7" }), "merge", expect.objectContaining({ confirm: true }));
   });
 
-  /// Scenario: open the coder's Card panel and move with the pane's next, previous and Next needing you. The pane follows the display order, Next needing you comes back to the coder, and once the coder's card leaves the list the panel says the dashboard has no card for it.
+  /// Scenario: open the coder's Card panel and move with the pane's next, previous and Next needing you. The pane follows the display order, Next needing you comes back to the coder, and once the coder's card leaves the list the panel says the card is not available right now.
   it("moves through agents in display order and says when the shown one has no card", () => {
     const live = runtime();
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
@@ -226,7 +226,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Next agent that needs you" }));
     expect(panel().getAttribute("data-card-key")).toBe("pane-7/7");
     view.rerender(<OverviewWithCardPane runtime={{ ...live, agentCards: { [FIXTURE_DAEMON_ID]: snapshot([TESTER, LONE]) } }} />);
-    expect(screen.getByTestId("agent-card-gone").textContent).toContain("no card");
+    expect(screen.getByTestId("agent-card-gone").textContent).toContain("This card is not available right now.");
   });
 
   /// Scenario: in the Table view, read the coder's row, which needs you, open its ⋯ menu and press Show card, then click another row. The menu opens nothing by itself; Show card opens the coder's pane with its Card panel; a row click opens that agent's pane without asking for the panel.

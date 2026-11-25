@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -40,6 +40,7 @@ import { KeptWorktreeText } from "./components/KeptWorktreeText";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { AgentCardPanel } from "./components/AgentCardPanel";
+import { EndedCardPane } from "./components/EndedCardPane";
 import { createPaneCardsChannel, readCardPanelChoice, usePaneCards, writeCardPanelChoice, type PaneCardsChannel } from "./lib/paneCards";
 import { ConfirmDialog, type ConfirmAction, type ConfirmChoice, type ConfirmState } from "./components/ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
@@ -449,14 +450,19 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * publishes for the agent pane drawn beside it, and whether the pane's Card
    * panel is open. It is settled once per navigation (`ofView` is the view it
    * was settled for): open when the pane was opened from a card or its agent
-   * needs the user, else as the pane before it had it, else as the user last
-   * chose. After that only the user changes it — its width is the terminal's,
-   * which the agent sees as a resize.
+   * needs the user, else as the user last chose with the Card button or voice
+   * (PR #2491 review J5: a panel the last pane forced open is not a choice, so
+   * a move does not carry it). After that only the user changes it — its
+   * width is the terminal's, which the agent sees as a change of size.
    */
   // voice-registry-exempt: the channel object itself, created once and never replaced; what flows through it is the overview's cards, not a choice of the user's
   const [paneCards] = useState<PaneCardsChannel>(createPaneCardsChannel);
   // voice-registry-exempt: the Card panel's open state, written by `setCardPanel` (the registry's openCardPanel/closeCardPanel) and settled once per navigation
   const [cardPanel, setCardPanelState] = useState<{ ofView: DeckView; open: boolean; section?: "references"; before?: boolean; provisional?: boolean }>();
+  /* The user's last explicit choice, kept in memory too so a storage that
+     refuses still carries it from pane to pane while the app runs (J5). */
+  const cardPanelChoice = useRef<boolean | undefined>(undefined);
+  const chosenCardPanel = () => cardPanelChoice.current ?? readCardPanelChoice();
   const settleCardPanel = (of: DeckView, before: boolean) => {
     if (of.kind !== "agent") return { ofView: of, open: before };
     const cards = paneCards.get();
@@ -473,7 +479,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     };
   };
   if (agentView && agentView.from === "overview" && cardPanel?.ofView !== requestedView) {
-    setCardPanelState(settleCardPanel(requestedView, cardPanel?.ofView.kind === "agent" ? cardPanel.open : readCardPanelChoice()));
+    setCardPanelState(settleCardPanel(requestedView, chosenCardPanel()));
   } else if (!agentView && cardPanel?.ofView.kind === "agent") {
     setCardPanelState({ ofView: requestedView, open: cardPanel.open });
   }
@@ -484,7 +490,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const chooseCardPanel = useCallback((open: boolean): string | undefined => {
     const shown = agentView && agentView.from === "overview" ? paneCards.get() : undefined;
     if (!agentView) return "No agent's pane is open.";
-    if (!shown?.shownFor(agentView.deckId)) return "This agent's daemon shows no cards.";
+    /* Closing is always the user's to do, so a panel kept open while its
+       daemon is not answering (J2) can still be put away. */
+    if (open && !shown?.shownFor(agentView.deckId)) return "This agent's daemon shows no cards.";
+    cardPanelChoice.current = open;
     writeCardPanelChoice(open);
     setCardPanelState((current) => (current && current.ofView === requestedView && current.open === open && current.section === undefined ? current : { ofView: requestedView, open }));
     return undefined;
@@ -961,7 +970,26 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * with the overview was precisely this stale view, so the condition is written
    * for `agentView` rather than for `base === "overview"`.
    */
-  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined;
+  /**
+   * PR #2491 review J1 — a card the deck keeps while its agent is gone (an
+   * orchestration role that exited) opens a read-only pane backed by the card
+   * alone: {@link EndedCardPane}. So a pane opened on the overview whose agent
+   * no deck lists is not retired while its daemon still lists its card, and
+   * is kept, saying the card is not available, while that daemon is not
+   * answering. A pane whose agent the user just closed is not this: it goes
+   * back to the dashboard as before. Read from the cards channel as a
+   * boolean, so the shell re-renders only when it flips.
+   */
+  const retainedCard = useSyncExternalStore(paneCards.subscribe, () => (
+    agentView?.from === "overview" && paneCards.get()?.cardFor(agentView.deckId, agentView.agentId, agentView.incarnation) !== undefined
+  ));
+  // voice-registry-exempt: which open view was last shown as a card-backed pane, so it is kept while its daemon is not answering; an invariant, not a control
+  const [endedPaneView, setEndedPaneView] = useState<DeckView>();
+  const cardBackedPane = agentView !== undefined && agentView.from === "overview" && paneAgent === undefined && !paneAgentReplaced
+    && stoppingAttempt.current?.view !== agentView
+    && (paneDeckAttachable ? retainedCard : endedPaneView === agentView && heldPaneAgent === undefined);
+  if (cardBackedPane && endedPaneView !== agentView) setEndedPaneView(agentView);
+  const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined && !cardBackedPane;
   useEffect(() => {
     if (!paneAgentRetired) return;
     // voice-registry-exempt: the stopped subject disappeared; retiring its view is an invariant, not another control
@@ -1708,7 +1736,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} stopContext={agentStopContext} generateConfig={paneGenerateConfig} onTabShown={setPaneTab} paneCards={paneCards} cardPanel={{ open: cardPanelOpen, section: cardPanel?.section, choose: chooseCardPanel }} />}
+        {agentView && cardBackedPane && <EndedCardPane view={agentView} paneCards={paneCards} onClose={closeAgentView} />}
+        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && !cardBackedPane && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} stopContext={agentStopContext} generateConfig={paneGenerateConfig} onTabShown={setPaneTab} paneCards={paneCards} cardPanel={{ open: cardPanelOpen, section: cardPanel?.section, choose: chooseCardPanel }} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -1901,10 +1930,16 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
   const cards = usePaneCards(paneCards);
   const withCards = cards !== undefined && cardPanel !== undefined && cards.shownFor(view.deckId);
   const card = withCards ? cards.cardFor(view.deckId, agent.id, view.incarnation) : undefined;
+  /* PR #2491 review J2 — once open for this navigation, the panel keeps its
+     place while the card is gone or its daemon is not answering, and says the
+     card is not available there: taking its place away would resize the
+     terminal with nothing pressed. Its header keeps the Card button for the
+     same reason, and for the user to close it. */
+  const keepsPanel = cards !== undefined && cardPanel !== undefined && cardPanel.open;
   // voice-registry-exempt: not a write — the header's controls carry the shell's Card panel choice under its registry name, and its Card button dispatches it through VOICE_ACTIONS.openCardPanel / closeCardPanel
-  const cardHeader = withCards ? { open: cardPanel.open, controls: { ...cards.controls, setCardPanel: cardPanel.choose } } : undefined;
-  const panel = withCards && cardPanel.open
-    ? <AgentCardPanel card={card} name={agent.displayName} results={card ? cards.resultsFor(card) : {}} tree={cards.treeFor(view.deckId)} ended={card ? cards.endedFor(card) : undefined} notice={cards.notice} section={cardPanel.section} controls={cards.controls} />
+  const cardHeader = withCards || keepsPanel ? { open: cardPanel.open, controls: { ...cards.controls, setCardPanel: cardPanel.choose } } : undefined;
+  const panel = keepsPanel
+    ? <AgentCardPanel card={card} name={agent.displayName} results={card ? cards.resultsFor(card) : {}} tree={withCards && cards.treeFor(view.deckId)} ended={card ? cards.endedFor(card) : undefined} notice={withCards ? cards.notice : undefined} section={cardPanel.section} controls={cards.controls} />
     : undefined;
   return (
     <AgentPaneFrame
