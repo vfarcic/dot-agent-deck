@@ -10,7 +10,7 @@ user-invocable: true
 
 The user has reported that something is broken. That includes the quiet forms: "it works except for…", "I have to do X twice", "it stopped doing Y", "is it supposed to…?".
 
-Do NOT use it for: a request for a new feature, a question about how something works, or a bug you found yourself while already mid-task with a test already failing for that reason.
+Do NOT use it for: a request for a new feature, a question about how something works, a change to docs or other text, a refactor, or a bug you found yourself while already mid-task with a test already failing for that reason.
 
 ## The order is the whole point
 
@@ -30,7 +30,7 @@ Do not reverse the order, and do not skip to the fix because the cause looks obv
 
 3. **Assert at the user's altitude.** The user-visible outcome, not an adjacent artefact — a file on disk, a log line, or a registry entry can all be correct while the screen is wrong. If they said "no orchestration tab appeared", the assertion is a tab with live role cards.
 
-4. **Run it and confirm it fails FOR THEIR REASON.** A test that fails for a setup error (a stub that broke an unrelated path, a form field that was pre-filled, an ellipsized card title) is not a reproduction. Read the failure message and check it describes their symptom. Fix the harness problem and re-run until the red is the right red.
+4. **Run it and confirm it fails FOR THEIR REASON.** A test that fails for a setup error (a stub that broke an unrelated path, a form field that was pre-filled, an ellipsized card title) is not a reproduction. Read the failure message and check it describes their symptom. Fix the harness problem and re-run until the red is the right red. If no test you can build fails for their reason, go no further: see "When it does not reproduce" below.
 
 5. **Add a control that isolates the cause.** The nearest thing that should still work — the same close on a card with no worktree, the same dispatch with a fast `git` — proves the failure is attributable to what you think it is. Without a control you cannot tell "this path is broken" from "this whole feature is broken".
 
@@ -50,7 +50,22 @@ Do not reverse the order, and do not skip to the fix because the cause looks obv
 
 **Reproduce before diagnosing, and diagnose on the reporter's machine, not yours.** Environment-shaped bugs do not travel: a whole diagnosis was once built from this server's process table while the user was reporting from a laptop. Ask for the artefacts — the message the pane printed, `~/.local/state/dot-agent-deck/deck.log`, `command -v` — instead of inferring them locally.
 
-**If it genuinely cannot be reproduced, say so explicitly** and name what is missing, before proposing a fix. "I could not reproduce this, so the fix is unverified" is a legitimate report. Presenting an unreproduced fix as verified is not.
+## When it does not reproduce: stop, and hand the decision back
+
+**If no test fails for the user's reason, do not write the fix, and do not open a pull request.** "The user's reason" means their symptom, through the path they used, in their configuration as far as you can build it. A plausible cause that nobody has seen happen is not a reason to change code: a fix for it may handle nothing the user hits, and once it merges, the issue looks dealt with while the user still has the bug.
+
+Stop and report instead, to whoever gave you the work (the user in a conversation; the dispatcher, through `work-done`, in a dispatched unit). Say:
+
+- what you ran: the configurations, the agent releases, how long and how many attempts;
+- what that showed, and what it ruled out;
+- what you could not cover, and what is missing to reproduce it: the reporter's artefacts, a platform, a release, a scale;
+- the options, with the one you recommend. Usually some of: ask the reporter for specific evidence (name exactly what to capture), add diagnostics so the next occurrence shows the cause, reproduce a narrower cause that the code shows is possible, build a fallback that limits the damage whatever the cause, or close the issue as not reproducible.
+
+Then wait for the decision: in a conversation, the person's; a dispatched unit ends after its `work-done` report, and the decision is made outside it. A fallback is a legitimate outcome, but someone has to choose it knowing the cause is still unknown; don't build one by default.
+
+**Forcing the suspected cause is not a reproduction.** A test-only switch or stub that makes the guessed failure happen proves the fix handles that guess, not that the guess is what the user hit. Issue #2385 is the example: a re-wake fallback (PR #2501) came with a test that held mail back from Claude Code's wake-up through a test-only switch. Two hours of real-agent soak runs afterwards woke every message, and the cause that did reproduce was a different path: a turn that ended on an API error left no wake-up armed.
+
+**"I could not reproduce this" is a complete and useful report.** Presenting a fix for an unreproduced bug as verified is not.
 
 ## Case studies from this repo
 
