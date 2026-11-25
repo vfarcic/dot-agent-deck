@@ -1282,12 +1282,58 @@ test.describe("desktop/agent-cards/087 — the selection bar floats at the foot 
 });
 
 /*
+ * PR #2491 review H1 — Clear pressed from the keyboard takes away the button
+ * that has focus. Focus goes back to the card ticked last, so the user stays
+ * where they were in the cards and the next Tab goes on from there, rather
+ * than to the page's header with the dashboard scrolled back to the top.
+ */
+test.describe("desktop/agent-cards/089 — Clear pressed with the keyboard keeps the user's place", () => {
+  /// Scenario: At 375x700, with forty-eight cards on a daemon that does batches, scroll down to the last card and tick it, then press Tab until Clear has focus and press Enter. The bar goes, the dashboard stays scrolled where it was (only as far back as the shorter page needs), focus is on that card's checkbox, and the next Tab goes to the card's name, inside the dashboard, without the dashboard scrolling.
+  test("Clear by keyboard leaves focus on the last ticked card and the dashboard where it was", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 700 });
+    await openCardsTree(page);
+    await pushManyBatchCards(page);
+    const region = page.locator(".overview-body");
+    const last = await cardNamed(page, "extra-39");
+    await last.scrollIntoViewIfNeeded();
+    const checkbox = last.getByTestId("agent-card-select");
+    await checkbox.click();
+    await expect(checkbox).toBeChecked();
+    await checkbox.focus();
+    const clear = page.getByTestId("agent-cards-selection-clear");
+    for (let presses = 0; presses < 80; presses++) {
+      if (await clear.evaluate((node) => node === document.activeElement)) break;
+      await page.keyboard.press("Tab");
+    }
+    await expect(clear, "Tab reached Clear").toBeFocused();
+    const before = await region.evaluate((node) => node.scrollTop);
+    expect(before, "the dashboard is scrolled down").toBeGreaterThan(1000);
+
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("agent-cards-selection-bar")).toHaveCount(0);
+    await expect(checkbox).not.toBeChecked();
+    await expect(checkbox, "focus is on the last ticked card's checkbox").toBeFocused();
+    const after = await region.evaluate((node) => ({ top: node.scrollTop, max: node.scrollHeight - node.clientHeight }));
+    expect(Math.abs(after.top - Math.min(before, after.max)), "the dashboard stays where it was").toBeLessThanOrEqual(2);
+
+    await page.keyboard.press("Tab");
+    const next = await page.evaluate(() => {
+      const active = document.activeElement as HTMLElement | null;
+      return { label: active?.getAttribute("aria-label") ?? "", inRegion: !!active?.closest(".overview-body"), scrollTop: document.querySelector(".overview-body")!.scrollTop };
+    });
+    expect(next.inRegion, "the next Tab stays in the dashboard").toBe(true);
+    expect(next.label, "the next Tab goes to the card's name").toBe("Open extra-39");
+    expect(Math.abs(next.scrollTop - after.top), "the next Tab does not scroll the dashboard").toBeLessThanOrEqual(2);
+  });
+});
+
+/*
  * PR #2491 review — the action icons sit in one visible box, the same on a
  * card, in the selection bar and in the batch row of an overlay.
  */
 test.describe("desktop/agent-cards/088 — action icons are grouped in a box that stands out", () => {
   for (const width of [375, 1440] as const) {
-    /// Scenario: At this width, on a daemon that does batches, give a root with agents under it three actions. Its icons sit in a box whose background or border differs from the card's, Close stays outside it, and the same box holds the selection bar's icons once the root is ticked (the bar at the dashboard's foot even when the cards do not fill it) and the batch row's icons in the root's overlay.
+    /// Scenario: At this width, on a daemon that does batches, give a root with agents under it three actions. Its icons sit in a box painted in the theme's tint, unlike the card, with the card's own Close outside it, and the same box holds the selection bar's icons once the root is ticked (the bar at the dashboard's foot even when the cards do not fill it) and the batch row's icons in the root's overlay. In the light and the dark theme, each box's background is that theme's tint, not transparent, and differs from what it sits on.
     test(`the icon group on a card, in the bar and in the overlay is visible and differs from the card at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
       await openCardsTree(page);
@@ -1302,19 +1348,34 @@ test.describe("desktop/agent-cards/088 — action icons are grouped in a box tha
         const own = getComputedStyle(node);
         const article = getComputedStyle(node.closest("article, [data-testid='agent-cards-selection-bar'], [data-testid='agent-card-overlay']")!);
         const at = node.getBoundingClientRect();
-        return { background: own.backgroundColor, border: own.borderTopColor, borderWidth: parseFloat(own.borderTopWidth), radius: parseFloat(own.borderTopLeftRadius), around: article.backgroundColor, width: at.width, height: at.height };
+        // The colours the theme means the group to have, resolved where the group is, in the theme on screen.
+        const probe = document.createElement("span");
+        probe.style.backgroundColor = "var(--teal-soft)";
+        probe.style.borderTopColor = "var(--teal-rim)";
+        node.appendChild(probe);
+        const intended = { background: getComputedStyle(probe).backgroundColor, border: getComputedStyle(probe).borderTopColor };
+        probe.remove();
+        return { background: own.backgroundColor, border: own.borderTopColor, borderWidth: parseFloat(own.borderTopWidth), radius: parseFloat(own.borderTopLeftRadius), around: article.backgroundColor, intended, width: at.width, height: at.height };
       });
+      /* A computed colour's alpha: `rgb(…)` is opaque, `rgba(…, a)` and `rgb(… / a)` say it. */
+      const alphaOf = (colour: string) => {
+        const parts = colour.match(/^rgba?\(([^)]*)\)$/)?.[1].split(/[\s,/]+/).filter(Boolean);
+        if (!parts) throw new Error(`not an rgb colour: ${colour}`);
+        return parts.length > 3 ? parseFloat(parts[3]) : 1;
+      };
       const expectStandsOut = (look: Awaited<ReturnType<typeof looks>>, where: string) => {
         expect(look.width, `${where}: the group is drawn`).toBeGreaterThan(0);
         expect(look.borderWidth, `${where}: the group has a border`).toBeGreaterThan(0);
         expect(look.radius, `${where}: the group's corners are rounded`).toBeGreaterThan(0);
-        expect(look.background !== look.around || look.border !== look.around, `${where}: the group differs from what it sits on`).toBe(true);
-        expect(look.background, `${where}: the group is tinted`).not.toBe(look.around);
+        expect(alphaOf(look.background), `${where}: the group's background is painted, not transparent (${look.background})`).toBeGreaterThan(0);
+        expect(look.background, `${where}: the group's background is the theme's tint`).toBe(look.intended.background);
+        expect(look.border, `${where}: the group's border is the theme's rim`).toBe(look.intended.border);
+        expect(look.background, `${where}: the group is tinted unlike what it sits on`).not.toBe(look.around);
       };
       const onCard = card.getByTestId("action-icon-group");
       await expect(onCard).toBeVisible();
       await expect(onCard.getByRole("button")).toHaveCount(3);
-      await expect(onCard.getByRole("button", { name: /^Close/ }), "Close is outside the group").toHaveCount(0);
+      await expect(onCard.getByRole("button", { name: /^Close/ }), "the card's own Close is outside the group").toHaveCount(0);
       await expect(card.getByRole("button", { name: /^Close/ })).toBeVisible();
       const cardLook = await looks(onCard);
       expectStandsOut(cardLook, "card");
@@ -1343,6 +1404,20 @@ test.describe("desktop/agent-cards/088 — action icons are grouped in a box tha
       expect(overlayLook.background, "the overlay's group looks like the card's").toBe(cardLook.background);
       expect(overlayLook.border).toBe(cardLook.border);
       await expectNoSidewaysScroll(page);
+
+      // In the light and the dark theme alike, each of the three groups is painted in that theme's tint, unlike what it sits on.
+      const tints: string[] = [];
+      for (const colorScheme of ["light", "dark"] as const) {
+        await page.emulateMedia({ colorScheme });
+        await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));
+        await expect.poll(() => page.evaluate(() => window.matchMedia("(prefers-color-scheme: dark)").matches)).toBe(colorScheme === "dark");
+        const inTheme = { card: await looks(onCard), bar: await looks(inBar), overlay: await looks(inOverlay) };
+        for (const [where, look] of Object.entries(inTheme)) expectStandsOut(look, `${colorScheme} ${where}`);
+        expect(inTheme.bar.background, `${colorScheme}: the bar's group looks like the card's`).toBe(inTheme.card.background);
+        expect(inTheme.overlay.background, `${colorScheme}: the overlay's group looks like the card's`).toBe(inTheme.card.background);
+        tints.push(inTheme.card.background);
+      }
+      expect(tints[1], "the dark theme's tint is its own, not the light one's").not.toBe(tints[0]);
     });
   }
 });

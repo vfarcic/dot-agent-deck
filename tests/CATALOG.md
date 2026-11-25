@@ -17709,8 +17709,22 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** Playwright `desktop/agent-cards/088 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** a root's three action icons sit in a group with a border, rounded corners and a background unlike the card's, and Close is outside it; the selection bar's group, once the root is ticked, and the batch row's group in the root's overlay each have a border, rounded corners and a background unlike what they sit on, and the same background and border colour as the card's group; the page never scrolls sideways (PR #2491 review).
-- **Does not assert:** the dark theme's colours, which come from the same tokens.
+- **Asserts:** a root's three action icons sit in a group with a border, rounded corners and a background unlike the card's, and the card's own Close is outside it; the selection bar's group, once the root is ticked, and the batch row's group in the root's overlay each have a border, rounded corners and a background unlike what they sit on, and the same background and border colour as the card's group; in the light and in the dark theme each of the three groups has a background with non-zero alpha, equal to that theme's `--teal-soft` resolved where the group is, a border equal to its `--teal-rim`, and unlike the background it sits on, and the two themes' tints differ; the page never scrolls sideways (PR #2491 review, H2).
+- **Does not assert:** that the tint and its surface contrast enough to see, beyond being different colours.
+
+##### desktop/agent-cards/089 — Clear pressed with the keyboard keeps the user's place.
+
+- **Test:** Playwright `desktop/agent-cards/089 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×700), against `cards=tree` through the fixture bridge with forty more roots pushed, chromium and webkit.
+- **Layer:** desktop browser (production build, `vite preview`).
+- **Asserts:** with the dashboard scrolled down to the last card and that card ticked, `Tab` reaches the bar's Clear; `Enter` removes the bar and unticks the card, focus is on that card's checkbox, the region's scroll position is unchanged (or clamped to the shorter page's end); the next `Tab` focuses the card's name button inside the region, without scrolling it (PR #2491 review, H1).
+- **Does not assert:** where focus goes when the ticked card is gone (`090`).
+
+##### desktop/agent-cards/090 — The bar going while it has focus hands focus back to the cards.
+
+- **Test:** vitest `desktop/agent-cards/090: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
+- **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
+- **Asserts:** with two cards selected by voice and focus on Clear, `clear_card_selection` removes the bar and leaves focus on the checkbox of the card selected last; with one card selected and focus on Clear, that card leaving the daemon's list removes the bar and leaves focus on the dashboard's scroll region (PR #2491 review, H1).
+- **Does not assert:** the scroll position or the next `Tab`, which jsdom does not lay out (`089`).
 
 ## Desktop native driver scenarios
 

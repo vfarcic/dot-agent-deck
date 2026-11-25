@@ -104,6 +104,8 @@ export interface CardBatchView {
 /** Issue #2399 — the Cards view's selection: the cards in it by placed key (PR #2491 review: every card's checkbox is always shown, so there is no selecting mode). */
 export interface CardSelection {
   selected: ReadonlySet<string>;
+  /** PR #2491 review H1 — the card whose checkbox was ticked or unticked last, by placed key: where focus goes back to when the bar takes its own away. */
+  last?: string;
   /** The actions the selected cards offer a batch, in the order they are first met. */
   choices: CardBatchChoice[];
 }
@@ -259,6 +261,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   /* Issue #2399 — the selection and the batch on screen. */
   const batchFor = useCallback((deckId: string) => runtime.agentCards?.[deckId]?.batch === true, [runtime.agentCards]);
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
+  const [lastToggled, setLastToggled] = useState<string>();
   const [batch, setBatch] = useState<CardBatchView>();
   /* Bumped by every batch started or closed, so a late answer to an earlier one changes nothing. */
   const batchRun = useRef(0);
@@ -569,6 +572,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       const keys = (closed ? cardSubtree(latest.current.placed, card, latest.current.treeFor(card.deckId)) : [card]).map(placedCardKey);
       /* The selection is the Cards view's: selecting by voice from the table shows that view. */
       remember("cards");
+      setLastToggled(cardKey);
       setSelected((current) => {
         const next = new Set(current);
         /* A checkbox flips; voice says which it wants ("select", "unselect"), so saying it twice changes nothing. */
@@ -730,7 +734,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   const anyBatches = shown && placed.some((card) => batchFor(card.deckId));
   const selection = useMemo<CardSelection | undefined>(() => {
     if (!anyBatches) return undefined;
-    return { selected, choices: batchChoices(placed.filter((card) => selected.has(placedCardKey(card)))) };
-  }, [anyBatches, placed, selected]);
+    return { selected, last: lastToggled, choices: batchChoices(placed.filter((card) => selected.has(placedCardKey(card)))) };
+  }, [anyBatches, placed, selected, lastToggled]);
   return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, overlay, notice, dismissNotice, rowMenu, controls, clickControls, voice, cardFor, resultsFor, batchFor, selection, batch: shown ? batch : undefined };
 }

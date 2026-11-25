@@ -134,8 +134,13 @@ function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (a
     agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: cards, catalogErrors: [], tree: true, batch: true, catalogEdit } },
     invokeCardAction, invokeCardActionBatch, resolveVoice, ...voice, ...extra,
   } as unknown as DeckRuntimeState;
-  render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
-  return { voice, cards, invokeCardAction, invokeCardActionBatch, release: () => release?.() };
+  const { rerender } = render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
+  /* The daemon's next list of cards, as a new runtime state. */
+  const setCards = (next: AgentCardEntry[]) => {
+    const agentCards = { [FIXTURE_DAEMON_ID]: { ...runtime.agentCards![FIXTURE_DAEMON_ID], revision: 2, entries: next } };
+    rerender(<DeckShell runtime={{ ...runtime, agentCards } as DeckRuntimeState} initialView={{ kind: "overview" }} />);
+  };
+  return { voice, cards, invokeCardAction, invokeCardActionBatch, setCards, release: () => release?.() };
 }
 
 async function turnOnVoice() {
@@ -301,6 +306,35 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expectRow("clear_card_selection", "clearCardSelection", ["overview"], []);
     expect(registry.toggleCardSelecting, "no Select switch to say").toBeUndefined();
     expect(commandRows().some((row) => row.invoke === "toggleCardSelecting")).toBe(false);
+  });
+
+  /// Scenario: By voice, select the first card and then the third, put keyboard focus on the selection bar's Clear, and say "clear the selection". The bar goes, and focus is on the third card's checkbox, the card last selected, rather than left on nothing. Select the first card again, focus Clear, take that card off the daemon's list, and the bar goes with focus on the dashboard's scroll region.
+  it("desktop/agent-cards/090: the bar going while it has focus hands focus to the last ticked card, or else the dashboard", async () => {
+    const run = setup(
+      (agents) => [cardFor(agents[0].id, "first-card"), cardFor(agents[1].id, "second-card"), cardFor(agents[2].id, "third-card")],
+      (agents) => ({
+        "select the first card": { action: "select_agent_card", invoke: "selectAgentCard", params: [agentParam(agents[0].id, "first-card")] },
+        "select the third card": { action: "select_agent_card", invoke: "selectAgentCard", params: [agentParam(agents[2].id, "third-card")] },
+        "clear the selection": { action: "clear_card_selection", invoke: "clearCardSelection", params: [] },
+      }),
+    );
+    const [first, second, third] = run.cards;
+    await turnOnVoice();
+    await speak(run.voice, "select the first card");
+    await speak(run.voice, "select the third card");
+    act(() => { screen.getByTestId("agent-cards-selection-clear").focus(); });
+    expect(document.activeElement).toBe(screen.getByTestId("agent-cards-selection-clear"));
+    await speak(run.voice, "clear the selection");
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
+    expect(document.activeElement, "focus is on the last selected card's checkbox").toBe(cardNode(third).getByRole("checkbox", { name: "Select third-card" }));
+
+    // The last ticked card gone with the selection: focus goes to the dashboard's scroll region.
+    await speak(run.voice, "select the first card");
+    act(() => { screen.getByTestId("agent-cards-selection-clear").focus(); });
+    await act(async () => { run.setCards([second, third]); });
+    expect(document.querySelector(`article[data-card-key="${first.key}"]`)).toBeNull();
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
+    expect(document.activeElement, "focus is on the dashboard").toBe(document.querySelector(".overview-body"));
   });
 
   /// Scenario: By voice, open the card actions editor, open the form for a new action, open Ship it for editing, and ask to remove Ship it. The editor opens on the local daemon's catalog, each request opens what it names, and the removal only opens the editor's own confirmation: nothing is written until it is pressed by hand. The registry entries behind each are voice-enabled with one matching command row each, parsed row by row with its screen and parameter, Ship it resolves from the editor although no card offers it, and every other control of the editor — Save, the removal's Remove, Hide, Restore, choosing the daemon, choosing an icon — is either a row or carries a written reason it is not.

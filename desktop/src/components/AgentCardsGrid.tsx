@@ -1,5 +1,5 @@
 import { BellRing, SlidersHorizontal, X } from "lucide-react";
-import { useLayoutEffect, useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
 import { cardKinds, cardTree, needsYouPath, type CardNode } from "../lib/agentCardsTree";
@@ -77,14 +77,48 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls, editor }: {
  * before it), and Clear. It floats over the end of the dashboard's scroll
  * region, which leaves room for it below the last card.
  */
-export function AgentCardsSelectionBar({ selection, controls }: {
+export function AgentCardsSelectionBar({ selection, controls }: SelectionBarProps) {
+  if (selection.selected.size === 0) return null;
+  return <SelectionBar selection={selection} controls={controls} />;
+}
+
+interface SelectionBarProps {
   selection: CardSelection;
   controls: Pick<VoiceActionContext, "clearCardSelection" | "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
-}) {
+}
+
+/**
+ * PR #2491 review H1 — where focus goes when the bar goes while it has it
+ * (Clear pressed from the keyboard, or the selection emptied by voice or by
+ * its cards leaving): the checkbox of the card ticked or unticked last, if it
+ * is still drawn, else the dashboard's scroll region. Left on the removed
+ * button, focus falls to the document, and WebKit's next Tab then starts from
+ * the page's header with the dashboard scrolled back to the top.
+ */
+function focusTargetAfterBar(bar: HTMLElement, last: string | undefined): HTMLElement | null {
+  const region = bar.closest<HTMLElement>(".overview-body") ?? bar.parentElement;
+  if (!region) return null;
+  const card = last === undefined ? undefined : `agent-card-${domIdentity(last)}`;
+  const checkbox = card === undefined ? undefined : [...region.querySelectorAll<HTMLElement>("[data-testid='agent-card-select']")]
+    .find((box) => box.closest("article")?.getAttribute("data-testid") === card);
+  return checkbox ?? region;
+}
+
+function SelectionBar({ selection, controls }: SelectionBarProps) {
   const count = selection.selected.size;
-  if (count === 0) return null;
+  const bar = useRef<HTMLDivElement>(null);
+  const last = useRef(selection.last);
+  useLayoutEffect(() => { last.current = selection.last; }, [selection.last]);
+  /* A layout effect's cleanup runs while the bar is still in the document, so focus can be moved before the button holding it is removed. */
+  useLayoutEffect(() => {
+    const node = bar.current;
+    return () => {
+      if (!node || !node.contains(document.activeElement)) return;
+      focusTargetAfterBar(node, last.current)?.focus({ preventScroll: true });
+    };
+  }, []);
   return (
-    <div className="agent-cards-selection-bar" role="region" aria-label="Selected cards" data-testid="agent-cards-selection-bar">
+    <div ref={bar} className="agent-cards-selection-bar" role="region" aria-label="Selected cards" data-testid="agent-cards-selection-bar">
       <span className="agent-cards-selection-count" data-testid="agent-cards-selection-count">{count} selected</span>
       {selection.choices.length === 0
         ? <span className="agent-cards-selection-hint">No action is offered by the selected cards.</span>
