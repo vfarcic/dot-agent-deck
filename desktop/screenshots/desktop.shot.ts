@@ -296,7 +296,9 @@ desktopScenario("agent-card-panel", async (page) => {
 });
 
 // The same pane in a phone-wide window: the Card panel between the pane's
-// header and the terminal, at a fixed height that scrolls.
+// header and the terminal, at a fixed height that scrolls. PR #2491 review:
+// the panel is scrolled to its Actions, so the shot shows the action icons and
+// the Edit beside the heading rather than only the top of the panel.
 desktopScenario("agent-card-panel-narrow", async (page) => {
   await page.setViewportSize({ width: 375, height: 812 });
   const panel = await openContractReviewPanel(page);
@@ -309,6 +311,14 @@ desktopScenario("agent-card-panel-narrow", async (page) => {
   await expect(pane.getByRole("button", { name: "Back to dashboard" })).toBeInViewport({ ratio: 1 });
   // PR #2491 review J7: the terminal under the panel shows the agent at work (a line short enough not to wrap at this width).
   await expectTerminalPainted(page, "One breaking change: the new status.");
+  const actions = panel.getByTestId("agent-card-panel-actions");
+  await actions.evaluate((node) => {
+    const scroller = node.closest("[data-testid='agent-card-panel']") as HTMLElement;
+    scroller.scrollTop += node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  });
+  await expect(actions.getByRole("heading", { name: /^Actions/ })).toBeInViewport({ ratio: 1 });
+  await expect(actions.getByRole("button", { name: "Edit card actions" })).toBeInViewport({ ratio: 1 });
+  await expect(actions.getByTestId("action-icon-group")).toBeInViewport({ ratio: 1 });
 });
 
 // PR #2491 review L3 — tick every root of a pushed scene. The push gives the
