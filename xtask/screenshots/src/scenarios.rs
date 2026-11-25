@@ -214,7 +214,22 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "agent-cards-actions-editor",
-        description: "The desktop Card actions editor's form for a new action, Deploy it, with its text over two lines and its icon grid open on the rocket; the listed actions are below it (PRD #2374 decision 2026-11-24).",
+        description: "The desktop Card actions editor, opened from the daemon's ⋯ menu and titled with its name: the form for a new action, Deploy it, with its text over two lines and its icon grid open on the rocket; the listed actions are below it (PRD #2374 decision 2026-11-24, PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-daemon-menu",
+        description: "A daemon's ⋯ menu on the desktop Dashboard, open on Card actions, with the cards right under the top bar (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "dashboard-more-menu",
+        description: "The desktop Dashboard's ⋯ menu, right of Refresh, open on Needs you only, with the count of agents that need you on the ⋯ (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "dashboard-needs-you-chip",
+        description: "Needs you only on in the desktop Dashboard's Table view: the Needs you only chip beside Filter, and only the agents that need you with the agents above them (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],
     },
     Scenario {

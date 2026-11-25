@@ -387,17 +387,63 @@ desktopScenario("agent-cards-batch-results", async (page) => {
 });
 
 // PRD #2374 decision 2026-11-24 — desktop-only: the TUI has no cards view.
-// The Card actions editor on the `cards=tree` scene's daemon (it advertises
-// the editor; the fixture bridge answers from the deck's two defaults), with
-// Add action's form filled in for a Deploy it action and its icon grid open
-// on the rocket chosen.
-desktopScenario("agent-cards-actions-editor", async (page) => {
+// The `cards=tree` scene's Cards view: its daemon advertises the Card
+// actions editor (the fixture bridge answers from the deck's two defaults).
+async function openTreeCards(page: Page): Promise<void> {
   await page.goto("/?fixture=1&state=docs&cards=tree");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await page.getByTestId("overview-mode-cards").click();
-  await page.getByRole("button", { name: "Card actions", exact: true }).click();
-  const editor = page.getByRole("dialog", { name: "Card actions" });
+  await expect(page.getByTestId("agent-cards-tree")).toBeVisible();
+}
+
+// PR #2491 decision 2026-11-25 — the daemon's ⋯ menu, just left of its New
+// agent button, open on Card actions; no line of counts or buttons above
+// the cards.
+desktopScenario("agent-cards-daemon-menu", async (page) => {
+  await openTreeCards(page);
+  await expect(page.locator(".agent-cards-toolbar")).toHaveCount(0);
+  await page.getByTestId("daemon-more").first().click();
+  const menu = page.getByTestId("daemon-more-menu");
+  await expect(menu.getByRole("menuitem", { name: "Card actions" })).toBeVisible();
+  await expect(menu).toBeInViewport({ ratio: 1 });
+});
+
+// PR #2491 decision 2026-11-25 — the Dashboard's ⋯ menu, right of Refresh,
+// open on Needs you only (not ticked), with the count of agents that need
+// you on the ⋯.
+desktopScenario("dashboard-more-menu", async (page) => {
+  await openTreeCards(page);
+  await expect(page.getByTestId("overview-needs-you-count")).toHaveText("3");
+  await page.getByRole("button", { name: "More", exact: true }).click();
+  const menu = page.getByTestId("overview-more-menu");
+  await expect(menu.getByRole("menuitemcheckbox", { name: "Needs you only" })).toHaveAttribute("aria-checked", "false");
+  await expect(menu).toBeInViewport({ ratio: 1 });
+});
+
+// PR #2491 decision 2026-11-25 — Needs you only on, in the Table view: the
+// chip beside Filter, and only the agents that need you with the agents above
+// them (issue-queue, prd-2374, tester, issue-2310, docs-site, editor).
+desktopScenario("dashboard-needs-you-chip", async (page) => {
+  await openTreeCards(page);
+  await page.getByTestId("overview-mode-table").click();
+  await page.getByRole("button", { name: "More", exact: true }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Needs you only" }).click();
+  await expect(page.getByTestId("overview-more-menu")).toHaveCount(0);
+  await expect(page.getByTestId("needs-you-chip")).toBeVisible();
+  await expect(page.getByRole("row", { name: /^Open .* agent$/ })).toHaveCount(6);
+  await page.mouse.move(0, 0);
+});
+
+// The Card actions editor on the `cards=tree` scene's daemon, opened from its
+// ⋯ menu and titled with its name, with Add action's form filled in for a
+// Deploy it action and its icon grid open on the rocket chosen.
+desktopScenario("agent-cards-actions-editor", async (page) => {
+  await openTreeCards(page);
+  await page.getByTestId("daemon-more").first().click();
+  await page.getByRole("menuitem", { name: "Card actions" }).click();
+  const editor = page.getByRole("dialog", { name: /^Card actions: / });
+  await expect(editor.getByRole("combobox", { name: "Daemon" })).toHaveCount(0);
   await expect(editor.locator('[data-testid="agent-card-actions-editor-row"][data-action="go-ahead"]')).toHaveAttribute("data-source", "deck");
   await expect(editor.locator('[data-testid="agent-card-actions-editor-row"][data-action="merge"]')).toHaveAttribute("data-source", "deck");
   await editor.getByRole("button", { name: "Add action", exact: true }).click();
