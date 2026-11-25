@@ -224,6 +224,33 @@ describe("the Dashboard's ⋯ menus (PR #2491 decision 2026-11-25)", () => {
   });
 });
 
+describe("the Cards view's note when no agent has a card (PR #2491 review)", () => {
+  /// Scenario: On the Cards view, the only daemon is from a release without cards and runs agents. The note above the daemons does not promise that every agent gets a card: it says no agent has a card yet and that the daemon's agents are shown as usual because it does not report cards.
+  it("desktop/agent-cards/122: with one daemon that does not report cards, the empty Cards view names it rather than promising cards", () => {
+    window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
+    render(<AgentOverview runtime={runtime({ cards: false })} onNavigate={vi.fn()} />);
+    const name = deckName(createFixtureFleet("fleet")[0].connection);
+    expect(screen.queryByTestId("agent-cards-empty")).toBeNull();
+    expect(document.body).not.toHaveTextContent("Every agent the daemon runs gets one");
+    expect(screen.getByTestId("agent-cards-empty-scoped")).toHaveTextContent(`No agent has a card yet. Agents on ${name} are shown as usual: that daemon does not report cards.`);
+  });
+
+  /// Scenario: On the Cards view, two daemons: one reports cards but has none yet, the other is from a release without cards and runs agents. The note names the daemon without cards instead of saying every agent gets a card; once both daemons report cards and neither has one, the note says no agent has a card yet and that every agent the daemon runs gets one.
+  it("desktop/agent-cards/122: in a mixed fleet, the empty Cards view names the daemon without cards, and keeps its promise only when every daemon reports cards", () => {
+    window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
+    const legacy = [entry("11", "legacy-lead"), entry("12", "legacy-asker")];
+    const view = render(<AgentOverview runtime={runtime({ entries: [], remote: { entries: legacy, catalogEdit: false, cards: false } })} onNavigate={vi.fn()} />);
+    const name = deckName(createFixtureFleet("fleet")[1].connection);
+    expect(screen.queryByTestId("agent-cards-empty")).toBeNull();
+    expect(document.body).not.toHaveTextContent("Every agent the daemon runs gets one");
+    expect(screen.getByTestId("agent-cards-empty-scoped")).toHaveTextContent(`No agent has a card yet. Agents on ${name} are shown as usual: that daemon does not report cards.`);
+
+    view.rerender(<AgentOverview runtime={runtime({ entries: [], remote: { entries: [], catalogEdit: false } })} onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("agent-cards-empty-scoped")).toBeNull();
+    expect(screen.getByTestId("agent-cards-empty")).toHaveTextContent("No agent has a card yet. Every agent the daemon runs gets one.");
+  });
+});
+
 describe("what the dashboard says about daemons the cards do not count (PR #2491 review S1)", () => {
   it("names daemons without cards and daemons not answering, in the note and in the ⋯'s description", () => {
     const uncounted = { notReporting: ["old-a", "old-b"], notAnswering: ["far"] };

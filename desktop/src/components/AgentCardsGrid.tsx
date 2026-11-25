@@ -88,9 +88,12 @@ export function needsYouCountDescription(count: number, uncounted: UncountedDaem
  * only, and each daemon's ⋯ opens its Card actions. `cards` is every card on
  * screen, across the daemons.
  *
- * "Nothing needs you right now" is said only when every daemon on screen
- * reports cards; otherwise the note says no card needs the user and names
- * the daemons it cannot speak for (PR #2491 review S1).
+ * "Nothing needs you right now" is said only while no daemon is in
+ * `uncounted`: a daemon that does not report cards and has agents on screen,
+ * or one that is not answering. Otherwise the note says no card needs the
+ * user and names those daemons (PR #2491 review S1). The empty Cards view's
+ * "Every agent the daemon runs gets one" is held to the same condition, and
+ * names the same daemons otherwise (PR #2491 review).
  */
 export function AgentCardsNotes({ cards, needsYouOnly, cardsView, uncounted = NO_UNCOUNTED }: {
   cards: readonly PlacedCard[];
@@ -108,7 +111,8 @@ export function AgentCardsNotes({ cards, needsYouOnly, cardsView, uncounted = NO
   const scoped = hasUncounted(uncounted);
   return (
     <div className="agent-cards-notes">
-      {empty && <p className="agent-cards-empty" data-testid="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
+      {empty && !scoped && <p className="agent-cards-empty" data-testid="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
+      {empty && scoped && <p className="agent-cards-empty" data-testid="agent-cards-empty-scoped">No agent has a card yet. {uncountedDaemonsText(uncounted, "shown as usual")}</p>}
       {noneNeedYou && !scoped && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">Nothing needs you right now. Needs you only is on: turn it off from the top bar to see every agent.</p>}
       {noneNeedYou && scoped && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you-scoped">No card needs you. {uncountedDaemonsText(uncounted, "shown as usual")}</p>}
     </div>

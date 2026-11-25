@@ -17899,6 +17899,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** each utterance on the dashboard declares `{view, needsYouOnly}` as they stood (table/off, then table/on, then cards/off); the declaration reads `{"view","needsYouOnly"}` and refuses another view, a missing field or an extra one; the command model's trusted state beside the command table carries `dashboard` with `view` and `needs_you_only` while declared, and nothing when not, and the untrusted data turn never carries it; with it declared, `filter_needs_you_cards`, `set_overview_mode` and `clear_dashboard_filter` each end with a sentence saying what the state makes "show all cards", "show all" and "show every agent" mean, and no other row changes; the meaning check is told the view and the filter on the dashboard only (PR #2491, 2026-11-25).
 - **Does not assert:** the model's pick without a credential (the fixtures, run live).
 
+##### desktop/agent-cards/122 — The empty Cards view keeps "Every agent the daemon runs gets one" only while no daemon is left uncounted.
+- **Test:** vitest `desktop/agent-cards/122: …` (two cases) in `desktop/src/components/DashboardMoreMenus.test.tsx`.
+- **Layer:** desktop overview (jsdom).
+- **Asserts:** on the Cards view with no card, a lone daemon that does not report cards, and a mixed fleet whose card daemon has no cards, get "No agent has a card yet." followed by the daemon without cards named as in the scoped Needs you only note, and never "Every agent the daemon runs gets one."; when every daemon reports cards and none has one, that sentence is kept (PR #2491 review).
+- **Does not assert:** a real browser.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
