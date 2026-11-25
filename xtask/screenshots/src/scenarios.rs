@@ -43,10 +43,57 @@ impl Client {
     }
 }
 
+/// One of the two themes a screenshot is taken in (PR #2491): a PR shows
+/// every changed screen in both, side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 2] = [Theme::Light, Theme::Dark];
+
+    /// The spelling used on the command line, in file names and in the
+    /// Playwright test titles.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Theme> {
+        Theme::ALL.into_iter().find(|t| t.as_str() == text)
+    }
+}
+
+/// How a run names its images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Naming {
+    /// `<scenario>-<client>-<theme>.png`, one file per theme: the default, and
+    /// what a pull request's screenshots use.
+    Paired,
+    /// `<scenario>-<client>.png` in one theme: the names the landing page and
+    /// `docs/installation.md` already reference (`--single-theme`).
+    Single,
+}
+
+impl Naming {
+    /// The spelling `cargo docs-screenshots` hands the rasterizer.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Naming::Paired => "paired",
+            Naming::Single => "single",
+        }
+    }
+}
+
 /// A named screenshot, captured from one or both clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scenario {
-    /// Kebab-case; the image is `docs/img/<name>-<client>.png`.
+    /// Kebab-case; the images are `<name>-<client>-<theme>.png`, or
+    /// `<name>-<client>.png` in a single-theme run.
     pub name: &'static str,
     /// One line for `--list`.
     pub description: &'static str,
@@ -58,9 +105,18 @@ impl Scenario {
         self.clients.contains(&client)
     }
 
-    /// The PNG this scenario produces for `client`.
+    /// The PNG this scenario produces for `client` in a single-theme run.
     pub fn image_file(&self, client: Client) -> String {
         format!("{}-{}.png", self.name, client.as_str())
+    }
+
+    /// The PNG this scenario produces for `client` in `theme`, named as
+    /// `naming` says.
+    pub fn themed_image_file(&self, client: Client, theme: Theme, naming: Naming) -> String {
+        match naming {
+            Naming::Single => self.image_file(client),
+            Naming::Paired => format!("{}-{}-{}.png", self.name, client.as_str(), theme.as_str()),
+        }
     }
 
     /// The name of the test function holding the TUI capture.
@@ -338,6 +394,28 @@ mod tests {
         assert_eq!(s.tui_test_name(), "docs_screenshot_dashboard_empty");
         assert_eq!(Client::parse("tui"), Some(Client::Tui));
         assert_eq!(Client::parse("gui"), None);
+    }
+
+    #[test]
+    fn a_paired_run_names_one_file_per_theme_and_a_single_run_keeps_the_old_name() {
+        let s = find("dashboard").unwrap();
+        assert_eq!(
+            s.themed_image_file(Client::Tui, Theme::Light, Naming::Paired),
+            "dashboard-tui-light.png"
+        );
+        assert_eq!(
+            s.themed_image_file(Client::Desktop, Theme::Dark, Naming::Paired),
+            "dashboard-desktop-dark.png"
+        );
+        for theme in Theme::ALL {
+            assert_eq!(
+                s.themed_image_file(Client::Desktop, theme, Naming::Single),
+                "dashboard-desktop.png"
+            );
+        }
+        assert_eq!(Theme::parse("light"), Some(Theme::Light));
+        assert_eq!(Theme::parse("dark"), Some(Theme::Dark));
+        assert_eq!(Theme::parse("system"), None);
     }
 
     #[test]

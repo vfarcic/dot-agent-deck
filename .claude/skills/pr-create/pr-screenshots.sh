@@ -3,9 +3,17 @@
 #
 #   .claude/skills/pr-create/pr-screenshots.sh <pr-number> <image>[=<alt text>]...
 #
-# Pass one image per client that has the feature, each with the alt text the PR
-# body should carry: what the frame shows, not its file name. An image given
-# without `=<alt text>` prints with an `ALT TEXT NEEDED` placeholder to replace.
+# Pass the images of every client that has the feature, each with the alt text
+# the PR body should carry: what the frame shows, not its file name. An image
+# given without `=<alt text>` prints with an `ALT TEXT NEEDED` placeholder to
+# replace.
+#
+# Every screenshot comes in a light and a dark version (PR #2491), named
+# `<scene>-<client>-light.png` and `<scene>-<client>-dark.png` as
+# `cargo docs-screenshots` writes them. After the one image line per file, the
+# script prints each pair it was given as a two-column `| Light | Dark |` table,
+# ready to go under the pair's caption in the body; an image passed without its
+# other half is printed as a line only, and a missing half is named on stderr.
 #
 # GitHub has no API for the image uploads its web editor does, so the images go
 # to a branch of their own, `pr-screenshots`, which shares no history with
@@ -79,7 +87,7 @@ for arg in "$@"; do
   esac
   image_signature "$f" || { echo "ERROR: its content is not a PNG, JPEG, GIF or WebP image: $f" >&2; exit 2; }
   case "$alt" in
-    *[\]\[]* | *$'\n'*) echo "ERROR: alt text may not contain brackets or a newline: $alt" >&2; exit 2 ;;
+    *[\]\[\|]* | *$'\n'*) echo "ERROR: alt text may not contain brackets, '|' or a newline: $alt" >&2; exit 2 ;;
   esac
   for seen in "${names[@]+"${names[@]}"}"; do
     [ "$seen" != "$name" ] || { echo "ERROR: two files named $name" >&2; exit 2; }
@@ -152,8 +160,38 @@ for attempt in 1 2 3 4 5; do
   sleep $((attempt * 2))
 done
 
+declare -a lines=()
 i=0
 for name in "${names[@]}"; do
-  echo "![${alts[$i]}](https://raw.githubusercontent.com/$repo/$commit/$pr/$name)"
+  lines+=("![${alts[$i]}](https://raw.githubusercontent.com/$repo/$commit/$pr/$name)")
+  echo "${lines[$i]}"
+  i=$((i + 1))
+done
+
+# Each light image with its dark half, as the table the PR body shows.
+i=0
+for name in "${names[@]}"; do
+  case "$name" in
+    *-light.*)
+      want="${name%-light.*}-dark.${name##*.}"
+      found=""
+      j=0
+      for other in "${names[@]}"; do
+        [ "$other" != "$want" ] || found=$j
+        j=$((j + 1))
+      done
+      if [ -n "$found" ]; then
+        printf '\n| Light | Dark |\n| --- | --- |\n| %s | %s |\n' "${lines[$i]}" "${lines[$found]}"
+      else
+        echo "NOTE: $name has no $want beside it; every screenshot comes in both themes" >&2
+      fi
+      ;;
+    *-dark.*)
+      want="${name%-dark.*}-light.${name##*.}"
+      found=""
+      for other in "${names[@]}"; do [ "$other" != "$want" ] || found=1; done
+      [ -n "$found" ] || echo "NOTE: $name has no $want beside it; every screenshot comes in both themes" >&2
+      ;;
+  esac
   i=$((i + 1))
 done

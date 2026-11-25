@@ -7,7 +7,15 @@
 //! cargo docs-screenshots --scenario dashboard             # one scenario, both clients
 //! cargo docs-screenshots --client desktop                 # every desktop image
 //! cargo docs-screenshots --out <dir>                      # somewhere other than docs/img
+//! cargo docs-screenshots --theme light                    # one theme of the pair
+//! cargo docs-screenshots --single-theme dark              # the landing/installation names
 //! ```
+//!
+//! Every image comes in a light and a dark version by default (PR #2491),
+//! `<scenario>-<client>-light.png` and `<scenario>-<client>-dark.png`.
+//! `--single-theme` writes one theme under the theme-less
+//! `<scenario>-<client>.png` the landing page and `docs/installation.md`
+//! reference.
 //!
 //! Two stages. The TUI stage runs the `#[ignore]`d captures in
 //! `tests/e2e_docs_screenshots.rs` under `--features e2e`: each drives the
@@ -24,22 +32,31 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use xtask_screenshots::scenarios::{self, Client, SCENARIOS, Scenario};
-use xtask_screenshots::{OUT_DIR_ENV, PORT_ENV, RUN_DIR_ENV, TUI_HTML_DIR_ENV, WEB_BUILD_ENV};
+use xtask_screenshots::scenarios::{self, Client, Naming, SCENARIOS, Scenario, Theme};
+use xtask_screenshots::{
+    NAMING_ENV, OUT_DIR_ENV, PORT_ENV, RUN_DIR_ENV, THEMES_ENV, TUI_HTML_DIR_ENV, WEB_BUILD_ENV,
+};
 
 const USAGE: &str = "\
-usage: cargo docs-screenshots [--list] [--scenario <name>]... [--client tui|desktop]... [--out <dir>]
+usage: cargo docs-screenshots [--list] [--scenario <name>]... [--client tui|desktop]...
+                              [--theme light|dark]... | [--single-theme light|dark] [--out <dir>]
 
-  --list               print the scenarios and exit
-  --scenario <name>    only this scenario (repeatable; default: all)
-  --client <client>    only this client, tui or desktop (repeatable; default: both)
-  --out <dir>          write the PNGs here instead of docs/img";
+  --list                 print the scenarios and exit
+  --scenario <name>      only this scenario (repeatable; default: all)
+  --client <client>      only this client, tui or desktop (repeatable; default: both)
+  --theme <theme>        only this theme, light or dark (repeatable; default: both),
+                         each image named <scenario>-<client>-<theme>.png
+  --single-theme <theme> one theme, each image named <scenario>-<client>.png: the
+                         names the landing page and docs/installation.md use
+  --out <dir>            write the PNGs here instead of docs/img";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     list: bool,
     scenarios: Vec<String>,
     clients: BTreeSet<Client>,
+    themes: BTreeSet<Theme>,
+    naming: Naming,
     out: Option<PathBuf>,
 }
 
@@ -48,8 +65,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
         list: false,
         scenarios: Vec::new(),
         clients: BTreeSet::new(),
+        themes: BTreeSet::new(),
+        naming: Naming::Paired,
         out: None,
     };
+    let mut single: Option<Theme> = None;
     let mut it = raw.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -69,6 +89,20 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                     .ok_or_else(|| format!("unknown client {text:?}; use tui or desktop"))?;
                 args.clients.insert(client);
             }
+            "--theme" => {
+                let text = it.next().ok_or("--theme needs light or dark")?;
+                let theme = Theme::parse(text)
+                    .ok_or_else(|| format!("unknown theme {text:?}; use light or dark"))?;
+                args.themes.insert(theme);
+            }
+            "--single-theme" => {
+                let text = it.next().ok_or("--single-theme needs light or dark")?;
+                let theme = Theme::parse(text)
+                    .ok_or_else(|| format!("unknown theme {text:?}; use light or dark"))?;
+                if single.replace(theme).is_some() {
+                    return Err("--single-theme is given once".into());
+                }
+            }
             "--out" => {
                 let dir = it.next().ok_or("--out needs a directory")?;
                 args.out = Some(PathBuf::from(dir));
@@ -79,6 +113,17 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
     }
     if args.clients.is_empty() {
         args.clients.extend(Client::ALL);
+    }
+    match single {
+        Some(_) if !args.themes.is_empty() => {
+            return Err("--single-theme and --theme do not go together".into());
+        }
+        Some(theme) => {
+            args.themes.insert(theme);
+            args.naming = Naming::Single;
+        }
+        None if args.themes.is_empty() => args.themes.extend(Theme::ALL),
+        None => {}
     }
     Ok(args)
 }
@@ -119,15 +164,47 @@ fn escape_regex(text: &str) -> String {
     out
 }
 
-/// The Playwright `--grep` selecting exactly these pairs. Test titles are
-/// `<client> <scenario>`; the `$` is what stops `dashboard` also selecting
-/// `dashboard-empty`.
-fn playwright_grep(pairs: &[(&Scenario, Client)]) -> String {
+/// The Playwright `--grep` selecting exactly these pairs in these themes.
+/// Test titles are `<client> <scenario> <theme>`; the space and the theme
+/// after the name are what stop `dashboard` also selecting `dashboard-empty`.
+fn playwright_grep(pairs: &[(&Scenario, Client)], themes: &BTreeSet<Theme>) -> String {
     let alternatives: Vec<String> = pairs
         .iter()
         .map(|(s, c)| escape_regex(&format!("{} {}", c.as_str(), s.name)))
         .collect();
-    format!("(?:^|\\s)(?:{})$", alternatives.join("|"))
+    let themes: Vec<&str> = themes.iter().map(|t| t.as_str()).collect();
+    format!(
+        "(?:^|\\s)(?:{}) (?:{})$",
+        alternatives.join("|"),
+        themes.join("|")
+    )
+}
+
+/// The value of [`THEMES_ENV`] for these themes.
+fn themes_env(themes: &BTreeSet<Theme>) -> String {
+    themes
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Every PNG a run of these pairs in these themes writes, in order.
+fn expected_images(
+    pairs: &[(&Scenario, Client)],
+    themes: &BTreeSet<Theme>,
+    naming: Naming,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (s, c) in pairs {
+        for theme in themes {
+            let file = s.themed_image_file(*c, *theme, naming);
+            if !out.contains(&file) {
+                out.push(file);
+            }
+        }
+    }
+    out
 }
 
 fn print_list() {
@@ -343,8 +420,10 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
     playwright
         .current_dir(&desktop)
         .args(["test", "-c", "playwright.screenshots.config.ts", "--grep"])
-        .arg(playwright_grep(&pairs))
+        .arg(playwright_grep(&pairs, &args.themes))
         .env(OUT_DIR_ENV, &out)
+        .env(THEMES_ENV, themes_env(&args.themes))
+        .env(NAMING_ENV, args.naming.as_str())
         .env(TUI_HTML_DIR_ENV, &html_dir)
         .env(RUN_DIR_ENV, &run_dir.0)
         .env(WEB_BUILD_ENV, if needs_web { "1" } else { "0" });
@@ -360,8 +439,8 @@ fn generate(args: &Args) -> Result<Vec<PathBuf>, String> {
     run(&mut playwright, "rasterize (Playwright Chromium)")?;
 
     let mut written = Vec::new();
-    for (s, c) in &pairs {
-        let png = out.join(s.image_file(*c));
+    for file in expected_images(&pairs, &args.themes, args.naming) {
+        let png = out.join(file);
         if !png.is_file() {
             return Err(format!("expected {} was not written", png.display()));
         }
@@ -419,6 +498,62 @@ mod tests {
         assert_eq!(a.clients, Client::ALL.into_iter().collect());
         let expected: usize = SCENARIOS.iter().map(|s| s.clients.len()).sum();
         assert_eq!(selected(&a).len(), expected);
+        // Both themes, one file each.
+        assert_eq!(a.themes, Theme::ALL.into_iter().collect());
+        assert_eq!(a.naming, Naming::Paired);
+        assert_eq!(
+            expected_images(&selected(&a), &a.themes, a.naming).len(),
+            expected * 2
+        );
+    }
+
+    #[test]
+    fn a_run_writes_a_light_and_a_dark_image_per_scenario_and_client() {
+        let a = args(&["--scenario", "dashboard"]).unwrap();
+        assert_eq!(
+            expected_images(&selected(&a), &a.themes, a.naming),
+            [
+                "dashboard-tui-light.png",
+                "dashboard-tui-dark.png",
+                "dashboard-desktop-light.png",
+                "dashboard-desktop-dark.png",
+            ]
+        );
+        assert_eq!(themes_env(&a.themes), "light,dark");
+        let light = args(&["--scenario", "dashboard", "--theme", "light"]).unwrap();
+        assert_eq!(
+            expected_images(&selected(&light), &light.themes, light.naming),
+            ["dashboard-tui-light.png", "dashboard-desktop-light.png"]
+        );
+        assert_eq!(themes_env(&light.themes), "light");
+    }
+
+    #[test]
+    fn single_theme_keeps_the_names_the_landing_and_installation_pages_use() {
+        let a = args(&["--scenario", "self-upgrade", "--single-theme", "dark"]).unwrap();
+        assert_eq!(a.naming, Naming::Single);
+        assert_eq!(a.themes, [Theme::Dark].into_iter().collect());
+        assert_eq!(
+            expected_images(&selected(&a), &a.themes, a.naming),
+            ["self-upgrade-tui.png", "self-upgrade-desktop.png"]
+        );
+        assert_eq!(themes_env(&a.themes), "dark");
+        assert!(
+            args(&["--single-theme", "dark", "--theme", "light"])
+                .unwrap_err()
+                .contains("do not go together")
+        );
+        assert!(
+            args(&["--single-theme", "dark", "--single-theme", "light"])
+                .unwrap_err()
+                .contains("once")
+        );
+        assert!(
+            args(&["--theme", "system"])
+                .unwrap_err()
+                .contains("unknown theme")
+        );
+        assert!(args(&["--single-theme"]).is_err());
     }
 
     #[test]
@@ -527,11 +662,13 @@ mod tests {
 
     #[test]
     fn the_playwright_grep_is_anchored_so_a_prefix_does_not_select_its_longer_sibling() {
+        let both: BTreeSet<Theme> = Theme::ALL.into_iter().collect();
         let dashboard = scenarios::find("dashboard").unwrap();
-        let grep = playwright_grep(&[(dashboard, Client::Desktop)]);
-        assert_eq!(grep, "(?:^|\\s)(?:desktop dashboard)$");
+        let grep = playwright_grep(&[(dashboard, Client::Desktop)], &both);
+        assert_eq!(grep, "(?:^|\\s)(?:desktop dashboard) (?:light|dark)$");
         let empty = scenarios::find("dashboard-empty").unwrap();
-        let grep = playwright_grep(&[(empty, Client::Tui)]);
-        assert_eq!(grep, "(?:^|\\s)(?:tui dashboard\\-empty)$");
+        let dark: BTreeSet<Theme> = [Theme::Dark].into_iter().collect();
+        let grep = playwright_grep(&[(empty, Client::Tui)], &dark);
+        assert_eq!(grep, "(?:^|\\s)(?:tui dashboard\\-empty) (?:dark)$");
     }
 }
