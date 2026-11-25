@@ -14609,8 +14609,9 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/058 — Live: a Claude Code whose last turn ended on an API error is still woken for the next message (issue #2385).
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, its lazy-spawned daemon and the deck's log.
 - **Agent:** Claude Code, on a model the provider rejects (`claude-3-7-sonnet-20250219`), so every turn ends on the provider's error and Claude Code runs its `StopFailure` hook instead of `Stop`.
-- **Asserts:** a first posted task is handed over by Claude Code's own wake and its turn ends on the provider's error, with the card reading Error; a second posted task, with nothing typed into the pane, is handed over too and Claude Code's transcript shows it took it (a `user` entry naming delivery 1.1). Before the fix the second task stayed queued with no waiter armed, beside an idle prompt.
+- **Asserts:** a first posted task is handed over by Claude Code's own wake and its turn ends on the provider's error, with the card reading Error; a second posted task, with nothing typed into the pane, is handed over too and Claude Code's transcript shows it took it as its own wake (a `user` entry for delivery 1.1, and no other attempt). Before the fix the second task stayed queued with no waiter armed, beside an idle prompt.
 - **Test:** `claude_058_live_a_turn_ended_by_an_api_error_still_wakes_for_the_next_message` in `tests/e2e_inbox_claude_live.rs`.
+- **Skips:** below Claude Code 2.1.328 (`CLAUDE_STOP_FAILURE_REWAKE_MIN`), where the deck writes no `StopFailure` waiter on purpose.
 - **Does not assert:** that the woken turn succeeds (the model still rejects it); an error a provider returns mid-turn after a tool call; a usage-limit refusal, which reads as Blocked (`status/blocked/*`); macOS. Run by hand on Claude Code 2.1.330 and 2.1.332.
 - **Platform coverage:** linux.
 - **Cost:** no model turns (the provider rejects each request).
