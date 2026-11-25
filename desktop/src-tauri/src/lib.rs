@@ -58,6 +58,7 @@ mod trust_review;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
 // crate's shared upgrade procedure.
 mod upgrade;
+mod upgrade_all;
 // Tests only: binding the production attach server's listener without the
 // process-umask flip (issue #1078).
 #[cfg(all(test, unix))]
@@ -7122,6 +7123,143 @@ async fn desktop_upgrade_daemon(
     Ok(settled.outcome)
 }
 
+/// Issue #1600: **Upgrade all**'s check — every remote deck on the deck list,
+/// checked at once by the root crate's batch
+/// ([`dot_agent_deck::daemon_upgrade_batch::check_all`]). Resolves with what
+/// each deck will have done to it, in the crate's words, and a batch id the
+/// run names; nothing is installed or restarted. Only the last check can run.
+#[tauri::command]
+async fn desktop_upgrade_all_check(
+    webview: Webview,
+    batches: State<'_, upgrade_all::UpgradeAllState>,
+) -> Result<upgrade_all::UpgradeAllPlanDto, String> {
+    ensure_main_webview(&webview)?;
+    let path = crate::decks::remotes_path();
+    let checked = tauri::async_runtime::spawn_blocking(move || upgrade_all::Checked::check(&path))
+        .await
+        .map_err(|error| safe_message(error.to_string()))??;
+    Ok(batches.insert(checked))
+}
+
+/// Issue #1600: run the batch `batch_id` checked — the older decks upgraded
+/// one after another by [`dot_agent_deck::daemon_upgrade_batch::run_plan`],
+/// each through the same `upgrade_daemon` a single Upgrade runs. Each deck's
+/// start, stages and result are emitted on `desktop://upgrade-all` with
+/// `attempt_id`; a daemon with live work asks on `desktop://upgrade-decision`,
+/// answered by [`desktop_upgrade_decide`]. A deck whose old daemon may be gone
+/// has its terminal sessions ended as a single Upgrade's would be, as soon as
+/// its part is over.
+///
+/// Rejects only when the batch could not start: not the last check, or a deck
+/// it would upgrade already being upgraded in this app.
+#[tauri::command]
+async fn desktop_upgrade_all_run(
+    app: AppHandle,
+    webview: Webview,
+    upgrades: State<'_, upgrade::UpgradeState>,
+    batches: State<'_, upgrade_all::UpgradeAllState>,
+    batch_id: String,
+    attempt_id: String,
+) -> Result<upgrade_all::UpgradeAllReportDto, String> {
+    use dot_agent_deck::daemon_upgrade_batch::{BatchEvent, DeckResult, run_plan};
+
+    ensure_main_webview(&webview)?;
+    let attempt_id = upgrade::validate_attempt_id(&attempt_id)?;
+    let checked = batches.take(&batch_id)?;
+    let _slots = checked.reserve(&upgrades)?;
+    let running = batches.start(&batch_id);
+    let stop = running.stop_flag();
+    let upgrade_id = upgrades.next_upgrade_id();
+    let handle = tokio::runtime::Handle::current();
+    let decider_state = upgrades.inner().clone();
+    let id_for_run = upgrade_id.clone();
+    let run = tauri::async_runtime::spawn_blocking(move || {
+        let decision_app = app.clone();
+        let decider = upgrade_all::BatchDecider::new(
+            decider_state,
+            &checked,
+            attempt_id.clone(),
+            id_for_run,
+            std::sync::Arc::new(move |event: &upgrade::UpgradeDecisionEvent| {
+                let _ = decision_app.emit(upgrade::DECISION_EVENT, event);
+            }),
+        );
+        let decks = checked.decks();
+        let report = run_plan(
+            &decks,
+            checked.plan(),
+            &decider,
+            &|| stop.load(std::sync::atomic::Ordering::SeqCst),
+            &mut |event| {
+                // The deck's own cleanup first, so the webview hears its
+                // result after the app has let go of its old daemon.
+                if let BatchEvent::Finished { index, report } = &event
+                    && let (Some(Some(deck_id)), DeckResult::Ran { .. }) =
+                        (checked.deck_ids().get(*index), &report.result)
+                {
+                    handle.block_on(after_batch_deck(
+                        &app,
+                        deck_id,
+                        upgrade_all::ends_sessions(report),
+                    ));
+                }
+                let _ = app.emit(
+                    upgrade_all::BATCH_EVENT,
+                    upgrade_all::UpgradeAllEventDto::new(
+                        &batch_id,
+                        &attempt_id,
+                        checked.deck_ids(),
+                        &event,
+                    ),
+                );
+            },
+        );
+        upgrade_all::UpgradeAllReportDto::new(&report, checked.deck_ids())
+    })
+    .await;
+    // A question a panicked run left waiting is closed, as for a single Upgrade.
+    upgrades.end_upgrade(&upgrade_id);
+    drop(running);
+    run.map_err(|error| {
+        safe_message(format!(
+            "Upgrade all stopped unexpectedly, so it is not known how far it got: {error}. Reconnect shows what each daemon runs now."
+        ))
+    })
+}
+
+/// Issue #1600: **Stop after this daemon** — the batch `batch_id` starts no
+/// deck after the one being upgraded, which finishes.
+#[tauri::command]
+fn desktop_upgrade_all_stop(
+    webview: Webview,
+    batches: State<'_, upgrade_all::UpgradeAllState>,
+    batch_id: String,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    batches.stop(&batch_id)
+}
+
+/// Issue #1600: what a single Upgrade does for its deck once it returns, for
+/// one deck of Upgrade all: drop the handshake held for it, end its terminal
+/// sessions when its old daemon may be gone, and re-establish against
+/// whatever answers now. Other decks are not touched.
+async fn after_batch_deck(app: &AppHandle, deck_id: &str, ends_sessions: bool) {
+    let state = app.state::<DesktopState>();
+    let Ok(scope) = crate::dto::DeckScope::resolve(Some(deck_id)) else {
+        return;
+    };
+    let endpoint = scope.endpoint().clone();
+    state.daemon.invalidate(&endpoint).await;
+    if ends_sessions {
+        terminal::detach_deck(&state, &endpoint).await;
+    }
+    state.request_refetch(&endpoint.identity());
+    ensure_snapshot_watchers(app, &state);
+    if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
+        emit_snapshot(app, &snapshot);
+    }
+}
+
 /// PRD #1487 M5: the decision dialog's answer to the restart question an
 /// upgrade is waiting on — `"restart-now"` or `"keep-current"`. Closing the
 /// dialog sends `"keep-current"`; an id with no question waiting is refused,
@@ -7583,6 +7721,8 @@ pub fn run() {
         .manage(VoiceState::default())
         // PRD #1487 M5: the running upgrades and the restart questions they wait on.
         .manage(upgrade::UpgradeState::default())
+        // Issue #1600: the last Upgrade all check, and the batch running from it.
+        .manage(upgrade_all::UpgradeAllState::default())
         // Issue #1635: the plans last shown and the one upgrade of this app's own copies.
         .manage(self_upgrade::SelfUpgradeState::default())
         // Issue #845: the stored Light/Dark choice reaches the document root
@@ -7761,6 +7901,9 @@ pub fn run() {
             desktop_run_action,
             desktop_upgrade_daemon,
             desktop_upgrade_decide,
+            desktop_upgrade_all_check,
+            desktop_upgrade_all_run,
+            desktop_upgrade_all_stop,
             self_upgrade::desktop_self_upgrade_check,
             self_upgrade::desktop_self_upgrade_run,
             self_upgrade::desktop_self_upgrade_relaunch,

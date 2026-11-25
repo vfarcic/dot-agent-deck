@@ -169,6 +169,11 @@ impl RemoteBatchDeck {
         }
     }
 
+    /// The deck-list row this deck was read from.
+    pub fn entry(&self) -> &RemoteEntry {
+        &self.entry
+    }
+
     /// One deck per row of the deck list at `remotes_path`, in its order.
     pub fn from_deck_list(
         remotes_path: &std::path::Path,

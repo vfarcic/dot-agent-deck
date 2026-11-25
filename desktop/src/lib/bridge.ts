@@ -7,11 +7,12 @@ import { agentKey, boundAgentKey } from "./agentKey";
 import { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } from "./agentIdentity";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, type DaemonHookEvent } from "./daemonEvents";
-import { DISPLAY_LIMITS, displayText } from "./displayText";
+import { DISPLAY_LIMITS, deckName, displayText } from "./displayText";
 import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
+import type { DeckReport, DeckStatus, PlannedDeck, UpgradeAllEvent, UpgradeAllPlan, UpgradeAllReport } from "./upgradeAll";
 import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, type UpgradeEvent, type UpgradeOffer, type UpgradeOutcome, type UpgradeProgressEvent, type UpgradeDecisionEvent, type UpgradeStopSet } from "./upgrade";
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
@@ -2444,6 +2445,21 @@ export interface DeckBridge {
    */
   decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void>;
   /**
+   * Issue #1600 — Upgrade all's check (`desktop_upgrade_all_check`): every
+   * remote deck on the deck list, checked by the root crate's batch. Nothing
+   * is installed or restarted. Optional: a bridge without it offers no
+   * Upgrade all.
+   */
+  checkUpgradeAll?(): Promise<UpgradeAllPlan>;
+  /**
+   * Issue #1600 — run the batch `batchId` checked (`desktop_upgrade_all_run`).
+   * `onEvent` hears each deck's start, stages and result, and each daemon's
+   * restart question, answered with {@link decideUpgrade}.
+   */
+  runUpgradeAll?(batchId: string, onEvent: (event: UpgradeAllEvent) => void): Promise<UpgradeAllReport>;
+  /** Issue #1600 — Stop after this daemon (`desktop_upgrade_all_stop`). */
+  stopUpgradeAll?(batchId: string): Promise<void>;
+  /**
    * PRD #1666 §6.4 — Retry or Cancel one deck message an agent card lists
    * (`desktop_inbox_action`), at the revision the card shows. Optional: a
    * bridge without it (the browser preview) offers no buttons. The daemon
@@ -4227,6 +4243,92 @@ class FixtureDeckBridge implements DeckBridge {
     if (waiting.questionId !== questionId) throw new Error("That question was replaced by a newer one, because what a restart would stop changed. Answer the question shown now.");
     this.upgradeQuestions.delete(upgradeId);
     waiting.answer(choice);
+  }
+
+  /** Issue #1600 — the fixture's batches: the last check, and the runs that can be stopped. */
+  private upgradeAllChecked?: { batchId: string; deckIds: (string | undefined)[]; plan: UpgradeAllPlan };
+  private upgradeAllStops = new Set<string>();
+  private upgradeAllCount = 0;
+
+  /**
+   * Issue #1600 — the fixture's Upgrade all check: every remote deck the
+   * preview shows, in the crate's words. A deck the preview plays as older is
+   * upgraded; the others are skipped with their reason.
+   */
+  async checkUpgradeAll(): Promise<UpgradeAllPlan> {
+    await Promise.resolve();
+    const remotes = this.fleet.filter((deck) => deck.connection.deckKind === "remote");
+    const decks: PlannedDeck[] = remotes.map((deck) => {
+      const offer = deck.connection.upgradeOffer;
+      const name = deckName(deck.connection);
+      const base = { deck: name, ...(deck.connection.deckId === undefined ? {} : { deckId: deck.connection.deckId }) };
+      switch (offer?.kind) {
+        case "offered":
+          return { ...base, kind: "upgrade", line: `Will be upgraded from ${offer.from} to ${offer.to}.` };
+        case "current":
+          return { ...base, kind: "skip", line: `Skipped: already runs ${FIXTURE_APP_VERSION}.` };
+        case "daemon-newer":
+          return { ...base, kind: "skip", line: `Skipped: runs ${offer.daemon}, which is newer than this version.` };
+        default:
+          return { ...base, kind: "skip", line: "Skipped: the version its daemon runs could not be read." };
+      }
+    });
+    const toUpgrade = decks.filter((deck) => deck.kind === "upgrade").length;
+    const batchId = `fixture-batch-${++this.upgradeAllCount}`;
+    const plan: UpgradeAllPlan = {
+      batchId,
+      headline: `Checked ${decks.length} ${decks.length === 1 ? "remote deck" : "remote decks"}: ${toUpgrade} to upgrade.`,
+      toUpgrade,
+      decks,
+    };
+    this.upgradeAllChecked = { batchId, deckIds: decks.map((deck) => deck.deckId), plan };
+    return plan;
+  }
+
+  /** Issue #1600 — the fixture's run: each older deck through the fixture's own Upgrade, one after another. */
+  async runUpgradeAll(batchId: string, onEvent: (event: UpgradeAllEvent) => void): Promise<UpgradeAllReport> {
+    const checked = this.upgradeAllChecked;
+    if (checked?.batchId !== batchId) throw new Error("That check is no longer current. Open Upgrade all again to check every daemon afresh.");
+    this.upgradeAllChecked = undefined;
+    this.upgradeAllStops.delete(batchId);
+    const reports: DeckReport[] = [];
+    let stopped = false;
+    for (const [index, planned] of checked.plan.decks.entries()) {
+      let report: DeckReport;
+      if (planned.kind !== "upgrade" || planned.deckId === undefined) {
+        report = { deck: planned.deck, ...(planned.deckId === undefined ? {} : { deckId: planned.deckId }), status: planned.kind === "unreachable" ? "failed" : "skipped", line: planned.line, endsSessions: false };
+      } else if (stopped || (stopped = this.upgradeAllStops.has(batchId))) {
+        report = { deck: planned.deck, deckId: planned.deckId, status: "skipped", line: "Not started: you stopped the upgrade before it reached this deck.", endsSessions: false };
+      } else {
+        onEvent({ type: "started", index });
+        const outcome = await this.upgradeDaemon(planned.deckId, (event) => {
+          if (event.type === "progress") onEvent({ type: "progress", index, stage: event.progress.stage });
+          else onEvent(event);
+        });
+        report = outcome.outcome === "restarted"
+          ? { deck: planned.deck, deckId: planned.deckId, status: "upgraded", line: `Upgraded: now runs ${outcome.toVersion} (was ${outcome.fromVersion}).${outcome.stopped.agents.length ? ` Stopped ${outcome.stopped.agents.length} ${outcome.stopped.agents.length === 1 ? "agent" : "agents"}.` : ""}`, endsSessions: true }
+          : outcome.outcome === "installed-not-restarted"
+            ? { deck: planned.deck, deckId: planned.deckId, status: "kept", line: `Kept running: installed ${outcome.installedVersion}; the daemon keeps running${outcome.fromVersion ? ` ${outcome.fromVersion}` : ""}, as you chose.`, endsSessions: false }
+            : { deck: planned.deck, deckId: planned.deckId, status: "failed", line: "Failed while installing the new version: the fixture could not upgrade it.", endsSessions: false };
+      }
+      onEvent({ type: "finished", index, report });
+      reports.push(report);
+    }
+    this.upgradeAllStops.delete(batchId);
+    const count = (status: DeckStatus) => reports.filter((report) => report.status === status).length;
+    const parts = ([["upgraded", "upgraded"], ["kept", "kept running"], ["skipped", "skipped"], ["failed", "failed"]] as const)
+      .filter(([status]) => count(status) > 0)
+      .map(([status, word]) => `${count(status)} ${word}`);
+    return {
+      headline: reports.length ? `Upgrade all: ${parts.join(", ")} of ${reports.length} ${reports.length === 1 ? "remote deck" : "remote decks"}.` : "No remote decks are on the deck list, so there is nothing to upgrade.",
+      failed: count("failed") > 0,
+      decks: reports,
+    };
+  }
+
+  async stopUpgradeAll(batchId: string): Promise<void> {
+    await Promise.resolve();
+    this.upgradeAllStops.add(batchId);
   }
 
   async desktopFeatures(): Promise<DesktopFeatures> {
@@ -6289,6 +6391,50 @@ export class TauriDeckBridge implements DeckBridge {
   async decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void> {
     const invoke = await this.getInvoke();
     await invoke("desktop_upgrade_decide", { upgradeId, questionId, choice });
+  }
+
+  async checkUpgradeAll(): Promise<UpgradeAllPlan> {
+    const invoke = await this.getInvoke();
+    return invoke<UpgradeAllPlan>("desktop_upgrade_all_check");
+  }
+
+  async runUpgradeAll(batchId: string, onEvent: (event: UpgradeAllEvent) => void): Promise<UpgradeAllReport> {
+    const invoke = await this.getInvoke();
+    const { listen } = await import("@tauri-apps/api/event");
+    // As for a single Upgrade: every event of this run carries the id chosen
+    // here, so the listeners hear this run and no other (PRD #1487, Qodo
+    // 4208054166).
+    const attemptId = newUpgradeAttemptId();
+    const registered = await Promise.allSettled([
+      listen<{ attemptId: string } & UpgradeAllEvent>("desktop://upgrade-all", (event) => {
+        if (event.payload.attemptId === attemptId) onEvent(event.payload);
+      }),
+      listen<UpgradeDecisionEvent>("desktop://upgrade-decision", (event) => {
+        if (event.payload.attemptId === attemptId) onEvent({ type: "decision", ...event.payload });
+      }),
+    ]);
+    const stops = registered.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+    const refused = registered.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (refused) {
+      stops.forEach((stop) => stop());
+      throw refused.reason;
+    }
+    try {
+      const report = await invoke<UpgradeAllReport>("desktop_upgrade_all_run", { batchId, attemptId });
+      // The crate ended these decks' terminal sessions with their old daemons;
+      // the bridge forgets them too, as after a single Upgrade.
+      for (const deck of report.decks) {
+        if (deck.endsSessions && deck.deckId !== undefined) this.forgetDeckSessions(deck.deckId);
+      }
+      return report;
+    } finally {
+      stops.forEach((stop) => stop());
+    }
+  }
+
+  async stopUpgradeAll(batchId: string): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke("desktop_upgrade_all_stop", { batchId });
   }
 
   /**

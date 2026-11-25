@@ -193,6 +193,18 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // `std::env::current_exe` once, in `NoInstall`, to name the client's own
     // binary; that is not a project read.)
     "daemon_upgrade",
+    // Issue #1600, argued with `daemon_upgrade` above. `daemon_upgrade_batch`
+    // is the ONE Upgrade all batch every client calls — which decks it
+    // upgrades, that one fails without stopping the rest, and the words each
+    // deck's result is shown in — so the desktop's Upgrade all has to reach
+    // it rather than carry a fourth copy. The desktop names its plan, report
+    // and event types, `RemoteBatchDeck` (one deck-list row reached over ssh,
+    // as `daemon_upgrade`'s installers are), `check_all` and `run_plan`.
+    // Checked against this rule's lines: the module resolves no project,
+    // reads no project state file (it reads only the deck list, through
+    // `remote`), names no FORBIDDEN_SYMBOL or project-state literal, and
+    // contains no `std::env::current_dir` — all zero for it.
+    "daemon_upgrade_batch",
     // Issue #1350, argued rather than added quietly. `deck_list` reads and
     // edits `remotes.toml`, the user's list of WHICH daemons to connect to —
     // the CLI's `connect` registry, which the desktop now shares as its deck
