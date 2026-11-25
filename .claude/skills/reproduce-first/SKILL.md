@@ -61,7 +61,7 @@ Stop and report instead, to whoever gave you the work (the user in a conversatio
 - what you could not cover, and what is missing to reproduce it: the reporter's artefacts, a platform, a release, a scale;
 - the options, with the one you recommend. Usually some of: ask the reporter for specific evidence (name exactly what to capture), add diagnostics so the next occurrence shows the cause, reproduce a narrower cause that the code shows is possible, build a fallback that limits the damage whatever the cause, or close the issue as not reproducible.
 
-Then wait for the decision. A fallback is a legitimate outcome, but someone has to choose it knowing the cause is still unknown; don't build one by default.
+Then wait for the decision: in a conversation, the person's; a dispatched unit ends after its `work-done` report, and the decision is made outside it. A fallback is a legitimate outcome, but someone has to choose it knowing the cause is still unknown; don't build one by default.
 
 **Forcing the suspected cause is not a reproduction.** A test-only switch or stub that makes the guessed failure happen proves the fix handles that guess, not that the guess is what the user hit. Issue #2385 is the example: a re-wake fallback (PR #2501) came with a test that held mail back from Claude Code's wake-up through a test-only switch. Two hours of real-agent soak runs afterwards woke every message, and the cause that did reproduce was a different path: a turn that ended on an API error left no wake-up armed.
 
