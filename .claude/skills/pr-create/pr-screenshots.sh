@@ -41,6 +41,13 @@
 # Every input must be a regular file, not a symlink, whose first bytes are a
 # PNG, JPEG, GIF or WebP signature: the branch is public, and a file that only
 # carries an image's extension could be anything readable on this machine.
+#
+# What goes into the printed Markdown is checked before anything is pushed
+# (PR #2491 audit K4): alt text may not hold brackets, '|', a line break (CR or
+# LF), a tab or any other control character, and the repository, whether from
+# PR_SCREENSHOTS_REPO or the remote's URL, must be exactly one GitHub
+# <owner>/<name>. `xtask/linkage-check/src/pr_screenshots.rs` drives these
+# refusals against a local bare repository.
 
 set -euo pipefail
 
@@ -71,6 +78,15 @@ image_signature() {
   return 1
 }
 
+# Whether a string holds a control character: CR, LF, a tab, an escape, DEL or
+# any other byte below 0x20. CommonMark ends a line at CR as well as LF, so
+# either would let alt text end the image line and start a heading or a link
+# of its own (PR #2491 audit K4).
+has_control() {
+  local LC_ALL=C
+  [[ $1 =~ [[:cntrl:]] ]]
+}
+
 declare -a files=() names=() alts=()
 for arg in "$@"; do
   f=${arg%%=*}
@@ -86,8 +102,12 @@ for arg in "$@"; do
     *) echo "ERROR: not a .png, .jpg, .jpeg, .gif or .webp image: $name" >&2; exit 2 ;;
   esac
   image_signature "$f" || { echo "ERROR: its content is not a PNG, JPEG, GIF or WebP image: $f" >&2; exit 2; }
+  if has_control "$alt"; then
+    echo "ERROR: alt text may not contain a line break, a tab or another control character: $(printf '%q' "$alt")" >&2
+    exit 2
+  fi
   case "$alt" in
-    *[\]\[\|]* | *$'\n'*) echo "ERROR: alt text may not contain brackets, '|' or a newline: $alt" >&2; exit 2 ;;
+    *[\]\[\|]*) echo "ERROR: alt text may not contain brackets or '|': $alt" >&2; exit 2 ;;
   esac
   for seen in "${names[@]+"${names[@]}"}"; do
     [ "$seen" != "$name" ] || { echo "ERROR: two files named $name" >&2; exit 2; }
@@ -108,10 +128,22 @@ else
     exit 2
   fi
 fi
-case "$repo" in
-  */*) ;;
-  *) echo "ERROR: not an <owner>/<repo>: $repo" >&2; exit 2 ;;
-esac
+# Both sources, the override and the remote's URL, must name exactly one
+# GitHub repository: an owner of letters, digits and single inner hyphens (at
+# most 39 characters), and a name of letters, digits, '.', '_' and '-' that is
+# not '.' or '..'. Anything else could carry text out of the URLs below and into
+# the PR body (PR #2491 audit K4).
+valid_repo() {
+  local LC_ALL=C owner name
+  [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/([A-Za-z0-9._-]{1,100})$ ]] || return 1
+  owner=${BASH_REMATCH[1]}
+  name=${BASH_REMATCH[3]}
+  [[ $owner != *--* && $name != "." && $name != ".." ]]
+}
+if ! valid_repo "$repo"; then
+  echo "ERROR: not an <owner>/<name> GitHub repository: $(printf '%q' "$repo")" >&2
+  exit 2
+fi
 tmp=$(mktemp -d)
 tip_ref=refs/pr-screenshots-upload/tip-$$
 cleanup() {
