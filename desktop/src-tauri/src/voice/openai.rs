@@ -294,6 +294,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             },
             "a-model",
             TokenCeiling::default(),
@@ -567,6 +568,7 @@ mod tests {
                 decks: &[],
                 directories: Some(&listing),
                 new_agent: None,
+                dashboard: None,
             },
             "a-model",
             TokenCeiling::default(),
@@ -593,6 +595,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             },
             "a-model",
             TokenCeiling::default(),
@@ -632,6 +635,7 @@ mod tests {
             decks: &[],
             directories: None,
             new_agent: None,
+            dashboard: None,
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
@@ -661,6 +665,7 @@ mod tests {
             decks: &[],
             directories: None,
             new_agent: None,
+            dashboard: None,
         };
 
         let bare = request_body(&request, "a-model", TokenCeiling::default(), None);

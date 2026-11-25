@@ -684,4 +684,30 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(screen.queryByRole("dialog", { name: /^Card actions: / })).toBeNull();
     expect(readCardCatalog).toHaveBeenCalledTimes(1);
   });
+
+  /// Scenario: On the Table view with Needs you only off, say "only the ones that need me": the voice panel declares the dashboard's view and the filter as they stood (table, off), and the filter turns on. Say "show all cards": it declares table and on, and the filter turns off. Switch to the Cards view and say "only the ones that need me" again: it declares cards and off. That declaration is what tells the command model that "show all cards" turns the filter off while it is on (PR #2491, 2026-11-25).
+  it("desktop/agent-cards/120: each utterance declares the dashboard's view and whether Needs you only is on", async () => {
+    window.localStorage.setItem(MODE_KEY, "table");
+    const declareVoiceScreen = vi.fn();
+    const needsYou = (value: "on" | "off"): VoiceResolvedParamDto => ({ name: "needs_you", kind: "needs_you_filter", spoken: value, value, label: value });
+    const run = setup(
+      (agents) => [cardFor(agents[0].id, "parent-card"), cardFor(agents[1].id, "child-card", { needs_you: true, needs_you_reasons: ["question"], status: "waiting_for_input" })],
+      () => ({
+        "only the ones that need me": { action: "filter_needs_you_cards", invoke: "toggleNeedsYouFilter", params: [needsYou("on")] },
+        "show all cards": { action: "filter_needs_you_cards", invoke: "toggleNeedsYouFilter", params: [needsYou("off")] },
+      }),
+      { extra: { declareVoiceScreen } },
+    );
+    const lastDashboard = () => declareVoiceScreen.mock.calls.at(-1)?.[6];
+    await turnOnVoice();
+    await speak(run.voice, "only the ones that need me");
+    expect(lastDashboard()).toEqual({ view: "table", needsYouOnly: false });
+    expect(screen.getByTestId("needs-you-chip")).toBeInTheDocument();
+    await speak(run.voice, "show all cards");
+    expect(lastDashboard()).toEqual({ view: "table", needsYouOnly: true });
+    expect(screen.queryByTestId("needs-you-chip")).toBeNull();
+    fireEvent.click(screen.getByTestId("overview-mode-cards"));
+    await speak(run.voice, "only the ones that need me");
+    expect(lastDashboard()).toEqual({ view: "cards", needsYouOnly: false });
+  });
 });

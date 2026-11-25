@@ -1757,9 +1757,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          while the cards are shown and a daemon on screen has them. */
       ...(cards.shown && cardActionsEditor.shown ? cardActionsEditor.controls : {}),
     };
+    /* PR #2491 (2026-11-25) — the dashboard's view and Needs you only as
+       they stand, while the runtime offers cards: the voice panel declares
+       them with each utterance on the dashboard, so the command model reads
+       "show all cards" as the filter's off switch while the filter is on. */
+    const dashboardState = cards.shown ? { dashboardState: () => ({ view: cards.mode, needsYouOnly: cards.needsYouOnly }) } : {};
     voiceChannel.current = newAgent
-      ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
-      : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
+      ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves, ...dashboardState }
+      : newAgentAvailable ? { openNewAgent, ...directoryMoves, ...dashboardState } : { ...directoryMoves, ...dashboardState };
     return () => { voiceChannel.current = undefined; };
   });
   const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters }), [onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters]);

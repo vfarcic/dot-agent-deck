@@ -53,6 +53,11 @@ pub struct IntentRequest<'a> {
     /// `mode_ref` or `agent_type_ref` resolves against. `None` while the
     /// dialog is closed; see [`VoiceNewAgent`].
     pub new_agent: Option<&'a VoiceNewAgent>,
+    /// PR #2491 (2026-11-25) — the agent dashboard's view and whether Needs
+    /// you only is on, as the voice panel declared them with this utterance on
+    /// the dashboard. `None` elsewhere, and from a webview that declares no
+    /// dashboard. See [`super::VoiceDashboard`].
+    pub dashboard: Option<&'a super::VoiceDashboard>,
 }
 
 /// What a backend answers with: an action id and the params as the user
@@ -677,6 +682,7 @@ mod tests {
             decks: &[],
             directories: None,
             new_agent: None,
+            dashboard: None,
         }
     }
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceReadingStateDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceReadingStateDto, VoiceDashboardDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import type { ReadingSentenceDto, ReadingTarget } from "../lib/reading";
 import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey, boundAgentKey } from "../lib/agentKey";
@@ -417,7 +417,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   /* Every declaration carries the New agent dialog's deck step, computed from
      the same `fleet` the dialog reads, so what voice says it preselected and
      what the dialog preselects are judged against one list. */
-  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints, dictation, reading), [bridge]);
+  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, dashboard?: VoiceDashboardDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints, dictation, reading, dashboard), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
   const answerVoiceChoice = useCallback((utterance: string, action: string, offered: VoiceResolvedParamDto[]) => bridge.answerVoiceChoice(utterance, action, offered), [bridge]);
   const answerVoiceNumber = useCallback((utterance: string, heard: VoiceNumberedListDto, generation: number) => bridge.answerVoiceNumber(utterance, heard, generation), [bridge]);

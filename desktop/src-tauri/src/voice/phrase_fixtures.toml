@@ -244,15 +244,89 @@ resolved_deck = "deck-build-box"
 name = "needs-you-only-on"
 utterance = "only the ones that need me"
 screen = "overview"
+dashboard_view = "table"
+needs_you_only = false
 action = "filter_needs_you_cards"
 outcome = "dispatch"
+resolved_needs_you = "on"
 
+# PR #2491, 2026-11-25: "show all cards" means two things, told apart by the
+# dashboard's state the voice panel declares with the utterance. While Needs
+# you only is on, it and "show all" / "show every agent" turn the filter off,
+# in either view; while it is off on the Table view, "show all cards" switches
+# to the Cards view.
 [[fixtures]]
 name = "needs-you-only-off-show-all-cards"
 utterance = "show all cards"
 screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
 action = "filter_needs_you_cards"
 outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-show-all-cards-on-cards"
+utterance = "show all cards"
+screen = "overview"
+dashboard_view = "cards"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-show-all"
+utterance = "show all"
+screen = "overview"
+dashboard_view = "cards"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-show-every-agent"
+utterance = "show every agent"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+# The words the rows above do not take keep their own rows while Needs you only
+# is on: "clear the filter" still clears the dashboard's filter, and a view
+# named without "all" still switches views. ("Show everything" said while Needs
+# you only is on turns Needs you only off: 5 of 5 runs, 2026-11-25.)
+[[fixtures]]
+name = "needs-you-only-on-clear-the-filter"
+utterance = "clear the filter"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "needs-you-only-on-switch-to-cards"
+utterance = "switch to cards"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "set_overview_mode"
+outcome = "dispatch"
+resolved_view = "cards"
+
+[[fixtures]]
+name = "show-all-cards-filter-off-switches-to-cards"
+utterance = "show all cards"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = false
+action = "set_overview_mode"
+outcome = "dispatch"
+resolved_view = "cards"
 
 # Issue #2399 review 12: the editor's choices that write nothing — reading the
 # list again, the form's icon (by the icon's name, held to the transcript like

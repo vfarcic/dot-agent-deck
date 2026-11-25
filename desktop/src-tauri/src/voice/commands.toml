@@ -373,7 +373,9 @@ unfiltered — opening the dashboard from any other screen as well. Only when th
 EVERYTHING, all agents or no filter: a request for the dashboard that says none of that is
 `open_overview`, even where that cannot run. Use for show everything, show
 all agents, show all, clear the filter, remove the filter, unfiltered, or reset — a bare "reset" said on its own means THIS one. With no filter
-set it simply opens the dashboard, as `open_overview` does. Filtering to some agents is
+set it simply opens the dashboard, as `open_overview` does. While `dashboard.needs_you_only` beside
+this table is true, a bare "show all", "show all cards" or "show every agent" turns Needs you only
+off instead: `filter_needs_you_cards`. Filtering to some agents is
 `filter_dashboard`; opening one agent is `open_agent`. Clearing an agent's PROMPT — "clear the
 prompt", "clear it", "clear everything" in an agent's pane — is `clear_prompt`, not this one.
 While the New agent dialog shows a directory listing, "clear filter" and "clear the filter" empty
@@ -2767,9 +2769,11 @@ description = """Switch the agent dashboard between its two views: the table (on
 and the cards (one card per agent, the agents each one started in a tree under it, showing what
 each agent is doing and what it needs). Use when the user asks to show cards, the card view, switch to
 cards, show the table, the list view, or back to the table. Set `view` to "table" or "cards".
-Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`. "Show all
-cards", "show every card" and "show all the agents again" after Needs you only are NOT this one: they
-turn Needs you only off, which is `filter_needs_you_cards` with `needs_you` = "off"."""
+Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`. Read
+`dashboard` beside this table: while `dashboard.needs_you_only` is true, "show all cards", "show
+every card" and "show all" are NOT this one: they turn Needs you only off,
+which is `filter_needs_you_cards` with `needs_you` = "off". While it is false and `dashboard.view` is
+"table", "show all cards" means this row with `view` = "cards"."""
 invoke      = "setOverviewMode"
 screens     = ["overview"]
 unavailable_hint = "the dashboard's view changes on the agent dashboard"
@@ -2841,12 +2845,23 @@ try_saying  = "next one that needs me"
 # PR #2491 decision 2026-11-25: Needs you only is in the dashboard's ⋯ (More)
 # menu and applies to the Table view as well as the Cards view, so turning it
 # on keeps the view the user is on.
+#
+# PR #2491, 2026-11-25: "show all cards" read as `set_overview_mode` in 5 of 5
+# runs while the model could not see the filter. The voice panel now declares
+# the dashboard with each utterance (`dashboard` beside this table: its `view`
+# and `needs_you_only`), and the two rows say what the words mean in each
+# state (fixtures `needs-you-only-off-*` and
+# `show-all-cards-filter-off-switches-to-cards`).
 [[commands]]
 id          = "filter_needs_you_cards"
-description = """Turn the agent dashboard's Needs you only on or off. "Show all cards", "show every
-card", "show all the cards again", "show every agent", "clear the needs you filter" and "turn off
-needs you only" turn it OFF (`needs_you` = "off"): they ask to see every card or agent again, not to
-switch views. "Only the ones that need me", "show only the cards that need me", "only the agents
+description = """Turn the agent dashboard's Needs you only on or off. While Needs you only is ON
+(`dashboard.needs_you_only` beside this table is true, and the user is told so where they are),
+"show all", "show all cards", "show every card", "show every agent" and "show all the cards again"
+mean THIS row with `needs_you` = "off", in either view, even when the view is the table: they ask to
+see every agent again, which is what turning the filter off does, not to switch views.
+"Show everything", "show all agents" and "clear the filter" clear the dashboard's own filter, which is
+`filter_dashboard`. "Clear the needs you filter" and "turn off needs you only"
+are this row with "off" at any time. "Only the ones that need me", "show only the cards that need me", "only the agents
 that need me", "just the ones needing my attention" and "needs you only" turn it ON (`needs_you` =
 "on"). On, the dashboard shows the agents that need the user with the agents they sit under (the
 Cards view opens the way to each such card and fades the others; the Table view shows only those
@@ -2858,7 +2873,7 @@ invoke      = "toggleNeedsYouFilter"
 screens     = ["overview"]
 unavailable_hint = "the Needs you only filter is in the agent dashboard's ⋯ menu"
 report      = "Showing {needs_you}."
-asks_to     = "show only the cards that need you, or every card again"
+asks_to     = "turn Needs you only on to show only the agents that need you, or off to show every agent again"
 try_saying  = "only the ones that need me"
 
   [[commands.params]]

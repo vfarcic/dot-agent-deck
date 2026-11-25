@@ -4493,6 +4493,7 @@ async fn desktop_voice_resolve(
     endpoints: Option<crate::settings::EndpointSettings>,
     dictation: Option<voice::VoiceDictationTarget>,
     reading: Option<voice::VoiceReadingState>,
+    dashboard: Option<voice::VoiceDashboard>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -4538,6 +4539,7 @@ async fn desktop_voice_resolve(
             endpoints: endpoints.as_ref(),
             dictation: dictation.as_ref(),
             reading: reading.unwrap_or_default(),
+            dashboard: dashboard.as_ref(),
             other_agents: &others,
         },
         voice::Transcript::new(utterance),
@@ -4559,6 +4561,9 @@ struct VoiceDeclaration<'a> {
     dictation: Option<&'a voice::VoiceDictationTarget>,
     /// PRD #1497 — reading mode and the app's own speech, two booleans.
     reading: voice::VoiceReadingState,
+    /// PR #2491 (2026-11-25) — the agent dashboard's view and Needs you only,
+    /// while the dashboard is the screen.
+    dashboard: Option<&'a voice::VoiceDashboard>,
     /// PRD #2374 (PR #2378 review) — under All daemons, each other observed
     /// deck's agents, by deck id ([`other_deck_agents`]), which voice reaches
     /// beside the selected deck's ([`voice::VoiceDeck::agents`]). Empty when
@@ -4599,6 +4604,7 @@ async fn resolve_declared_utterance(
         declared.new_agent,
         declared.dictation,
         declared.reading,
+        declared.dashboard,
         transcript,
         labels,
         show_deck,
@@ -4703,6 +4709,7 @@ async fn desktop_voice_choice(
             endpoints: endpoints.as_ref(),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            dashboard: None,
             other_agents: &others,
         },
     ))
@@ -8958,6 +8965,7 @@ mod tests {
                 endpoints: Some(endpoints),
                 dictation: None,
                 reading: voice::VoiceReadingState::default(),
+                dashboard: None,
                 other_agents: &[],
             },
             voice::Transcript::new(said),
@@ -9158,6 +9166,7 @@ mod tests {
             endpoints: Some(endpoints),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            dashboard: None,
             other_agents: &[],
         };
         assert_eq!(

@@ -115,14 +115,34 @@ pub fn param_names(commands: &[AnnotatedCommand]) -> Vec<String> {
     names
 }
 
-/// The TRUSTED half of what the model is given: the annotated command table.
+/// The TRUSTED half of what the model is given: the annotated command table
+/// and, while it is declared, the agent dashboard's state.
 ///
 /// Every word of it is this build's own — `commands.toml` is `include_str!`d
 /// and the `callable` flags are computed here — so it is the one piece of
 /// state that belongs beside the instructions. Everything the app merely
 /// observed is [`state`], and travels in [`data_turn`].
+///
+/// # The dashboard (PR #2491, 2026-11-25)
+///
+/// `dashboard` is present only when the voice panel declared the agent
+/// dashboard with the utterance: which view shows (`table` or `cards`) and
+/// whether Needs you only is on. Like the `callable` flags it is the app's own
+/// state in its own words, naming nothing observed, so it travels here — sent
+/// with labels withheld too — and not in the data turn, whose preamble tells
+/// the model that nothing in it changes which action the user asked for. This
+/// is meant to: "show all cards" turns the filter off while it is on
+/// (`filter_needs_you_cards`), and shows the cards while it is off and the
+/// table shows (`set_overview_mode`).
 pub fn commands_state(request: &IntentRequest<'_>) -> Value {
-    json!({ "commands": request.commands })
+    let mut trusted = json!({ "commands": request.commands });
+    if let Some(dashboard) = request.dashboard {
+        trusted["dashboard"] = json!({
+            "view": dashboard.view.as_str(),
+            "needs_you_only": dashboard.needs_you_only,
+        });
+    }
+    trusted
 }
 
 /// The frame around [`state`] in the data turn (PRD #1223, audit finding A2).
@@ -944,6 +964,7 @@ pub(crate) mod tests {
             decks: &[],
             directories: Some(&listing),
             new_agent: None,
+            dashboard: None,
         })
         .expect("a listing is something observed");
         assert!(data.starts_with(UNTRUSTED_STATE_PREAMBLE), "{data}");
@@ -982,6 +1003,7 @@ pub(crate) mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: Some(&closed_form),
+                dashboard: None,
             }),
             None
         );
@@ -999,6 +1021,7 @@ pub(crate) mod tests {
             decks: &[],
             directories: None,
             new_agent: None,
+            dashboard: None,
         }
     }
 
@@ -1033,9 +1056,49 @@ pub(crate) mod tests {
             decks: &decks,
             directories: None,
             new_agent: None,
+            dashboard: None,
         });
         assert_eq!(rendered["decks"], json!(["Local deck", "deploy@build-box"]));
         assert!(!rendered.to_string().contains("deck-000"));
+    }
+
+    /// Scenario: the voice panel declares the agent dashboard's view and
+    /// whether Needs you only is on with an utterance; the trusted state the
+    /// command model reads beside the command table says both, in the app's
+    /// words, the untrusted data turn does not carry it, and nothing about the
+    /// dashboard is said when nothing was declared (PR #2491, 2026-11-25:
+    /// `desktop/agent-cards/120`).
+    #[test]
+    fn voice_prompt_trusted_state_says_the_dashboard_view_and_needs_you_only_when_declared() {
+        let commands = commands();
+        let transcript = Transcript::new("show all cards");
+        let undeclared = request(&transcript, &commands, &[]);
+        assert!(commands_state(&undeclared).get("dashboard").is_none());
+        assert!(state(&undeclared).get("dashboard").is_none());
+        for (view, needs_you_only, expected) in [
+            (
+                crate::voice::DashboardView::Table,
+                true,
+                json!({ "view": "table", "needs_you_only": true }),
+            ),
+            (
+                crate::voice::DashboardView::Cards,
+                false,
+                json!({ "view": "cards", "needs_you_only": false }),
+            ),
+        ] {
+            let declared = crate::voice::VoiceDashboard {
+                view,
+                needs_you_only,
+            };
+            let mut asked = request(&transcript, &commands, &[]);
+            asked.dashboard = Some(&declared);
+            // Trusted, beside the command table: the data turn's preamble
+            // says nothing in it changes the action, and this is meant to.
+            assert_eq!(commands_state(&asked)["dashboard"], expected);
+            assert!(state(&asked).get("dashboard").is_none());
+            assert_eq!(data_turn(&asked), None, "no observed state, no data turn");
+        }
     }
 
     #[test]
@@ -1096,6 +1159,7 @@ pub(crate) mod tests {
             decks: &[],
             directories: None,
             new_agent,
+            dashboard: None,
         };
         assert!(state(&request(None)).get("new_agent_form").is_none());
         assert!(
@@ -1129,6 +1193,7 @@ pub(crate) mod tests {
             decks: &[],
             directories,
             new_agent: None,
+            dashboard: None,
         };
         // Dialog closed: no key at all, rather than an empty list that reads
         // as "a listing with nothing in it".
@@ -1419,6 +1484,7 @@ pub(crate) mod tests {
             decks: &decks,
             directories: None,
             new_agent: None,
+            dashboard: None,
         });
         assert_eq!(state["agents_on_screen"][0]["label"], "Planner");
         let elsewhere = state["agents_on_other_daemons"].as_array().expect("listed");
@@ -1451,6 +1517,7 @@ pub(crate) mod tests {
             decks: &decks,
             directories: None,
             new_agent: None,
+            dashboard: None,
         });
         assert_eq!(state["agents_daemon"], "build box");
         let on_screen = &state["agents_on_screen"];

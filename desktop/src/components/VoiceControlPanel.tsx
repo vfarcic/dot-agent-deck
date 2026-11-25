@@ -84,7 +84,7 @@ import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText, sanitizeText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceChoiceAsk, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceReadingStateDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
+import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDashboardDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceReadingStateDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceItemAnswerDto, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedOpens, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
@@ -1731,6 +1731,13 @@ interface VoiceControlPanelProps {
    * another page is told that page instead of "no matching action".
    */
   pages?: () => VoicePager | undefined;
+  /**
+   * PR #2491 (2026-11-25) — the agent dashboard's view and whether Needs you
+   * only is on, declared with each utterance while the dashboard is the
+   * screen, so the command model can tell "show all cards" the filter's off
+   * switch from the Cards view.
+   */
+  dashboard?: () => VoiceDashboardDto | undefined;
   /** PR #1451 round 3 — told when the numbered choice opens or closes, so the lists behind it can hide their numbers. */
   onChoiceChange?: (open: boolean) => void;
   /**
@@ -1785,7 +1792,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, reading, readingAgents, readingDecks, onReadingSwitch, onReadingNoticeShown, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, reading, readingAgents, readingDecks, onReadingSwitch, onReadingNoticeShown, onVoiceChange, agentIncarnations, numbered, pages, dashboard, onChoiceChange, keyboard }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -1804,6 +1811,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   numberedRef.current = numbered;
   const pagesRef = useRef(pages);
   pagesRef.current = pages;
+  const dashboardRef = useRef(dashboard);
+  dashboardRef.current = dashboard;
+  /* The dashboard declared with an utterance judged against `screen`: only the dashboard's own. */
+  const declaredDashboard = (screen: VoiceScreen): VoiceDashboardDto | undefined => (screen === "overview" ? dashboardRef.current?.() : undefined);
   /**
    * PR #1451 round 3, change 3 — the numbered list as it stood when the user
    * began to speak: read when the microphone opens and refreshed by every
@@ -3683,7 +3694,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setPhase("resolving");
       let verdict: VoiceChoiceAnswerDto;
       try {
-        declareVoiceScreen?.(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.(), endpointsRef.current?.());
+        declareVoiceScreen?.(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.(), endpointsRef.current?.(), undefined, undefined, declaredDashboard(screenRef.current));
         /* A choice between numbered items is answered by the webview's rule:
            its entries may be other decks' agents, which Rust's liveness
            check reads against the selected deck alone. What stands behind
@@ -3730,7 +3741,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const declaredDictation = mode.kind === "dictating" ? { deckId: mode.target.deckId, agentId: mode.target.agentId } : undefined;
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading());
+      declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading(), declaredDashboard(declared.screen));
       const answer = await resolveVoice(utterance);
       // Abandoned, or replaced by a later utterance. Say nothing and run
       // nothing: voice is off, or this belongs to the cycle that replaced it.
@@ -3788,7 +3799,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
           }, VOICE_JOIN_WINDOW_MS);
           return;
         }
-        declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading());
+        declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading(), declaredDashboard(declared.screen));
         const own = await resolveVoice(alone);
         if (!ours()) return;
         if (!HOLDABLE_OUTCOMES.has(own.outcome.kind)) {

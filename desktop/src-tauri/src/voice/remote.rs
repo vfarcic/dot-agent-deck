@@ -748,6 +748,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -803,6 +804,7 @@ mod tests {
             decks: &[],
             directories: None,
             new_agent: None,
+            dashboard: None,
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
@@ -1009,6 +1011,7 @@ mod tests {
                 decks: &[],
                 directories: Some(&listing),
                 new_agent: None,
+                dashboard: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -1037,6 +1040,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -1333,6 +1337,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("fails");
@@ -1359,6 +1364,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("fails");
@@ -1390,6 +1396,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("no key is stored");
@@ -1472,6 +1479,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("nothing is listening on port 1");

@@ -89,7 +89,7 @@ import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal,
 import { agentKey, boundAgentKey, sameIncarnation } from "./lib/agentKey";
 import { confirmInboxActionFor, type InboxScreenNow } from "./lib/inboxVoice";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
-import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext, type VoiceActionContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoiceOverviewPublished, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext, type VoiceActionContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { useRestartNotice } from "./hooks/useRestartNotice";
 import { INTERRUPTED_UNREAD, interruptedFooter, listedCount, mayHaveInterrupted } from "./lib/interruptedWork";
@@ -436,7 +436,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * that dialog rather than report "nothing to close"; `openNewAgent` while it
    * is closed; and the directory browser's three moves.
    */
-  const overviewVoiceContext = useRef<Partial<VoiceOverviewContext> | undefined>(undefined);
+  const overviewVoiceContext = useRef<VoiceOverviewPublished | undefined>(undefined);
+  /* PR #2491 (2026-11-25) — the dashboard's view and Needs you only, as the overview publishes them, declared with each utterance on it. */
+  const readDashboard = useCallback(() => overviewVoiceContext.current?.dashboardState?.(), []);
   /**
    * PRD #1223 — the New agent dialog's own slot: what its directory browser
    * shows, and its three moves. Created here rather than in the overview
@@ -1848,7 +1850,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {selfUpgradeDaemon && selfUpgrade && selfUpgradeApi && <LocalUpgradeFlow entry="notice" copies={{ check: selfUpgrade, api: selfUpgradeApi }} daemon={selfUpgradeDaemon.daemon} runtime={runtime} onClose={() => { setSelfUpgradeDaemon(undefined); recheckSelfUpgrade(); }} />}
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
         {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
-        <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
+        <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} dashboard={readDashboard} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} addDaemonOpen={overlaysOpen.addDaemon ?? false} onCloseAddDaemon={closeAddDaemon} />
         {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
         {/* PRD #211: one reminder at a time — the star reminder waits while the Antigravity notice is due, and the notice waits behind the star reminder on screen (it is drawn above the pane). */}

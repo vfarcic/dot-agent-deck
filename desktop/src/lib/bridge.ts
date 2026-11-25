@@ -1102,6 +1102,17 @@ export interface VoiceReadingStateDto {
 }
 
 /**
+ * PR #2491 (2026-11-25) — the agent dashboard as it stands, declared with
+ * each utterance on it — `voice::VoiceDashboard`: which view shows and whether
+ * Needs you only is on. The command model reads it, so "show all cards" turns
+ * the filter off while it is on and switches to the Cards view while it is off.
+ */
+export interface VoiceDashboardDto {
+  view: "table" | "cards";
+  needsYouOnly: boolean;
+}
+
+/**
  * What the New agent dialog shows BESIDES its browser, declared with an
  * utterance while the dialog is open (PRD #1223) — `voice::VoiceNewAgent`.
  *
@@ -2157,9 +2168,11 @@ export interface DeckBridge {
    * on ({@link VoiceDictationTargetDto}), which keeps that utterance off the
    * Commands backend entirely. `reading` is the seventh (PRD #1497): whether
    * reading mode is on and whether the app was speaking while the utterance
-   * was recorded ({@link VoiceReadingStateDto}).
+   * was recorded ({@link VoiceReadingStateDto}). `dashboard` is the eighth
+   * (PR #2491, 2026-11-25): the agent dashboard's view and whether Needs you
+   * only is on, while the dashboard is the screen ({@link VoiceDashboardDto}).
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, dashboard?: VoiceDashboardDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -3981,7 +3994,7 @@ class FixtureDeckBridge implements DeckBridge {
   /* The preview's directory rows (the Filter box's two) and its Command row
      need only to know a listing or a live form is showing; the rows
      themselves feed nothing here. */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, _dashboard?: VoiceDashboardDto): void {
     this.voiceScreen = screen;
     this.voiceDirectoryListing = directories !== undefined;
     this.voiceNewAgentForm = newAgent?.form !== undefined;
@@ -5981,9 +5994,12 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceDictation: VoiceDictationTargetDto | undefined;
   /** PRD #1497 — reading mode and the app's speech, as declared. */
   private voiceReading: VoiceReadingStateDto | undefined;
+  /** PR #2491 — the agent dashboard's view and Needs you only, as declared. */
+  private voiceDashboard: VoiceDashboardDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, dashboard?: VoiceDashboardDto): void {
     this.voiceReading = reading;
+    this.voiceDashboard = dashboard;
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
@@ -6027,7 +6043,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null, reading: this.voiceReading ?? null }));
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null, reading: this.voiceReading ?? null, dashboard: this.voiceDashboard ?? null }));
   }
 
   /**

@@ -2335,7 +2335,7 @@ export interface DeckRuntimeState {
    * screen is the one piece of live state that exists ONLY in the webview; see
    * `DeckBridge.declareVoiceScreen` for the whole of that seam.
    */
-  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto, reading?: import("./lib/bridge").VoiceReadingStateDto) => void;
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto, reading?: import("./lib/bridge").VoiceReadingStateDto, dashboard?: import("./lib/bridge").VoiceDashboardDto) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
   /**
    * PRD #1261 — answer a pending numbered choice, locally

@@ -2775,7 +2775,14 @@ export type NewAgentVoiceChannel = { current: NewAgentVoice | undefined };
  * is no browser to move — to the shell that dispatches, the way
  * {@link VoiceContextChannel} carries the deck's.
  */
-export type VoiceOverviewChannel = { current: Partial<VoiceOverviewContext> | undefined };
+export type VoiceOverviewChannel = { current: VoiceOverviewPublished | undefined };
+
+/**
+ * What the overview publishes: its members, and (PR #2491, 2026-11-25) the
+ * dashboard's view and Needs you only as they stand, which the voice panel
+ * declares with each utterance on the dashboard. Not a member: no action runs it.
+ */
+export type VoiceOverviewPublished = Partial<VoiceOverviewContext> & { dashboardState?: () => import("./bridge").VoiceDashboardDto };
 
 /**
  * How a screen publishes its half of the context up to the host that dispatches
