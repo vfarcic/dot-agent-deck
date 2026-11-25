@@ -5,7 +5,7 @@ import { useLayoutEffect, useRef, useState, type ReactNode, type RefObject } fro
 import { cardStatusClass, cardStatusLabel, disabledReasonSentence, exactTextSegments, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, needsYouSentence, placedCardKey, type PlacedCard } from "../lib/agentCards";
 import { cardTone, issueLabels, referenceUrl, referenceView, rollupSegments, rollupSentence, type CardKind, type IssueLabelView } from "../lib/agentCardsTree";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
-import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import { CardActionIcon, cardActionHover, cardIconName, hoverCutsPrompt } from "../lib/cardIcons";
 import { endedRoleLine } from "../lib/endedRoles";
 import type { AgentCardAction, AgentCardCheckedRef, AgentCardEntry, AgentCardRollup, EndedRole } from "../types";
@@ -69,14 +69,14 @@ export type ReferenceControls = Pick<VoiceActionContext, "openCardReference"> & 
  * Issue #2418 — one reference the agent reported, drawn from the deck's check
  * of it: a pull request or issue badge that opens its page, or a short text
  * saying it is still to be checked or why it cannot be. The card draws it on
- * its reference line, and the overlay in its list of every reference
- * (`scope: "overlay"`, whose test ids carry `-overlay`); both open a page
- * through the same action, so the same address checks apply.
+ * its reference line, and the agent pane's Card panel in its list of every
+ * reference (`scope: "panel"`, whose test ids carry `-panel`); both open a
+ * page through the same action, so the same address checks apply.
  */
-export function CardReference({ card, reference, controls, scope = "card", hidden = false }: { card: PlacedCard; reference: AgentCardCheckedRef; controls: ReferenceControls; scope?: "card" | "overlay"; hidden?: boolean }) {
+export function CardReference({ card, reference, controls, scope = "card", hidden = false }: { card: PlacedCard; reference: AgentCardCheckedRef; controls: ReferenceControls; scope?: "card" | "panel"; hidden?: boolean }) {
   const view = referenceView(reference);
   const url = referenceUrl(reference);
-  const id = scope === "overlay" ? "agent-card-overlay" : "agent-card";
+  const id = scope === "panel" ? "agent-card-panel" : "agent-card";
   const stale = view.status === "stale" ? <small className="agent-card-ref-stale">stale</small> : null;
   let body: ReactNode;
   /* Whether `body` is a control that opens the reference's page. */
@@ -98,12 +98,13 @@ export function CardReference({ card, reference, controls, scope = "card", hidde
     body = <small className="agent-card-ref-text">{displayText(view.text, DISPLAY_LIMITS.name)}</small>;
   }
   /* A badge that opens a page does only that: its click does not reach the
-     card, which would open the overlay too (issue #2418, D12). Text saying a
-     reference is still to be checked, or why it cannot be, opens nothing, so
-     its click reaches the card and opens the overlay like the rest of it. */
+     card, which would open the agent's pane too (issue #2418, D12). Text
+     saying a reference is still to be checked, or why it cannot be, opens
+     nothing, so its click reaches the card and opens the pane like the rest
+     of it. */
   if (opensPage) body = <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>{body}</span>;
   return (
-    <span className={`agent-card-ref is-${view.status}${hidden ? " is-overflow" : ""}`} data-testid={scope === "overlay" ? "agent-card-overlay-ref-badge" : "agent-card-ref"} data-field={reference.field} data-kind={reference.kind} data-ref-status={view.status} data-overflow={hidden ? "true" : undefined} aria-hidden={hidden ? true : undefined} title={displayTitle(view.title)}>
+    <span className={`agent-card-ref is-${view.status}${hidden ? " is-overflow" : ""}`} data-testid={scope === "panel" ? "agent-card-panel-ref-badge" : "agent-card-ref"} data-field={reference.field} data-kind={reference.kind} data-ref-status={view.status} data-overflow={hidden ? "true" : undefined} aria-hidden={hidden ? true : undefined} title={displayTitle(view.title)}>
       {body}{stale}
     </span>
   );
@@ -144,7 +145,8 @@ function useFitOnOneLine(line: RefObject<HTMLElement | null>, itemSelector: stri
 /**
  * Issue #2418 review (D-R1) — a card's reference line: as many reference
  * badges as fit whole on its one line, in the daemon's order, and a `+N`
- * control counting the rest, which opens the card's overlay at its list of
+ * control counting the rest, which opens the agent's pane with its Card
+ * panel at its list of
  * every reference. The line has a fixed height, so references arriving never
  * move a root; a badge that would be cut is hidden whole (not drawn, not
  * focusable) rather than cut, and the count says it is there.
@@ -194,7 +196,8 @@ export function IssueLabelChip({ label, testId, hidden = false }: { label: Issue
  * Issue #2418 (D13) — the labels of the first issue on a card that has any,
  * on one fixed-height line under the references: as many chips as fit whole,
  * and a `+N` counting the rest. The `+N` is text, not a control: like the rest
- * of the card, clicking it opens the overlay, which lists every label.
+ * of the card, clicking it opens the agent's pane, whose Card panel lists
+ * every label.
  */
 function CardLabels({ labels, issue }: { labels: IssueLabelView[]; issue: string }) {
   const line = useRef<HTMLDivElement>(null);
@@ -224,7 +227,8 @@ function CardRollup({ rollup }: { rollup: AgentCardRollup }) {
 
 /**
  * PRD #2374 decision 2026-11-24 — the most action icons a card draws in its
- * bottom row; past it, one `+N` control opens the card's overlay, which lists
+ * bottom row; past it, one `+N` control opens the agent's pane, whose Card
+ * panel lists
  * every action. Three, with `+N`, leave room for the roll-up beside them on a
  * 224-pixel card.
  */
@@ -235,7 +239,7 @@ export const CARD_ICON_LIMIT = 3;
  * in the daemon's order — never a reply (or any action that takes the user's
  * own words), Open, an answer to the agent's own question, a close, which
  * keeps its own control, or an action whose catalog `placement` is `detail`,
- * which is offered only in the card's overlay. They are the overlay's
+ * which is offered only in the agent pane's Card panel. They are the panel's
  * actions, pressed the same way.
  */
 export function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
@@ -243,7 +247,46 @@ export function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
   return entry.actions.filter((action) => action.kind === "prompt" && !action.text_input && !options.has(action.id) && action.placement !== "detail");
 }
 
-/** A card action's hover, in the overlay's words: its label, the exact text, whether it asks first, why it is disabled. */
+/**
+ * PR #2491 decision 2026-11-25 — the actions the agent pane's Card panel
+ * draws as icons: every prompt action a card's icons would draw, and also the
+ * ones whose catalog `placement` is `detail`, which are offered only there.
+ */
+export function panelIconActions(entry: AgentCardEntry): AgentCardAction[] {
+  const options = new Set(entry.questions.flatMap((question) => question.options.map((option) => option.action_id)));
+  return entry.actions.filter((action) => action.kind === "prompt" && !action.text_input && !options.has(action.id));
+}
+
+/**
+ * The grouped row of action icons a card draws in its bottom row and the
+ * agent pane's Card panel draws whole: each icon's hover gives the action's
+ * label and exact text, and a press takes the same path from both — sent, or,
+ * when it asks first, its text is the agent's, or its hover could not show
+ * the text whole, the single-action review opens instead (audit 1).
+ */
+export function CardActionIconRow({ card, actions, controls, label, children }: { card: PlacedCard; actions: readonly AgentCardAction[]; controls: Pick<VoiceActionContext, "runCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>; label: string; children?: ReactNode }) {
+  const ref = cardRef(card);
+  return (
+    <ActionIconGroup className="agent-card-action-icons" label={label}>
+      {actions.map((action) => (
+        <ActionTipButton
+          key={action.id}
+          className="icon-button agent-card-action-icon"
+          data-testid="agent-card-action-icon"
+          data-action={action.id}
+          data-icon={cardIconName(action.icon)}
+          aria-label={displayText(action.label, DISPLAY_LIMITS.name)}
+          tip={actionHover(action)}
+          unavailable={!action.enabled}
+          onClick={(_, shown) => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token, ...(hoverCutsPrompt(action.prompt) || !shown.whole ? { cardActionReview: true } : {}) })}
+        ><CardActionIcon name={action.icon} /></ActionTipButton>
+      ))}
+      {children}
+    </ActionIconGroup>
+  );
+}
+
+/** A card action's hover: its label, the exact text, whether it asks first, why it is disabled. */
 export function actionHover(action: AgentCardAction): string {
   return cardActionHover(action.label, action.prompt, [
     action.source === "agent" && "Suggested by the agent, not in the catalog",
@@ -289,27 +332,26 @@ export interface CardPlace {
  * roll-up, and Close. Everything comes from the daemon's entry as received;
  * nothing here decides status, needs-you, roll-ups or references.
  *
- * Round 2 (D11, D12): the name opens the agent, as a table row does; a click
- * anywhere else on the card opens its overlay, which holds what the agent
- * said, its agent type and every action. Each control — the name, a badge,
- * the `+N`, the tree toggle and Close — does only its own thing: it sits in a
- * wrapper that keeps its click from reaching the card. The status line is a
- * button with no handler of its own, so the keyboard reaches the overlay too:
- * its click is the card's. No control is nested in another.
+ * PR #2491 decision 2026-11-25: a click on the card, its name or anywhere
+ * else, opens the agent's pane with its Card panel open, which holds what the
+ * agent said, its agent type and every action. Each other control — a badge,
+ * the `+N`, the tree toggle, the checkbox, an action icon and Close — does
+ * only its own thing: it sits in a wrapper that keeps its click from reaching
+ * the card. The status line is a button with no handler of its own, so the
+ * keyboard reaches the pane too: its click is the card's. No control is
+ * nested in another.
  *
  * Issue #1965: an exited orchestration role's card says why on its status
  * line, after the daemon's status word, in the words its table row and the
  * TUI's card use: `Exited: <reason>` and its last output. The line truncates
- * like every other, so a report arriving never resizes the card; the overlay
+ * like every other, so a report arriving never resizes the card; the Card panel
  * shows the reason and the last output in full.
  */
-export function AgentCard({ card, controls, results, place, openTarget, ended }: {
+export function AgentCard({ card, controls, results, place, ended }: {
   card: PlacedCard;
   controls: CardControls;
   results?: CardResults;
   place: CardPlace;
-  /** What the name opens: the target the dashboard's table row opens for this agent (D12); without one, the card's own deck, agent and daemon process. */
-  openTarget?: (card: PlacedCard) => AgentViewTarget;
   /** Issue #1965 — the exited orchestration role this card is for, when its agent exited on its own. */
   ended?: EndedRole;
 }) {
@@ -322,7 +364,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
   const labelled = refs.map((reference) => ({ reference, labels: issueLabels(reference) })).find(({ labels }) => labels.length > 0);
   const ref = cardRef(card);
   const statusText = cardStatusLabel(entry.status);
-  /* Close is the overlay's own Close action, the same token and the same
+  /* Close is the card's own Close action, the same token and the same
      confirmation (D12); it is drawn only when the daemon offers one. */
   const close = entry.actions.find((action) => action.kind === "close");
   const closeResult = close ? results?.[close.token] : undefined;
@@ -333,12 +375,12 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
      word, the needs-you marker, a reference, a label or a roll-up appearing
      never resizes a card or moves a root (issue #2418 review). A cut line's
      text is in its tooltip. References and labels that do not fit are not
-     cut: a `+N` counts them, and the overlay lists them all. */
+     cut: a `+N` counts them, and the Card panel lists them all. */
   /* The prompt actions the agent offers now, as icons in the card's bottom
      row (PRD #2374 decision 2026-11-24, placed there by issue #2399 review 2
      so the name and the status keep their lines): each is pressed exactly as
-     its overlay button is, so one that asks first, or whose text the agent
-     wrote, opens the overlay at its review instead of sending — and so does
+     its Card panel icon is, so one that asks first, or whose text the agent
+     wrote, opens the single-action review instead of sending — and so does
      one whose text is too long for its hover to quote whole (audit 1). */
   const iconActions = cardIconActions(entry);
   const icons = iconActions.slice(0, CARD_ICON_LIMIT);
@@ -376,8 +418,8 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
             className="agent-card-name"
             data-testid="agent-card-open-agent"
             aria-label={`Open ${name}`}
-            title={`Open ${name}`}
-            onClick={() => VOICE_ACTIONS.openAgent.run(controls, openTarget?.(card) ?? { deckId: card.deckId, agentId: entry.agent_id, from: "overview", ...(entry.instance_id ? { incarnation: entry.instance_id } : {}) })}
+            title={`Open ${name} with its card`}
+            onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
           >{name}</button>
         </span>
         {/* Issue #2399 re-review N6, PR #2491 review: Needs you is its bell alone on every card, so the name keeps its room beside the checkbox; its words stay its tooltip and what a screen reader reads. */}
@@ -410,7 +452,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
         )}
       </header>
       <div className="agent-card-meta-row">
-        {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the overlay.
+        {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the agent's pane with its Card panel.
             Its name starts with the kind and status it shows, so a screen reader announces them and a spoken label of what is visible matches it (round 2 review). */}
         <button type="button" className="agent-card-meta" data-testid="agent-card-details" aria-label={`${place.kind} ${statusText}${endedText ? `, ${endedText}` : ""}: show ${name}'s card`} title={displayTitle(metaTitle)}>
           <span className="agent-card-kind" data-testid="agent-card-kind">{place.kind}</span>
@@ -429,31 +471,18 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
         {place.tree && (rollup ? <CardRollup rollup={rollup} /> : <div className="agent-card-rollup-block is-empty" aria-hidden="true" />)}
         {icons.length > 0 && (
           <span className="agent-card-control agent-card-foot-actions" onClick={(event) => event.stopPropagation()}>
-            <ActionIconGroup className="agent-card-action-icons" label={`${name}'s actions`}>
-              {icons.map((action) => (
-                <ActionTipButton
-                  key={action.id}
-                  className="icon-button agent-card-action-icon"
-                  data-testid="agent-card-action-icon"
-                  data-action={action.id}
-                  data-icon={cardIconName(action.icon)}
-                  aria-label={displayText(action.label, DISPLAY_LIMITS.name)}
-                  tip={actionHover(action)}
-                  unavailable={!action.enabled}
-                  onClick={(_, shown) => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: action.id, cardActionToken: action.token, ...(hoverCutsPrompt(action.prompt) || !shown.whole ? { cardActionReview: true } : {}) })}
-                ><CardActionIcon name={action.icon} /></ActionTipButton>
-              ))}
+            <CardActionIconRow card={card} actions={icons} controls={controls} label={`${name}'s actions`}>
               {moreActions > 0 && (
                 <button
                   type="button"
                   className="agent-card-actions-more"
                   data-testid="agent-card-actions-more"
                   aria-label={`${moreActions} more actions: show ${name}'s card`}
-                  title={displayTitle(`${moreActions} more ${moreActions === 1 ? "action" : "actions"}: ${iconActions.slice(CARD_ICON_LIMIT).map((action) => action.label).join(", ")}. Open the card to see every action.`)}
+                  title={displayTitle(`${moreActions} more ${moreActions === 1 ? "action" : "actions"}: ${iconActions.slice(CARD_ICON_LIMIT).map((action) => action.label).join(", ")}. Open the agent to see every action in its Card panel.`)}
                   onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
                 >+{moreActions}</button>
               )}
-            </ActionIconGroup>
+            </CardActionIconRow>
           </span>
         )}
       </div>

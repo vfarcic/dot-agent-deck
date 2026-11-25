@@ -83,6 +83,96 @@ outcome = "dispatch"
 resolved_agent = "agent-gen-coder"
 resolved_card_action = "go ahead"
 
+# PR #2491 decision 2026-11-25: the card overlay is gone. A card opens its
+# agent's pane with the Card panel beside the terminal; the pane's header moves
+# between agents, and its Card panel opens and closes by voice too.
+[[fixtures]]
+name = "card-panel-show-coders-card-from-dashboard"
+utterance = "show the coder's card"
+screen = "overview"
+generated_run = true
+action = "show_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-panel-show-coders-card-from-a-pane"
+utterance = "show the coder's card"
+screen = "agent"
+generated_run = true
+action = "show_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-panel-show-the-card"
+utterance = "show the card"
+screen = "agent"
+action = "open_card_panel"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-close-the-card"
+utterance = "close the card"
+screen = "agent"
+action = "close_card_panel"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-close-the-card-unavailable-on-dashboard"
+utterance = "hide the card panel"
+screen = "overview"
+action = "close_card_panel"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "card-panel-next-agent"
+utterance = "next agent"
+screen = "agent"
+action = "next_agent_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-previous-agent"
+utterance = "previous agent"
+screen = "agent"
+action = "previous_agent_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-next-needing-me-from-a-pane"
+utterance = "next one that needs me"
+screen = "agent"
+action = "next_needs_you_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-next-needing-me-from-dashboard"
+utterance = "next one that needs me"
+screen = "overview"
+action = "next_needs_you_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-press-go-ahead-on-coders-card"
+utterance = "press go ahead on the coder's card"
+screen = "overview"
+generated_run = true
+action = "run_card_action"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+resolved_card_action = "go ahead"
+
+[[fixtures]]
+name = "card-panel-answer-main-to-the-coder"
+utterance = "answer main to the coder"
+screen = "overview"
+generated_run = true
+action = "run_card_action"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+resolved_card_action = "main"
+
 # PRD #2374 decision 2026-11-24 (issue #2399 on PR #2491): the card actions
 # editor opens by voice from the agent dashboard, and so does its form for a
 # new action (CLAUDE.md rule 23). TDD (RED): these name commands that do not
@@ -185,10 +275,10 @@ action = "show_card_action_on_the_card"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "card-actions-editor-placement-only-in-the-overlay"
-utterance = "only show it in the overlay"
+name = "card-actions-editor-placement-only-in-the-card-panel"
+utterance = "only show it in the card panel"
 screen = "overview"
-action = "show_card_action_only_in_the_overlay"
+action = "show_card_action_only_in_the_card_panel"
 outcome = "dispatch"
 
 [[fixtures]]

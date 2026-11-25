@@ -17133,23 +17133,23 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status in the daemon's words as the table shows them (`working`, `needs input`, `thinking`, `stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and fields are not on the compact card; Needs you only (`aria-pressed`) keeps every card in place and fades exactly the cards the daemon did not mark, and turning it off unfades them.
 - **Does not assert:** the hover text of the needs-you reasons; the tree's layout (019).
 
-##### desktop/agent-cards/003 — The compact card's Close sits beside its action icons, using the overlay's confirmation and action definition.
+##### desktop/agent-cards/003 — The compact card's Close sits beside its action icons, with its confirmation, token and disabled states.
 - **Test:** vitest `desktop/agent-cards/003: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
-- **Layer:** desktop component (jsdom), `invokeCardAction` stubbed.
-- **Asserts:** the compact card shows its primary action only as an icon with no text, whose hover holds the exact prompt, and the prompt is nowhere on the card (PRD #2374 decision 2026-11-24, which reverses round 2's "only Close"); its icon-only Close has an accessible name and tooltip and opens the same confirmation with the same pending detail as the overlay's Close; confirming sends `close` to that card's `{deckId, instanceId, paneId, agentId}`, with `confirm: true` and the offered token. Close on a running agent that the daemon disabled remains disabled, names the reason in its tooltip, sends nothing and opens no overlay.
+- **Layer:** desktop component (jsdom), `invokeCardAction` stubbed, the Card panel beside the dashboard (`src/test/cardPane.tsx`).
+- **Asserts:** the compact card shows its primary action only as an icon with no text, whose hover holds the exact prompt, and the prompt is nowhere on the card (PRD #2374 decision 2026-11-24); its icon-only Close has an accessible name and tooltip, opens no pane, and opens the Close confirmation (an `alertdialog` named "Close?") with the pending detail; confirming sends `close` to that card's `{deckId, instanceId, paneId, agentId}`, with `confirm: true` and the offered token, after which the confirmation says what became of it and closes on Close. The agent's Card panel offers no Close (the pane's Close agent does). Close on a running agent that the daemon disabled remains disabled, names the reason in its tooltip, sends nothing and opens nothing (PR #2491 decision 2026-11-25).
 - **Does not assert:** what the daemon does with the request (`agent-report/actions/001`); delivery-state words.
 
-##### desktop/agent-cards/004 — The overlay navigates in display order, updates live, and survives its agent closing.
-- **Test:** vitest `desktop/agent-cards/004: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
-- **Layer:** desktop component (jsdom).
-- **Asserts:** opened from a card at `2 of 5`; `]` / `[` and the Next card / Previous card buttons walk the daemon's order with wrap-around; `n` and Next card that needs you land only on daemon-marked cards; the overlay lists every action's full prompt, `detail` fields, the needs-you reasons and the `agent says` / `deck checked` labels; a new list with the same key re-renders the open card (new summary and status); a list without its key shows "This agent was closed." under the old name and navigation still moves on; Escape closes it. With an open question, summary, question/options and the directly visible reply field precede fields, other actions and deliveries; Send reply sends the user's text through the offered reply action.
-- **Does not assert:** the full-screen layout under 640 px (CSS); focus handling.
+##### desktop/agent-cards/004 — The Card panel shows what the agent says, and the pane moves between agents in display order.
+- **Test:** vitest `desktop/agent-cards/004: …` (two tests) in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom), the dashboard with the real `AgentCardPanel` for the agent last opened and the pane header's three moves dispatching what the header's do (`src/test/cardPane.tsx`).
+- **Asserts:** with an open question, the panel's "What the agent says" part shows the summary before the question and its answer buttons, and the fields; "Checked by the deck" holds what was sent from the card; there is no reply box and no Reply, Send reply or Open control; an answer pressed in the panel is sent with its token and the panel says it was. Next agent / Previous agent walk the daemon's order with wrap-around and Next needing you lands only on daemon-marked agents, each move showing that agent's card; the panel shows every action as an icon with its full prompt in its hover, `detail` fields, the needs-you reasons and the `agent says` / `deck checked` labels; a new list with the same key re-renders the shown card (new summary and status); a list without it says the dashboard has no card for the agent, and the moves still work (PR #2491 decision 2026-11-25).
+- **Does not assert:** the panel's place in the pane, its default open state or the keys (`095`–`098`).
 
-##### desktop/agent-cards/005 — Table rows carry the daemon's needs-you marker and a menu that shows the card.
-- **Test:** vitest `desktop/agent-cards/005: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
-- **Layer:** desktop component (jsdom), Table view.
-- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status (since issue #2454 it is a badge in the name cell, which `OverviewCards.test.tsx` places after the PR badge and outside the row's controls); the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent. In Cards, the name is a focusable native button that invokes the same open-agent action and navigation target as that row, without opening the overlay; clicking the body opens the overlay without agent navigation, and controls are not nested inside other controls.
-- **Does not assert:** the menu's keyboard dismissal beyond Escape; the row primary's send (covered by 003's path); a real native webview's tab order.
+##### desktop/agent-cards/005 — A card opens its agent like its table row, with the Card panel; table rows carry the needs-you marker and a menu that shows the card.
+- **Test:** vitest `desktop/agent-cards/005: …` (two tests) in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom), Table and Cards views.
+- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status (since issue #2454 a badge in the name cell); the row's ⋯ menu opens without navigating and holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that agent's pane asking for its Card panel (`cardPanel: true`), from which the pane's next walks the daemon's order; clicking the row opens the agent without asking for the panel. In Cards, the name (a focusable native button), the status line and the card's body each invoke the same open-agent action and target as that row, with `cardPanel: true`; no control is nested in another (PR #2491 decision 2026-11-25).
+- **Does not assert:** the menu's keyboard dismissal beyond Escape; the row primary's review (`099`, review B8 in `AgentCardsReview.test.tsx`); a real native webview's tab order.
 
 ##### desktop/agent-cards/006 — The view is remembered per client, and a broken storage falls back to the table.
 - **Test:** vitest `desktop/agent-cards/006: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
@@ -17160,15 +17160,15 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 ##### desktop/agent-cards/007 — With no cards offered, none of the new controls render and no cards are consumed.
 - **Test:** vitest `desktop/agent-cards/007: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** with Cards remembered and a runtime that offers no cards (`agentCards` absent), the dashboard shows no Table | Cards switch, grid, Needs you filter, row needs-you marker, row menu or overlay, never calls the runtime's `consumeAgentCards`, and a row click still opens the agent; with cards offered, mounting the Table | Cards switch calls `consumeAgentCards` once, and a re-render does not call it again.
+- **Asserts:** with Cards remembered and a runtime that offers no cards (`agentCards` absent), the dashboard shows no Table | Cards switch, grid, Needs you filter, row needs-you marker, row menu or Card panel, never calls the runtime's `consumeAgentCards`, and a row click still opens the agent; with cards offered, mounting the Table | Cards switch calls `consumeAgentCards` once, and a re-render does not call it again.
 - **Does not assert:** that a consumed runtime asks the backend once before it listens and reads (`useDeckRuntime agent cards` in `desktop/src/hooks/useDeckRuntime.test.ts`).
 
-##### desktop/agent-cards/008 — Every new card control is reachable by voice, and a spoken confirm action, or one whose text the agent wrote, only opens its step.
+##### desktop/agent-cards/008 — Every card control is reachable by voice, and a spoken confirm action, or one whose text the agent wrote, only opens its review.
 - **Test:** vitest `desktop/agent-cards/008: …` in `desktop/src/components/AgentCardsVoice.test.tsx`.
-- **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it (`card_action` and `reply_text` param kinds).
-- **Asserts:** each of `setOverviewMode`, `showAgentCard`, `nextAgentCard`, `previousAgentCard`, `nextNeedsYouCard`, `toggleNeedsYouFilter`, `closeAgentCard`, `runCardAction` and `replyToAgentCard` is `voice: true` with no `no_voice`, and exactly one `commands.toml` row invokes it, with the contract's row id, `screens = ["overview"]` and its param names and kinds; `confirmCardAction` and `toggleOverviewRowMenu` carry a `no_voice` reason and no row. A spoken `run_card_action` naming a `confirm` action, or Close, opens that card's overlay at its confirm step (exact prompt and pending detail) and sends nothing; one naming an action or a question's answer whose text is, or quotes, what the agent wrote (`prompt_source: "agent"`, the deck-composed answer included) opens that card's review step showing the exact text, says why on the voice row, and sends nothing until Send, which sends it once — including an answer to a question whose quotes and line breaks smuggle an instruction into the composed text (audit A1); only one naming a catalog prompt action sends exactly that action of that card once, unconfirmed; a spoken `reply_to_agent_card` sends `reply` with the user's words.
-- **Asserts (compact controls):** name-open and spoken `open_agent` dispatch `VOICE_ACTIONS.openAgent` and show the agent terminal without a card overlay; the existing `open_agent` command row is voice-enabled on overview. The Close icon and spoken Close use `runCardAction` and show the same confirmation without sending or opening a terminal.
-- **Does not assert:** the model's choice of row or the crate's param resolution (the desktop crate's voice tests); real speech.
+- **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it (`card_action` param kind).
+- **Asserts:** each of `setOverviewMode`, `showAgentCard`, `nextAgentCard`, `previousAgentCard`, `nextNeedsYouCard`, `toggleNeedsYouFilter`, `openCardPanel`, `closeCardPanel` and `runCardAction` is `voice: true` with no `no_voice`, and exactly one `commands.toml` row invokes it, with the row id, screens (`show_agent_card`, `next_needs_you_card` and `run_card_action` on the dashboard and the agent pane; the moves and the Card panel's rows on the agent pane only; the rest on the dashboard) and param names and kinds; the retired `close_agent_card` and `reply_to_agent_card` rows and their registry entries are gone; `confirmCardAction`, `closeCardReview` and `toggleOverviewRowMenu` carry a `no_voice` reason and no row. A spoken `run_card_action` naming a `confirm` action, or Close, opens the single-action review over the dashboard (exact prompt and pending detail) and sends nothing; one naming an action or a question's answer whose text is, or quotes, what the agent wrote opens the review showing the exact text, says why on the voice row, and sends nothing until Send, which sends it once — including an answer whose question smuggles an instruction into the composed text (audit A1); only one naming a catalog prompt action sends exactly that action of that card once, unconfirmed.
+- **Asserts (compact controls):** name-open and spoken `open_agent` dispatch `VOICE_ACTIONS.openAgent` and show the agent terminal with its Card panel (opened from its card, or because the agent needs you), and no review; the `open_agent` row is voice-enabled on the dashboard. The Close icon and spoken Close use `runCardAction` and show the same confirmation without sending or opening a terminal.
+- **Does not assert:** the model's choice of row or the crate's param resolution (the desktop crate's voice tests and `voice_desktop_phrases_001`'s `card-panel-*` fixtures); real speech.
 
 ##### desktop/agent-cards/009 — Only roots show at first, and opening a card shows exactly its children, to any depth.
 - **Test:** vitest `desktop/agent-cards/009: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
@@ -17188,23 +17188,23 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** after a new list in which only a closed root's `rollup` changed, its colour, totals and bar follow the new roll-up with no client recount; another root's open tree stays open, and a card in it shows its new status. The status button's accessible name includes the kind and current status words before and after the update.
 - **Does not assert:** the daemon's doorbell or the runtime's re-read (`useDeckRuntime agent cards`).
 
-##### desktop/agent-cards/012 — A compact card shows who and what in the daemon's words, and the overlay keeps what the agent said.
+##### desktop/agent-cards/012 — A compact card shows who and what in the daemon's words, and the Card panel keeps what the agent said.
 - **Test:** vitest `desktop/agent-cards/012: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** each card shows its kind (`dispatcher` for a card the daemon names as another's dispatcher, `orchestrator` and `role` from its orchestration relation, else `agent`), its status in the daemon's words (`working`, `needs input` for `waiting_for_input`, `idle` for `unknown`, `error`) and the needs-you marker where the daemon set it; agent type, summary, progress and next step are not on the compact card; opening the overlay shows the summary, progress, next step and agent type there.
-- **Does not assert:** the overlay's own behaviour (004).
+- **Asserts:** each card shows its kind (`dispatcher` for a card the daemon names as another's dispatcher, `orchestrator` and `role` from its orchestration relation, else `agent`), its status in the daemon's words (`working`, `needs input` for `waiting_for_input`, `idle` for `unknown`, `error`) and the needs-you marker where the daemon set it; agent type, summary, progress and next step are not on the compact card; opening the agent from it shows the summary, progress, next step and agent type in its Card panel.
+- **Does not assert:** the panel's own behaviour (004).
 
 ##### desktop/agent-cards/013 — Checked pull request and issue badges show the deck's check and open their GitHub pages.
 - **Test:** vitest `desktop/agent-cards/013: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
 - **Layer:** desktop component (jsdom), the shell's `OpenCardReference` replaced by a spy.
-- **Asserts:** a pull request the agent claimed as `#24180` shows the deck's check (`data-pr-state="merged"`, checks `failing`, review `approved`) through the shared pull request badge; clicking it calls the opener once with the card (its deck, the daemon instance that listed it and its key), `pull_request`, the number and the checked github.com address, and opens no overlay; an issue claimed as `o/r#3` shows `closed` and opens its checked issue address the same way.
-- **Asserts (issue labels):** display-only label chips show repo colours, invalid and missing colours share a neutral decoration, and a measured line that fits two of five chips shows those two plus `+3`; the overlay lists all five labels. For malformed daemon data, `issueLabels()` and the rendered compact card and overlay keep at most 20 labels and 50 characters per name, with no extra hidden chip nodes; a usable label after 1,000 invalid entries is ignored by the bounded scan. Clicking the issue badge opens no overlay.
+- **Asserts:** a pull request the agent claimed as `#24180` shows the deck's check (`data-pr-state="merged"`, checks `failing`, review `approved`) through the shared pull request badge; clicking it calls the opener once with the card (its deck, the daemon instance that listed it and its key), `pull_request`, the number and the checked github.com address, and opens no pane; an issue claimed as `o/r#3` shows `closed` and opens its checked issue address the same way.
+- **Asserts (issue labels):** display-only label chips show repo colours, invalid and missing colours share a neutral decoration, and a measured line that fits two of five chips shows those two plus `+3`; the Card panel lists all five labels. For malformed daemon data, `issueLabels()` and the rendered compact card and Card panel keep at most 20 labels and 50 characters per name, with no extra hidden chip nodes; a usable label after 1,000 invalid entries is ignored by the bounded scan. Clicking the issue badge opens no pane.
 - **Does not assert:** the lookup (`agent-report/refs/001`); the in-app browser itself (018 opens it through the shell); real browser label geometry.
 
 ##### desktop/agent-cards/014 — Pending, unavailable and stale references say so.
 - **Test:** vitest `desktop/agent-cards/014: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** a pending reference reads `#7 · checking…` with a tooltip saying the deck has not looked it up yet; a `not_found` one reads `not found or private` with the daemon's detail in its tooltip and no button; an `unrecognised` one reads `not a GitHub reference` with the agent's claim in its tooltip; a stale one keeps its badge with its last checked state, is marked `stale`, and its tooltip says when it was last checked. A pending and a `not_found` reference that already carry an address are drawn as text with no button, and a click on that text opens no page and opens the card's overlay.
+- **Asserts:** a pending reference reads `#7 · checking…` with a tooltip saying the deck has not looked it up yet; a `not_found` one reads `not found or private` with the daemon's detail in its tooltip and no button; an `unrecognised` one reads `not a GitHub reference` with the agent's claim in its tooltip; a stale one keeps its badge with its last checked state, is marked `stale`, and its tooltip says when it was last checked. A pending and a `not_found` reference that already carry an address are drawn as text with no button, and a click on that text opens no page and opens the agent with its Card panel, as the rest of the card does.
 - **Does not assert:** the daemon's failure classification (`agent-report/refs/002`).
 
 ##### desktop/agent-cards/015 — Needs you only opens the path to every card that needs you and fades the rest.
@@ -17264,14 +17264,14 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 ##### desktop/agent-cards/024 — An agent-written prompt is read whole before it is sent.
 - **Test:** vitest `primaryNeedsReview (issue #2418 audit A4)` in `desktop/src/lib/agentCards.test.ts`, review regressions in `desktop/src/components/AgentCardsReview.test.tsx` and `desktop/src/components/OverviewCards.test.tsx`; Playwright `desktop/agent-cards/024` in `desktop/e2e/agent-cards-tree.spec.ts`, against the fixture scene `cards=tree` with pushed agent-written actions.
 - **Layer:** pure webview helper; desktop component (jsdom); desktop browser (production build, `vite preview`) at 1024 px.
-- **Asserts:** the pure `primaryNeedsReview` helper returns false for catalog prompts and actions without a prompt, and true for prompts with agent, deck or unspecified source, including short prompts. General actions and question options send catalog prompts directly, while non-catalog prompts first open a token-bound review with no delivery, and only its Send delivers the shown definition. Existing exact-character markers and changed-token review checks remain covered. In the browser, the compact card shows the agent-written action only as an icon whose hover holds the text, beside Close, and pressing that icon sends nothing and opens the full-text review (PRD #2374 decision 2026-11-24); the vitest regression S2 checks the same icon in jsdom. A separate regression supplies a multiline prompt shorter than 2,000 characters, proves its suffix lies below the overlay viewport, then verifies that pressing the visible action sends nothing and opens the full-text review; only the review's Send produces `m-fixture-card`.
+- **Asserts:** the pure `primaryNeedsReview` helper returns false for catalog prompts and actions without a prompt, and true for prompts with agent, deck or unspecified source, including short prompts. General actions and question options send catalog prompts directly, while non-catalog prompts first open a token-bound review with no delivery, and only its Send delivers the shown definition. Existing exact-character markers and changed-token review checks remain covered. In the browser, the compact card shows the agent-written action only as an icon whose hover holds the text, beside Close, and pressing that icon sends nothing and opens the full-text review (PRD #2374 decision 2026-11-24); the vitest regression S2 checks the same icon in jsdom. Pressed in bench's Card panel, the same icon sends nothing and opens the review; only the review's Send produces `m-fixture-card`, which the review and the panel then show. A separate regression gives an agent a multiline prompt of a hundred lines, under 2,000 characters, whose hover in the Card panel says it cannot show it all; pressing the icon sends nothing and opens the full-text review with the final instruction (PR #2491 decision 2026-11-25).
 - **Does not assert:** what the daemon does with the request (`agent-report/actions/001`); a real agent.
 
 ##### desktop/agent-cards/025 — Every checked reference is reachable from a compact card.
 - **Test:** vitest `desktop/agent-cards/025: …` (three tests) in `desktop/src/components/AgentCardsTree.test.tsx`; Playwright `desktop/agent-cards/025 — every checked reference is reachable from a compact card at <width>px` in `desktop/e2e/agent-cards-tree.spec.ts`, against `cards=tree` with pushed references.
-- **Layer:** desktop component (jsdom; the second test stubs the reference line's and badges' layout widths); desktop browser at 375 and 1440 px.
-- **Asserts:** the card overlay's "Pull requests and issues" section lists every `checked_refs` entry in the daemon's order with the deck's check (a pull request's state, review and CI, an issue's state, the title), when it was checked or that it is stale, that it is still to be checked, or why it cannot be (with the daemon's detail), and the agent's claim marked **agent says**; its checked badges open their pages through the same opener as the card's, named by the card; an open the opener accepts closes the overlay, and one it refuses leaves the overlay open with the opener's sentence in it, and on the card the same refusal shows in a dashboard banner that Dismiss clears; an unchecked one has no link. On the card, badges that do not fit the line whole are hidden whole (`data-overflow`, `aria-hidden`, not drawn) and counted by a `+N` button; pressing it, from the keyboard in the browser, opens that card's overlay with the focus on the section, scrolled into view. In the browser with two pull requests, a stale issue and a not-found issue, every drawn badge is wholly inside the line and clear of the count, the roots do not move, the overlay lists all four with their states, and a real click on the stale issue past the card's line opens the in-app browser on it although bench's card is `stopped` and its agent is absent from the fleet's agents. The browser is then in front: the card overlay is gone, the browser is not `inert`, none of its toolbar buttons is, it is not marked covered, a hit-test at its centre lands inside it and the focus is inside it; its Back works, a later card list that still holds bench keeps it open, Close puts the focus back on the `+N`, and a list without bench's card closes it.
-- **Does not assert:** the lookup (`agent-report/refs/001`, `002`); voice beyond the existing show-card command, which opens the same overlay.
+- **Layer:** desktop component (jsdom) with the Card panel beside the dashboard; real browser, chromium and webkit.
+- **Asserts:** the agent's Card panel lists, under "Pull requests and issues", every `checked_refs` entry in the daemon's order with the deck's check (a pull request's state, review and CI, an issue's state, the title), when it was checked or that it is stale, that it is still to be checked, or why it cannot be (with the daemon's detail), and the agent's claim marked **agent says**; its checked badges open their pages through the same opener as the card's, named by the card; an open the opener refuses leaves its sentence in the panel, one it accepts clears it, and on the card the same refusal shows in a dashboard banner that Dismiss clears; an unchecked one has no link. On the card, badges that do not fit the line whole are hidden whole (`data-overflow`, `aria-hidden`, not drawn) and counted by a `+N` button; pressing it, from the keyboard in the browser, opens that agent's pane with the Card panel scrolled to the list. In the browser with two pull requests, a stale issue and a not-found issue, every drawn badge is wholly inside the line and clear of the count, the roots do not move, the panel lists all four with their states, and a real click on the stale issue past the card's line opens the in-app browser on it although bench's card is `stopped`. The browser is then in front of the pane: not `inert`, none of its toolbar buttons is, not marked covered, a hit-test at its centre lands inside it and the focus is inside it; its Back works, a later card list that still holds bench keeps it open, Close returns to bench's pane with its panel, and a list without bench's card closes the browser (PR #2491 decision 2026-11-25).
+- **Does not assert:** the lookup (`agent-report/refs/001`, `002`).
 
 ##### desktop/agent-cards/026 — A reference opened again follows what asked for it last.
 - **Test:** vitest `desktop/agent-cards/026: …` (four tests) in `desktop/src/CardReferenceSubject.test.tsx`.
@@ -17291,13 +17291,6 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop component (jsdom).
 - **Asserts:** the checkbox every card carries (no Select to press, PR #2491 review) selects a closed root, counts the root, child and grandchild without opening them, leaves the unrelated root unselected, previews precisely the selected subtree, and clears the selection, and with it the selection bar, when the root is unchecked.
 - **Does not assert:** browser geometry (033).
-
-##### desktop/agent-cards/029 — An overlay batch reaches the card's whole subtree.
-
-- **Test:** vitest `desktop/agent-cards/029: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
-- **Layer:** desktop component (jsdom).
-- **Asserts:** the root's overlay offers a batch action which previews the root and its nested descendants, excluding the unrelated root, opens confirmation and executes nothing.
-- **Does not assert:** daemon admission checks (agent-report/batch/003).
 
 ##### desktop/agent-cards/030 — A batch always confirms the daemon's exact per-agent text.
 
@@ -17338,7 +17331,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/035: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
 - **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech, and a batch bridge that holds the execution until released.
-- **Asserts:** while the execution is held, a spoken `close` ("never mind", through `closeTopmost` and the overlay stack) leaves the dialog sending and the voice report and the dialog both say it is still sending; `Escape` leaves it open; Cancel is disabled; a spoken new batch is refused and previews nothing; once released, both agents' results are shown and `Escape` closes them (#2399 review 2 and 4).
+- **Asserts:** while the execution is held, a spoken `close` ("never mind", through `closeTopmost` and the overlay stack), on a batch started from the selection bar with a closed parent ticked, leaves the dialog sending and the voice report and the dialog both say it is still sending; `Escape` leaves it open; Cancel is disabled; a spoken new batch is refused and previews nothing; once released, both agents' results are shown and `Escape` closes them (#2399 review 2 and 4).
 - **Does not assert:** microphone capture, transcription or model classification; daemon-side execution.
 
 ##### desktop/agent-cards/036 — Voice builds a selection by name and starts a batch on it.
@@ -17418,18 +17411,18 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** a root offering two catalog prompts, an answer to its own question, Reply, Open, Close and Close keeping the worktree shows exactly two icons (`agent-card-action-icon`), in the daemon's order, each a button named by its label with no text, an SVG, and a hover (`data-tip`, the accessible description) holding its label and exact text, which is nowhere on the card; no icon for Reply, Open, the answer or Close keeping the worktree, and Close keeps its own; opening the root shows its child's icon, and the open root keeps its icons (PRD #2374 decision 2026-11-24).
 - **Does not assert:** geometry (061).
 
-##### desktop/agent-cards/047 — Pressing a card's icon takes the overlay's path.
+##### desktop/agent-cards/047 — Pressing a card's icon takes the Card panel's path.
 
 - **Test:** vitest `desktop/agent-cards/047: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), `invokeCardAction` stubbed.
-- **Asserts:** a catalog action with no confirmation is sent once through `invokeCardAction` with its token, the same call the overlay's button makes; an action with `confirm` opens the overlay's confirmation quoting its exact text and is sent only by Send, with `confirm: true`; an action whose text the agent wrote opens the review step and sends nothing.
+- **Asserts:** a catalog action with no confirmation is sent once through `invokeCardAction` with its token, the same call the Card panel's icon makes; an action with `confirm` opens the single-action review quoting its exact text and is sent only by Send, with `confirm: true`; an action whose text the agent wrote opens the review step and sends nothing.
 - **Does not assert:** what the daemon does with the press (`agent-report/actions/001`).
 
 ##### desktop/agent-cards/048 — A disabled action's icon is disabled and says why.
 
 - **Test:** vitest `desktop/agent-cards/048: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** a running agent's prompt action the daemon disabled is an icon marked `aria-disabled` but not natively disabled, so keyboard focus still reaches it, whose hover holds its label, its text and the reason in the overlay's words ("the agent is not running"); pressing it sends nothing and opens nothing (issue #2399 review, finding 7).
+- **Asserts:** a running agent's prompt action the daemon disabled is an icon marked `aria-disabled` but not natively disabled, so keyboard focus still reaches it, whose hover holds its label, its text and the reason in the Card panel's words ("the agent is not running"); pressing it sends nothing and opens nothing (issue #2399 review, finding 7).
 - **Does not assert:** the daemon's enablement rules (`agent_cards` unit tests).
 
 ##### desktop/agent-cards/049 — An action with no icon, or an icon the app does not bundle, gets the generic icon.
@@ -17439,18 +17432,18 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** `git-merge` and `play` draw as themselves (`data-icon`); an action with no icon and one naming an icon the app does not bundle both draw `generic`, the same SVG, which differs from a named icon's.
 - **Does not assert:** which icons the app bundles beyond those named here and in 054.
 
-##### desktop/agent-cards/050 — Past three icons a card counts the rest with +N, which opens the overlay.
+##### desktop/agent-cards/050 — Past three icons a card counts the rest with +N, which opens the agent's Card panel.
 
 - **Test:** vitest `desktop/agent-cards/050: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** a card offering five prompt actions shows the first three as icons, in the daemon's order, and `+2` (`agent-card-actions-more`, named "… 2 more actions …") beside a whole Close; pressing `+2` opens the card's overlay listing all five and sends nothing.
+- **Asserts:** a card offering five prompt actions shows the first three as icons, in the daemon's order, and `+2` (`agent-card-actions-more`, named "… 2 more actions …") beside a whole Close; pressing `+2` opens the agent's pane, whose Card panel draws all five as icons, and sends nothing.
 - **Does not assert:** geometry at narrow widths (061), or the three/four boundary and a changed card (064).
 
 ##### desktop/agent-cards/051 — The batch buttons are icons, with the label and text on hover.
 
 - **Test:** vitest `desktop/agent-cards/051: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed batch bridge.
-- **Asserts:** the selection bar's and a root overlay's Go ahead are icon buttons named Go ahead with no text and an SVG, whose hover holds the label and, when every selected card lists the same text, that text; when a child's text differs, both surfaces' hover says "text differs per agent" and quotes neither; on both surfaces an action with the catalog icon `git-merge` draws it, and one with no icon or an icon the app does not bundle draws the generic icon, the same drawing on both; pressing the bar's icon only opens the confirmation, and nothing is invoked as a single press (PRD #2374 decision 2026-11-24 (3); issue #2399 review, finding 8). `desktop/agent-cards/028`–`045` find these buttons by the same accessible name.
+- **Asserts:** the selection bar's Go ahead is an icon button named Go ahead with no text and an SVG, whose hover holds the label and, when every selected card lists the same text, that text; when a child's text differs, its hover says "text differs per agent" and quotes no agent's text; an action with the catalog icon `git-merge` draws it, and one with no icon or one the app does not bundle draws the generic icon; pressing an icon only opens the confirmation (PRD #2374 decision 2026-11-24 (3); the card overlay's batch row went with the overlay, PR #2491 decision 2026-11-25).
 - **Does not assert:** the daemon's preview text (030).
 
 ##### desktop/agent-cards/052 — The confirmation quotes text every agent shares once, and ties each agent to its own text.
@@ -17520,7 +17513,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** Playwright `desktop/agent-cards/061 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (three tests at 375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** a pushed catalog action with `confirm` and icon `rocket` draws as an icon whole inside its card, with Close whole, its exact text in its hover and none on the card, and pressing it opens the confirmation quoting the text with nothing sent; the Card actions editor lists Go ahead and Merge it with a visible deck source label, adds Deploy it with a two-line text and the `rocket` picked from the searched grid, then lists it with a visible user source label, and fits the window; a card offering five long-labelled actions draws three icons, `+2` and Close inside the card with no two overlapping; keyboard focus reaches each icon, the disabled one included, and shows a tooltip inside the window with its label and exact text (and that it asks first, or why it is disabled), Tab moves between icons and Escape hides it; `+2` opens the overlay with all five and Close stays pressable; the page never scrolls sideways (issue #2399 review, findings 6, 7 and 11).
+- **Asserts:** a pushed catalog action with `confirm` and icon `rocket` draws as an icon whole inside its card, with Close whole, its exact text in its hover and none on the card, and pressing it opens the single-action review quoting the text with nothing sent; the Card actions editor lists Go ahead and Merge it with a visible deck source label, adds Deploy it with a two-line text and the `rocket` picked from the searched grid, then lists it with a visible user source label, and fits the window; a card offering five long-labelled actions draws three icons, `+2` and Close inside the card with no two overlapping; keyboard focus reaches each icon, the disabled one included, and shows a tooltip inside the window with its label and exact text (and that it asks first, or why it is disabled), Tab moves between icons and Escape hides it; `+2` opens the agent's pane, whose Card panel draws all five icons, and Close stays pressable; the page never scrolls sideways (issue #2399 review, findings 6, 7 and 11).
 - **Does not assert:** a real daemon writing the file (`agent-report/catalog-edit/*`).
 
 ##### desktop/agent-cards/062 — The Card actions editor's production bridge sends the deck and the edit as given.
@@ -17555,7 +17548,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/066: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed catalog bridge.
-- **Asserts:** the form's Placement control offers `card` (Show on the card) and `detail` (Only in the overlay) and shows the action's own; setting `detail` and ticking Offer on every card sends both in the update; reopening shows them; unticking sends `always: false` and keeps the placement; an add with a non-default placement sends it; an action whose file says `compact` shows as Show on the card and is saved back as `compact` when not changed (issue #2399 review, finding 5; review 11).
+- **Asserts:** the form's Placement control offers `card` (Show on the card) and `detail` (Only in the Card panel) and shows the action's own; setting `detail` and ticking Offer on every card sends both in the update; reopening shows them; unticking sends `always: false` and keeps the placement; an add with a non-default placement sends it; an action whose file says `compact` shows as Show on the card and is saved back as `compact` when not changed (issue #2399 review, finding 5; review 11).
 - **Does not assert:** what placement does on a card.
 
 ##### desktop/agent-cards/067 — Late answers after the daemon changed are dropped, and every write goes to the daemon shown.
@@ -17572,11 +17565,11 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** a preview giving the root (catalog text) and the child (agent-written text) the same exact text quotes it once and lists both agents; the child's row carries the "agent says" badge and the root's does not (issue #2399 review 9).
 - **Does not assert:** the daemon's preview.
 
-##### desktop/agent-cards/069 — Action icons sit in the card's bottom row, and an overlay-only action draws none.
+##### desktop/agent-cards/069 — Action icons sit in the card's bottom row, and a Card-panel-only action draws none on the card.
 
 - **Test:** vitest `desktop/agent-cards/069: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), the real dashboard on a tree list.
-- **Asserts:** a card offering actions placed `card`, `detail` and `compact` draws the `card` and `compact` ones as icons inside its `agent-card-foot` row and none in the header or on the status line; the `detail` one has no icon and is listed in the overlay; a card with no icons still has the bottom row (issue #2399 review 2 and 11).
+- **Asserts:** a card offering actions placed `card`, `detail` and `compact` draws the `card` and `compact` ones as icons inside its `agent-card-foot` row and none in the header or on the status line; the `detail` one has no icon on the card and is drawn, with the others, in the agent's Card panel; a card with no icons still has the bottom row (issue #2399 review 2 and 11).
 - **Does not assert:** geometry (076).
 
 ##### desktop/agent-cards/070 — The hover draws on pointer and keyboard alike, and a text it cannot quote whole opens the review.
@@ -17618,14 +17611,14 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/075: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
 - **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
-- **Asserts:** "icon git merge" (a `filter_text`) sets the form's icon to `git-merge` and an unknown name is refused in words; "ask before sending" ticks the box and saying it again leaves it ticked, and each of the four checkbox rows sets its box as said; "only in the overlay" sets Placement to Only in the overlay, saying it again keeps it, and "show it on the card" sets it back; "refresh the card actions" reads the list again keeping the form; a `deck_ref` naming the daemon shown is accepted and one naming no daemon on the dashboard is refused in words; nothing is written; `chooseCardActionsDaemon`, `refreshCardActions`, `chooseCardActionIcon`, the four checkbox entries and the two Placement entries (`showCardActionOnCard`, `showCardActionOnlyInOverlay`) are `voice: true`, each with exactly one `commands.toml` row on `overview` with its parameters; `060` checks that every other editor control is a row or carries a written reason (issue #2399 review 12, re-review N4).
+- **Asserts:** "icon git merge" (a `filter_text`) sets the form's icon to `git-merge` and an unknown name is refused in words; "ask before sending" ticks the box and saying it again leaves it ticked, and each of the four checkbox rows sets its box as said; "only in the Card panel" sets Placement to Only in the Card panel, saying it again keeps it, and "show it on the card" sets it back; "refresh the card actions" reads the list again keeping the form; a `deck_ref` naming the daemon shown is accepted and one naming no daemon on the dashboard is refused in words; nothing is written; `chooseCardActionsDaemon`, `refreshCardActions`, `chooseCardActionIcon`, the four checkbox entries and the two Placement entries (`showCardActionOnCard`, `showCardActionOnlyInCardPanel`) are `voice: true`, each with exactly one `commands.toml` row on `overview` with its parameters; `060` checks that every other editor control is a row or carries a written reason (issue #2399 review 12, re-review N4).
 - **Does not assert:** that the model picks these rows for the words: the `card-actions-editor-*` phrase fixtures do, against the real default backend (lane 2, `voice_desktop_phrases_001`).
 
 ##### desktop/agent-cards/076 — The card's action row at its fullest keeps the name and status readable.
 
 - **Test:** Playwright `desktop/agent-cards/076 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** a root with agents under it, given a long name, Needs you, a long status and five actions, shows at least 48 px of its name, draws its status whole inside its line, draws the roll-up and, to its right in the bottom row, three icons and `+2`; every header and bottom-row control is inside the card and none overlaps another; Close can be pressed and `+2` opens the overlay; the page never scrolls sideways (issue #2399 review 2).
+- **Asserts:** a root with agents under it, given a long name, Needs you, a long status and five actions, shows at least 48 px of its name, draws its status whole inside its line, draws the roll-up and, to its right in the bottom row, three icons and `+2`; every header and bottom-row control is inside the card and none overlaps another; Close can be pressed and `+2` opens the agent's Card panel; the page never scrolls sideways (issue #2399 review 2).
 - **Does not assert:** other widths.
 
 ##### desktop/agent-cards/077 — A read that began before a newer write or read answers is dropped.
@@ -17653,28 +17646,28 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** Playwright `desktop/agent-cards/080 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×600 and 1440×900), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** a catalog action that does not ask first, whose text is a short line, eighty empty lines and a sentinel instruction — under the hover's 1,200 characters — draws, on hover and on keyboard focus alike, a tooltip whose box is inside the window on both axes and which ends, in view, by saying it is too long to show here; a click and an Enter each open the review with the whole text, sentinel included, and send nothing; the page never scrolls sideways (issue #2399 re-review N2, re-audit new 2).
+- **Asserts:** a catalog action that does not ask first, whose text is a short line, eighty empty lines and a sentinel instruction — under the hover's 1,200 characters — draws, on hover and on keyboard focus alike, a tooltip whose box is inside the window on both axes and within a few pixels of its icon's edge, starting over it, and which ends, in view, by saying it is too long to show here; a click and an Enter each open the review with the whole text, sentinel included, and send nothing; the page never scrolls sideways (issue #2399 re-review N2, re-audit new 2).
 - **Does not assert:** a spoken action, which sends as it always did (the review is a safeguard for icon presses).
 
 ##### desktop/agent-cards/081 — A root at its fullest with its checkbox keeps its name.
 
 - **Test:** Playwright `desktop/agent-cards/081 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** on a daemon that does batches, with no Select to press (PR #2491 review), a root with agents under it, a long name, Needs you, a long status and five actions draws the checkbox, the name, Needs you as its bell (whose tooltip and screen-reader words remain), the tree toggle and Close in its header; the name shows at least 48 px of itself, as `076` requires without the checkbox; no header control overlaps another and all are inside the card; the checkbox can be ticked, which opens no overlay, and Close pressed; the page never scrolls sideways (issue #2399 re-review N6).
+- **Asserts:** on a daemon that does batches, with no Select to press (PR #2491 review), a root with agents under it, a long name, Needs you, a long status and five actions draws the checkbox, the name, Needs you as its bell (whose tooltip and screen-reader words remain), the tree toggle and Close in its header; the name shows at least 48 px of itself, as `076` requires without the checkbox; no header control overlaps another and all are inside the card; the checkbox can be ticked, which opens no pane, and Close pressed; the page never scrolls sideways (issue #2399 re-review N6).
 - **Does not assert:** other widths.
 
 ##### desktop/agent-cards/082 — A shown hover is drawn again when its text changes.
 
 - **Test:** Playwright `desktop/agent-cards/082 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×600 and 1440×900), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** with an icon's one-line hover shown, by the pointer and then by keyboard focus, and drawn whole, a daemon update that makes the action's text eighty empty lines and a sentinel line redraws the shown tooltip without the pointer moving or focus changing: it carries the sentinel, its box is inside the window on both axes, and it ends, in view, by saying it is too long to show here; focus stays on the icon; the page never scrolls sideways (issue #2399 final review F1).
+- **Asserts:** with an icon's one-line hover shown, by the pointer and then by keyboard focus, and drawn whole, a daemon update that makes the action's text eighty empty lines and a sentinel line redraws the shown tooltip without the pointer moving or focus changing: it carries the sentinel, its box is inside the window on both axes and stays beside its icon (as does the short one, and, by keyboard, after the page reflows under it with no scroll or resize — PR #2491 v9 review), and it ends, in view, by saying it is too long to show here; focus stays on the icon; the page never scrolls sideways (issue #2399 final review F1).
 - **Does not assert:** a scroll or a change in the button's size while shown, which take the same path as the resize `083` drives.
 
 ##### desktop/agent-cards/083 — A hover drawn cut keeps the review after the window grows.
 
 - **Test:** Playwright `desktop/agent-cards/083 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×600 → 375×1200 and 1440×680 → 1440×1200), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** an icon whose text (a line, forty empty lines and a sentinel) is drawn cut in the small window, shown by keyboard focus, is drawn again whole and inside the window when the window grows with focus staying on it; a click, and on a second pass an Enter, then each open the review with the whole text and send nothing, rather than sending because the press measured the text as fitting (issue #2399 final audit A4).
+- **Asserts:** an icon whose text (a line, forty empty lines and a sentinel) is drawn cut in the small window, shown by keyboard focus, is drawn again whole, inside the window and beside its icon when the window grows with focus staying on it; a click, and on a second pass an Enter, then each open the review with the whole text and send nothing, rather than sending because the press measured the text as fitting (issue #2399 final audit A4).
 - **Does not assert:** a hover-shown tooltip across the resize at 375 px, where the growing window moves the icon from under the pointer and the hover ends (a fresh hover then draws it whole).
 
 ##### desktop/agent-cards/084 — A spoken edit or removal with the editor closed ends in what it asked for or a refusal.
@@ -17688,7 +17681,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/085: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop overview (jsdom).
-- **Asserts:** on a daemon that does batches every card shows its checkbox with no Select button and no selection line under the toolbar; with nothing selected there is no selection bar; Needs you is the compact bell, its words kept as tooltip and screen-reader text; a card's own action icons sit in the action group, with Close outside it; ticking a card opens no overlay and shows the bar with `1 selected`, the selected cards' actions inside one action group, and Clear outside it; Clear empties the selection and removes the bar, sending nothing; the overlay's batch row is the same group; a daemon without batches shows no checkbox and no bar (PR #2491 review).
+- **Asserts:** on a daemon that does batches every card shows its checkbox with no Select button and no selection line under the toolbar; with nothing selected there is no selection bar; Needs you is the compact bell, its words kept as tooltip and screen-reader text; a card's own action icons sit in the action group, with Close outside it; ticking a card opens nothing else and shows the bar with `1 selected`, the selected cards' actions inside one action group, and Clear outside it; Clear empties the selection and removes the bar, sending nothing; a daemon without batches shows no checkbox and no bar (PR #2491 review).
 - **Does not assert:** where the bar is drawn or how the group looks (`087`, `088`).
 
 ##### desktop/agent-cards/086 — Voice clears the selection, and there is no selection switch left to say.
@@ -17709,7 +17702,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** Playwright `desktop/agent-cards/088 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** a root's three action icons sit in a group with a border, rounded corners and a background unlike the card's, and the card's own Close is outside it; the selection bar's group, once the root is ticked, and the batch row's group in the root's overlay each have a border, rounded corners and a background unlike what they sit on, and the same background and border colour as the card's group; in the light and in the dark theme each of the three groups has a background with non-zero alpha, equal to that theme's `--teal-soft` resolved where the group is, a border equal to its `--teal-rim`, and unlike the background it sits on, and the two themes' tints differ; in each theme the selection bar's own background has non-zero alpha and differs from the dashboard's (the first painted background from `.overview-body` up) and from a daemon section's and its header's, it has a drawn border in the theme's `--teal` and a box shadow, and, from the resolved colours composited over the dashboard, its count is at least 4.5:1 against it and an icon and Clear's border at least 3:1 (the ratios are printed); the page never scrolls sideways (PR #2491 review, H2; the maintainer, 2026-11-25).
+- **Asserts:** a root's three action icons sit in a group with a border, rounded corners and a background unlike the card's, and the card's own Close is outside it; the selection bar's group, once the root is ticked, and the group in the root's Card panel each have a border, rounded corners and a background unlike what they sit on, and the same background and border colour as the card's group; in the light and in the dark theme each of the three groups has a background with non-zero alpha, equal to that theme's `--teal-soft` resolved where the group is, a border equal to its `--teal-rim`, and unlike the background it sits on, and the two themes' tints differ; in each theme the selection bar's own background has non-zero alpha and differs from the dashboard's (the first painted background from `.overview-body` up) and from a daemon section's and its header's, it has a drawn border in the theme's `--teal` and a box shadow, and, from the resolved colours composited over the dashboard, its count is at least 4.5:1 against it and an icon and Clear's border at least 3:1 (the ratios are printed); the page never scrolls sideways (PR #2491 review, H2; the maintainer, 2026-11-25).
 - **Does not assert:** that the group's tint and its surface contrast enough to see, beyond being different colours; the explicit `data-theme` choice (the theme loop goes through `prefers-color-scheme`, and the palette guard keeps the two dark blocks equal).
 
 ##### desktop/agent-cards/089 — Clear pressed with the keyboard keeps the user's place.
@@ -17746,6 +17739,44 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed batch bridge.
 - **Asserts:** with 30 included agents sharing one text, the text is quoted once and at most 10 names are listed with a collapsed "+N more" button counting the rest; pressing it lists all 30; Send executes all 30 previewed entries (PR #2491 decision 2026-11-25).
 - **Does not assert:** how many names show before the fold beyond "at most 10".
+
+##### desktop/agent-cards/094 — In an agent's pane, voice works the Card panel and moves between agents.
+- **Test:** vitest `desktop/agent-cards/094: …` (six cases) in `desktop/src/components/AgentCardsVoice.test.tsx`.
+- **Layer:** desktop component (jsdom), real `DeckShell` opened on an agent's pane, voice panel and dispatch seam, the resolved answer shaped as the crate sends it.
+- **Asserts:** opened by no card, the pane shows the Card panel only for an agent that needs you; "close the card" (`close_card_panel`) hides it and remembers `closed`; "show the card" (`open_card_panel`) shows it and remembers `open`; "next agent", "previous agent" and "next one that needs me" open the other agent's pane with its card; "show the second agent's card" (`show_agent_card` from the pane) opens that agent's pane with the panel; the header's Card button reads each state through `aria-pressed`; none sends a card action (PR #2491 decision 2026-11-25).
+- **Does not assert:** the model's choice of row (`voice_desktop_phrases_001`'s `card-panel-*` fixtures).
+
+##### desktop/agent-cards/095 — The Card panel opens from a card or for an agent that needs you, else as last chosen, and never by itself.
+- **Test:** vitest `desktop/agent-cards/095: …` in `desktop/src/AgentPaneCardPanel.test.tsx`.
+- **Layer:** desktop shell (jsdom), real `DeckShell` with a stand-in terminal.
+- **Asserts:** an agent that does not need you, opened from its table row, opens with the panel closed; the header's Card button shows it inside the pane's body beside the terminal and remembers `open`, so the next row opens with it; hidden again, `closed` is remembered; a card update while the pane is shown — the agent coming to need you, or no longer needing you — neither opens nor closes it; an agent that needs you opens with it whatever was chosen, and one opened from its card too; with storage throwing, the button still toggles it (PR #2491 decision 2026-11-25).
+- **Does not assert:** geometry (`097`).
+
+##### desktop/agent-cards/096 — The pane header moves between agents, and its keys stay out of the terminal.
+- **Test:** vitest `desktop/agent-cards/096: …` in `desktop/src/AgentPaneCardPanel.test.tsx`.
+- **Layer:** desktop shell (jsdom), real `DeckShell` with a focusable stand-in terminal.
+- **Asserts:** opened from the first card, Next agent, Previous agent and Next needing you each open that agent's pane and card in the dashboard's order; with focus on the header, `[`, `]` and `n` do the same; with focus in the terminal, they move nothing (PR #2491 decision 2026-11-25).
+- **Does not assert:** that the keys reach the agent (`098`).
+
+##### desktop/agent-cards/097 — A card opens its agent's pane with the Card panel beside or above the terminal.
+- **Test:** Playwright `desktop/agent-cards/097 — …` in `desktop/e2e/agent-card-panel.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
+- **Asserts:** a click on a card's body opens its agent's pane with the Card panel and the Card button pressed; at 1440 px the panel is on the terminal's right, 300–340 px wide; at 375 px it is under the pane's header and above the terminal, spanning the pane, at most 262 px tall and scrolling; nothing scrolls sideways; a card update (new summary, needs-you flipped) changes the panel's text and moves the terminal's box by at most a pixel; the Card button hides the panel, the terminal growing by more than 100 px, and shows it again (PR #2491 decision 2026-11-25).
+- **Does not assert:** the agent's own terminal size reports.
+
+##### desktop/agent-cards/098 — The pane's header moves between agents, and the keys stay the agent's in its terminal.
+- **Test:** Playwright `desktop/agent-cards/098 — …` in `desktop/e2e/agent-card-panel.spec.ts` (1440 px), against `cards=tree`, chromium and webkit.
+- **Asserts:** from bench's pane, Next agent shows another agent's card and Previous agent returns to bench; Next needing you lands on an agent whose card needs you; with focus on the header, `[` and `]` move; Escape leaves the pane; with focus in the terminal, typing `]`, `[` and `n` reaches the agent's terminal input exactly (`][n`) and the pane stays on bench (PR #2491 decision 2026-11-25).
+- **Does not assert:** the order's wrap-around (`004`).
+
+##### desktop/agent-cards/099 — The Table view's row menu opens the agent's pane.
+- **Test:** Playwright `desktop/agent-cards/099 — …` in `desktop/e2e/agent-card-panel.spec.ts` (375 and 1440 px), against `cards=tree`, chromium and webkit.
+- **Asserts:** Show card opens bench's pane with its Card panel; after Back to dashboard, the menu's most needed action (one that asks first) opens bench's pane with its panel under the single-action review showing the exact text, sends nothing until Send, and the review then says what became of it; nothing scrolls sideways (PR #2491 decision 2026-11-25).
+- **Does not assert:** the review's changed-token path (`AgentCardsReview.test.tsx`).
+
+##### desktop/agent-cards/100 — An action icon shows the pointer and the keyboard, and its tooltip sits by it.
+- **Test:** Playwright `desktop/agent-cards/100 — …` in `desktop/e2e/agent-card-panel.spec.ts` (375 and 1440 px), against `cards=tree`, chromium and webkit.
+- **Asserts:** in the light and the dark theme, an action icon on a card, in the selection bar and in the Card panel is drawn differently under the pointer than at rest (background or outline shadow), has an outline at least 2 px wide under keyboard focus (`:focus-visible`), and its tooltip, by pointer and by keyboard, sits within a few pixels of the icon's bottom or top edge, starting over it (PR #2491 v9 review).
+- **Does not assert:** contrast ratios of the marks.
 
 ## Desktop native driver scenarios
 

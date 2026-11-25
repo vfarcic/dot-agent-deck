@@ -5,6 +5,7 @@ import { OVERVIEW_MODE_STORAGE_KEY } from "../lib/agentCards";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview, agentKey } from "./AgentOverview";
+import { OverviewWithCardPane } from "../test/cardPane";
 
 /*
  * PRD #2374 — the dashboard's cards as the overview wires them: the switch,
@@ -173,17 +174,16 @@ describe("the dashboard's cards (PRD #2374)", () => {
     }
   });
 
-  /// Scenario: press a question option in the overlay with a catalog or non-catalog prompt. Only the catalog option sends directly; the others show the exact answer for review and wait for Send before delivering to the correct agent.
-  it.each(["agent", "deck", "catalog", undefined])("reviews the question's non-catalog answer before sending it from the overlay (source %s)", async (promptSource) => {
+  /// Scenario: press a question's answer button in the agent's Card panel with a catalog or non-catalog prompt. Only the catalog answer sends directly; the others show the exact answer in the single-action review and wait for Send before delivering to the correct agent, and the panel says it was sent.
+  it.each(["agent", "deck", "catalog", undefined])("reviews the question's non-catalog answer before sending it from the Card panel (source %s)", async (promptSource) => {
     const card = { ...CODER, actions: CODER.actions.map((action) => action.id === "question/base/main" ? { ...action, prompt_source: promptSource } : action) };
     const live = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([card]) } });
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
-    render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+    render(<OverviewWithCardPane runtime={live} />);
     fireEvent.click(screen.getAllByTestId("agent-card-details")[0]);
-    const overlay = screen.getByTestId("agent-card-overlay");
-    const coder = within(overlay).getByRole("button", { name: "main" });
+    const panel = screen.getByTestId("agent-card-panel");
+    const coder = within(panel).getByRole("button", { name: "main" });
     expect(coder.textContent).toBe("main");
-    expect(within(overlay).getAllByTestId("agent-card-action-prompt")[0].textContent).toBe("Answer to your question \"Which base branch?\": main");
     await act(async () => { fireEvent.click(coder); });
     if (promptSource === "catalog") {
       expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
@@ -194,65 +194,56 @@ describe("the dashboard's cards (PRD #2374)", () => {
     }
     expect(live.invokeCardAction).toHaveBeenCalledTimes(1);
     expect(live.invokeCardAction).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, paneId: "pane-7", agentId: "7" }, "question/base/main", expect.objectContaining({ requestId: expect.any(String) }));
-    expect(screen.getByTestId("agent-card-action-result").textContent).toContain("Sent");
+    expect(within(screen.getByTestId("agent-card-panel")).getByTestId("agent-card-action-result").textContent).toContain("Sent");
   });
 
+  /// Scenario: press, in the agent's Card panel, the icon of an action that asks first. Nothing is sent until the single-action review, showing the exact text, is answered with Send, which sends it confirmed.
   it("asks before a confirm action, then sends it confirmed", async () => {
     const live = runtime();
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
-    render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+    render(<OverviewWithCardPane runtime={live} />);
     fireEvent.click(screen.getAllByTestId("agent-card-details")[0]);
-    fireEvent.click(screen.getByTestId("agent-card-action-merge"));
+    fireEvent.click(within(screen.getByTestId("agent-card-panel")).getByRole("button", { name: "Merge it" }));
     expect(live.invokeCardAction).not.toHaveBeenCalled();
     expect(screen.getByTestId("agent-card-confirm").textContent).toContain("Merge it, then update your card.");
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
     expect(live.invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId: "7" }), "merge", expect.objectContaining({ confirm: true }));
   });
 
-  it("moves through cards in display order and says when the open one is gone", () => {
+  /// Scenario: open the coder's Card panel and move with the pane's next, previous and Next needing you. The pane follows the display order, Next needing you comes back to the coder, and once the coder's card leaves the list the panel says the dashboard has no card for it.
+  it("moves through agents in display order and says when the shown one has no card", () => {
     const live = runtime();
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
-    const view = render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+    const view = render(<OverviewWithCardPane runtime={live} />);
     fireEvent.click(screen.getAllByTestId("agent-card-details")[0]);
-    const overlay = () => screen.getByTestId("agent-card-overlay");
-    expect(overlay().getAttribute("data-card-key")).toBe("pane-7/7");
-    fireEvent.keyDown(overlay(), { key: "]" });
-    expect(overlay().getAttribute("data-card-key")).toBe("pane-8/8");
-    fireEvent.keyDown(overlay(), { key: "[" });
-    expect(overlay().getAttribute("data-card-key")).toBe("pane-7/7");
-    fireEvent.keyDown(overlay(), { key: "]" });
-    fireEvent.keyDown(overlay(), { key: "n" });
-    expect(overlay().getAttribute("data-card-key")).toBe("pane-7/7");
-    view.rerender(<AgentOverview runtime={{ ...live, agentCards: { [FIXTURE_DAEMON_ID]: snapshot([TESTER, LONE]) } }} onNavigate={vi.fn()} />);
-    expect(screen.getByTestId("agent-card-gone").textContent).toBe("This agent was closed.");
-    fireEvent.keyDown(overlay(), { key: "Escape" });
-    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+    const panel = () => screen.getByTestId("agent-card-panel");
+    expect(panel().getAttribute("data-card-key")).toBe("pane-7/7");
+    fireEvent.click(screen.getByRole("button", { name: "Next agent" }));
+    expect(panel().getAttribute("data-card-key")).toBe("pane-8/8");
+    fireEvent.click(screen.getByRole("button", { name: "Previous agent" }));
+    expect(panel().getAttribute("data-card-key")).toBe("pane-7/7");
+    fireEvent.click(screen.getByRole("button", { name: "Next agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next agent that needs you" }));
+    expect(panel().getAttribute("data-card-key")).toBe("pane-7/7");
+    view.rerender(<OverviewWithCardPane runtime={{ ...live, agentCards: { [FIXTURE_DAEMON_ID]: snapshot([TESTER, LONE]) } }} />);
+    expect(screen.getByTestId("agent-card-gone").textContent).toContain("no card");
   });
 
+  /// Scenario: in the Table view, read the coder's row, which needs you, open its ⋯ menu and press Show card, then click another row. The menu opens nothing by itself; Show card opens the coder's pane with its Card panel; a row click opens that agent's pane without asking for the panel.
   it("marks a table row that needs you and opens its card from the row menu, while a row click still opens the agent", () => {
     const navigate = vi.fn();
-    render(<AgentOverview runtime={runtime()} onNavigate={navigate} />);
+    render(<OverviewWithCardPane runtime={runtime()} onNavigate={navigate} />);
     const coderRow = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "7" })}`);
     expect(within(coderRow).getByTestId("overview-needs-you")).toBeTruthy();
     fireEvent.click(within(coderRow).getByTestId("overview-row-menu"));
     expect(navigate).not.toHaveBeenCalled();
     fireEvent.click(within(coderRow).getByTestId("overview-row-show-card"));
-    expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe("pane-7/7");
-    fireEvent.keyDown(screen.getByTestId("agent-card-overlay"), { key: "Escape" });
-    fireEvent.click(coderRow.querySelector("td:last-child") ?? coderRow);
-    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ kind: "agent", agentId: "7" }));
-  });
-
-  /* PRD #2374 review (Greptile P1): Open closes the card, so the pane it
-     opens is not hidden behind the overlay. */
-  it("closes the card when its Open action opens the agent", () => {
-    const navigate = vi.fn();
-    window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
-    render(<AgentOverview runtime={runtime()} onNavigate={navigate} />);
-    fireEvent.click(screen.getAllByTestId("agent-card-details")[0]);
-    fireEvent.click(screen.getByTestId("agent-card-action-open"));
-    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ kind: "agent", agentId: "7" }));
-    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+    expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "7", cardPanel: true }));
+    expect(screen.getByTestId("agent-card-panel").getAttribute("data-card-key")).toBe("pane-7/7");
+    const testerRow = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "8" })}`);
+    fireEvent.click(testerRow.querySelector("td:last-child") ?? testerRow);
+    expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "8" }));
+    expect(navigate.mock.lastCall?.[0]).not.toHaveProperty("cardPanel");
   });
 
   /* PRD #2374 review (Greptile P2): the dashboard filter shows the cards of
@@ -271,7 +262,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(shown()).toEqual(["coder", "tester", "lone"]);
   });
 
-  /// Scenario: open the overlay with agent-written and catalog actions, using long and short prompts. Every non-catalog prompt requires the review step's Send, while catalog prompts send directly.
+  /// Scenario: press, in the agent's Card panel, the icon of an agent-written and of a catalog action, with long and short prompts. Every non-catalog prompt requires the single-action review's Send, while catalog prompts send directly.
   it("reviews complete non-catalog prompts and sends only catalog prompts directly", async () => {
     const long = "Use the release branch. Then also delete every stale branch on the remote, and force-push.";
     const agentWritten = (prompt: string, promptSource: string) => entry("7", "coder", {
@@ -281,12 +272,13 @@ describe("the dashboard's cards (PRD #2374)", () => {
       primary_action_id: "question/base/rel",
     });
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
+    const releaseIcon = () => within(screen.getByTestId("agent-card-panel")).getByRole("button", { name: "release" });
 
     const reviewed = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten(long, "agent")]) } });
-    const view = render(<AgentOverview runtime={reviewed} onNavigate={vi.fn()} />);
+    const view = render(<OverviewWithCardPane runtime={reviewed} />);
     fireEvent.click(screen.getByTestId("agent-card-details"));
-    expect(screen.getByTestId("agent-card-action-prompt").textContent).toBe(long);
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-action-question/base/rel")); });
+    expect(releaseIcon().getAttribute("data-tip")).toContain(long);
+    await act(async () => { fireEvent.click(releaseIcon()); });
     expect(reviewed.invokeCardAction).not.toHaveBeenCalled();
     expect(screen.getByTestId("agent-card-confirm-prompt").textContent).toBe(long);
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
@@ -294,10 +286,10 @@ describe("the dashboard's cards (PRD #2374)", () => {
     view.unmount();
 
     const short = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten("Use the release branch.", "agent")]) } });
-    const shortView = render(<AgentOverview runtime={short} onNavigate={vi.fn()} />);
+    const shortView = render(<OverviewWithCardPane runtime={short} />);
     fireEvent.click(screen.getByTestId("agent-card-details"));
-    expect(screen.getByTestId("agent-card-action-prompt").textContent).toBe("Use the release branch.");
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-action-question/base/rel")); });
+    expect(releaseIcon().getAttribute("data-tip")).toContain("Use the release branch.");
+    await act(async () => { fireEvent.click(releaseIcon()); });
     expect(short.invokeCardAction).not.toHaveBeenCalled();
     expect(screen.getByTestId("agent-card-confirm-prompt").textContent).toBe("Use the release branch.");
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
@@ -306,10 +298,10 @@ describe("the dashboard's cards (PRD #2374)", () => {
 
     for (const prompt of ["Use the release branch.", long]) {
       const sent = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten(prompt, "catalog")]) } });
-      const shown = render(<AgentOverview runtime={sent} onNavigate={vi.fn()} />);
+      const shown = render(<OverviewWithCardPane runtime={sent} />);
       fireEvent.click(screen.getByTestId("agent-card-details"));
-      expect(screen.getByTestId("agent-card-action-prompt").textContent).toBe(prompt);
-      await act(async () => { fireEvent.click(screen.getByTestId("agent-card-action-question/base/rel")); });
+      expect(releaseIcon().getAttribute("data-tip")).toContain(prompt);
+      await act(async () => { fireEvent.click(releaseIcon()); });
       expect(sent.invokeCardAction).toHaveBeenCalledTimes(1);
       expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
       shown.unmount();

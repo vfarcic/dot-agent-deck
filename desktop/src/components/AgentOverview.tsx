@@ -44,7 +44,8 @@ import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsVi
 import { needsYouSentence, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
 import { AgentCardsDeckBody, AgentCardsSelectionBar, AgentCardsToolbar } from "./AgentCardsGrid";
-import { AgentCardOverlay } from "./AgentCardOverlay";
+import { AgentCardReviewDialog } from "./AgentCardReviewDialog";
+import type { PaneCardsChannel, PaneCardsView } from "../lib/paneCards";
 import { AgentCardBatchDialog } from "./AgentCardBatchDialog";
 import { AgentCardActionsEditor } from "./AgentCardActionsEditor";
 import { useCardActionsEditor, type CardActionsDaemon } from "../hooks/useCardActionsEditor";
@@ -1195,7 +1196,7 @@ function interruptedSeveral(names: string[], definite: boolean, then: string): s
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, onNewAgentChange, notice, selfUpgrade, onConfigRequestSent }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, agentPane, paneCards, voiceChannel, newAgentVoice, onConfirmationChange, onNewAgentChange, notice, selfUpgrade, onConfigRequestSent }: {
   runtime: DeckRuntimeState;
   /**
    * PRD #2119 — told when Generate config was sent from this screen, after it
@@ -1221,6 +1222,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * readline's next-history key, and an agent's terminal may be waiting for it.
    */
   agentPaneOpen?: boolean;
+  /**
+   * PR #2491 decision 2026-11-25 — the agent whose pane is open over this
+   * screen: where the pane header's previous and next move from.
+   */
+  agentPane?: { deckId: string; agentId: string; incarnation?: string };
+  /**
+   * PR #2491 decision 2026-11-25 — where this screen publishes the cards the
+   * agent pane's Card panel draws; absent where no pane is drawn beside it.
+   */
+  paneCards?: PaneCardsChannel;
   /**
    * PRD #1223 U5 — where this screen publishes what a voice dispatch may need
    * from it: `closeNewAgent`, only while the New agent dialog is open. Absent
@@ -1738,7 +1749,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          it; withheld while the New agent dialog is open over the dashboard. */
       ...(interrupted && !newAgent ? { showInterruptedWork, hideInterruptedWork, interruptedDialog } : {}),
       /* PRD #2374 — the cards' members, only while the runtime offers cards;
-         `closeAgentCard` only while a card is open. */
+         `closeCardReview` only while a review is open. */
       ...(cards.shown ? cards.voice : {}),
       /* PRD #2374 decision 2026-11-24 — the Card actions editor's members,
          while the cards are shown and a daemon on screen has them. */
@@ -1855,14 +1866,22 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [voiceContext]);
   /*
     PRD #2374 — the agent cards: the Table |
-    Cards switch, the cards grid, the card overlay and the table's needs-you
+    Cards switch, the cards grid, the single-action review and the table's needs-you
     marker and row menu. A card's `open` action opens the agent exactly as a
     row does.
   */
   const cardDeckList = useMemo(() => decks.map((deck) => ({ deckId: deck.snapshot.connection.deckId, connected: deck.connected })), [decks]);
-  const openCardAgent = useCallback((target: { deckId: string; agentId: string; incarnation?: string }) => {
-    VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
-  }, [voiceContext]);
+  /* A card opens its agent's pane through the target the agent's table row
+     opens (issue #2418, D12), so the two cannot open different things. */
+  const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
+    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => candidate.id === card.entry.agent_id);
+    return agent
+      ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
+      : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
+  }, [decks]);
+  const openCardAgent = useCallback((card: PlacedCard, options?: { cardPanel?: boolean; cardSection?: "references" }) => {
+    VOICE_ACTIONS.openAgent.run(voiceContext, { ...cardOpenTarget(card), ...(options?.cardPanel ? { cardPanel: true } : {}), ...(options?.cardSection ? { cardSection: options.cardSection } : {}) });
+  }, [cardOpenTarget, voiceContext]);
   /* PRD #2374 — in the Cards view, the cards of a deck whose daemon has them,
      after the dashboard filter; `undefined` for a deck that keeps its usual
      body (the Table view, or a daemon with no cards or not answering). */
@@ -1890,7 +1909,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} openTarget={cardOpenTarget} endedRoles={deck.snapshot.endedRoles} selection={cards.batchFor(deckId) ? cards.selection : undefined} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} endedRoles={deck.snapshot.endedRoles} selection={cards.batchFor(deckId) ? cards.selection : undefined} />;
   };
   const openCardReference = useContext(OpenCardReference);
   /* Issue #2418 — whether the dashboard filter keeps a card off the Cards
@@ -1902,7 +1921,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       return deck !== undefined && !cardMatchesFilter(card, deck.matchingAgents);
     };
   }, [decks, filtering]);
-  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
+  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, pane: agentPane, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
   /* PRD #2374 decision 2026-11-24 — the Card actions editor, over the daemons
      whose cards the dashboard shows, in the dashboard's order (which puts the
      selected daemon first, not necessarily the local one). Each carries
@@ -1915,26 +1934,32 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true, local: deck.snapshot.connection.deckKind === "local" }] : [];
   }), [decks, runtime.agentCards]);
   const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons });
-  /* Issue #1965 — the exited role the open card is for, from its own deck's reply: the overlay says why in full. */
-  const overlayCard = cards.overlay?.card;
-  const overlayEnded = overlayCard
-    ? endedRoleOfCard(decks.find((deck) => deck.snapshot.connection.deckId === overlayCard.deckId)?.snapshot.endedRoles, overlayCard.entry)
-    : undefined;
+  /* Issue #1965 — the exited role a card is for, from its own deck's reply: the Card panel says why in full. */
+  const endedForCard = useCallback((card: PlacedCard) => endedRoleOfCard(decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.snapshot.endedRoles, card.entry), [decks]);
   /* Issue #2418 (D12) — a card's name opens its agent through `openAgent`
      with the same members a table row's click uses, so the two cannot open
      different things. */
   const cardControls = useMemo(() => ({ ...cards.clickControls, navigate: voiceContext.navigate, revealAgent: voiceContext.revealAgent }), [cards.clickControls, voiceContext]);
+  /* PR #2491 decision 2026-11-25 — what the agent pane's Card panel draws,
+     published for the pane beside this screen; withdrawn on unmount. */
+  const paneCardsView = useMemo<PaneCardsView | undefined>(() => (cards.shown
+    ? {
+      shownFor: (deckId) => cards.decksWithCards.has(deckId),
+      cardFor: cards.cardFor,
+      resultsFor: cards.resultsFor,
+      treeFor: cards.treeFor,
+      endedFor: endedForCard,
+      notice: cards.notice,
+      controls: cards.clickControls,
+    }
+    : undefined), [cards.cardFor, cards.clickControls, cards.decksWithCards, cards.notice, cards.resultsFor, cards.shown, cards.treeFor, endedForCard]);
+  useLayoutEffect(() => { paneCards?.set(paneCardsView); }, [paneCards, paneCardsView]);
+  useEffect(() => () => { paneCards?.set(undefined); }, [paneCards]);
   /* Issue #2399 review — the batch dialog names each agent's daemon the way
      the dashboard's section header does, when a batch reaches more than one. */
   const batchDaemonName = useCallback((deckId: string) => {
     const deck = decks.find((candidate) => candidate.snapshot.connection.deckId === deckId);
     return deck ? deckName(deck.snapshot.connection) : deckId;
-  }, [decks]);
-  const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
-    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => candidate.id === card.entry.agent_id);
-    return agent
-      ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
-      : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
   }, [decks]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   /* The confirmation on screen as of the last render, read by an answer that
@@ -2472,7 +2497,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           {cards.mode === "cards" && cards.selection && <AgentCardsSelectionBar selection={cards.selection} controls={cards.clickControls} />}
         </section>
       </main>
-      {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} ended={overlayEnded} />}
+      {cards.review && <AgentCardReviewDialog review={cards.review} controls={cards.clickControls} />}
       {cards.batch && <AgentCardBatchDialog view={cards.batch} controls={cards.clickControls} daemonName={batchDaemonName} />}
       {cardActionsEditor.view && <AgentCardActionsEditor view={cardActionsEditor.view} editor={cardActionsEditor} />}
       {interruptedDialogView}

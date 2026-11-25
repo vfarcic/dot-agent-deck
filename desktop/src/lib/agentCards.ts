@@ -72,7 +72,7 @@ export function placeCards(decks: readonly { deckId: string | undefined; connect
   });
 }
 
-/** Where the overlay moves: one card on, one back, or to the next card that needs the user. */
+/** Where the pane's header moves: one agent on, one back, or to the next one that needs the user. */
 export type CardStep = "next" | "previous" | "needs-you";
 
 /**
@@ -120,7 +120,7 @@ export function reportStatusLabel(status: string): string {
   return words ? `${words[0].toUpperCase()}${words.slice(1)}` : "Unknown";
 }
 
-/** Why a card needs the user, in words, for its marker's hover and the overlay. */
+/** Why a card needs the user, in words, for its marker's hover and the Card panel. */
 const NEEDS_YOU_REASON: Record<string, string> = {
   stopped: "its agent stopped",
   native_question: "the agent is asking a question in its terminal",
@@ -204,7 +204,7 @@ export function fieldValueText(value: unknown): string {
   }
 }
 
-/** A field value the overlay may offer as a link: an `http(s)` URL and nothing else. */
+/** A field value the Card panel may offer as a link: an `http(s)` URL and nothing else. */
 export function linkOf(type: string, value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   if (type !== "url" && type !== "pull_request" && type !== "issue") return undefined;
@@ -385,14 +385,6 @@ export function exactTextString(value: string): string {
   return exactTextSegments(value).map((segment) => segment.shown).join("");
 }
 
-/**
- * What the overlay is doing besides showing the card: asking to confirm (or,
- * from the table's menu, to review) one action, or taking a reply. A confirm
- * step holds the `token` of the definition it shows, so what the user
- * confirms is what is sent: if the agent changes the action meanwhile, the
- * step says so and sends nothing until the new text was reviewed.
- */
-export type CardOverlayStep = { kind: "confirm"; actionId: string; token: string } | { kind: "reply"; /** Words to put in the reply box when the step opens (a spoken reply). */ text?: string } | { /** Issue #2418 review: opened at the card's checked references, from its `+N`. */ kind: "references" };
 
 /**
  * The answer to the last press of each action definition on one card, by the

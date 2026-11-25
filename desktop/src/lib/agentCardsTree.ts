@@ -359,8 +359,8 @@ export function referenceView(ref: AgentCardCheckedRef): ReferenceView {
 }
 
 /**
- * Issue #2418 review — one reported reference in words, for the card
- * overlay's list of every reference: what the deck's check found (a pull
+ * Issue #2418 review — one reported reference in words, for the agent
+ * pane's Card panel's list of every reference: what the deck's check found (a pull
  * request's state, review and CI, an issue's state, and the title GitHub
  * gave), how fresh that check is, or why there is no check yet or at all; and
  * what the agent wrote. Agent-written and GitHub-supplied text is returned as

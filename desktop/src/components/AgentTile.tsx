@@ -1,17 +1,21 @@
-import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { VoiceNumber } from "./VoiceNumber";
 import {
   AlertTriangle,
+  BellRing,
   BookOpenText,
   Box,
   Check,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CircleDot,
   CircleStop,
   FileCode2,
   FileCog,
   GitCompareArrows,
   Handshake,
+  IdCard,
   Maximize2,
   Pencil,
   ShieldCheck,
@@ -116,6 +120,14 @@ function useTileClock(ticking: boolean): number {
 
 export interface AgentTileProps {
   agent: AgentSession;
+  /**
+   * PR #2491 decision 2026-11-25 — the overview pane's Card button and its
+   * navigation (previous, next and next needing-you agent), in the header,
+   * when the agent's daemon shows cards. `open` is whether the Card panel is.
+   */
+  cardHeader?: { open: boolean; controls: Pick<VoiceActionContext, "setCardPanel" | "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">> };
+  /** PR #2491 decision 2026-11-25 — the agent's Card panel, drawn beside the terminal (above it in a narrow window) while it is open. */
+  cardPanel?: ReactNode;
   /**
    * PR #1451 round 3, change 3 — the number this tile shows while voice is
    * on: first in its header and in its accessible name. The 1–4 keys focus
@@ -344,6 +356,8 @@ function formatTokens(tokens: number): string {
 
 export function AgentTile({
   agent,
+  cardHeader,
+  cardPanel,
   voiceNumber,
   presentation,
   showDetails,
@@ -648,6 +662,46 @@ export function AgentTile({
           </div>
         </div>
         <div className="agent-header-actions">
+          {/* PR #2491 decision 2026-11-25 — the Card panel's button and the moves between agents, in the dashboard's order. */}
+          {cardHeader && (
+            <div className="agent-pane-card-nav" role="group" aria-label="Card and agents">
+              <button
+                type="button"
+                className={`agent-pane-card-toggle${cardHeader.open ? " is-on" : ""}`}
+                data-testid="agent-pane-card-toggle"
+                aria-pressed={cardHeader.open}
+                title={cardHeader.open ? "Hide the agent's card" : "Show the agent's card"}
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => VOICE_ACTIONS[cardHeader.open ? "closeCardPanel" : "openCardPanel"].run(cardHeader.controls)}
+              ><IdCard size={14} aria-hidden="true" /> Card</button>
+              <button
+                type="button"
+                className="agent-pane-control"
+                data-testid="agent-pane-previous"
+                aria-label="Previous agent"
+                title="Previous agent ([)"
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => VOICE_ACTIONS.previousAgentCard.run(cardHeader.controls)}
+              ><ChevronLeft size={14} /></button>
+              <button
+                type="button"
+                className="agent-pane-control"
+                data-testid="agent-pane-next"
+                aria-label="Next agent"
+                title="Next agent (])"
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => VOICE_ACTIONS.nextAgentCard.run(cardHeader.controls)}
+              ><ChevronRight size={14} /></button>
+              <button
+                type="button"
+                className="agent-pane-needs-you"
+                data-testid="agent-pane-next-needs-you"
+                title="Next agent that needs you (n)"
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => VOICE_ACTIONS.nextNeedsYouCard.run(cardHeader.controls)}
+              ><BellRing size={13} aria-hidden="true" /> Next needing you</button>
+            </div>
+          )}
           {/*
             PRD #1105 M5's deck entry point, and M2's way back out. Both are
             native `<button>`s in the header rather than a click handler on the
@@ -754,6 +808,8 @@ export function AgentTile({
 
       {!readerSuppressed && readerOpen && <OutputReader agent={agent} onClose={() => setReaderOpen(false)} />}
 
+      {/* PR #2491 decision 2026-11-25 — always this wrapper, so the terminal under it is never re-parented when the Card panel comes and goes; outside the overview's pane it lays nothing out. */}
+      <div className={`agent-pane-body${cardPanel ? " has-card-panel" : ""}`}>
       <div className="agent-panel" role="tabpanel">
         {tab === "terminal" && (
           /*
@@ -860,6 +916,8 @@ export function AgentTile({
             )) : <EmptyPanel label={fixture ? "No artifacts produced" : "Artifacts are not exposed by the daemon"} />}
           </div>
         )}
+      </div>
+      {cardPanel}
       </div>
 
       <footer className="agent-footer">

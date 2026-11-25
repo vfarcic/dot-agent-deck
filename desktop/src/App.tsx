@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -39,6 +39,8 @@ import { worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
 import { KeptWorktreeText } from "./components/KeptWorktreeText";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
+import { AgentCardPanel } from "./components/AgentCardPanel";
+import { createPaneCardsChannel, readCardPanelChoice, usePaneCards, writeCardPanelChoice, type PaneCardsChannel } from "./lib/paneCards";
 import { ConfirmDialog, type ConfirmAction, type ConfirmChoice, type ConfirmState } from "./components/ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
@@ -255,7 +257,6 @@ const RUN_CARD_ACTION_BATCH_INVOKE: keyof typeof VOICE_ACTIONS = "runCardActionB
 const RUN_SELECTION_BATCH_INVOKE: keyof typeof VOICE_ACTIONS = "runSelectionBatch";
 /* PRD #2374 decision 2026-11-24 — the card actions editor's rows that name an action by its label. */
 const CARD_ACTION_EDITOR_INVOKES: readonly (keyof typeof VOICE_ACTIONS)[] = ["editCardAction", "removeCardAction"];
-const REPLY_TO_AGENT_CARD_INVOKE: keyof typeof VOICE_ACTIONS = "replyToAgentCard";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
 
@@ -443,6 +444,51 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const newAgentVoice = useRef<NewAgentVoice | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
+  /**
+   * PR #2491 decision 2026-11-25 — the dashboard's cards, which the overview
+   * publishes for the agent pane drawn beside it, and whether the pane's Card
+   * panel is open. It is settled once per navigation (`ofView` is the view it
+   * was settled for): open when the pane was opened from a card or its agent
+   * needs the user, else as the pane before it had it, else as the user last
+   * chose. After that only the user changes it — its width is the terminal's,
+   * which the agent sees as a resize.
+   */
+  // voice-registry-exempt: the channel object itself, created once and never replaced; what flows through it is the overview's cards, not a choice of the user's
+  const [paneCards] = useState<PaneCardsChannel>(createPaneCardsChannel);
+  // voice-registry-exempt: the Card panel's open state, written by `setCardPanel` (the registry's openCardPanel/closeCardPanel) and settled once per navigation
+  const [cardPanel, setCardPanelState] = useState<{ ofView: DeckView; open: boolean; section?: "references"; before?: boolean; provisional?: boolean }>();
+  const settleCardPanel = (of: DeckView, before: boolean) => {
+    if (of.kind !== "agent") return { ofView: of, open: before };
+    const cards = paneCards.get();
+    const card = cards?.cardFor(of.deckId, of.agentId, of.incarnation);
+    return {
+      ofView: of,
+      open: of.cardPanel === true || card?.entry.needs_you === true || before,
+      before,
+      ...(of.cardSection ? { section: of.cardSection } : {}),
+      /* Settled before the dashboard published its cards at all — a pane
+         the app opened on: settled again once it has, before anything is
+         painted (the layout effect below). */
+      ...(cards === undefined ? { provisional: true } : {}),
+    };
+  };
+  if (agentView && agentView.from === "overview" && cardPanel?.ofView !== requestedView) {
+    setCardPanelState(settleCardPanel(requestedView, cardPanel?.ofView.kind === "agent" ? cardPanel.open : readCardPanelChoice()));
+  } else if (!agentView && cardPanel?.ofView.kind === "agent") {
+    setCardPanelState({ ofView: requestedView, open: cardPanel.open });
+  }
+  useLayoutEffect(() => {
+    if (cardPanel?.provisional && cardPanel.ofView === requestedView && paneCards.get() !== undefined) setCardPanelState(settleCardPanel(requestedView, cardPanel.before ?? false));
+  });
+  const cardPanelOpen = agentView !== undefined && cardPanel?.ofView === requestedView && cardPanel.open;
+  const chooseCardPanel = useCallback((open: boolean): string | undefined => {
+    const shown = agentView && agentView.from === "overview" ? paneCards.get() : undefined;
+    if (!agentView) return "No agent's pane is open.";
+    if (!shown?.shownFor(agentView.deckId)) return "This agent's daemon shows no cards.";
+    writeCardPanelChoice(open);
+    setCardPanelState((current) => (current && current.ofView === requestedView && current.open === open && current.section === undefined ? current : { ofView: requestedView, open }));
+    return undefined;
+  }, [agentView, paneCards, requestedView]);
   const [agentStopConfirm, setAgentStopConfirm] = useState<ConfirmState & { ownerView: NonNullable<typeof agentView> }>(); // voice-registry-exempt: the confirmation confirmStopAgent (or confirmGenerateConfig) opens, not an independently opened capability
   useEffect(() => {
     setAgentStopConfirm((current) => current?.ownerView === agentView ? current : undefined);
@@ -513,11 +559,28 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   useEffect(() => {
     if (!agentView) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !prBrowserOpen.current && !overlayAbove(document.querySelector(".agent-pane-overlay"))) closeAgentView();
+      if (prBrowserOpen.current || overlayAbove(document.querySelector(".agent-pane-overlay"))) return;
+      if (event.key === "Escape") {
+        closeAgentView();
+        return;
+      }
+      /* PR #2491 decision 2026-11-25 — `[`, `]` and `n` move the overview's
+         pane to the previous, next or next needing-you agent, as its header's
+         buttons do, but only while the keyboard is not in the terminal or a
+         field: there they are the user's typing, and reach the agent. */
+      if (event.metaKey || event.ctrlKey || event.altKey || agentView.from !== "overview") return;
+      const step = event.key === "[" ? "previousAgentCard" : event.key === "]" ? "nextAgentCard" : event.key === "n" ? "nextNeedsYouCard" : undefined;
+      if (!step) return;
+      const focused = document.activeElement;
+      if (focused instanceof Element && focused.closest(".agent-terminal-stack, .xterm, input, textarea, select, [contenteditable='true']")) return;
+      const cards = paneCards.get();
+      if (!cards?.shownFor(agentView.deckId)) return;
+      event.preventDefault();
+      VOICE_ACTIONS[step].run(cards.controls);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [agentView, closeAgentView]);
+  }, [agentView, closeAgentView, paneCards]);
   const base = agentView?.from ?? view.kind;
   /**
    * Issue #1197 — the one rail, and the overlays it shows as open. Held here
@@ -1376,7 +1439,6 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        Filter box's text, and `reply_text`, the transcript's own slice like the
        Command field's), not as `filter_text` / `command_text`. */
     const namedCardAction = outcome.params.find((param) => param.kind === "card_action");
-    const namedReplyText = outcome.params.find((param) => param.kind === "reply_text");
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -1429,7 +1491,6 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          transcript), and a reply's words (a `reply_text`: the transcript's
          own slice), each for its own row only. */
       ...((outcome.invoke === RUN_CARD_ACTION_INVOKE || outcome.invoke === RUN_CARD_ACTION_BATCH_INVOKE || outcome.invoke === RUN_SELECTION_BATCH_INVOKE || CARD_ACTION_EDITOR_INVOKES.includes(outcome.invoke as keyof typeof VOICE_ACTIONS)) && namedCardAction ? { cardActionLabel: namedCardAction.value } : {}),
-      ...(outcome.invoke === REPLY_TO_AGENT_CARD_INVOKE && namedReplyText ? { cardReplyText: namedReplyText.value } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {
@@ -1445,6 +1506,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The shell's, so Settings opens from the overview as from the deck (#1197). */
       openOverlay: railContext.openOverlay,
       closeOverlays: railContext.closeOverlays,
+      /* PR #2491 decision 2026-11-25 — the overview pane's Card panel. */
+      setCardPanel: chooseCardPanel,
       /* PRD #1885 — the review dialog's Approve and start, wherever it is open:
          over the New agent dialog or over the Runs screen. With none open it
          answers that there is nothing to approve. Bound to the review that
@@ -1570,7 +1633,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view, voicePane, runtime.sendTerminalInput]);
+  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, chooseCardPanel, setOverlay, view, voicePane, runtime.sendTerminalInput]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -1637,7 +1700,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     ? (
       <>
         {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} onNewAgentChange={setNewAgentOpen} onConfigRequestSent={configRequestSent} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} selfUpgrade={{ check: selfUpgrade, api: selfUpgradeApi, onClosed: recheckSelfUpgrade }} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} agentPane={openAgent} paneCards={paneCards} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} onNewAgentChange={setNewAgentOpen} onConfigRequestSent={configRequestSent} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} selfUpgrade={{ check: selfUpgrade, api: selfUpgradeApi, onClosed: recheckSelfUpgrade }} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -1645,7 +1708,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} stopContext={agentStopContext} generateConfig={paneGenerateConfig} onTabShown={setPaneTab} />}
+        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} stopContext={agentStopContext} generateConfig={paneGenerateConfig} onTabShown={setPaneTab} paneCards={paneCards} cardPanel={{ open: cardPanelOpen, section: cardPanel?.section, choose: chooseCardPanel }} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -1822,7 +1885,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, stopContext, generateConfig, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; onTabShown?: (tab: PanelTab) => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, stopContext, generateConfig, onTabShown, paneCards, cardPanel }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; onTabShown?: (tab: PanelTab) => void; paneCards?: PaneCardsChannel; cardPanel?: { open: boolean; section?: "references"; choose: (open: boolean) => string | undefined } }) {
   const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   /* PR #1451 — the voice panel's view of which tab is shown (see `paneTab`). */
@@ -1832,9 +1895,22 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
   const shownTab = shownPanelTab(tab, desktopFeaturesOf(runtime).showAgentDetails);
   useEffect(() => { tabShown.current?.(shownTab); }, [shownTab]);
   useEffect(() => () => { tabShown.current?.("terminal"); }, []);
+  /* PR #2491 decision 2026-11-25 — the agent's card, beside its terminal,
+     while its daemon shows cards: the header's Card button and its
+     navigation, and the panel itself while it is open. */
+  const cards = usePaneCards(paneCards);
+  const withCards = cards !== undefined && cardPanel !== undefined && cards.shownFor(view.deckId);
+  const card = withCards ? cards.cardFor(view.deckId, agent.id, view.incarnation) : undefined;
+  // voice-registry-exempt: not a write — the header's controls carry the shell's Card panel choice under its registry name, and its Card button dispatches it through VOICE_ACTIONS.openCardPanel / closeCardPanel
+  const cardHeader = withCards ? { open: cardPanel.open, controls: { ...cards.controls, setCardPanel: cardPanel.choose } } : undefined;
+  const panel = withCards && cardPanel.open
+    ? <AgentCardPanel card={card} name={agent.displayName} results={card ? cards.resultsFor(card) : {}} tree={cards.treeFor(view.deckId)} ended={card ? cards.endedFor(card) : undefined} notice={cards.notice} section={cardPanel.section} controls={cards.controls} />
+    : undefined;
   return (
     <AgentPaneFrame
       open
+      cardHeader={cardHeader}
+      cardPanel={panel}
       agent={agent}
       showDetails={desktopFeaturesOf(runtime).showAgentDetails}
       mode={runtime.mode}

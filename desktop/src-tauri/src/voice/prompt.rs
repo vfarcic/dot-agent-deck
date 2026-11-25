@@ -799,7 +799,8 @@ pub(crate) mod tests {
                 "previous_agent_card".to_string(),
                 "next_needs_you_card".to_string(),
                 "filter_needs_you_cards".to_string(),
-                "close_agent_card".to_string(),
+                "open_card_panel".to_string(),
+                "close_card_panel".to_string(),
                 "open_card_tree".to_string(),
                 "close_card_tree".to_string(),
                 "open_card_pull_request".to_string(),
@@ -810,7 +811,6 @@ pub(crate) mod tests {
                 "unselect_agent_card".to_string(),
                 "clear_card_selection".to_string(),
                 "run_card_action_on_selection".to_string(),
-                "reply_to_agent_card".to_string(),
                 "open_card_actions_editor".to_string(),
                 "add_card_action".to_string(),
                 "edit_card_action".to_string(),
@@ -823,7 +823,7 @@ pub(crate) mod tests {
                 "offer_card_action_on_every_card".to_string(),
                 "offer_card_action_when_agents_choose".to_string(),
                 "show_card_action_on_the_card".to_string(),
-                "show_card_action_only_in_the_overlay".to_string(),
+                "show_card_action_only_in_the_card_panel".to_string(),
                 "none".to_string(),
             ]
         );
@@ -862,7 +862,6 @@ pub(crate) mod tests {
                 "view".to_string(),
                 "needs_you".to_string(),
                 "action".to_string(),
-                "reply".to_string(),
                 // Issue #2399 review 12: the Card actions form's icon, by name.
                 "icon".to_string(),
             ]

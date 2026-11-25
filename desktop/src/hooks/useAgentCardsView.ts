@@ -1,25 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
+import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
 import { boundOpenCards, cardTree, openableReference, pathTo, pruneOpenCards, readOpenCards, writeOpenCards } from "../lib/agentCardsTree";
 import { newCardRequestId } from "../lib/bridge";
 import type { CardReferenceTarget } from "../lib/prBrowser";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
-import type { AgentCardRef, VoiceActionContext } from "../lib/voiceActions";
+import type { AgentCardRef, CardOverlaySection, VoiceActionContext } from "../lib/voiceActions";
 import type { AgentCardAction, CardBatchOutcome, DeckRuntimeState } from "../types";
 
 /** What a card member says when the cards are not shown (this connection offers no cards). */
 const CARDS_HIDDEN = "Agent cards are not available here.";
 /** …when the card it names is not on the dashboard any more. */
 const CARD_GONE = "That agent has no card on the dashboard any more, so nothing was done.";
-/** …when a card step or close is asked for with no card open. */
-const NO_CARD_OPEN = "No card is open.";
-/** …when no card needs the user. */
-const NO_CARD_NEEDS_YOU = "No other card needs you right now.";
-/** …when there are no cards to move between. */
-const NO_CARDS = "There are no cards to show.";
-/** …when voice named an action whose text the agent wrote: its card opens at the review step instead of sending. */
-const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so its card is open for you to read it first: press Send to send it.`;
+/** …when the single-action review is asked to close with none open. */
+const NO_REVIEW_OPEN = "No action is waiting for you to review it.";
+/** …when no agent needs the user. */
+const NO_CARD_NEEDS_YOU = "No other agent needs you right now.";
+/** …when there are no agents with cards to move between. */
+const NO_CARDS = "There are no agents with cards to move between.";
+/** …when voice named an action whose text the agent wrote: it opens for review instead of sending. */
+const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so it is shown for you to read first: press Send to send it.`;
 
 /** …when voice asks for a card's tree on a card with nothing under it. */
 const nothingUnder = (name: string) => `${name} has no cards under it.`;
@@ -54,7 +54,7 @@ export const CODE_BATCH_DAEMON_UNREACHABLE = "daemon_unreachable";
 export const ANOTHER_BATCH_SENDING = "A batch is still being sent; wait for its results before starting another.";
 
 /** The card members the overview serves, every one of them. */
-type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch">;
+type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeCardReview" | "runCardAction" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch">;
 
 /**
  * Issue #2399 — an action a batch can send: its id and the label and icon its
@@ -164,18 +164,20 @@ function subtreeScope(top: PlacedCard, cards: readonly PlacedCard[]): string {
   return under === 0 ? name : `${name} and the ${under} ${under === 1 ? "agent" : "agents"} under it`;
 }
 
-/** The overlay as the overview renders it. */
-interface CardOverlayView {
+/**
+ * PR #2491 decision 2026-11-25 — the single-action review on screen: the card
+ * and the version (`token`) of the action it shows, and whether Send was
+ * pressed, after which it shows what became of it.
+ */
+export interface CardReviewView {
+  /** The card, `undefined` once its agent is gone. */
   card: PlacedCard | undefined;
+  /** The card's name when the review opened, for the closed notice. */
   lastName: string;
-  position: number;
-  count: number;
-  step: CardOverlayStep | undefined;
+  actionId: string;
+  token: string;
+  sent: boolean;
   results: CardResults;
-  /** Whether the open card's daemon builds the tree, so its checked references are its own (issue #2418). */
-  tree: boolean;
-  /** Issue #2399 — the batch actions for the open card and every card under it, when its daemon does batches and it has cards under it. */
-  batch?: { choices: CardBatchChoice[]; under: number };
 }
 
 /** What {@link useAgentCardsView} hands the overview. */
@@ -193,10 +195,11 @@ export interface AgentCardsView {
   openCards: ReadonlySet<string>;
   /** Issue #2418 — whether a deck's daemon builds the card tree; an older one's cards are all roots. */
   treeFor: (deckId: string) => boolean;
-  overlay: CardOverlayView | undefined;
+  /** PR #2491 decision 2026-11-25 — the single-action review on screen. */
+  review: CardReviewView | undefined;
   /**
    * Issue #2418 review (F2) — why the last thing pressed on a card or in its
-   * overlay did not happen, until it is dismissed, the overlay closes, or a
+   * Card panel did not happen, until it is dismissed, the review closes, or a
    * reference opens: a press that did nothing says why.
    */
   notice: string | undefined;
@@ -205,12 +208,12 @@ export interface AgentCardsView {
   rowMenu: string | undefined;
   controls: AgentCardControls;
   /**
-   * {@link controls} for the cards' and the overlay's own controls, which
+   * {@link controls} for the cards' and the Card panel's own controls, which
    * report a refusal in {@link notice}. Kept apart from `controls`, which is
    * also published to voice, where the voice panel reports refusals itself.
    */
   clickControls: AgentCardControls & Pick<VoiceActionContext, "reportRefused">;
-  /** The members published to voice: `closeAgentCard` only while a card is open. */
+  /** The members published to voice: `closeCardReview` only while a review is open. */
   voice: Partial<AgentCardControls>;
   /** The card of one dashboard agent, when it has one. */
   cardFor: (deckId: string, agentId: string, incarnation?: string) => PlacedCard | undefined;
@@ -241,16 +244,19 @@ function sameIncarnation(card: PlacedCard, incarnation: string | undefined): boo
 
 /**
  * PRD #2374 — the dashboard's cards view: which view is on screen, the Needs
- * you filter, the open card overlay and its step, each table row's menu, and
- * the card members every control and voice dispatch through. It renders and
- * sends what the daemon decided; the only things decided here are the user's
- * own choices (view, filter, which card is open).
+ * you filter, the single-action review, each table row's menu, and the card
+ * members every control and voice dispatch through. It renders and sends what
+ * the daemon decided; the only things decided here are the user's own choices
+ * (view, filter, which review is open). A card itself is shown in its agent's
+ * pane (PR #2491 decision 2026-11-25), which `openAgent` opens.
  */
-export function useAgentCardsView({ runtime, decks, openAgent, openReference, hiddenByFilter }: {
+export function useAgentCardsView({ runtime, decks, openAgent, pane, openReference, hiddenByFilter }: {
   runtime: Pick<DeckRuntimeState, "agentCards" | "invokeCardAction" | "invokeCardActionBatch">;
   decks: readonly { deckId: string | undefined; connected: boolean }[];
-  /** Open an agent's pane — a card's `open` action. */
-  openAgent: (target: { deckId: string; agentId: string; incarnation?: string }) => void;
+  /** Open a card's agent's pane — a card's `open` action, and with `cardPanel`, the card itself. */
+  openAgent: (card: PlacedCard, options?: { cardPanel?: boolean; cardSection?: CardOverlaySection }) => void;
+  /** The agent whose pane is open over the dashboard, if any: where the header's previous and next move from. */
+  pane?: { deckId: string; agentId: string; incarnation?: string };
   /** Issue #2418 — open a checked pull request or issue in the app's GitHub browser; absent where there is none. */
   openReference?: (target: CardReferenceTarget) => string | undefined;
   /** Issue #2418 — whether the dashboard filter keeps a card off screen; absent when nothing filters. */
@@ -260,7 +266,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   const [storedMode, setStoredMode] = useState<OverviewMode>(readOverviewMode);
   const mode: OverviewMode = shown ? storedMode : "table";
   const [needsYouOnly, setNeedsYouOnly] = useState(false);
-  const [open, setOpen] = useState<{ key: string; name: string; step?: CardOverlayStep }>();
+  const [review, setReview] = useState<{ key: string; name: string; actionId: string; token: string; sent?: boolean }>();
   const [results, setResults] = useState<Readonly<Record<string, CardResults>>>({});
   const [rowMenu, setRowMenu] = useState<string>();
   // voice-registry-exempt: why a press on a card did nothing, written by the controls that refused it; it opens nothing
@@ -280,8 +286,8 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
      a new batch asked for before the next render is refused too. */
   const batchSending = useRef(false);
   /* The latest committed state, for members a dispatch calls after a render. */
-  const latest = useRef({ placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selected, batch, batchFor });
-  latest.current = { placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selected, batch, batchFor };
+  const latest = useRef({ placed, review, pane, shown, treeFor, openReference, hiddenByFilter, openCards, selected, batch, batchFor });
+  latest.current = { placed, review, pane, shown, treeFor, openReference, hiddenByFilter, openCards, selected, batch, batchFor };
   /* Every change to the open cards is remembered; one this window cannot
      store still applies until it closes. */
   const changeOpenCards = useCallback((change: (current: ReadonlySet<string>) => ReadonlySet<string>) => {
@@ -365,7 +371,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     }
     const run = ++batchRun.current;
     setRowMenu(undefined);
-    setOpen(undefined);
+    setReview(undefined);
     setNotice(undefined);
     setBatch({ actionId, label, scope, stage: "previewing", groups: [], results: [] });
     /* Each daemon's preview settles on its own (PR #2491 review): one that
@@ -448,15 +454,17 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       const card = find(ref);
       if (!card) return CARD_GONE;
       setRowMenu(undefined);
-      setOpen({ key: placedCardKey(card), name: card.entry.name, ...(section === "references" ? { step: { kind: "references" } } : {}) });
+      openAgent(card, { cardPanel: true, ...(section ? { cardSection: section } : {}) });
       return undefined;
     },
     stepAgentCard: (step: CardStep) => {
-      const { open: current, placed: order } = latest.current;
-      if (!current) return NO_CARD_OPEN;
-      const at = stepCard(order, order.findIndex((card) => placedCardKey(card) === current.key), step);
+      const { pane: current, placed: order } = latest.current;
+      const from = current ? order.findIndex((card) => card.deckId === current.deckId && card.entry.agent_id === current.agentId && sameIncarnation(card, current.incarnation)) : -1;
+      const at = stepCard(order, from, step);
       if (at === undefined) return step === "needs-you" ? NO_CARD_NEEDS_YOU : NO_CARDS;
-      setOpen({ key: placedCardKey(order[at]), name: order[at].entry.name });
+      /* Moving keeps the Card panel as the user has it; the shell opens it
+         for an agent that needs them, as any pane opening does. */
+      openAgent(order[at]);
       return undefined;
     },
     setNeedsYouFilter: (on) => {
@@ -468,9 +476,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       if (on) remember("cards");
       return undefined;
     },
-    closeAgentCard: () => {
-      if (!latest.current.open) return NO_CARD_OPEN;
-      setOpen(undefined);
+    closeCardReview: () => {
+      if (!latest.current.review) return NO_REVIEW_OPEN;
+      setReview(undefined);
       setNotice(undefined);
       return undefined;
     },
@@ -485,69 +493,45 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       if (!action) return wanted.label !== undefined ? `${name}'s card has no single action called "${displayText(wanted.label, DISPLAY_LIMITS.name)}", so nothing was sent.` : CARD_GONE;
       setRowMenu(undefined);
       if (!action.enabled) return `${displayText(action.label, DISPLAY_LIMITS.name)} is disabled: ${disabledReasonSentence(action.disabled_reason)}.`;
-      if (action.kind === "open") {
-        // The card overlay sits above the agent's pane: close it, or the pane
-        // opens hidden behind it (PRD #2374 review).
-        setOpen(undefined);
-        openAgent({ deckId: card.deckId, agentId: card.entry.agent_id, ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) });
+      /* Open is the pane itself, and a reply is the user's own words, typed
+         into the agent's terminal there (PR #2491 decision 2026-11-25). */
+      if (action.kind === "open" || action.text_input) {
+        openAgent(card, action.text_input ? { cardPanel: true } : {});
         return undefined;
       }
-      if (action.text_input) {
-        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "reply" } });
-        return undefined;
-      }
+      const reviewIt = (sentence?: string) => {
+        if (wanted.openPane) openAgent(card, { cardPanel: true });
+        setReview({ key: placedCardKey(card), name: card.entry.name, actionId: action.id, token: action.token });
+        return sentence;
+      };
       // A confirm action, a close, and any press from a control that showed
-      // only the action's label stop at a step showing exactly what it does.
-      if (action.confirm || wanted.review) {
-        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
-        return undefined;
-      }
+      // only the action's label stop at a review showing exactly what it does.
+      if (action.confirm || wanted.review) return reviewIt();
       // Text the catalog did not write (the agent's, or an answer quoting its
-      // question) is shown whole at the review step and sent only from there,
+      // question) is shown whole at the review and sent only from there,
       // whoever pressed (audit A4; issue #2418 round 2, R2-A1). A control's
-      // token names the definition it drew, not that its text was on screen:
-      // the overlay draws a prompt under its button, where the end of a long
-      // one can lie below the overlay's visible part. So the token is never a
-      // reason to skip this step; only the prompt's source is.
+      // token names the definition it drew, not that its text was on screen,
+      // so the token is never a reason to skip this step; only the prompt's
+      // source is.
       if (!sendableUnread(action)) {
-        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
-        // A button press sees the step open; voice is told why it did.
-        return wanted.token === undefined ? agentWrittenReview(displayText(action.label, DISPLAY_LIMITS.name), name) : undefined;
+        // A button press sees the review open; voice is told why it did.
+        return reviewIt(wanted.token === undefined ? agentWrittenReview(displayText(action.label, DISPLAY_LIMITS.name), name) : undefined);
       }
       send(card, action, wanted.token !== undefined ? { token: wanted.token } : {});
       return undefined;
     },
-    replyToAgentCard: (ref, text, sendNow) => {
-      if (!latest.current.shown) return CARDS_HIDDEN;
-      const card = find(ref);
-      if (!card) return CARD_GONE;
-      const reply = card.entry.actions.find((candidate) => candidate.id === "reply");
-      if (!reply) return `${displayText(card.entry.name, DISPLAY_LIMITS.name)}'s card takes no reply.`;
-      if (!reply.enabled) return `Reply is disabled: ${disabledReasonSentence(reply.disabled_reason)}.`;
-      // Spoken words are put in the card's reply box for the user to read,
-      // edit and send, as `dictate_to_agent` types into a prompt without
-      // sending it; only the Send reply button, which shows them, sends.
-      if (!sendNow) {
-        setRowMenu(undefined);
-        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "reply", text } });
-        return undefined;
-      }
-      send(card, reply, { text, token: reply.token });
-      setOpen((current) => (current && current.key === placedCardKey(card) ? { key: current.key, name: current.name } : current));
-      return undefined;
-    },
     confirmCardAction: () => {
-      const { open: current, placed: order } = latest.current;
-      if (!current || current.step?.kind !== "confirm") return;
+      const { review: current, placed: order } = latest.current;
+      if (!current || current.sent) return;
       const card = order.find((candidate) => placedCardKey(candidate) === current.key);
-      const actionId = current.step.actionId;
+      const actionId = current.actionId;
       const action = card?.entry.actions.find((candidate) => candidate.id === actionId);
       if (!card || !action || !action.enabled) return;
       // The definition reviewed is what is confirmed: a changed action is
       // shown again for review, never sent on the old approval.
-      if (action.token !== current.step.token) return;
-      send(card, action, { confirm: action.confirm, token: current.step.token });
-      setOpen({ key: current.key, name: current.name });
+      if (action.token !== current.token) return;
+      send(card, action, { confirm: action.confirm, token: current.token });
+      setReview({ ...current, sent: true });
     },
     toggleOverviewRowMenu: (rowKey) => setRowMenu((current) => (current === rowKey ? undefined : rowKey)),
     runCardActionBatch: (ref, wanted) => {
@@ -707,37 +691,25 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
          references too: the shell checks it against the card its deck lists. */
       const refused = opener({ deckId: card.deckId, instanceId: card.entry.instance_id, cardKey: card.entry.key, kind, number: checked.number, url: checked.url });
       if (refused !== undefined) return refused;
-      /* The page opens over the dashboard, and the card overlay is drawn
-         over that and would fence it: the overlay closes so the page is in
-         front, as a card's Open closes it for the pane (issue #2418 review,
-         F1). */
-      setOpen(undefined);
+      /* The page opens over the dashboard and any pane: a review left open
+         would be drawn over it and fence it, so it closes (issue #2418
+         review, F1). */
+      setReview(undefined);
       setNotice(undefined);
       return undefined;
     },
   }), [changeOpenCards, find, invokeBatch, openAgent, remember, send, startBatch]);
 
-  const overlay = useMemo<CardOverlayView | undefined>(() => {
-    if (!open || !shown) return undefined;
-    const at = placed.findIndex((card) => placedCardKey(card) === open.key);
-    const card = at < 0 ? undefined : placed[at];
-    const under = card && batchFor(card.deckId) ? cardSubtree(placed, card, treeFor(card.deckId)) : [];
-    return {
-      card,
-      lastName: open.name,
-      position: at + 1,
-      count: placed.length,
-      step: open.step,
-      results: results[open.key] ?? {},
-      tree: at >= 0 && treeFor(placed[at].deckId),
-      ...(under.length > 1 ? { batch: { choices: batchChoices(under), under: under.length - 1 } } : {}),
-    };
-  }, [batchFor, open, placed, results, shown, treeFor]);
+  const reviewView = useMemo<CardReviewView | undefined>(() => {
+    if (!review || !shown) return undefined;
+    const card = placed.find((candidate) => placedCardKey(candidate) === review.key);
+    return { card, lastName: review.name, actionId: review.actionId, token: review.token, sent: review.sent === true, results: results[review.key] ?? {} };
+  }, [placed, results, review, shown]);
 
-  const overlayOpen = overlay !== undefined;
+  const reviewOpen = reviewView !== undefined;
   const voice = useMemo<Partial<AgentCardControls>>(() => (
-    overlayOpen ? controls : { ...controls, closeAgentCard: undefined }
-  ), [controls, overlayOpen]);
+    reviewOpen ? controls : { ...controls, closeCardReview: undefined }
+  ), [controls, reviewOpen]);
 
   const clickControls = useMemo(() => ({ ...controls, reportRefused: setNotice }), [controls]);
   const dismissNotice = useCallback(() => setNotice(undefined), []);
@@ -752,5 +724,5 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     const reachable = cards.length === selected.size ? selected : new Set(cards.map(placedCardKey));
     return { selected: reachable, last: lastToggled, choices: batchChoices(cards) };
   }, [anyBatches, batchFor, placed, selected, lastToggled]);
-  return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, overlay, notice, dismissNotice, rowMenu, controls, clickControls, voice, cardFor, resultsFor, batchFor, selection, batch: shown ? batch : undefined };
+  return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, review: reviewView, notice, dismissNotice, rowMenu, controls, clickControls, voice, cardFor, resultsFor, batchFor, selection, batch: shown ? batch : undefined };
 }

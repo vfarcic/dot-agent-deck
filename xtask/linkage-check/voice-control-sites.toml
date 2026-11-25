@@ -1364,10 +1364,3 @@ handler = "onClick"
 code = "() => setSkippedOpen((open) => !open)"
 reason = "The batch confirmation's skipped line: lists the skipped agents grouped by reason where the line counts them by reason. It changes what the open dialog shows and acts on nothing; the line itself says how many were skipped and why, and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) and is sent only by hand."
 
-# --- desktop/src/components/AgentCardOverlay.tsx ---
-
-[[site]]
-file = "desktop/src/components/AgentCardOverlay.tsx"
-handler = "onChange"
-code = "(event) => setReply(event.target.value)"
-reason = "A keystroke into the card overlay's reply box (PRD #2374). Sending the reply is the Send reply button, which dispatches `replyToAgentCard` — a `voice: true` entry whose `reply_to_agent_card` row sends the spoken words directly."

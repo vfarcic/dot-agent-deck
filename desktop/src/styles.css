@@ -2210,6 +2210,9 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-action-icons { flex: none; flex-wrap: nowrap; }
 .agent-card-action-icon { width: 22px; height: 18px; color: var(--muted); }
 .agent-card-action-icon:hover:not(:disabled):not([aria-disabled="true"]), .agent-card-action-icon:focus-visible { color: var(--teal); border-color: var(--teal); }
+/* PR #2491 v9 review — every action icon, on a card, in the selection bar and in the Card panel, shows that the pointer is on it (a filled, outlined button) and where the keyboard is (a ring outside it), in both themes. */
+.action-icon-group .icon-button:hover:not(:disabled):not([aria-disabled="true"]) { color: var(--teal); border-color: var(--teal); background: var(--paper-strong); box-shadow: 0 0 0 1px var(--teal); }
+.action-icon-group .icon-button:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 2px; }
 .agent-card-action-icon:disabled, .agent-card-action-icon[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
 /* Issue #2399 review — an action icon's explanation on keyboard focus, drawn over the page so no card clips it. */
 .action-tip { position: fixed; z-index: 1000; max-width: 320px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-strong); color: var(--ink); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); font-size: var(--text-sm); line-height: 1.35; white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }
@@ -2252,8 +2255,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 /* The repository's colour is a dot beside the name, never the text's own colour, so the name reads in both themes; a label with no usable colour gets the neutral one. */
 .agent-card-label-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--line-strong); box-shadow: inset 0 0 0 1px rgb(var(--scrim-rgb) / .18); }
 .agent-card-labels-more { position: absolute; top: 1px; right: 0; height: 16px; padding: 0 3px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--ink); background: var(--paper-sunken); font-size: var(--text-xs); font-weight: 600; line-height: 14px; text-align: center; font-variant-numeric: tabular-nums; }
-.agent-card-overlay-labels { display: flex; flex-wrap: wrap; gap: 4px 6px; }
-.agent-card-overlay-labels .agent-card-label + .agent-card-label { margin-left: 0; }
+.agent-card-panel-labels { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.agent-card-panel-labels .agent-card-label + .agent-card-label { margin-left: 0; }
 .issue-state-open .pr-badge-state { color: var(--gh-open-fg); }
 .issue-state-closed .pr-badge-state { color: var(--gh-merged-fg); }
 .issue-state-merged .pr-badge-state { color: var(--gh-merged-fg); }
@@ -2282,30 +2285,49 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-prompt, .agent-card-disabled, .agent-card-result, .agent-card-delivery { color: var(--muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
 .agent-card-disabled { color: var(--faint); }
 .agent-card-result { color: var(--ink); }
-.agent-card-backdrop { padding-top: 6vh; }
-.agent-card-overlay { width: min(720px, 100%); max-height: 100%; overflow-y: auto; padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
-.agent-card-overlay-header { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px; }
-.agent-card-overlay-identity { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.agent-card-overlay-identity h2 { margin: 0; font-size: var(--text-xl); overflow-wrap: anywhere; }
 .agent-card-agent-type { color: var(--muted); font-size: var(--text-sm); }
-.agent-card-overlay-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
-.agent-card-overlay-position { margin-right: 4px; color: var(--muted); font-size: var(--text-sm); }
-.agent-card-overlay-body { display: grid; gap: 12px; }
-.agent-card-overlay-refs:focus { outline: none; }
-.agent-card-overlay-refs:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 3px; }
-.agent-card-overlay-ref-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
-.agent-card-overlay-ref { display: grid; gap: 3px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; }
-.agent-card-overlay-ref-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.agent-card-overlay-ref .agent-card-ref-text { white-space: normal; overflow-wrap: anywhere; }
-.agent-card-overlay-ref-note.is-stale { color: var(--amber-ink); }
-.agent-card-overlay-ref-checked { font-size: var(--text-sm); font-weight: 600; overflow-wrap: anywhere; }
+/* PR #2491 decision 2026-11-25 — the agent pane's Card panel: on the right of
+   the terminal, about 320 px wide, scrolling on its own; in a window narrower
+   than about 900 px it sits between the header strip and the terminal at a
+   fixed height that scrolls, so what it shows never resizes the terminal. The wrapper around the terminal and the panel
+   lays nothing out on a tile, so the tile keeps its own layout. */
+.agent-pane-body { display: contents; }
+[data-presentation="overlay"] .agent-pane-body { flex: 1 1 auto; min-height: 0; display: flex; }
+[data-presentation="overlay"] .agent-pane-body > .agent-panel { flex: 1 1 auto; min-width: 0; }
+.agent-card-panel { flex: 0 0 320px; min-width: 0; max-width: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding: 12px; border-left: 1px solid var(--line); background: var(--paper-strong); }
+@media (max-width: 899px) { [data-presentation="overlay"] .agent-pane-body { flex-direction: column; } .agent-card-panel { order: -1; flex: 0 0 min(40vh, 260px); height: min(40vh, 260px); max-width: none; border-left: 0; border-bottom: 1px solid var(--line); } }
+.agent-card-panel-title { margin: 0; color: var(--muted); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.agent-card-panel-part { padding-top: 10px; border-top: 1px solid var(--line); }
+.agent-card-panel-part:first-of-type { padding-top: 0; border-top: 0; }
+.agent-card-panel-part h4 { margin: 4px 0 0; color: var(--muted); font-size: var(--text-sm); }
+.agent-card-panel-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.agent-card-panel-needs-you { justify-self: start; }
+.agent-card-panel-refs { display: grid; gap: 6px; }
+.agent-card-panel-refs:focus { outline: none; }
+.agent-card-panel-refs:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 3px; }
+.agent-card-panel-ref-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.agent-card-panel-ref { display: grid; gap: 3px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; }
+.agent-card-panel-ref-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.agent-card-panel-ref .agent-card-ref-text { white-space: normal; overflow-wrap: anywhere; }
+.agent-card-panel-ref-note.is-stale { color: var(--amber-ink); }
+.agent-card-panel-ref-checked { font-size: var(--text-sm); font-weight: 600; overflow-wrap: anywhere; }
+.agent-card-panel-deliveries { display: grid; gap: 6px; }
+.agent-card-panel-questions { display: grid; gap: 8px; }
+.agent-card-panel-actions .action-icon-group { flex-wrap: wrap; }
+.agent-card-panel-results { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.agent-card-panel-notice { margin: 0; padding: 8px 10px; border: 1px solid var(--amber); border-radius: 6px; color: var(--ink); background: var(--amber-soft); font-size: var(--text-xs); overflow-wrap: anywhere; }
+/* The pane header's Card button and the moves between agents. */
+.agent-pane-card-nav { display: flex; align-items: center; gap: 2px; margin-right: 6px; }
+.agent-pane-card-toggle, .agent-pane-needs-you { height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: transparent; font-size: var(--text-base); font-weight: 650; white-space: nowrap; cursor: pointer; }
+.agent-pane-card-toggle:hover, .agent-pane-needs-you:hover { border-color: var(--teal); background: var(--teal-soft); }
+.agent-pane-card-toggle:focus-visible, .agent-pane-needs-you:focus-visible, .agent-pane-control:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
+.agent-pane-card-toggle.is-on { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); }
 .agent-card-section { display: grid; gap: 6px; }
 .agent-card-section h3 { margin: 0; font-size: var(--text-base); }
 .agent-card-section p { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .agent-card-question { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 5px; }
 .agent-card-question-text { white-space: pre-wrap; }
-.agent-card-options, .agent-card-actions { display: grid; gap: 8px; }
-.agent-card-action { display: grid; justify-items: start; gap: 3px; }
+.agent-card-options { display: flex; flex-wrap: wrap; gap: 6px; }
 /* Issue #2418 (D16): the exact text an action sends reads as a quotation — a rule at its left and no box — so it is not taken for a field to type in. */
 .agent-card-prompt-text { margin: 0; padding: 1px 0 1px 10px; max-width: 100%; border-left: 3px solid var(--line-strong); color: var(--ink); background: transparent; font-size: var(--text-sm); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-card-prompt-text .exact-text-escape { font-style: normal; }
@@ -2313,14 +2335,13 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 /* A marker for a character the preview cannot show as itself (PRD #2374 review R3): a boxed code, set apart from the prompt's own text in shape, face and colour. */
 .exact-text-escape { display: inline-block; margin: 0 1px; padding: 0 3px; border: 1px solid var(--amber-rim); border-radius: 3px; color: var(--amber-ink); background: var(--amber-soft); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: var(--text-xs); font-weight: 600; line-height: 1.3; white-space: nowrap; }
 .exact-text-note { color: var(--muted); font-size: var(--text-xs); }
-.agent-card-confirm { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--amber-rim); border-radius: 6px; background: var(--amber-bright); }
+/* The single-action review: a small dialog of its own over the dashboard or the pane. */
+.agent-card-confirm { width: min(520px, 100%); max-height: 100%; overflow-y: auto; display: grid; gap: 8px; padding: 14px 16px; border: 1px solid var(--amber-rim); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
 .agent-card-confirm h3 { margin: 0; font-size: var(--text-lg); }
 .agent-card-confirm p { margin: 0; font-size: var(--text-sm); }
 .agent-card-confirm-detail { color: var(--amber-ink); }
-.agent-card-confirm-buttons, .agent-card-reply-buttons { display: flex; flex-wrap: wrap; gap: 7px; }
-.agent-card-reply textarea { width: 100%; min-height: 70px; padding: 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font: inherit; font-size: var(--text-base); resize: vertical; }
+.agent-card-confirm-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .agent-card-gone { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); text-align: center; }
-.agent-card-overlay-notice { margin: 0; padding: 8px 10px; border: 1px solid var(--amber); border-radius: 6px; color: var(--ink); background: var(--amber-soft); font-size: var(--text-xs); overflow-wrap: anywhere; }
 /* Issue #2454 — the daemon's Needs you as a name-cell badge, shaped like `.overview-lease` and the ORCHESTRATOR badge beside it. */
 .overview-needs-you { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 1px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .overview-card-menu { position: relative; flex: 0 0 auto; }
@@ -2330,8 +2351,7 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .overview-card-menu-list button { padding: 6px 8px; border: 0; border-radius: 4px; color: var(--ink); background: transparent; font-size: var(--text-sm); text-align: left; cursor: pointer; }
 .overview-card-menu-list button:hover, .overview-card-menu-list button:focus-visible { background: var(--teal-soft); }
 .overview-card-menu-list button:disabled { color: var(--faint); cursor: default; }
-/* Full screen at narrow widths: the overlay is the whole window, its body scrolls. */
-@media (max-width: 640px) { .agent-card-backdrop { padding: 0; } .agent-card-overlay { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }
+
 
 /* Issue #2399 — batch card actions: the selection line under the toolbar, a
    card's checkbox, and the batch's confirmation and results. The dialog never

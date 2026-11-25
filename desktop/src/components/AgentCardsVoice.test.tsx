@@ -28,16 +28,17 @@ import { DeckShell } from "../App";
  *    reason and no row. Read off the file the Rust crate embeds, as
  *    `src/data/fixture.test.ts` does, with the row ids and param names written
  *    out as the contract gives them.
- * 2. a spoken `run_card_action` / `reply_to_agent_card` goes through the real
- *    shell, voice panel and dispatch seam, with only the microphone and the
- *    resolved answer synthetic. The answer is shaped as the crate sends it:
- *    the action's param is of kind `card_action` and the reply's of kind
- *    `reply_text` (`desktop/src-tauri/src/voice/table.rs`). A confirm action,
- *    and a close, open the card's confirm step and send nothing; so does an
- *    action or answer whose text is, or quotes, what the agent wrote
- *    (`prompt_source: "agent"` — the answer the deck composes from the
- *    agent's question included, audit A1), at the review step; only a
- *    catalog prompt action is sent directly; a reply sends the user's words.
+ * 2. a spoken `run_card_action` goes through the real shell, voice panel and
+ *    dispatch seam, with only the microphone and the resolved answer
+ *    synthetic. The answer is shaped as the crate sends it: the action's param
+ *    is of kind `card_action` (`desktop/src-tauri/src/voice/table.rs`). A
+ *    confirm action, and a close, open the single-action review and send
+ *    nothing; so does an action or answer whose text is, or quotes, what the
+ *    agent wrote (`prompt_source: "agent"` — the answer the deck composes from
+ *    the agent's question included, audit A1); only a catalog prompt action is
+ *    sent directly. PR #2491 decision 2026-11-25: there is no card overlay and
+ *    no reply box — a card opens its agent's pane with the Card panel, which
+ *    voice opens, closes and moves between agents with too.
  */
 
 const commandsSource = readFileSync(resolve("src-tauri/src/voice/commands.toml"), "utf8");
@@ -54,17 +55,21 @@ function commandRows(): Row[] {
   });
 }
 
-/** Registry id → (commands.toml row id, its params), from the contract's §8 table as change 13 settled the param names. */
-const CARD_ROWS: Record<string, { row: string; params: { name: string; kind: string }[] }> = {
-  setOverviewMode: { row: "set_overview_mode", params: [{ name: "view", kind: "overview_mode" }] },
-  showAgentCard: { row: "show_agent_card", params: [{ name: "agent", kind: "agent_ref" }] },
-  nextAgentCard: { row: "next_agent_card", params: [] },
-  previousAgentCard: { row: "previous_agent_card", params: [] },
-  nextNeedsYouCard: { row: "next_needs_you_card", params: [] },
-  toggleNeedsYouFilter: { row: "filter_needs_you_cards", params: [{ name: "needs_you", kind: "needs_you_filter" }] },
-  closeAgentCard: { row: "close_agent_card", params: [] },
-  runCardAction: { row: "run_card_action", params: [{ name: "agent", kind: "agent_ref" }, { name: "action", kind: "card_action" }] },
-  replyToAgentCard: { row: "reply_to_agent_card", params: [{ name: "agent", kind: "agent_ref" }, { name: "reply", kind: "reply_text" }] },
+/**
+ * Registry id → (commands.toml row id, the screens it runs on, its params),
+ * from the contract's §8 table as change 13 settled the param names and PR
+ * #2491's decision of 2026-11-25 moved the card into the agent's pane.
+ */
+const CARD_ROWS: Record<string, { row: string; screens: string[]; params: { name: string; kind: string }[] }> = {
+  setOverviewMode: { row: "set_overview_mode", screens: ["overview"], params: [{ name: "view", kind: "overview_mode" }] },
+  showAgentCard: { row: "show_agent_card", screens: ["overview", "agent"], params: [{ name: "agent", kind: "agent_ref" }] },
+  nextAgentCard: { row: "next_agent_card", screens: ["agent"], params: [] },
+  previousAgentCard: { row: "previous_agent_card", screens: ["agent"], params: [] },
+  nextNeedsYouCard: { row: "next_needs_you_card", screens: ["overview", "agent"], params: [] },
+  toggleNeedsYouFilter: { row: "filter_needs_you_cards", screens: ["overview"], params: [{ name: "needs_you", kind: "needs_you_filter" }] },
+  openCardPanel: { row: "open_card_panel", screens: ["agent"], params: [] },
+  closeCardPanel: { row: "close_card_panel", screens: ["agent"], params: [] },
+  runCardAction: { row: "run_card_action", screens: ["overview", "agent"], params: [{ name: "agent", kind: "agent_ref" }, { name: "action", kind: "card_action" }] },
 };
 
 /** Issue #2418 — the tree's rows (D8): open and close a named card's tree, and open a named card's checked pull request or issue. */
@@ -150,7 +155,7 @@ function settingsStore() {
 }
 
 /** The real shell on the dashboard, a daemon list with one card per fixture agent, and one utterance resolved to `outcome`. */
-function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries, batch = false }: { secondDeck?: string; entries?: (agents: { id: string }[]) => AgentCardEntry[]; batch?: boolean } = {}) {
+function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries, batch = false, onAgent = false }: { secondDeck?: string; entries?: (agents: { id: string }[]) => AgentCardEntry[]; batch?: boolean; onAgent?: boolean } = {}) {
   let started = false;
   let delivered = false;
   const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 900, maxMs: 30_000, capped: false, available: true, backend: "remote" });
@@ -199,7 +204,7 @@ function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries,
     voiceStop: vi.fn(async () => ({ outcome: { kind: "heard" as const, transcript: outcome.kind === "dispatch" ? outcome.transcript : "", sentence: "Heard." }, transcribeMs: null, backend: "remote" as const, audioMs: 900 })),
     voiceCancel: vi.fn(async () => status("idle")),
   } as unknown as DeckRuntimeState;
-  render(createElement(DeckShell, { runtime, initialView: { kind: "overview" } }));
+  render(createElement(DeckShell, { runtime, initialView: onAgent ? { kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: agent.id, from: "overview" } : { kind: "overview" } }));
   return { agent, card, invokeCardAction, invokeCardActionBatch, resolveVoice };
 }
 
@@ -269,7 +274,7 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(spoken.invokeCardAction).not.toHaveBeenCalled();
   });
 
-  /// Scenario: read the action registry and the command table the crate embeds. The card controls and shared name-open entry are voice-enabled on overview with the expected row ids and parameter names; the confirm step's send and the row menu are kept off voice with a reason and no row.
+  /// Scenario: read the action registry and the command table the crate embeds. The card controls and shared name-open entry are voice-enabled with the expected row ids, screens and parameter names — the Card panel's and the moves between agents on the agent pane — while the review's Send and Cancel and the row menu are kept off voice with a reason and no row, and the retired overlay and reply rows are gone.
   it("desktop/agent-cards/008: every new card control is voice: true with its commands.toml row", () => {
     const rows = commandRows();
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
@@ -278,10 +283,12 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
       expect(registry[invoke]?.no_voice, `${invoke} has no no_voice`).toBeUndefined();
       const invoking = rows.filter((row) => row.invoke === invoke);
       expect(invoking.map((row) => row.id), `the rows invoking ${invoke}`).toEqual([wanted.row]);
-      expect(invoking[0].screens).toEqual(["overview"]);
+      expect(invoking[0].screens, `${wanted.row}'s screens`).toEqual(wanted.screens);
       expect(invoking[0].params).toEqual(wanted.params);
     }
-    for (const kept of ["confirmCardAction", "toggleOverviewRowMenu"]) {
+    for (const retired of ["close_agent_card", "reply_to_agent_card"]) expect(rows.map((row) => row.id)).not.toContain(retired);
+    for (const gone of ["closeAgentCard", "replyToAgentCard"]) expect(registry[gone]).toBeUndefined();
+    for (const kept of ["confirmCardAction", "closeCardReview", "toggleOverviewRowMenu"]) {
       expect(registry[kept]?.voice).not.toBe(true);
       expect((registry[kept]?.no_voice ?? "").trim().length, `${kept} carries a no_voice reason`).toBeGreaterThan(0);
       expect(rows.filter((row) => row.invoke === kept)).toEqual([]);
@@ -293,7 +300,7 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(open[0].params).toEqual([{ name: "agent", kind: "agent_ref" }]);
   });
 
-  /// Scenario: open the agent using the name on its compact card, or by saying "open the voice card agent". Both dispatch the shared open-agent action and show the agent's terminal, without opening its card overlay or sending a card action.
+  /// Scenario: open the agent using the name on its compact card, or by saying "open the voice card agent". Both dispatch the shared open-agent action and show the agent's terminal with its Card panel beside it — opened from its card, or because the agent needs you — without sending a card action.
   it.each(["name", "voice"] as const)("desktop/agent-cards/008: opening by %s uses the shared voice action and shows the agent terminal", async (method) => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;
     const sharedOpen = vi.spyOn(VOICE_ACTIONS.openAgent, "run");
@@ -307,19 +314,20 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
       else await act(async () => { fireEvent.click(screen.getByText("voice-card-agent", { selector: "button" })); });
       await waitFor(() => expect(screen.getByTestId(`terminal-${agentId}`)).toBeInTheDocument());
       expect(sharedOpen).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ deckId: FIXTURE_DAEMON_ID, agentId, from: "overview" }));
-      expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+      expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-card-panel")).toBeInTheDocument();
+      expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
       expect(invokeCardAction).not.toHaveBeenCalled();
     } finally {
       sharedOpen.mockRestore();
     }
   });
 
-  /// Scenario: say "press merge it on the voice card agent's card", where Merge it asks for confirmation. The card's overlay opens at its confirm step showing the exact prompt and what is pending, and nothing is sent.
-  it("desktop/agent-cards/008: a spoken confirm action opens the card's confirm step and sends nothing", async () => {
-    const { card, invokeCardAction, resolveVoice } = renderSpoken(runCardAction(createFixtureSnapshot("connected").agents[0].id, "Merge it", "press merge it on the voice card agent's card"));
+  /// Scenario: say "press merge it on the voice card agent's card", where Merge it asks for confirmation. The single-action review opens over the dashboard showing the exact prompt and what is pending, and nothing is sent.
+  it("desktop/agent-cards/008: a spoken confirm action opens its review and sends nothing", async () => {
+    const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(createFixtureSnapshot("connected").agents[0].id, "Merge it", "press merge it on the voice card agent's card"));
     await speak(resolveVoice);
     await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
-    expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     const step = screen.getByTestId("agent-card-confirm");
     expect(step.textContent).toContain("Merge it, following this project's own merge procedure, then update your card.");
     expect(step.textContent).toContain("Still pending: open pull request #7.");
@@ -338,7 +346,6 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
       }
       await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
       expect(sharedClose).toHaveBeenCalledTimes(1);
-      expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
       expect(screen.getByRole("alertdialog", { name: "Close?" })).toHaveTextContent("This closes voice-card-agent.");
       expect(invokeCardAction).not.toHaveBeenCalled();
       expect(screen.queryByTestId(`terminal-${card.agent_id}`)).toBeNull();
@@ -385,39 +392,37 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ deckId: "deck-build", agentId }), "go-ahead", expect.objectContaining({ requestId: expect.any(String) }));
   });
 
-  /// Scenario: say "press re-run tests on the voice card agent's card", an action whose text the agent wrote. The card's overlay opens at its review step showing that exact text, the voice row says why, and nothing is sent until Send is pressed, which sends it once.
-  it("desktop/agent-cards/008: a spoken action the agent wrote opens its review step and sends nothing", async () => {
+  /// Scenario: say "press re-run tests on the voice card agent's card", an action whose text the agent wrote. The single-action review opens showing that exact text, the voice row says why, and nothing is sent until Send is pressed, which sends it once.
+  it("desktop/agent-cards/008: a spoken action the agent wrote opens its review and sends nothing", async () => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;
-    const { card, invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, "Re-run tests", "press re-run tests on the voice card agent's card"));
+    const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, "Re-run tests", "press re-run tests on the voice card agent's card"));
     await speak(resolveVoice);
     await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
-    expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
     expect(screen.getByTestId("agent-card-confirm").textContent).toContain("Re-run the failing tests and update your card.");
-    expect(await screen.findByText("voice-card-agent wrote the text of Re-run tests, so its card is open for you to read it first: press Send to send it.")).toBeInTheDocument();
+    expect(await screen.findByText("voice-card-agent wrote the text of Re-run tests, so it is shown for you to read first: press Send to send it.")).toBeInTheDocument();
     expect(invokeCardAction).not.toHaveBeenCalled();
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
     await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
     expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "rerun", expect.objectContaining({ actionToken: "tok-rerun" }));
   });
 
-  /// Scenario: say "answer release branch to the voice card agent", a question option carrying its own prompt the agent wrote. The card's overlay opens at its review step showing that prompt, and nothing is sent.
-  it("desktop/agent-cards/008: a spoken answer whose text the agent wrote opens its review step and sends nothing", async () => {
-    const { card, invokeCardAction, resolveVoice } = renderSpoken(runCardAction(createFixtureSnapshot("connected").agents[0].id, "Release branch", "answer release branch to the voice card agent"));
+  /// Scenario: say "answer release branch to the voice card agent", a question option carrying its own prompt the agent wrote. The single-action review opens showing that prompt, and nothing is sent.
+  it("desktop/agent-cards/008: a spoken answer whose text the agent wrote opens its review and sends nothing", async () => {
+    const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(createFixtureSnapshot("connected").agents[0].id, "Release branch", "answer release branch to the voice card agent"));
     await speak(resolveVoice);
     await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
-    expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
     expect(screen.getByTestId("agent-card-confirm").textContent).toContain("Use the release branch.");
     expect(invokeCardAction).not.toHaveBeenCalled();
   });
 
-  /// Scenario: say "answer main to the voice card agent", a question option with no prompt of its own, whose answer the deck composes by quoting the agent's question. The card's overlay opens at its review step showing that answer, and nothing is sent.
-  it("desktop/agent-cards/008: a spoken answer the deck composed from the agent's question opens its review step and sends nothing", async () => {
+  /// Scenario: say "answer main to the voice card agent", a question option with no prompt of its own, whose answer the deck composes by quoting the agent's question. The single-action review opens showing that answer, and nothing is sent.
+  it("desktop/agent-cards/008: a spoken answer the deck composed from the agent's question opens its review and sends nothing", async () => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;
     const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, "main", "answer main to the voice card agent"));
     await speak(resolveVoice);
     await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
     expect(screen.getByTestId("agent-card-confirm").textContent).toContain("Answer to your question \"Which base branch?\": main");
-    expect(await screen.findByText("voice-card-agent wrote the text of main, so its card is open for you to read it first: press Send to send it.")).toBeInTheDocument();
+    expect(await screen.findByText("voice-card-agent wrote the text of main, so it is shown for you to read first: press Send to send it.")).toBeInTheDocument();
     expect(invokeCardAction).not.toHaveBeenCalled();
   });
 
@@ -434,28 +439,28 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "question/plan/ok", expect.objectContaining({ actionToken: "tok-question/plan/ok" }));
   });
 
-  /// Scenario: say "reply to the voice card agent use the release branch". The card opens with the words in its reply box and nothing is sent; the user changes them and presses Send reply, and the card's `reply` action is sent with exactly the words in the box.
-  it("desktop/agent-cards/008: a spoken reply is put in the reply box for review, and sent only by Send reply", async () => {
-    const agentId = createFixtureSnapshot("connected").agents[0].id;
-    const transcript = "reply to the voice card agent use the release branch";
-    const { invokeCardAction, resolveVoice } = renderSpoken({
-      kind: "dispatch", transcript, action: "reply_to_agent_card", invoke: "replyToAgentCard",
-      params: [
-        { name: "agent", kind: "agent_ref", spoken: "the voice card agent", value: agentId, label: "voice-card-agent" },
-        { name: "reply", kind: "reply_text", spoken: "use the release branch", value: "use the release branch", label: "use the release branch" },
-      ],
-      sentence: "Your reply to voice-card-agent is in its card: press Send reply to send it.",
-    } as VoiceResultDto["outcome"]);
+  /// Scenario: with an agent's pane open over the dashboard, say "close the card", "show the card", "next agent", "previous agent", "next one that needs me" or "show the second agent's card". Closing and opening the Card panel hide and show it beside the terminal and remember the choice; the moves open the next, previous or next needing-you agent's pane in the dashboard's order; naming another agent's card opens its pane with the panel; none of them sends a card action.
+  it.each([
+    { said: "close the card", action: "close_card_panel", invoke: "closeCardPanel", needy: true, shows: "none", stored: "closed" },
+    { said: "show the card", action: "open_card_panel", invoke: "openCardPanel", needy: false, shows: 0, stored: "open" },
+    { said: "next agent", action: "next_agent_card", invoke: "nextAgentCard", needy: true, shows: 1 },
+    { said: "previous agent", action: "previous_agent_card", invoke: "previousAgentCard", needy: true, shows: 1 },
+    { said: "next one that needs me", action: "next_needs_you_card", invoke: "nextNeedsYouCard", needy: true, shows: 1 },
+    { said: "show the second agent's card", action: "show_agent_card", invoke: "showAgentCard", needy: false, shows: 1, names: 1 },
+  ] as const)("desktop/agent-cards/094: in an agent's pane, \"$said\" works the pane's Card panel or moves between agents", async ({ said, action, invoke, needy, shows, stored, names }) => {
+    const agents = createFixtureSnapshot("connected").agents;
+    const two = (all: { id: string }[]) => [0, 1].map((at) => ({ ...cardFor(all[at].id, `voice-card-${at}`), ...(needy ? {} : { needs_you: false, needs_you_reasons: [] }) }));
+    const params = names === undefined ? [] : [{ name: "agent", kind: "agent_ref", spoken: "the second agent", value: agents[names].id, label: `voice-card-${names}` }];
+    const { invokeCardAction, resolveVoice } = renderSpoken({ kind: "dispatch", transcript: said, action, invoke, params, sentence: "Done." } as VoiceResultDto["outcome"], { entries: two, onAgent: true });
+    const pane = () => screen.getByTestId("agent-pane-overlay");
+    // Opened by no card: the panel opens only for an agent that needs you.
+    expect(within(pane()).queryByTestId("agent-card-panel") !== null).toBe(needy);
     await speak(resolveVoice);
-    const box = await waitFor(() => screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement);
-    await waitFor(() => expect(box.value).toBe("use the release branch"));
+    if (shows === "none") await waitFor(() => expect(within(pane()).queryByTestId("agent-card-panel")).toBeNull());
+    else await waitFor(() => expect(within(pane()).getByTestId("agent-card-panel").getAttribute("data-card-key")).toBe(`pane-${agents[shows].id}/${agents[shows].id}`));
+    if (stored) expect(window.localStorage.getItem("dot-agent-deck.agent-pane.card-panel")).toBe(stored);
+    expect(within(pane()).getByTestId("agent-pane-card-toggle")).toHaveAttribute("aria-pressed", shows === "none" ? "false" : "true");
     expect(invokeCardAction).not.toHaveBeenCalled();
-    expect(within(document.body).queryByText(/Say what to reply/)).toBeNull();
-    fireEvent.change(box, { target: { value: "use the release branch, not main" } });
-    expect(invokeCardAction).not.toHaveBeenCalled();
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-reply-send")); });
-    await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
-    expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "reply", expect.objectContaining({ text: "use the release branch, not main" }));
   });
 
   /// Scenario: read the action registry and the command table for the tree's controls. Opening and closing a named card's tree and opening a named card's checked pull request or issue are each `voice: true` with one overview row taking the agent.

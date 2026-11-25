@@ -81,13 +81,12 @@ function card(card: AgentCardEntry) {
 }
 
 /*
- * PRD #2374 decision 2026-11-24 (3): the selection toolbar's and the overlay's
- * batch buttons are icons, named by the action's label. The tests find them by
+ * PRD #2374 decision 2026-11-24 (3): the selection toolbar's batch buttons are
+ * icons, named by the action's label. The tests find them by
  * that name, which a text button and an icon button both carry; what the icon
  * form itself must look like is `desktop/agent-cards/051`'s.
  */
 const selectionAction = (label: string) => within(screen.getByTestId("agent-cards-selection-bar")).getByRole("button", { name: label });
-const overlayBatchAction = (label: string) => within(screen.getByTestId("agent-card-batch")).getByRole("button", { name: label });
 
 /** PR #2491 decision 2026-11-25 — the skipped agents are one collapsed line: open it to read each one. */
 function showSkipped(dialog: HTMLElement) {
@@ -184,7 +183,7 @@ describe("batch card actions (#2399)", () => {
     expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
   });
 
-  /// Scenario: Open the Cards view on a daemon that does batches. Every card shows its checkbox with no Select button to press, nothing selected shows no selection bar, and ticking a card opens neither its overlay nor anything else but shows a bar at the foot with the count, the actions as icons inside one group, and Clear, which empties the selection and takes the bar away. A card's own icons and the overlay's batch row sit in the same kind of group, Needs you is the compact bell with its words kept, and a daemon without batches shows no checkbox and no bar.
+  /// Scenario: Open the Cards view on a daemon that does batches. Every card shows its checkbox with no Select button to press, nothing selected shows no selection bar, and ticking a card opens neither its agent's pane nor anything else but shows a bar at the foot with the count, the actions as icons inside one group, and Clear, which empties the selection and takes the bar away. A card's own icons and the bar's sit in the same kind of group, Needs you is the compact bell with its words kept, and a daemon without batches shows no checkbox and no bar.
   it("desktop/agent-cards/085: checkboxes are always there, and a bar at the foot appears with the selection", async () => {
     const onCard = { ...action, id: "card-merge", label: "Merge it", placement: "card" as const, icon: "git-merge", token: "tok-merge" };
     const needy = { ...OUTSIDE, needs_you: true, needs_you_reasons: ["waiting"], actions: [onCard, action] };
@@ -209,7 +208,7 @@ describe("batch card actions (#2399)", () => {
 
     // Ticking a card opens nothing but shows the bar.
     fireEvent.click(card(OUTSIDE).getByRole("checkbox", { name: "Select outside" }));
-    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+    expect(screen.queryByTestId("agent-card-panel")).toBeNull();
     const bar = screen.getByTestId("agent-cards-selection-bar");
     expect(within(bar).getByTestId("agent-cards-selection-count")).toHaveTextContent("1 selected");
     const barGroup = within(bar).getByTestId("action-icon-group");
@@ -223,27 +222,12 @@ describe("batch card actions (#2399)", () => {
     expect(calls.invokeCardActionBatch).not.toHaveBeenCalled();
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
 
-    // The overlay's batch row is the same group.
-    fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
-    const overlayGroup = within(screen.getByTestId("agent-card-batch")).getByTestId("action-icon-group");
-    expect(within(overlayGroup).getByRole("button", { name: "Go ahead" })).toBeInTheDocument();
     cleanup();
 
     // A daemon without batches: no checkbox, no bar.
     setup({ batch: false });
     expect(card(ROOT).queryByRole("checkbox")).toBeNull();
     expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
-  });
-
-  /// Scenario: Open a root card's overlay while its subtree is closed, then choose its batch action. The daemon previews the root, child and grandchild, excluding an unrelated root, and nothing is executed.
-  it("desktop/agent-cards/029: an overlay batch reaches the card's whole subtree", async () => {
-    const calls = setup();
-    fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
-    await act(async () => { fireEvent.click(overlayBatchAction("Go ahead")); });
-    expect(screen.getByTestId("agent-cards-batch-confirm")).toBeInTheDocument();
-    expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
-    expect(calls.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "preview", entries: targets([ROOT, CHILD, STOPPED]) }));
-    expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });
 
   /// Scenario: Start a batch whose action has confirm=false. Its confirmation quotes each daemon-previewed prompt and skipped reason without an editable text box; Cancel executes nothing, and a later Send submits precisely the previewed included tokens and instances.
@@ -613,8 +597,8 @@ describe("batch card actions (#2399)", () => {
     expect(within(results).getByRole("status")).not.toHaveTextContent(/failed/);
   });
 
-  /// Scenario: Select a closed root whose three cards all list Go ahead with the same text, then open the root's overlay. The selection toolbar's and the overlay's Go ahead are icon buttons named Go ahead, with no text, whose hover says the label and that exact text; with a child whose Go ahead sends other words, both surfaces' hover says the text differs per agent instead. An action with the catalog's `git-merge` icon draws it on both surfaces, and one with no icon or an icon the app does not bundle draws the generic icon on both. Pressing an icon still only opens the confirmation.
-  it("desktop/agent-cards/051: the selection toolbar's and the overlay's batch buttons are icons with the label and text on hover", async () => {
+  /// Scenario: Select a closed root whose three cards all list Go ahead with the same text. The selection toolbar's Go ahead is an icon button named Go ahead, with no text, whose hover says the label and that exact text; with a child whose Go ahead sends other words, its hover says the text differs per agent instead. An action with the catalog's `git-merge` icon draws it, the same drawing as on a card, and one with no icon or an icon the app does not bundle draws the generic icon. Pressing an icon still only opens the confirmation.
+  it("desktop/agent-cards/051: the selection toolbar's batch buttons are icons with the label and text on hover", async () => {
     const same = action.prompt!;
     const expectIcon = (button: HTMLElement, icon = "generic") => {
       expect(button.textContent).toBe("");
@@ -632,12 +616,6 @@ describe("batch card actions (#2399)", () => {
     expect(screen.getByTestId("agent-cards-batch-confirm")).toBeInTheDocument();
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
     fireEvent.click(within(screen.getByTestId("agent-cards-batch-confirm")).getByRole("button", { name: /^Cancel$/ }));
-
-    fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
-    const overlayButton = overlayBatchAction("Go ahead");
-    expectIcon(overlayButton);
-    expect(overlayButton.getAttribute("data-tip")).toContain(same);
-    expect(overlayButton.getAttribute("data-tip")).not.toMatch(/differs/);
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
     cleanup();
 
@@ -650,12 +628,6 @@ describe("batch card actions (#2399)", () => {
     expect(mixed.getAttribute("data-tip")).toMatch(/text differs per agent/);
     expect(mixed.getAttribute("data-tip")).not.toContain(same);
     expect(mixed.getAttribute("data-tip")).not.toContain("Other words for the child.");
-    fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
-    const mixedOverlay = overlayBatchAction("Go ahead");
-    expectIcon(mixedOverlay);
-    expect(mixedOverlay.getAttribute("data-tip")).toMatch(/text differs per agent/);
-    expect(mixedOverlay.getAttribute("data-tip")).not.toContain(same);
-    expect(mixedOverlay.getAttribute("data-tip")).not.toContain("Other words for the child.");
     expect(mixedCalls.invokeCardAction).not.toHaveBeenCalled();
     expect(mixedCalls.invokeCardActionBatch).not.toHaveBeenCalled();
     cleanup();
@@ -669,10 +641,6 @@ describe("batch card actions (#2399)", () => {
       selectRoot();
       const onToolbar = selectionAction("Go ahead");
       expectIcon(onToolbar, shown);
-      fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
-      const onOverlay = overlayBatchAction("Go ahead");
-      expectIcon(onOverlay, shown);
-      expect(svg(onOverlay), `${icon}: one drawing on both surfaces`).toBe(svg(onToolbar));
       drawn[String(icon)] = svg(onToolbar);
       cleanup();
     }

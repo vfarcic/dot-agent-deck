@@ -107,12 +107,12 @@ export function searchCardIcons(query: string): string[] {
   return CARD_ICON_NAMES.filter((name) => words.every((word) => name.includes(word)));
 }
 
-/** The longest prompt a hover quotes before it says the rest is in the card's overlay. */
+/** The longest prompt a hover quotes before it says the rest is shown when pressed. */
 const HOVER_PROMPT_CHARS = 1200;
 
 /**
  * The exact text a hover quotes of `prompt` — every invisible or reordering
- * character as its marker, as the overlay shows it — and whether it had to
+ * character as its marker, as the review shows it — and whether it had to
  * stop short. It stops at {@link HOVER_PROMPT_CHARS} shown characters, and
  * only between two segments or inside plain text: a marker is quoted whole
  * or not at all, so a cut never leaves half of one looking like plain text.
@@ -146,7 +146,7 @@ export function hoverCutsPrompt(prompt: string | null | undefined): boolean {
 /**
  * A card action icon's hover: its label, then the exact text it sends with
  * its line breaks kept and every invisible or reordering character shown as a
- * marker (as the overlay shows it), then `notes` — that it asks first, why it
+ * marker (as the review shows it), then `notes` — that it asks first, why it
  * is disabled. A text longer than the hover holds ends by saying so.
  */
 export function cardActionHover(label: string, prompt: string | null | undefined, notes: readonly (string | false | null | undefined)[] = []): string {

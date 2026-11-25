@@ -408,7 +408,8 @@ mod tests {
                 "previous_agent_card",
                 "next_needs_you_card",
                 "filter_needs_you_cards",
-                "close_agent_card",
+                "open_card_panel",
+                "close_card_panel",
                 "open_card_tree",
                 "close_card_tree",
                 "open_card_pull_request",
@@ -419,7 +420,6 @@ mod tests {
                 "unselect_agent_card",
                 "clear_card_selection",
                 "run_card_action_on_selection",
-                "reply_to_agent_card",
                 "open_card_actions_editor",
                 "add_card_action",
                 "edit_card_action",
@@ -432,7 +432,7 @@ mod tests {
                 "offer_card_action_on_every_card",
                 "offer_card_action_when_agents_choose",
                 "show_card_action_on_the_card",
-                "show_card_action_only_in_the_overlay",
+                "show_card_action_only_in_the_card_panel",
                 "none"
             ]
         );

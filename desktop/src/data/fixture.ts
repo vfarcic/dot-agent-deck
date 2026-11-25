@@ -1603,7 +1603,13 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
 
   const messagingParam = state === "docs" && typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("messaging") : null;
   const messaging = messagingParam === "1" || messagingParam === "attention";
-  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
+  /* PR #2491 decision 2026-11-25 — a card opens its agent's pane, so the tree
+     scenes list an agent for each of their cards, under the card's id. */
+  const treeScene = state === "docs" && typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("cards") : null;
+  const treeAgents = treeScene === "tree" || treeScene === "tree-nested"
+    ? treeAgentCards(treeScene).entries.map((entry) => crowdedAgent({ id: entry.agent_id, displayName: entry.name, role: "Claude code", cli: "claude", status: "idle", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: `Work as ${entry.name}.`, tab: { kind: "dashboard" } }))
+    : [];
+  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? [...docsAgents, ...treeAgents] : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
   const docs = state === "docs" || state === "docs-question" || state === "docs-restart";

@@ -112,7 +112,7 @@ const EMPTY_FORM: CardActionFormValues = { name: "", label: "", prompt: "", desc
 /**
  * An action's placement as the form holds it: the catalog's own, `card` when
  * it names none the form knows. The form offers two choices, Show on the card
- * (`card`) and Only in the overlay (`detail`); a `compact` action shows as on
+ * (`card`) and Only in the Card panel (`detail`); a `compact` action shows as on
  * the card and keeps `compact` unless the user picks the other choice.
  */
 function formPlacement(placement: string | null | undefined): CardActionPlacement {

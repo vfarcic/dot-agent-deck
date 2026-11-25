@@ -1182,7 +1182,13 @@ export type DeckView =
    * (`bindViewIncarnation`), and a key holding `undefined` is a deck that named
    * no process, on which the backend sends no action.
    */
-  | { kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview"; incarnation?: string };
+  | {
+    kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview"; incarnation?: string;
+    /** PR #2491 decision 2026-11-25 — opened from the agent's card (a click on it, its `+N`, the table's Show card, voice's "show its card"): the pane opens with its Card panel open. */
+    cardPanel?: boolean;
+    /** …and the panel scrolled to this part of it. */
+    cardSection?: "references";
+  };
 
 /**
  * An agent's tab membership exactly as the daemon reports it, mirroring
