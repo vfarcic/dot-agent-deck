@@ -1,4 +1,4 @@
-import { X } from "lucide-react";
+import { SlidersHorizontal, X } from "lucide-react";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
@@ -11,6 +11,7 @@ import type { EndedRole } from "../types";
 import { CardActionIcon, cardIconName } from "../lib/cardIcons";
 import { ActionIconGroup, ActionTipButton } from "./ActionTipButton";
 import { AgentCard, batchChoiceHover, type CardControls, type CardPlace } from "./AgentCard";
+import { MoreMenu } from "./MoreMenu";
 
 /**
  * Issue #2399, decision 2026-11-24 — a batch button's icon: the action's
@@ -63,14 +64,77 @@ export function AgentCardsNotes({ cards, needsYouOnly, cardsView }: {
  * before it), and Clear. It floats over the end of the dashboard's scroll
  * region, which leaves room for it below the last card.
  */
-export function AgentCardsSelectionBar({ selection, controls }: SelectionBarProps) {
+export function AgentCardsSelectionBar({ selection, controls, editor }: SelectionBarProps) {
   if (selection.selected.size === 0) return null;
-  return <SelectionBar selection={selection} controls={controls} />;
+  return <SelectionBar selection={selection} controls={controls} editor={editor} />;
+}
+
+/**
+ * PR #2491 (the maintainer, 2026-11-25) — the selection bar's shortcut to the
+ * Card actions editor: the daemons of the selected cards whose ⋯ menu offers
+ * it, in the dashboard's order, and the editor's members its presses go through.
+ */
+export interface SelectionBarEditor {
+  daemons: readonly { deckId: string; name: string }[];
+  controls: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused" | "askVoiceChoice">>;
 }
 
 interface SelectionBarProps {
   selection: CardSelection;
   controls: Pick<VoiceActionContext, "clearCardSelection" | "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
+  editor?: SelectionBarEditor;
+}
+
+const EDIT_CARD_ACTIONS = "Edit card actions";
+
+/**
+ * PR #2491 (the maintainer, 2026-11-25) — Edit card actions in the selection
+ * bar, after the batch actions and set apart from them so it does not read as
+ * one more action to send: with every selected card on one daemon, a button
+ * that opens that daemon's editor (read-only on a release that cannot edit
+ * them, as from its ⋯ menu); with the selection across daemons, a menu of
+ * those daemons, each opening its own. The daemon's ⋯ menu stays the main way in.
+ */
+function SelectionEditButton({ editor }: { editor: SelectionBarEditor }) {
+  const { daemons, controls } = editor;
+  if (daemons.length === 0) return null;
+  const icon = <SlidersHorizontal size={15} aria-hidden="true" focusable="false" />;
+  if (daemons.length === 1) {
+    const [daemon] = daemons;
+    return (
+      <span className="agent-cards-selection-edit">
+        <button
+          type="button"
+          className="icon-button agent-cards-selection-edit-button"
+          data-testid="agent-cards-selection-edit"
+          data-icon="sliders-horizontal"
+          aria-label={EDIT_CARD_ACTIONS}
+          title={EDIT_CARD_ACTIONS}
+          onClick={() => VOICE_ACTIONS.openCardActionsEditor.run(controls, daemon.deckId)}
+        >{icon}</button>
+      </span>
+    );
+  }
+  return (
+    <span className="agent-cards-selection-edit" data-icon="sliders-horizontal">
+      <MoreMenu
+        label={EDIT_CARD_ACTIONS}
+        menuLabel={EDIT_CARD_ACTIONS}
+        testId="agent-cards-selection-edit"
+        menuTestId="agent-cards-selection-edit-menu"
+        className="agent-cards-selection-edit-menu"
+        buttonClassName="icon-button agent-cards-selection-edit-button"
+        icon={icon}
+        items={daemons.map((daemon) => ({
+          key: daemon.deckId,
+          label: displayText(daemon.name, DISPLAY_LIMITS.name),
+          testId: `agent-cards-selection-edit-${domIdentity(daemon.deckId)}`,
+          title: `Add, change, hide or remove the actions ${displayText(daemon.name, DISPLAY_LIMITS.name)}'s agents offer on their cards`,
+          onSelect: () => VOICE_ACTIONS.openCardActionsEditor.run(controls, daemon.deckId),
+        }))}
+      />
+    </span>
+  );
 }
 
 /**
@@ -90,7 +154,7 @@ function focusTargetAfterBar(bar: HTMLElement, last: string | undefined): HTMLEl
   return checkbox ?? region;
 }
 
-function SelectionBar({ selection, controls }: SelectionBarProps) {
+function SelectionBar({ selection, controls, editor }: SelectionBarProps) {
   const count = selection.selected.size;
   const bar = useRef<HTMLDivElement>(null);
   const last = useRef(selection.last);
@@ -123,6 +187,7 @@ function SelectionBar({ selection, controls }: SelectionBarProps) {
             ))}
           </ActionIconGroup>
         )}
+      {editor && <SelectionEditButton editor={editor} />}
       <button
         type="button"
         className="button secondary compact agent-cards-selection-clear"

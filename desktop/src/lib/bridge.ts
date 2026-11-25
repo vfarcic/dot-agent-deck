@@ -1,4 +1,4 @@
-import { createFixtureCardCatalog, createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureCardCatalog, createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, fleetAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, FIXTURE_REMOTE_DAEMON_ID, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -3356,8 +3356,17 @@ class FixtureDeckBridge implements DeckBridge {
    * and scene answers as a daemon without cards does.
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
+    const cards = this.sceneCardsFor(deckId);
+    return cards && cards.deckId === deckId ? cards : null;
+  }
+  /** The scene's cards for one deck: PR #2491's `cards=fleet` scene has two daemons showing cards; every other scene one at most. */
+  private sceneCardsFor(deckId: string): AgentCardsSnapshot | null {
+    if (this.fleetCardsScene()) return fleetAgentCards(deckId) ?? null;
     const cards = this.sceneCards();
     return cards && cards.deckId === deckId ? cards : null;
+  }
+  private fleetCardsScene(): boolean {
+    return this.fixtureState === "docs-fleet" && new URLSearchParams(window.location.search).get("cards") === "fleet";
   }
   /**
    * The docs and tree scenes' cards, as last pushed. Issue #2418 review: the
@@ -3447,10 +3456,12 @@ class FixtureDeckBridge implements DeckBridge {
    * a daemon without the editor is.
    */
   private readonly cardCatalog = createFixtureCardCatalog();
+  /** PR #2491 — the `cards=fleet` scene's second daemon keeps a catalog of its own. */
+  private readonly remoteCardCatalog = createFixtureCardCatalog();
   private cardCatalogFor(deckId: string) {
-    const cards = this.sceneCards();
+    const cards = this.sceneCardsFor(deckId);
     if (!cards || cards.deckId !== deckId || cards.catalogEdit !== true) throw new Error("this deck's daemon is from a release whose card actions cannot be edited from the app");
-    return this.cardCatalog;
+    return deckId === FIXTURE_REMOTE_DAEMON_ID ? this.remoteCardCatalog : this.cardCatalog;
   }
   async readCardCatalog(deckId: string): Promise<EditableCardCatalog> {
     return this.cardCatalogFor(deckId).read();
@@ -3468,7 +3479,7 @@ class FixtureDeckBridge implements DeckBridge {
    * the fixture's state.
    */
   async invokeCardActionBatch(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult> {
-    const shown = this.treeCards ?? this.sceneCards();
+    const shown = this.fleetCardsScene() ? this.sceneCardsFor(deckId) : this.treeCards ?? this.sceneCards();
     const cards = shown && shown.deckId === deckId ? shown.entries : [];
     const entries = options.entries.map((target): CardBatchOutcome => {
       const card = cards.find((candidate) => candidate.pane_id === target.pane_id && candidate.agent_id === target.agent_id);

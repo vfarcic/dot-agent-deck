@@ -11,12 +11,12 @@ import { cardActionsWhich, useCardActionsEditor, type CardActionsDaemon } from "
 const LOCAL: CardActionsDaemon = { deckId: "deck-local", name: "Local daemon", editable: true };
 const BUILD: CardActionsDaemon = { deckId: "deck-build-box", name: "deploy@build-box", editable: true };
 
-function editorOver(daemons: CardActionsDaemon[]) {
+function editorOver(daemons: CardActionsDaemon[], preferredDeckId?: string) {
   const runtime = {
     readCardCatalog: vi.fn(async () => ({ actions: [], errors: [], user_config: null })),
     editCardCatalog: vi.fn(),
   };
-  const hook = renderHook(({ list }) => useCardActionsEditor({ runtime, daemons: list }), { initialProps: { list: daemons } });
+  const hook = renderHook(({ list, preferred }) => useCardActionsEditor({ runtime, daemons: list, preferredDeckId: preferred }), { initialProps: { list: daemons, preferred: preferredDeckId } });
   return { runtime, hook };
 }
 
@@ -62,5 +62,26 @@ describe("opening the Card actions editor by voice (PR #2491 decision 2026-11-25
 
     expect(two.hook.result.current.offeredFor(BUILD.deckId)).toBe(true);
     expect(two.hook.result.current.offeredFor("deck-moon")).toBe(false);
+  });
+});
+
+describe("open card actions with a selection on screen (PR #2491, 2026-11-25)", () => {
+  /// Scenario: With two daemons showing cards and the selected cards all on the second, say "open card actions" without naming a daemon: the second daemon's editor opens with no question. Naming the first still opens the first. With no preferred daemon, or one not on the dashboard, a bare open asks which daemon as before.
+  it("desktop/agent-cards/119: a bare open card actions prefers the selected cards' only daemon", async () => {
+    const said: string[] = [];
+    const report = { reportRefused: (sentence: string) => { said.push(sentence); } };
+    const preferred = editorOver([LOCAL, BUILD], BUILD.deckId);
+    await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...preferred.hook.result.current.controls, ...report }, {}); });
+    expect(said).toEqual([]);
+    expect(preferred.hook.result.current.view?.daemon.deckId).toBe(BUILD.deckId);
+    expect(preferred.runtime.readCardCatalog).toHaveBeenCalledExactlyOnceWith(BUILD.deckId);
+    await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...preferred.hook.result.current.controls, ...report }, { preselectDeckId: LOCAL.deckId }); });
+    expect(preferred.hook.result.current.view?.daemon.deckId, "a daemon named wins over the selection").toBe(LOCAL.deckId);
+    preferred.hook.unmount();
+
+    const stale = editorOver([LOCAL, BUILD], "deck-moon");
+    await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...stale.hook.result.current.controls, ...report }, {}); });
+    expect(said).toEqual([cardActionsWhich([LOCAL.name, BUILD.name])]);
+    expect(stale.hook.result.current.view).toBeUndefined();
   });
 });

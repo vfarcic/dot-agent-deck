@@ -127,13 +127,17 @@ function formPlacement(placement: string | null | undefined): CardActionPlacemen
  * PR #2491 decision 2026-11-25 — the daemon an opening means: the one named
  * (by its ⋯ menu, or by voice), else the only daemon showing cards. With
  * several and none named, the user is asked which rather than one being
- * guessed, the way a spoken "show host" asks.
+ * guessed, the way a spoken "show host" asks. PR #2491 (2026-11-25): with
+ * none named, `preferred` — the one daemon the selected cards are on — is
+ * meant while it is on the dashboard.
  */
-function chooseDaemon(daemons: readonly CardActionsDaemon[], wanted: string | undefined): { daemon: CardActionsDaemon } | { refused: string; which?: CardActionsWhich["which"] } {
+function chooseDaemon(daemons: readonly CardActionsDaemon[], wanted: string | undefined, preferred?: string): { daemon: CardActionsDaemon } | { refused: string; which?: CardActionsWhich["which"] } {
   if (wanted !== undefined) {
     const named = daemons.find((candidate) => candidate.deckId === wanted);
     return named ? { daemon: named } : { refused: NOT_SHOWN };
   }
+  const selected = preferred === undefined ? undefined : daemons.find((candidate) => candidate.deckId === preferred);
+  if (selected) return { daemon: selected };
   if (daemons.length === 0) return { refused: NOT_AVAILABLE };
   if (daemons.length > 1) return { refused: cardActionsWhich(daemons.map((candidate) => candidate.name)), which: daemons.map(({ deckId, name }) => ({ deckId, name })) };
   return { daemon: daemons[0] };
@@ -201,9 +205,11 @@ export function cardIconByName(said: string): string | undefined {
  * the edit again. A daemon that did not advertise the editor is shown
  * read-only and sent nothing.
  */
-export function useCardActionsEditor({ runtime, daemons }: {
+export function useCardActionsEditor({ runtime, daemons, preferredDeckId }: {
   runtime: Pick<DeckRuntimeState, "readCardCatalog" | "editCardCatalog">;
   daemons: readonly CardActionsDaemon[];
+  /** PR #2491 (2026-11-25) — the daemon an opening that names none means, before asking which: the one the selected cards on screen are all on. */
+  preferredDeckId?: string;
 }): CardActionsEditor {
   const read = runtime.readCardCatalog;
   const write = runtime.editCardCatalog;
@@ -397,7 +403,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
     if (!now.shown) return NOT_AVAILABLE;
     if (!now.open) {
       if (!voiceAsk) return NOT_OPEN;
-      const chosen = chooseDaemon(daemons, undefined);
+      const chosen = chooseDaemon(daemons, undefined, preferredDeckId);
       if ("refused" in chosen) return chosen.refused;
       openEditor(chosen.daemon.deckId);
       if (!chosen.daemon.editable) return readOnly(displayText(chosen.daemon.name, DISPLAY_LIMITS.name));
@@ -427,7 +433,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
      stays as it is. */
   function openEditor(wanted?: string): string | CardActionsWhich | undefined {
     if (!latest.current.shown) return NOT_AVAILABLE;
-    const chosen = chooseDaemon(daemons, wanted);
+    const chosen = chooseDaemon(daemons, wanted, preferredDeckId);
     if ("refused" in chosen) return chosen.which ? { refused: chosen.refused, which: chosen.which } : chosen.refused;
     const target = chosen.daemon;
     if (latest.current.open && latest.current.daemon?.deckId === target.deckId) return undefined;
@@ -477,7 +483,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
       if (now.busy) return SAVING_FORM;
       let target = now.daemon;
       if (!now.open) {
-        const chosen = chooseDaemon(daemons, undefined);
+        const chosen = chooseDaemon(daemons, undefined, preferredDeckId);
         if ("refused" in chosen) return chosen.refused;
         target = chosen.daemon;
         openEditor(target.deckId);

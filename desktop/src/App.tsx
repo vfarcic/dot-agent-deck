@@ -1974,7 +1974,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
   // voice-registry-exempt: not a write — the header's controls carry the shell's Card panel choice under its registry name, and its Card button dispatches it through VOICE_ACTIONS.openCardPanel / closeCardPanel
   const cardHeader = withCards || keepsPanel ? { open: cardPanel.open, controls: { ...cards.controls, setCardPanel: cardPanel.choose } } : undefined;
   const panel = keepsPanel
-    ? <AgentCardPanel card={card} name={agent.displayName} results={card ? cards.resultsFor(card) : {}} tree={withCards && cards.treeFor(view.deckId)} ended={card ? cards.endedFor(card) : undefined} notice={withCards ? cards.notice : undefined} section={cardPanel.section} controls={cards.controls} />
+    ? <AgentCardPanel card={card} name={agent.displayName} results={card ? cards.resultsFor(card) : {}} tree={withCards && cards.treeFor(view.deckId)} ended={card ? cards.endedFor(card) : undefined} notice={withCards ? cards.notice : undefined} section={cardPanel.section} controls={cards.controls} cardActions={withCards && (cards.cardActionsFor?.(view.deckId) ?? false)} />
     : undefined;
   return (
     <AgentPaneFrame

@@ -25,7 +25,7 @@ import { CardActionIconRow, CardReference, cardRef, ExactText, ExactTextNote, Is
  * terminal's, which the agent sees as a resize, so the pane shows it only on
  * the user's choice or when the pane opens.
  */
-export function AgentCardPanel({ card, name, results, tree, ended, notice, section, controls, readOnly = false }: {
+export function AgentCardPanel({ card, name, results, tree, ended, notice, section, controls, readOnly = false, cardActions = false }: {
   /** The agent's card; `undefined` when the dashboard lists none for it (any more). */
   card: PlacedCard | undefined;
   /** What the pane calls the agent, for a panel with no card. */
@@ -46,6 +46,12 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
    * the card marks them, and says so.
    */
   readOnly?: boolean;
+  /**
+   * PR #2491 (the maintainer, 2026-11-25) — whether the card's daemon offers
+   * its Card actions editor, so the Actions heading has an Edit beside it
+   * (never in a read-only panel).
+   */
+  cardActions?: boolean;
 }) {
   const entry = card?.entry;
   const shownName = entry ? displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id) : displayText(name, DISPLAY_LIMITS.name);
@@ -70,6 +76,10 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
   const checkedRefs = tree ? entry?.checked_refs ?? [] : [];
   const pullRequest = entry?.facts.pull_request as { number?: number; title?: string; state?: string } | null | undefined;
   const icons = entry && !readOnly ? panelIconActions(entry) : [];
+  /* PR #2491 (the maintainer, 2026-11-25) — the Edit beside Actions: the card's daemon's editor, as its ⋯ menu opens it. */
+  const editActions = cardActions && !readOnly && controls.openCardActionsEditor
+    ? { openCardActionsEditor: controls.openCardActionsEditor, reportRefused: controls.reportRefused }
+    : undefined;
   const offersSomething = entry !== undefined && (panelIconActions(entry).length > 0 || entry.questions.some((question) => question.options.length > 0));
   /* What became of each press from this card, in the order the actions are listed. */
   const answered = entry ? entry.actions.flatMap((action) => (results[action.token] ? [{ action, result: results[action.token]! }] : [])) : [];
@@ -183,7 +193,19 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
           {readOnly && offersSomething && <p className="agent-card-hint agent-card-panel-read-only" role="note" data-testid="agent-card-panel-read-only">{`${shownName} has ended, so its actions and answers are not available.`}</p>}
           {icons.length > 0 && (
             <section className="agent-card-section agent-card-panel-part agent-card-panel-actions" aria-label="Actions" data-testid="agent-card-panel-actions">
-              <h3>Actions</h3>
+              <div className="agent-card-panel-actions-heading">
+                <h3>Actions</h3>
+                {editActions && (
+                  <button
+                    type="button"
+                    className="agent-card-panel-edit-actions"
+                    data-testid="agent-card-panel-edit-actions"
+                    aria-label="Edit card actions"
+                    title="Edit card actions"
+                    onClick={() => VOICE_ACTIONS.openCardActionsEditor.run(editActions, card.deckId)}
+                  >Edit</button>
+                )}
+              </div>
               <CardActionIconRow card={card} actions={icons} controls={controls} label={`${shownName}'s actions`} />
             </section>
           )}

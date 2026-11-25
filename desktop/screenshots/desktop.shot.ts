@@ -198,6 +198,44 @@ desktopScenario("agent-cards-select", async (page) => {
   await expect(page.getByTestId("agent-cards-batch-confirm")).toHaveCount(0);
 });
 
+// PR #2491 (the maintainer, 2026-11-25) — the selection bar's Edit card
+// actions, on the two-daemon fleet scene: two cards ticked on the local
+// daemon and the sliders button, set apart after the action group, under the
+// pointer.
+async function openFleetCards(page: Page): Promise<void> {
+  await overview(page, "docs-fleet", "&cards=fleet");
+  await page.getByTestId("overview-mode-cards").click();
+  await expect(page.getByRole("checkbox", { name: "Select API review" })).toBeVisible();
+}
+
+desktopScenario("agent-cards-select-edit", async (page) => {
+  await openFleetCards(page);
+  await page.getByRole("checkbox", { name: "Select Plan / architecture" }).check();
+  await page.getByRole("checkbox", { name: "Select User-path verification" }).check();
+  const bar = page.getByTestId("agent-cards-selection-bar");
+  const edit = bar.getByRole("button", { name: "Edit card actions" });
+  await expect(edit).not.toHaveAttribute("aria-haspopup", /.*/);
+  await expect(bar).toBeInViewport({ ratio: 1 });
+  await edit.hover();
+  expect(await edit.evaluate((node) => node.matches(":hover"))).toBe(true);
+}, { hover: true });
+
+// The same bar with a card ticked on each daemon: Edit card actions opens a
+// menu naming both daemons, and the pointer stays on the button.
+desktopScenario("agent-cards-select-edit-menu", async (page) => {
+  await openFleetCards(page);
+  await page.getByRole("checkbox", { name: "Select Plan / architecture" }).check();
+  await page.getByRole("checkbox", { name: "Select API review" }).check();
+  const bar = page.getByTestId("agent-cards-selection-bar");
+  const edit = bar.getByRole("button", { name: "Edit card actions" });
+  await expect(edit).toHaveAttribute("aria-haspopup", "menu");
+  await edit.click();
+  const menu = page.getByRole("menu", { name: "Edit card actions" });
+  await expect(menu.getByRole("menuitem")).toHaveCount(2);
+  await expect(menu).toBeInViewport({ ratio: 1 });
+  await edit.hover();
+}, { hover: true });
+
 // PR #2491 review J7 — the Card panel scenes are shots of an agent at work,
 // so they wait until its terminal has PAINTED its transcript: the DOM
 // renderer's row holding `line` is in the window, every one of its text runs

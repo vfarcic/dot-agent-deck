@@ -1045,6 +1045,30 @@ export function docsBatchAgentCards(): AgentCardsSnapshot {
   return { ...snapshot, entries, batch: true };
 }
 
+/**
+ * PR #2491 (2026-11-25) — the `cards=fleet` scene
+ * (`/?fixture=1&state=docs-fleet&cards=fleet`): the two daemons of the
+ * `docs-fleet` state both show cards and do batches, so a selection can span
+ * them. The local daemon's are the `cards=batch` scene's; the build box's
+ * are its two agents, each offering Go ahead. Both advertise the Card
+ * actions editor. `undefined` for any other deck.
+ */
+export function fleetAgentCards(deckId: string): AgentCardsSnapshot | undefined {
+  if (deckId === FIXTURE_DAEMON_ID) return { ...docsBatchAgentCards(), catalogEdit: true };
+  if (deckId !== FIXTURE_REMOTE_DAEMON_ID) return undefined;
+  const instance = "docs-fleet-cards";
+  const goAhead = () => docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", prompt_source: "catalog", icon: "play" });
+  const card = (agentId: string, name: string, overrides: Partial<AgentCardEntry>): AgentCardEntry => docsCard(agentId, name, {
+    key: `remote-pane-${agentId}/${agentId}`, pane_id: `remote-pane-${agentId}`, instance_id: instance,
+    actions: [goAhead(), ...docsDeckActions()], primary_action_id: "go-ahead", ...overrides,
+  });
+  const entries = [
+    card("1", "API implementation", { agent_type: "codex", status: "working" }),
+    card("2", "API review", { status: "idle", needs_you: true, needs_you_reasons: ["done"] }),
+  ];
+  return { deckId: FIXTURE_REMOTE_DAEMON_ID, instanceId: instance, revision: 3, entries, catalogErrors: [], tree: true, batch: true, catalogEdit: true };
+}
+
 /** Issue #2399 — how the `cards=batch` scene's daemon refuses `agentId` at Send, if it does. */
 export function docsBatchExecuteFailure(agentId: string): { code: string; message: string } | undefined {
   return DOCS_BATCH_EXECUTE_FAILURES[agentId];

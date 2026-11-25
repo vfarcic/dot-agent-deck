@@ -173,6 +173,16 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards-select-edit",
+        description: "The desktop selection bar with two cards on one daemon ticked: after the action group and set apart from it, the Edit card actions sliders button under the pointer (PR #2491, 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-select-edit-menu",
+        description: "The desktop selection bar with a card ticked on each of two daemons: Edit card actions open on its menu naming both daemons (PR #2491, 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "agent-card-panel",
         description: "An agent's pane opened from its card in the desktop Cards view, with the Card panel beside the terminal: the deck-checked status and pull request, the agent's summary, why it needs you, its question with two answers, and its action icons (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],

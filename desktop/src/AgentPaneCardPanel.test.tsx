@@ -59,7 +59,7 @@ function settingsStore() {
  * whether its cards listing has not been read yet since it connected
  * (`unlisted`: connected, with no cards listing at all).
  */
-type DeckState = { connected?: boolean; endedRoles?: EndedRole[]; tree?: boolean; gone?: string[]; unlisted?: boolean };
+type DeckState = { connected?: boolean; endedRoles?: EndedRole[]; tree?: boolean; gone?: string[]; unlisted?: boolean; catalogEdit?: boolean };
 
 /** The real shell on the dashboard, with a card for each of the fixture deck's first three agents; the third needs you. */
 function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {}) {
@@ -74,6 +74,7 @@ function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {
     ? { ...live, connection: { ...live.connection, status: "disconnected" as const, message: "The daemon stopped answering." }, agents: [], endedRoles: deck.endedRoles }
     : { ...live, agents: live.agents.filter((agent) => !deck.gone?.includes(agent.id)), endedRoles: deck.endedRoles });
   const invokeCardAction = vi.fn(async (_target: unknown, _actionId: string, options?: { requestId?: string }) => ({ request_id: options?.requestId ?? "r", outcome: "sent" as const, message_id: "m-pane-1" }));
+  const readCardCatalog = vi.fn(async () => ({ actions: [], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
   const runtime = (cards: AgentCardEntry[], revision: number, deck: DeckState = initial.deck ?? {}) => ({
     mode: "fixture",
     desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
@@ -92,8 +93,10 @@ function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {
     setZoom: vi.fn(async (level: number) => level),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
-    agentCards: deck.connected === false || deck.unlisted ? {} : { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision, entries: cards, catalogErrors: [], ...(deck.tree ? { tree: true } : {}) } },
+    agentCards: deck.connected === false || deck.unlisted ? {} : { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision, entries: cards, catalogErrors: [], ...(deck.tree ? { tree: true } : {}), ...(deck.catalogEdit ? { catalogEdit: true } : {}) } },
     invokeCardAction,
+    readCardCatalog,
+    editCardCatalog: vi.fn(),
   }) as unknown as DeckRuntimeState;
   const view = render(createElement(DeckShell, { runtime: runtime(entries, 1), initialView: { kind: "overview" } }));
   return {
@@ -101,6 +104,7 @@ function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {
     entries,
     resizeTerminal,
     invokeCardAction,
+    readCardCatalog,
     update: (cards: AgentCardEntry[], revision: number, deck?: DeckState) => view.rerender(createElement(DeckShell, { runtime: runtime(cards, revision, deck), initialView: { kind: "overview" } })),
   };
 }
@@ -403,5 +407,42 @@ describe("the agent pane's Card panel (PR #2491 decision 2026-11-25)", () => {
     }
     expect(fields.querySelector("a")).toBeNull();
     expect(panel()!.querySelector("a[href='https://agent-controlled.invalid/']")).toBeNull();
+  });
+
+  /// Scenario: Open an agent's pane from its card on a daemon whose card actions can be edited. Beside the Card panel's Actions heading is a small Edit button, named "Edit card actions"; pressing it opens that daemon's Card actions editor over the pane and reads its actions. The read-only pane of an agent that has ended shows no Edit, and neither does the panel of an agent whose daemon offers no Card actions editor (PR #2491, 2026-11-25).
+  it("desktop/agent-cards/118: the Card panel's Edit opens its daemon's Card actions editor, and the ended pane has none", async () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const goneId = "gone-118";
+    const ended = cardFor(goneId, "ended-118", { status: "stopped", actions: [action("go-ahead", { label: "Go ahead", enabled: true })] });
+    const shell = renderShell({ extra: [ended], deck: { catalogEdit: true } });
+    fireEvent.click(card(shell.entries[0]));
+    const actions = within(panel()!).getByTestId("agent-card-panel-actions");
+    const heading = within(actions).getByRole("heading", { name: /^Actions/ });
+    const edit = within(actions).getByRole("button", { name: "Edit card actions" });
+    expect(edit).toHaveTextContent("Edit");
+    expect(edit).toHaveAttribute("title", "Edit card actions");
+    expect(edit).toHaveAttribute("type", "button");
+    expect(heading.contains(edit) || heading.parentElement === edit.parentElement, "beside the Actions heading").toBe(true);
+    await act(async () => { fireEvent.click(edit); });
+    const editor = screen.getByRole("dialog", { name: /^Card actions: / });
+    expect(editor).toBeInTheDocument();
+    expect(shell.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
+    await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
+    back();
+
+    fireEvent.click(card(ended));
+    expect(screen.getByTestId("ended-card-pane")).toBeInTheDocument();
+    expect(within(panel()!).queryByRole("button", { name: "Edit card actions" })).toBeNull();
+  });
+
+  /// Scenario: Open an agent's pane from its card on a daemon from a release whose card actions cannot be edited. The Card panel still has Edit beside Actions; pressing it opens that daemon's Card actions editor read-only, saying why, as its ⋯ menu does, and reads nothing.
+  it("desktop/agent-cards/118: the Card panel's Edit opens a daemon that cannot edit card actions read-only", async () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const shell = renderShell();
+    fireEvent.click(card(shell.entries[0]));
+    await act(async () => { fireEvent.click(within(panel()!).getByRole("button", { name: "Edit card actions" })); });
+    const editor = screen.getByRole("dialog", { name: /^Card actions: / });
+    expect(within(editor).getByTestId("agent-card-actions-editor-readonly")).toHaveTextContent(/earlier release, so its card actions cannot be edited from the app/);
+    expect(shell.readCardCatalog).not.toHaveBeenCalled();
   });
 });

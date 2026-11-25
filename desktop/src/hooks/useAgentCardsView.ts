@@ -126,6 +126,8 @@ export interface CardSelection {
   last?: string;
   /** The actions the selected cards offer a batch, in the order they are first met. */
   choices: CardBatchChoice[];
+  /** PR #2491 (2026-11-25) — the daemons the selected cards are on, each once, in the dashboard's order: the selection bar's Edit card actions opens one of their editors. */
+  deckIds: string[];
 }
 
 /**
@@ -755,7 +757,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
     /* Read through the same rule as a batch, so the render before the pruning above lands never counts a card no action reaches. */
     const cards = selectedBatchCards(placed, selected, batchFor);
     const reachable = cards.length === selected.size ? selected : new Set(cards.map(placedCardKey));
-    return { selected: reachable, last: lastToggled, choices: batchChoices(cards) };
+    return { selected: reachable, last: lastToggled, choices: batchChoices(cards), deckIds: [...new Set(cards.map((card) => card.deckId))] };
   }, [anyBatches, batchFor, placed, selected, lastToggled]);
   return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, review: reviewView, notice, dismissNotice, rowMenu, controls, clickControls, voice, cardFor, resultsFor, batchFor, selection, batch: shown ? batch : undefined };
 }

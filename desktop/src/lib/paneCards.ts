@@ -9,7 +9,7 @@ import type { EndedRole } from "../types";
  * answers and action icons, its reference badges, and the pane header's
  * previous, next and Next needing you.
  */
-export type PaneCardControls = Pick<VoiceActionContext, "runCardAction" | "openCardReference" | "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
+export type PaneCardControls = Pick<VoiceActionContext, "runCardAction" | "openCardReference" | "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused" | "openCardActionsEditor">>;
 
 /**
  * PR #2491 decision 2026-11-25 — what the agent pane needs from the
@@ -31,6 +31,8 @@ export interface PaneCardsView {
   endedFor: (card: PlacedCard) => EndedRole | undefined;
   /** Why the last press did not happen, said in the panel, which covers the dashboard's banner. */
   notice: string | undefined;
+  /** PR #2491 (2026-11-25) — whether a deck's Card actions editor opens from the panel's Edit, as from its ⋯ menu. */
+  cardActionsFor?: (deckId: string) => boolean;
   controls: PaneCardControls;
 }
 

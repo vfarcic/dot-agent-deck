@@ -40,7 +40,7 @@ export function OverviewWithCardPane({ onNavigate, ...props }: Omit<ComponentPro
           <button type="button" aria-label="Previous agent" onClick={() => VOICE_ACTIONS.previousAgentCard.run(cards.controls)}>Previous</button>
           <button type="button" aria-label="Next agent" onClick={() => VOICE_ACTIONS.nextAgentCard.run(cards.controls)}>Next</button>
           <button type="button" aria-label="Next agent that needs you" onClick={() => VOICE_ACTIONS.nextNeedsYouCard.run(cards.controls)}>Next needing you</button>
-          <AgentCardPanel card={card} name={pane.agentId} results={card ? cards.resultsFor(card) : {}} tree={cards.treeFor(pane.deckId)} ended={card ? cards.endedFor(card) : undefined} notice={cards.notice} section={view.kind === "agent" ? view.cardSection : undefined} controls={cards.controls} />
+          <AgentCardPanel card={card} name={pane.agentId} results={card ? cards.resultsFor(card) : {}} tree={cards.treeFor(pane.deckId)} ended={card ? cards.endedFor(card) : undefined} notice={cards.notice} section={view.kind === "agent" ? view.cardSection : undefined} controls={cards.controls} cardActions={cards.cardActionsFor?.(pane.deckId) ?? false} />
         </section>
       )}
     </>

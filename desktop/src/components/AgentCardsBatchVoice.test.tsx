@@ -659,4 +659,29 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(screen.getByRole("dialog", { name: `Card actions: ${localName}` })).toBeInTheDocument();
     expect(readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID);
   });
+
+  /// Scenario: With two daemons showing cards, tick a card on the second daemon only and say "open card actions" without naming a daemon: that daemon's Card actions editor opens with no question. Close it, add a card on the first daemon to the selection and say it again: the selection spans both daemons, so the app asks "Which daemon?" as it does with nothing selected (PR #2491, 2026-11-25).
+  it("desktop/agent-cards/119: a bare open card actions prefers the selected cards' daemon when there is exactly one", async () => {
+    const readCardCatalog = vi.fn(async () => ({ actions: [], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
+    const farName = deckName(createFixtureFleet("fleet")[1].connection);
+    const run = setup(
+      (agents) => [cardFor(agents[0].id, "coder-card")],
+      () => ({ "open card actions": { action: "open_card_actions_editor", invoke: "openCardActionsEditor", params: [] } }),
+      { extra: { readCardCatalog, editCardCatalog: vi.fn() }, remote: true },
+    );
+    await turnOnVoice();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select far-coder" }));
+    await speak(run.voice, "open card actions");
+    expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
+    const editor = screen.getByRole("dialog", { name: `Card actions: ${farName}` });
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
+
+    fireEvent.click(cardNode(run.cards[0]).getByRole("checkbox", { name: "Select coder-card" }));
+    expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("2 selected");
+    await speak(run.voice, "open card actions");
+    expect(screen.getByRole("dialog", { name: "Which daemon?" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /^Card actions: / })).toBeNull();
+    expect(readCardCatalog).toHaveBeenCalledTimes(1);
+  });
 });

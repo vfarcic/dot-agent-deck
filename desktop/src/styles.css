@@ -2341,6 +2341,11 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 @media (max-width: 640px) { .agent-pane-needs-you .agent-pane-needs-you-words { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; } }
 .agent-card-section { display: grid; gap: 6px; }
 .agent-card-section h3 { margin: 0; font-size: var(--text-base); }
+/* PR #2491 (the maintainer, 2026-11-25) — the Card panel's Edit beside its Actions heading: a small link-styled button opening the daemon's Card actions editor. */
+.agent-card-panel-actions-heading { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.agent-card-panel-edit-actions { padding: 0 2px; border: 0; border-radius: 3px; color: var(--teal-deep); background: transparent; font-size: var(--text-sm); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.agent-card-panel-edit-actions:hover { color: var(--teal); }
+.agent-card-panel-edit-actions:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
 .agent-card-section p { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .agent-card-question { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 5px; }
 .agent-card-question-text { white-space: pre-wrap; }
@@ -2396,6 +2401,15 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-selection-hint { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: var(--text-sm); }
 .agent-cards-selection-actions { flex: 0 1 auto; }
 .agent-cards-selection-clear { flex: none; margin-left: auto; }
+/* PR #2491 (the maintainer, 2026-11-25) — Edit card actions, after the action group and set apart from it by a gap and a rule in the accent, so it
+   reads as a way into the editor rather than one more action to send. With the selection across daemons it is a ⋯-style menu, which opens upward:
+   the bar sits at the foot of the dashboard. */
+.agent-cards-selection-edit { flex: none; display: inline-flex; align-items: center; margin-left: 6px; padding-left: 12px; border-left: 1px solid var(--teal); }
+.agent-cards-selection-edit-button { width: 28px; height: 26px; color: var(--ink); border-color: var(--teal); }
+.agent-cards-selection-edit-button:hover, .agent-cards-selection-edit-button:focus-visible { color: var(--teal); background: var(--teal-soft); }
+.agent-cards-selection-edit .agent-cards-selection-edit-button[aria-expanded="true"] { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.agent-cards-selection-edit-menu .overview-card-menu-list { top: auto; bottom: calc(100% + 6px); left: 0; right: auto; max-width: calc(100vw - 32px); }
+.agent-cards-selection-edit-menu .overview-card-menu-list button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agent-cards-selection-bar .agent-cards-selection-clear { border-color: var(--teal); }
 .agent-card-select { flex: none; display: inline-flex; align-items: center; }
 .agent-card-select input { margin: 0; width: 14px; height: 14px; accent-color: var(--teal); cursor: pointer; }

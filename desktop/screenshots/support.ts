@@ -106,11 +106,11 @@ export async function fontsSettled(page: Page): Promise<void> {
  * before `prepare` loads it, and the shot is refused unless the app's root
  * says that theme.
  */
-export function desktopScenario(name: string, prepare: (page: Page) => Promise<void>, { tooltip = false }: { tooltip?: boolean } = {}): void {
-  for (const theme of THEMES) desktopScenarioIn(name, theme, prepare, tooltip);
+export function desktopScenario(name: string, prepare: (page: Page) => Promise<void>, { tooltip = false, hover = false }: { tooltip?: boolean; hover?: boolean } = {}): void {
+  for (const theme of THEMES) desktopScenarioIn(name, theme, prepare, tooltip, hover);
 }
 
-function desktopScenarioIn(name: string, theme: Theme, prepare: (page: Page) => Promise<void>, tooltip: boolean): void {
+function desktopScenarioIn(name: string, theme: Theme, prepare: (page: Page) => Promise<void>, tooltip: boolean, hover: boolean): void {
   test(`desktop ${name} ${theme}`, async ({ page }) => {
     // A run told it needs no web build starts no server, so a desktop scenario
     // selected anyway would only fail on a refused connection; say why instead.
@@ -123,9 +123,13 @@ function desktopScenarioIn(name: string, theme: Theme, prepare: (page: Page) => 
     await expect(page.locator("html"), `the app is in the ${theme} theme`).toHaveAttribute("data-theme", theme);
     // Park the pointer where nothing reacts to it, so a hover tooltip from the
     // last click is not in the picture — unless the picture is of a tooltip
-    // (`tooltip: true`), which `prepare` left shown and which must still be.
+    // (`tooltip: true`), which `prepare` left shown and which must still be,
+    // or of a control under the pointer (`hover: true`, PR #2491), which
+    // `prepare` left hovered and which has no drawn tooltip to wait for.
     if (tooltip) {
       await expect(page.locator("[role=tooltip]:visible")).toHaveCount(1);
+    } else if (hover) {
+      await expect(page.locator("[role=tooltip]:visible")).toHaveCount(0);
     } else {
       await page.mouse.move(0, page.viewportSize()!.height - 1);
       await expect(page.locator("[role=tooltip]:visible")).toHaveCount(0);

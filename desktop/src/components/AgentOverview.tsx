@@ -43,7 +43,7 @@ import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import { needsYouSentence, placedCardKey, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
-import { AgentCardsDeckBody, AgentCardsNotes, AgentCardsSelectionBar } from "./AgentCardsGrid";
+import { AgentCardsDeckBody, AgentCardsNotes, AgentCardsSelectionBar, type SelectionBarEditor } from "./AgentCardsGrid";
 import { needsYouRowKeys } from "../lib/agentCardsTree";
 import { MoreMenu, type MoreMenuItem } from "./MoreMenu";
 import { AgentCardReviewDialog } from "./AgentCardReviewDialog";
@@ -1970,7 +1970,25 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const snapshot = deckId !== undefined ? runtime.agentCards?.[deckId] : undefined;
     return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true }] : [];
   }), [decks, runtime.agentCards]);
-  const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons });
+  /* PR #2491 (the maintainer, 2026-11-25) — the daemons the selected cards
+     are on, in the dashboard's order: the selection bar's Edit card actions
+     opens one of their editors, and with a selection on screen on exactly one
+     daemon, a spoken "open card actions" naming none opens that daemon's. */
+  const selectionDaemons = useMemo(() => {
+    const deckIds = cards.mode === "cards" && cards.selection && cards.selection.selected.size > 0 ? cards.selection.deckIds : [];
+    return cardActionDaemons.filter((daemon) => deckIds.includes(daemon.deckId));
+  }, [cardActionDaemons, cards.mode, cards.selection]);
+  const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons, preferredDeckId: selectionDaemons.length === 1 ? selectionDaemons[0].deckId : undefined });
+  /* The editor's opening, stable across renders, for the surfaces outside the
+     overview's own controls (the selection bar, the agent pane's Card panel):
+     it always reaches the editor as it stands now. */
+  const latestEditor = useRef(cardActionsEditor);
+  latestEditor.current = cardActionsEditor;
+  const openCardActionsEditor = useCallback((deckId?: string) => latestEditor.current.controls.openCardActionsEditor(deckId), []);
+  const { shown: editorShown, offeredFor: editorOfferedFor } = cardActionsEditor;
+  const selectionEditor = useMemo<SelectionBarEditor | undefined>(() => (editorShown
+    ? { daemons: selectionDaemons.filter((daemon) => editorOfferedFor(daemon.deckId)), controls: { openCardActionsEditor, reportRefused: cards.clickControls.reportRefused } }
+    : undefined), [cards.clickControls.reportRefused, editorOfferedFor, editorShown, openCardActionsEditor, selectionDaemons]);
   /* PR #2491 decision 2026-11-25 — the items of a daemon's ⋯ menu: Card
      actions, opening the editor bound to that daemon, while it shows cards
      (read-only, with the reason, on a daemon whose release cannot edit them).
@@ -2004,9 +2022,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       treeFor: cards.treeFor,
       endedFor: endedForCard,
       notice: cards.notice,
-      controls: cards.clickControls,
+      /* PR #2491 (the maintainer, 2026-11-25) — the panel's Edit, beside its
+         Actions heading, opens the editor of the agent's daemon. */
+      cardActionsFor: editorOfferedFor,
+      controls: { ...cards.clickControls, openCardActionsEditor },
     }
-    : undefined), [cards.cardFor, cards.clickControls, cards.decksWithCards, cards.notice, cards.resultsFor, cards.shown, cards.treeFor, endedForCard]);
+    : undefined), [editorOfferedFor, openCardActionsEditor, cards.cardFor, cards.clickControls, cards.decksWithCards, cards.notice, cards.resultsFor, cards.shown, cards.treeFor, endedForCard]);
   useLayoutEffect(() => { paneCards?.set(paneCardsView); }, [paneCards, paneCardsView]);
   useEffect(() => () => { paneCards?.set(undefined); }, [paneCards]);
   /* Issue #2399 review — the batch dialog names each agent's daemon the way
@@ -2590,7 +2611,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             />
           ))}
           {/* PR #2491 review — last in the scroll region, so it sticks to the region's foot while cards are selected and, scrolled to the end, sits below the last card rather than over it. */}
-          {cards.mode === "cards" && cards.selection && <AgentCardsSelectionBar selection={cards.selection} controls={cards.clickControls} />}
+          {cards.mode === "cards" && cards.selection && <AgentCardsSelectionBar selection={cards.selection} controls={cards.clickControls} editor={selectionEditor} />}
         </section>
       </main>
       {cards.review && <AgentCardReviewDialog review={cards.review} controls={cards.clickControls} />}
