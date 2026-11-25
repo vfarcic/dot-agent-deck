@@ -178,7 +178,7 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(marker.backgroundColor).not.toBe(text.backgroundColor);
   });
 
-  /// Scenario: review and send an action from the agent's Card panel, then let the agent replace the action's text and token. The review and the panel say the first send happened; the new definition does not inherit that sent result in either.
+  /// Scenario: review and send an action from the agent's Card panel, then let the agent replace the action's text and token. The review and the panel say the first send happened; the new definition does not inherit that sent result: the panel shows none for it, and the review keeps showing the text it sent with its result, not the new text (PR #2491 review J4).
   it("an answer belongs to the action's definition: a reused action id does not show the old text's answer (S1)", async () => {
     const first = runtime([hostile("Run the tests.", "tok-go-1")]);
     const view = render(<OverviewWithCardPane runtime={first} />);
@@ -189,7 +189,11 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     for (const result of screen.getAllByTestId("agent-card-action-result")) expect(result.textContent).toContain("m-1");
     expect(within(screen.getByTestId("agent-card-panel")).getByTestId("agent-card-action-result")).toBeInTheDocument();
     view.rerender(<OverviewWithCardPane runtime={runtime([hostile("Something else.", "tok-go-2")], first.invokeCardAction as never)} />);
-    expect(screen.queryByTestId("agent-card-action-result")).toBeNull();
+    expect(within(screen.getByTestId("agent-card-panel")).queryByTestId("agent-card-action-result")).toBeNull();
+    const step = screen.getByTestId("agent-card-confirm");
+    expect(within(step).getByTestId("agent-card-confirm-prompt").textContent).toBe("Run the tests.");
+    expect(within(step).getByTestId("agent-card-action-result").textContent).toContain("m-1");
+    expect(step.textContent).not.toContain("Something else.");
   });
 
   /// Scenario: read a compact card without a summary, then open its agent's Card panel. The compact card shows the agent's custom action only as an icon whose text is in its hover, never on the card, and the panel's icon says the agent suggested it, with its text in its hover, and shows the fields under the agent's label.
@@ -234,5 +238,40 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(records[0].textContent).toContain("Go ahead");
     expect(records[0].textContent).toContain("Run\u27E6tab\u27E7the tests.");
     expect(within(records[0]).getByTestId("agent-card-delivery-state").textContent).toBe("Delivered to the agent");
+  });
+
+  /// Scenario: Review and send an action, then the card changes under the open review: the agent is closed and its card goes, or the agent stops offering the action it was sent. The review keeps what was sent and says what became of it — sending, sent, closed — and never says nothing was sent; a review whose Send was never pressed still says nothing was sent when its card goes.
+  it.each([
+    { case: "a successful Close, then the card goes", id: "close", answer: { outcome: "closed" }, after: [] as AgentCardEntry[], says: "Closed." },
+    { case: "a sent prompt, then the action is withdrawn", id: "go", answer: { outcome: "sent", message_id: "m-106" }, after: [entry("7", "coder")], says: "Sent (message m-106)." },
+    { case: "a sent prompt, then the card goes", id: "go", answer: { outcome: "sent", message_id: "m-106" }, after: [] as AgentCardEntry[], says: "Sent (message m-106)." },
+    { case: "a press still pending, then the card goes", id: "go", answer: undefined, after: [] as AgentCardEntry[], says: "Sending…" },
+  ])("desktop/agent-cards/106: a sent review keeps its outcome after the card changes ($case)", async ({ id, answer, after, says }) => {
+    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => (answer === undefined ? new Promise(() => {}) : Promise.resolve({ request_id: options.requestId ?? "r", ...answer })));
+    // The row menu's most needed action is the one reviewed: Go ahead, or the card's Close.
+    const first = runtime([id === "close" ? entry("7", "coder", { primary_action_id: "close" }) : hostile("Run the tests.", "tok-go-1")], invoke as never);
+    const view = render(<AgentOverview runtime={first} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    await act(async () => { fireEvent.click(within(row()).getByTestId("overview-row-primary")); });
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    view.rerender(<AgentOverview runtime={runtime(after, invoke as never)} onNavigate={vi.fn()} />);
+    const step = screen.getByTestId("agent-card-confirm");
+    expect(step.textContent).not.toContain("Nothing was sent");
+    expect(within(step).getByTestId("agent-card-action-result")).toHaveTextContent(says);
+    if (id === "go") expect(within(step).getByTestId("agent-card-confirm-prompt").textContent).toBe("Run the tests.");
+    expect(within(step).getByTestId("agent-card-confirm-close")).toBeInTheDocument();
+  });
+
+  /// Scenario: Open the review of an action but do not press Send; the agent is closed and its card goes. The review says the agent was closed and nothing was sent.
+  it("desktop/agent-cards/106: a review never sent still says nothing was sent when its card goes", async () => {
+    const invoke = vi.fn();
+    const first = runtime([hostile("Run the tests.", "tok-go-1")], invoke as never);
+    const view = render(<AgentOverview runtime={first} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    await act(async () => { fireEvent.click(within(row()).getByTestId("overview-row-primary")); });
+    view.rerender(<AgentOverview runtime={runtime([], invoke as never)} onNavigate={vi.fn()} />);
+    expect(screen.getByTestId("agent-card-gone")).toHaveTextContent("This agent was closed. Nothing was sent.");
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

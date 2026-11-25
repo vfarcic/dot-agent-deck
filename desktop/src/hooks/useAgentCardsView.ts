@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { cardTarget, spokenLabelMatch, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardTarget, spokenLabelMatch, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
 import { boundOpenCards, cardTree, openableReference, pathTo, pruneOpenCards, readOpenCards, writeOpenCards } from "../lib/agentCardsTree";
 import { newCardRequestId } from "../lib/bridge";
 import type { CardReferenceTarget } from "../lib/prBrowser";
@@ -196,6 +196,13 @@ export interface CardReviewView {
   token: string;
   sent: boolean;
   results: CardResults;
+  /**
+   * PR #2491 review J4 — once Send is pressed, the action as it was reviewed
+   * and sent, its label, and what became of the press, kept apart from the
+   * card: a Close removes the card, and an agent can stop offering an action
+   * once it has it, and neither makes the review say nothing was sent.
+   */
+  reviewed?: { action: AgentCardAction; label: string; result: CardResults[string] };
 }
 
 /** What {@link useAgentCardsView} hands the overview. */
@@ -284,7 +291,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
   const [storedMode, setStoredMode] = useState<OverviewMode>(readOverviewMode);
   const mode: OverviewMode = shown ? storedMode : "table";
   const [needsYouOnly, setNeedsYouOnly] = useState(false);
-  const [review, setReview] = useState<{ key: string; name: string; actionId: string; token: string; sent?: boolean }>();
+  const [review, setReview] = useState<{ key: string; name: string; actionId: string; token: string; sent?: boolean; reviewed?: CardReviewView["reviewed"]; run?: number }>();
+  /* Numbers each Send from a review, so a late answer lands only on the review that sent it. */
+  const reviewRun = useRef(0);
   const [results, setResults] = useState<Readonly<Record<string, CardResults>>>({});
   const [rowMenu, setRowMenu] = useState<string>();
   // voice-registry-exempt: why a press on a card did nothing, written by the controls that refused it; it opens nothing
@@ -441,10 +450,13 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
   /* `token` is the version of the action the user was shown — the pressed
      button's, or the reviewed step's — and the daemon sends nothing for any
      other (review B2). */
-  const send = useCallback((card: PlacedCard, action: AgentCardAction, options: { confirm?: boolean; text?: string; token?: string }) => {
+  const send = useCallback((card: PlacedCard, action: AgentCardAction, options: { confirm?: boolean; text?: string; token?: string }, onAnswer?: (answer: CardResults[string]) => void) => {
     const cardKey = placedCardKey(card);
     const actionToken = options.token ?? action.token;
-    const record = (answer: CardResults[string]) => setResults((current) => ({ ...current, [cardKey]: { ...current[cardKey], [actionToken]: answer } }));
+    const record = (answer: CardResults[string]) => {
+      setResults((current) => ({ ...current, [cardKey]: { ...current[cardKey], [actionToken]: answer } }));
+      onAnswer?.(answer);
+    };
     if (!invoke) {
       record({ outcome: "failed", message: "this app cannot reach the daemon for card actions" });
       return;
@@ -550,8 +562,13 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
       // The definition reviewed is what is confirmed: a changed action is
       // shown again for review, never sent on the old approval.
       if (action.token !== current.token) return;
-      send(card, action, { confirm: action.confirm, token: current.token });
-      setReview({ ...current, sent: true });
+      /* What was sent and its answer stay with the review (J4), whatever
+         becomes of the card or the action after. */
+      const run = ++reviewRun.current;
+      setReview({ ...current, sent: true, run, reviewed: { action, label: actionLabel(card.entry, action), result: { outcome: "pending" } } });
+      send(card, action, { confirm: action.confirm, token: current.token }, (answer) => {
+        setReview((shown) => (shown?.run === run && shown.reviewed ? { ...shown, reviewed: { ...shown.reviewed, result: answer } } : shown));
+      });
     },
     toggleOverviewRowMenu: (rowKey) => setRowMenu((current) => (current === rowKey ? undefined : rowKey)),
     runCardActionBatch: (ref, wanted) => {
@@ -719,7 +736,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
   const reviewView = useMemo<CardReviewView | undefined>(() => {
     if (!review || !shown) return undefined;
     const card = placed.find((candidate) => placedCardKey(candidate) === review.key);
-    return { card, lastName: review.name, actionId: review.actionId, token: review.token, sent: review.sent === true, results: results[review.key] ?? {} };
+    return { card, lastName: review.name, actionId: review.actionId, token: review.token, sent: review.sent === true, results: results[review.key] ?? {}, ...(review.reviewed ? { reviewed: review.reviewed } : {}) };
   }, [placed, results, review, shown]);
 
   const reviewOpen = reviewView !== undefined;

@@ -27,11 +27,16 @@ export function AgentCardReviewDialog({ review, controls }: {
   const { card, results } = review;
   const entry = card?.entry;
   const name = entry ? displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id) : displayText(review.lastName, DISPLAY_LIMITS.name);
-  const action = entry?.actions.find((candidate) => candidate.id === review.actionId);
+  /* Once sent, the review shows the action it sent and what became of it,
+     not the card's current state: a Close removes the card and an agent can
+     stop offering an action it got, and neither unsends it (review J4). */
+  const sent = review.sent ? review.reviewed : undefined;
+  const action = sent?.action ?? entry?.actions.find((candidate) => candidate.id === review.actionId);
   /* The agent changed the action after the review opened: it shows the new
      text, sends nothing, and asks for a fresh review (review B2). */
-  const changed = action !== undefined && action.token !== review.token;
-  const result = results[review.token];
+  const changed = !sent && action !== undefined && action.token !== review.token;
+  const result = sent?.result ?? results[review.token];
+  const title = sent ? sent.label : entry && action ? actionLabel(entry, action) : "";
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     if (event.key !== "Escape" || event.metaKey || event.ctrlKey || event.altKey) return;
     event.preventDefault();
@@ -52,7 +57,7 @@ export function AgentCardReviewDialog({ review, controls }: {
         onMouseDown={(event) => event.stopPropagation()}
         onKeyDown={onKeyDown}
       >
-        {!entry || !action || !card
+        {!action || (!sent && (!entry || !card))
           ? (
             <>
               <h3 id="agent-card-confirm-title">{name}</h3>
@@ -61,13 +66,13 @@ export function AgentCardReviewDialog({ review, controls }: {
           )
           : (
             <>
-              <h3 id="agent-card-confirm-title">{displayText(actionLabel(entry, action), DISPLAY_LIMITS.name)}?</h3>
+              <h3 id="agent-card-confirm-title">{displayText(title, DISPLAY_LIMITS.name)}?</h3>
               {action.source === "agent" && <p className="agent-card-hint"><SourceBadge source="agent" /> The agent wrote this action and its text.</p>}
               {action.prompt
                 ? <><p>This sends {name} exactly:</p><blockquote className="agent-card-prompt-text" data-testid="agent-card-confirm-prompt"><ExactText text={action.prompt} /></blockquote><ExactTextNote text={action.prompt} /></>
                 : <p>{action.kind === "close_keep_worktree" ? `This closes ${name} and keeps its worktree.` : action.kind === "close" ? `This closes ${name}.` : `This runs ${displayText(action.label, DISPLAY_LIMITS.name)} on ${name}.`}</p>}
               {action.confirm_detail && <p className="agent-card-confirm-detail">{displayText(action.confirm_detail, DISPLAY_LIMITS.detail)}</p>}
-              {changed && !review.sent && (
+              {changed && card && (
                 <p className="agent-card-changed" role="status" data-testid="agent-card-confirm-changed">
                   The agent changed this action while you were reviewing it. Nothing was sent; review the text above before sending it.
                   {" "}<button type="button" className="button secondary compact" data-testid="agent-card-confirm-review" onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: action.id, cardActionReview: true })}>I have reviewed the new text</button>
@@ -77,7 +82,7 @@ export function AgentCardReviewDialog({ review, controls }: {
             </>
           )}
         <div className="agent-card-confirm-buttons">
-          {review.sent || !entry || !action
+          {review.sent || !entry || !action || !card
             ? <button type="button" className="button primary" data-testid="agent-card-confirm-close" onClick={() => VOICE_ACTIONS.closeCardReview.run(controls)}>Close</button>
             : (
               <>

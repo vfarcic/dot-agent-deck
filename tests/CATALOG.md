@@ -17796,6 +17796,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** with 11 included agents in three text groups (nine on the catalog's text, two on different texts their agents wrote), all three texts are quoted before Send, the catalog's marked `catalog` and each agent's `agent says`, the heading reads "Sends to 11 agents: 3 different texts", all 11 names are listed, and Send executes exactly those 11 previewed entries; with 30 on the catalog's text instead, all three texts stay quoted, that group alone lists 8 names and "+22 more", the two agent-written agents stay listed, and pressing it lists all 32 (PR #2491 audit K1).
 - **Does not assert:** the dialog's layout at narrow widths (`033`).
 
+##### desktop/agent-cards/106 — A sent review keeps what it sent and what became of it.
+- **Test:** vitest `desktop/agent-cards/106: …` (five cases) in `desktop/src/components/AgentCardsReview.test.tsx`.
+- **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed card bridge, re-rendered with the card changed.
+- **Asserts:** after Send in the single-action review, a successful Close whose card then goes reads "Closed."; a sent prompt whose action the agent then withdraws, or whose card goes, keeps its quoted text and reads "Sent (message …)."; a press still pending when the card goes reads "Sending…"; none of them says "Nothing was sent", and each offers Close; a review whose Send was never pressed still says "This agent was closed. Nothing was sent." when its card goes (PR #2491 review J4).
+- **Does not assert:** a changed-token review after Send (`S1` in the same file).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
