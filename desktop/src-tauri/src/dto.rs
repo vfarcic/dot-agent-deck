@@ -1522,10 +1522,6 @@ pub enum DesktopAction {
         /// basename and an empty orchestration name is derived from that
         /// basename (PRD #220).
         cwd: String,
-        /// The coordinator's task, which may be empty (issue #1044): the
-        /// daemon then composes the context without a task section and the
-        /// coordinator waits for the user's instructions, as under the TUI.
-        task_prompt: String,
         roles: Vec<OrchestrationRoleInput>,
         rows: Option<u16>,
         cols: Option<u16>,
@@ -2291,7 +2287,6 @@ pub(crate) fn desktop_agent_registry() -> Vec<DesktopAgentOption> {
 pub struct DesktopFeatures {
     pub show_deck: bool,
     pub show_projects: bool,
-    pub show_prompts: bool,
     pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
     pub show_agent_details: bool,
@@ -2305,7 +2300,6 @@ impl DesktopFeatures {
         Self {
             show_deck: features::show_desktop_deck(),
             show_projects: features::show_desktop_projects(),
-            show_prompts: features::show_desktop_prompts(),
             show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
             show_agent_details: features::show_desktop_agent_details(),
@@ -6399,7 +6393,6 @@ mod tests {
             DesktopFeatures {
                 show_deck: false,
                 show_projects: false,
-                show_prompts: false,
                 show_orchestrations: false,
                 show_agent_profiles: false,
                 show_agent_details: false,
@@ -6412,7 +6405,6 @@ mod tests {
             DesktopFeatures {
                 show_deck: true,
                 show_projects: true,
-                show_prompts: true,
                 show_orchestrations: true,
                 show_agent_profiles: true,
                 show_agent_details: true,
@@ -6427,7 +6419,6 @@ mod tests {
         let value = serde_json::to_value(DesktopFeatures {
             show_deck: true,
             show_projects: false,
-            show_prompts: true,
             show_orchestrations: false,
             show_agent_profiles: true,
             show_agent_details: false,
@@ -6438,7 +6429,6 @@ mod tests {
             serde_json::json!({
                 "showDeck": true,
                 "showProjects": false,
-                "showPrompts": true,
                 "showOrchestrations": false,
                 "showAgentProfiles": true,
                 "showAgentDetails": false,

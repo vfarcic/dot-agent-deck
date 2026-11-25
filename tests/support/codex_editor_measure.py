@@ -38,6 +38,11 @@ Modes:
   cwd      issue #2130: Codex's status line and Ctrl+G after `/cd` into a
            project that binds the editor to F6, and back
   worktree issue #2130: the same after `/worktree` (git `work`)
+  sandbox-home  issue #2127: which directory Codex hands its editor a file
+           in, for a CODEX_HOME inside or outside each kind of folder its
+           sandbox may write (`--add-dir`, `writable_roots` in config.toml
+           and in `-c`, a root's own `.codex`, `/tmp` excluded) and under
+           each sandbox mode
 """
 import hashlib
 import json
@@ -221,7 +226,7 @@ class Exited(RuntimeError):
 class Session:
     """One Codex launch on a private PTY, its raw output kept with read times."""
 
-    def __init__(self, rec, name, env=None, args=(), cwd=None):
+    def __init__(self, rec, name, env=None, args=(), cwd=None, base=None):
         import fcntl
         import pty
         import termios
@@ -229,7 +234,7 @@ class Session:
         self.raw, self.reads, self.events = bytearray(), [], []
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
-        self.argv = [rec.binary] + BASE_ARGS + list(args)
+        self.argv = [rec.binary] + (BASE_ARGS if base is None else base) + list(args)
         self.exit_status = None
         self.child, self.fd = pty.fork()
         if self.child == 0:
@@ -380,18 +385,20 @@ class Recorder:
             'wire_api = "responses"', 'requires_openai_auth = true', 'request_max_retries = 0',
             'stream_max_retries = 0', '', extra])
 
-    def seed(self, extra=''):
-        """A fresh CODEX_HOME: the dummy key, the fake provider and the work
-        directory trusted; `extra` appended to config.toml."""
-        if self.codex_home.exists():
-            shutil.rmtree(self.codex_home)
+    def seed(self, extra='', home=None):
+        """A fresh CODEX_HOME (`home`, else `~/.codex`): the dummy key, the
+        fake provider and the work directory trusted; `extra` appended to
+        config.toml."""
+        home = home or self.codex_home
+        if home.exists():
+            shutil.rmtree(home)
         project = self.work / '.codex'
         if project.exists():
             shutil.rmtree(project)
-        self.codex_home.mkdir(mode=0o700)
-        (self.codex_home / 'auth.json').write_text(json.dumps({'auth_mode': 'apikey', 'OPENAI_API_KEY': DUMMY}))
-        os.chmod(self.codex_home / 'auth.json', 0o600)
-        (self.codex_home / 'config.toml').write_text(self.base_config(extra))
+        home.mkdir(mode=0o700, parents=True)
+        (home / 'auth.json').write_text(json.dumps({'auth_mode': 'apikey', 'OPENAI_API_KEY': DUMMY}))
+        os.chmod(home / 'auth.json', 0o600)
+        (home / 'config.toml').write_text(self.base_config(extra))
 
     def plan(self, **plan):
         (self.out / 'plan.json').write_text(json.dumps(plan))
@@ -410,11 +417,11 @@ class Recorder:
         import shlex
         return ' '.join(shlex.quote(w) for w in self.editor_words(tag))
 
-    def launch(self, name, env=None, args=(), wait=30, settle=SETTLE):
+    def launch(self, name, env=None, args=(), wait=30, settle=SETTLE, base=None):
         """A launch at its ready composer, then `settle` seconds more: a
         Ctrl+G about a second after start opens nothing (the `startup`
         mode measures when it starts to)."""
-        s = Session(self, name, env, args)
+        s = Session(self, name, env, args, base=base)
         try:
             ok = s.wait(s.ready, wait)
             if ok:
@@ -908,6 +915,72 @@ class Recorder:
 
     # ---- forms (M44e) -----------------------------------------------------
 
+    def sandbox_home_cases(self):
+        """Issue #2127's layouts: (case, CODEX_HOME, sandbox arguments,
+        other arguments, extra config.toml text). `extra` is a folder outside
+        the working directory that a case makes writable; `/tmp` is the
+        sandbox's own tmpfs."""
+        extra = self.root / 'extra'
+        outside = self.root / 'outside' / 'codexhome'
+        in_extra = extra / 'codexhome'
+        extra_own = extra / '.codex'
+        in_work = self.work / 'codexhome'
+        in_tmp = Path('/tmp/codexhome')
+        ww = ['--sandbox', 'workspace-write', '--ask-for-approval', 'never']
+        roots = f'[sandbox_workspace_write]\nwritable_roots = ["{extra}"]\n'
+        no_tmp = '[sandbox_workspace_write]\nexclude_slash_tmp = true\n'
+        return [
+            ('outside', outside, ww, [], ''),
+            ('outside-add-dir-elsewhere', outside, ww, ['--add-dir', str(extra)], ''),
+            ('in-add-dir', in_extra, ww, ['--add-dir', str(extra)], ''),
+            ('in-add-dir-relative', in_extra, ww, ['--add-dir', '../extra'], ''),
+            ('in-writable-roots', in_extra, ww, [], roots),
+            ('in-writable-roots-c', in_extra, ww, ['-c', f'sandbox_workspace_write.writable_roots=["{extra}"]'], ''),
+            ('add-dir-own-codex', extra_own, ww, ['--add-dir', str(extra)], ''),
+            ('in-extra-no-root', in_extra, ww, [], ''),
+            ('in-cwd', in_work, ww, [], ''),
+            ('in-cwd-full-access', in_work, ['--sandbox', 'danger-full-access', '--ask-for-approval', 'never'], [], ''),
+            ('in-cwd-read-only', in_work, ['--sandbox', 'read-only', '--ask-for-approval', 'never'], [], ''),
+            ('in-tmp', in_tmp, ww, [], ''),
+            ('in-tmp-excluded', in_tmp, ww, [], no_tmp),
+        ]
+
+    def run_sandbox_home(self):
+        (self.root / 'extra').mkdir(mode=0o700)
+        candidates = {'codex_home': None, 'default_home': str(self.codex_home), 'cwd_codex': str(self.work / '.codex')}
+        for case, home, base, args, extra in self.sandbox_home_cases():
+            for stale in (self.codex_home, self.work / '.codex'):
+                if stale.exists():
+                    shutil.rmtree(stale)
+            self.seed(extra, home)
+            env = {'VISUAL': self.editor_command(case), 'CODEX_HOME': str(home)}
+            row = {'case': case, 'codex_home': str(home), 'base': base, 'args': args, 'config_extra': extra}
+            try:
+                s = self.launch(f'sandbox-home-{case}', env, base + WRAP_PAIR + args, base=[])
+            except Exception as exc:
+                row['error'] = repr(exc)
+                self.rows.append(row)
+                continue
+            try:
+                got = self.invoke(s, '\x07', f'sandbox-home-{case}', {'action': 'keep'}, timeout=4)
+                row['opened'] = got['opened']
+                row['footer'] = self.footer(s)
+                if got['opened']:
+                    path = Path(got['start']['path'])
+                    row['export'] = str(path)
+                    row['export_parent_mode'] = got['start']['parent_mode']
+                    where = 'elsewhere'
+                    for key, cand in (('codex_home', home), ('default_home', self.codex_home),
+                                      ('cwd_codex', self.work / '.codex')):
+                        if path.parent == Path(cand) / 'editor':
+                            where = key
+                            break
+                    row['export_in'] = where
+            finally:
+                s.close()
+            self.rows.append(row)
+        self.notes.append({'candidates': candidates})
+
     def run_forms(self):
         self.seed()
         s = self.launch('forms', {'VISUAL': self.editor_command('forms')})
@@ -979,7 +1052,8 @@ def inner(mode, root, binary, release, digest, pyte_path):
     try:
         {'editor': rec.run_editor, 'startup': rec.run_startup, 'config-writes': rec.run_config_writes,
          'e1f': rec.run_e1f, 'keymap': rec.run_keymap,
-         'forms': rec.run_forms, 'cwd': rec.run_cwd, 'worktree': rec.run_worktree}[mode]()
+         'forms': rec.run_forms, 'cwd': rec.run_cwd, 'worktree': rec.run_worktree,
+         'sandbox-home': rec.run_sandbox_home}[mode]()
     except Exception as exc:
         import traceback
         error = repr(exc) + '\n' + traceback.format_exc()

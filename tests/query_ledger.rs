@@ -146,16 +146,25 @@ fn probe_045_split_duplicate_unsolicited_and_cancelled_replies() {
     assert_eq!(input.reply_class(BG), (false, false));
 }
 
-/// Scenario: Note a CPR query, then write its whole reply. The reply settles the query but is never exempt, so it touches the box.
+/// Scenario: Note a CPR query, then write its whole reply; then note another and write a reply in a modified F3 key's shape (`CSI 1 ; 2 R`). Both settle their query. The first is exempt and leaves the box untouched; the second touches it, since a person's key could have sent it (issue #2467 narrowed OQ3 to that shape).
 #[spec("inbox/probe/045")]
 #[test]
-fn probe_045_a_cpr_reply_settles_and_touches() {
+fn probe_045_a_cpr_reply_settles_and_touches_only_in_a_keys_shape() {
     let input = GenerationInput::default();
     noted(&input, &[CPR]);
-    assert_eq!(input.reply_class(CPR), (true, false));
-    assert!(moved(input.enqueue(Writer::Human, CPR_REPLY)));
+    assert_eq!(input.reply_class(CPR), (true, true));
+    assert!(matches!(
+        input.enqueue(Writer::Human, CPR_REPLY),
+        Enqueued::Exempt(_)
+    ));
     assert_eq!(input.reply_class(CPR), (false, false));
     assert!(!input.backlog());
+    assert!(!input.touched());
+    noted(&input, &[CPR]);
+    assert!(moved(input.enqueue(Writer::Human, b"\x1b[1;2R")));
+    assert_eq!(input.reply_class(CPR), (false, false));
+    assert!(!input.backlog());
+    assert!(input.touched());
 }
 
 /// Scenario: With a CPR query outstanding and no answering client, accept a native Ctrl+G, let time pass, then write the CPR's reply. The candidate is latched behind the unanswered backlog, the FIFO stays non-clear across more than two quiet periods, and the reply ends `B` without popping it.
@@ -346,7 +355,7 @@ fn probe_060_the_startup_shape_leaves_b_false() {
     assert!(input.backlog());
     hook.on_output(b"\x1b[?2026h\x1b[1;1H\x1b[Jhello\x1b[?2026l");
     assert!(!input.backlog());
-    assert_eq!(input.reply_class(CPR), (true, false), "still outstanding");
+    assert_eq!(input.reply_class(CPR), (true, true), "still outstanding");
 }
 
 /// Scenario: On a profile that declares nothing, note three CPR queries and write two whole CPR replies, then three more, one of them split and one typed with a byte before it. `B` holds while queries outnumber whole replies, counts a split reply once it is whole, ignores a reply that isn't whole, and is floored at zero.

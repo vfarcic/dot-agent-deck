@@ -60,7 +60,8 @@ pub const T_TRIGGER: Duration = Duration::from_secs(10);
 /// A query whose reply the input side can recognise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
-    /// `CSI 6 n` or `CSI ? 6 n`. Its reply is never exempt (OQ3).
+    /// `CSI 6 n` or `CSI ? 6 n`. Its reply is exempt unless it has a
+    /// modified F3's shape ([`QueryKind::exempt_reply`], issue #2467).
     Cpr,
     /// `CSI c` or `CSI 0 c`.
     Da1,
@@ -76,6 +77,24 @@ impl QueryKind {
             Report::Da1 => Some(Self::Da1),
             Report::OscColour { slot } => Some(Self::OscColour { slot }),
             Report::FocusIn | Report::FocusOut | Report::SgrMouse => None,
+        }
+    }
+
+    /// The query `report` answers, if a whole `report` to it can be exempt
+    /// from touching the box. That is [`Self::answered_by`], except for a
+    /// cursor position report in row 1 at column 2 or later: a key with
+    /// modifiers sends F3 as `CSI 1 ; m R`, `m` from 2, so a reply of that
+    /// shape could be the person's key, the ambiguity `Report::Cpr` records.
+    /// OQ3 refused every CPR reply; issue #2467 narrowed that to the shape a
+    /// key can have, since a client's reply to Codex's start-up query
+    /// (`CSI 1 ; 1 R` in a fresh pane) otherwise left a Codex box touched,
+    /// and, with no observer to check it, unrung for the generation's life.
+    /// Settling a query is not this: any CPR reply settles one
+    /// ([`QueryLedger::settle`]).
+    pub fn exempt_reply(report: Report) -> Option<Self> {
+        match report {
+            Report::Cpr { row: 1, col } if col >= 2 => None,
+            _ => Self::answered_by(report),
         }
     }
 }
@@ -118,9 +137,10 @@ impl QueryLedger {
     }
 
     /// Whether one whole reply to `kind` is exempt from touching the box:
-    /// solicited, not a CPR, and the ledger not saturated.
+    /// solicited, and the ledger not saturated. A CPR reply's shape is the
+    /// caller's to check first ([`QueryKind::exempt_reply`]).
     pub fn exempts(&self, kind: QueryKind) -> bool {
-        !self.saturated && kind != QueryKind::Cpr && self.solicited(kind)
+        !self.saturated && self.solicited(kind)
     }
 
     /// Whether one whole reply to `kind` may pass ahead of a fence whose

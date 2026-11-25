@@ -9,11 +9,17 @@
 //! from the doorbell's own debug line, `doorbell evidence-refresh nudge`,
 //! and timed by that line's timestamp.
 //!
+//! `inbox/probe/105` (issue #2467) runs the same stand-in with a client
+//! attached that answers its query, as the desktop app's terminal does
+//! (`support/cpr_answerer.rs`).
+//!
 //! What it does not show: that a real Codex or Claude Code redraws within its
 //! profile's declared time (M41), or anything about continuing activity, which
 //! can keep moving the estimate (A2 §6): every case here is a finite history
 //! followed by quiescence.
 dot_agent_deck_test_harness::link!();
+#[path = "support/cpr_answerer.rs"]
+mod cpr_answerer;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 
@@ -201,4 +207,42 @@ fn probe_055_a_start_up_without_a_witness_is_nudged_once() {
     let id = enqueue(&deck.daemon, &pane, BODY);
     deck.rings(&pane, &id);
     assert_eq!(deck.nudges(&pane).len(), 1, "one nudge, as today");
+}
+
+/// Scenario: Start the CPR stand-in Idle in two panes, one reported as Claude Code and one as Codex, each with a test-owned client attached that answers cursor position queries as the desktop app's terminal does. Resize each pane, so the stand-in asks for the cursor position and the client's reply reaches it as input, then queue a task: the doorbell rings into each pane, where before issue #2467 the reply counted as the person touching the box and, with no check possible on this pane, held the task queued for the pane's life.
+#[spec("inbox/probe/105")]
+#[test]
+fn probe_105_a_clients_cursor_reply_does_not_hold_the_doorbell() {
+    let deck = Deck::new();
+    for agent_type in ["claude-code", "codex"] {
+        let pane = deck.stand_in(&format!("client-reply-{agent_type}"), &[]);
+        if agent_type != "claude-code" {
+            status(&deck.daemon, &pane, "idle", agent_type);
+        }
+        let record = attach(&deck.daemon, json!({"op": "list-agents"}))["agent_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == pane.agent.as_str())
+            .cloned()
+            .unwrap();
+        let answerer = cpr_answerer::CprAnswerer::attach(
+            deck.daemon.attach_socket(),
+            &pane.agent,
+            record["rows"].as_u64().unwrap() as u16,
+            record["cols"].as_u64().unwrap() as u16,
+        );
+        answerer.resize(40, 120);
+        deck.resize(&pane, 40, 120);
+        assert!(
+            common::wait_until(RING_WAIT, || answerer.answered() >= 1
+                && bytes(&pane).ends_with(b"R")),
+            "{agent_type}: the client answers the stand-in's query and the reply reaches it \
+             (answered {}, received {:?})",
+            answerer.answered(),
+            String::from_utf8_lossy(&bytes(&pane))
+        );
+        let id = enqueue(&deck.daemon, &pane, BODY);
+        deck.rings(&pane, &id);
+    }
 }

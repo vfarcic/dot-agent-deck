@@ -1120,8 +1120,11 @@ impl Telemetry {
         // Whether or not the shim is installed: without it, an id the daemon
         // inherited from another deck's agent would reach this one (#1902).
         env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
+        // PRD #1790 stage 3: a restore spawn already put the shim first.
         if let Some(shim) = self.shim_dir.as_deref().and_then(Path::to_str)
             && let Some(path) = base.get("PATH")
+            && path != shim
+            && !path.starts_with(&format!("{shim}:"))
         {
             // An empty `PATH` is the current directory, and stays so after
             // the shim: `<shim>:` ends in an empty entry.

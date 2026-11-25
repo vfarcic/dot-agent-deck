@@ -90,8 +90,9 @@ use std::sync::Arc;
 /// configuration from this process's environment, (re)write the `PATH` shim
 /// ([`shim`]) running this binary, subscribe the tracker to `event_tx`, and
 /// hand `registry` the handle so the agents it spawns get runs. With telemetry
-/// off the returned handle does nothing, nothing is subscribed, no shim is
-/// written, and `registry` is left alone.
+/// off the returned handle does nothing, nothing is subscribed, and
+/// `registry` is left alone; the shim is still written (PRD #1790 stage 3),
+/// but goes on no ordinary spawn's `PATH`.
 ///
 /// Installs no signal handler: when the daemon's teardown begins is told by
 /// the daemon itself ([`teardown_began`]).
@@ -178,15 +179,22 @@ fn start_from(
     launch::remove_leftover_config_files(&config_dir);
     exporter::remove_leftover_usage_files(&config_dir);
     let mut telemetry = Telemetry::start_in(env, config_dir.clone());
+    // PRD #1790 stage 3: the shim is written whether or not telemetry is on,
+    // since a restore resumes an agent through it; an ordinary spawn's `PATH`
+    // gains its directory only with telemetry on.
     #[cfg(unix)]
-    if telemetry.is_enabled()
-        && let Some(deck) = deck
-    {
+    if let Some(deck) = deck {
         match shim::install(&config_dir, deck) {
-            Ok(dir) => telemetry.set_shim_dir(dir),
+            Ok(dir) => {
+                shim::record_installed(dir.clone());
+                if telemetry.is_enabled() {
+                    telemetry.set_shim_dir(dir);
+                }
+            }
             Err(e) => tracing::warn!(
                 "telemetry: the PATH shim could not be written ({e}); Codex and Devin will not \
-                 switch on their own telemetry"
+                 switch on their own telemetry, and no agent can be restored with its \
+                 conversation"
             ),
         }
     }
@@ -1002,12 +1010,10 @@ mod tests {
         start_from(&exporting_env(), missing, None, &event_tx, &registry);
     }
 
-    /// The daemon writes the `PATH` shim only when telemetry is on, and an
-    /// agent's `PATH` gains it only then: with telemetry off there is no shim
-    /// directory and nothing is added to any agent.
+    /// Scenario: Start the daemon with telemetry off and on and inspect its launch shims and an ordinary Codex spawn's PATH. Shims are installed in both cases, while an ordinary spawn receives the shim PATH only when telemetry is on.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_shim_is_written_and_used_only_when_telemetry_is_on() {
+    async fn the_shim_is_always_written_but_used_for_ordinary_spawns_only_when_telemetry_is_on() {
         let mut on = exporting_env();
         on.insert("PATH".into(), "/usr/bin".into());
         let off: config::EnvMap = [("PATH".to_string(), "/usr/bin".to_string())].into();
@@ -1023,9 +1029,12 @@ mod tests {
                 &registry,
             );
             let shim = dir.path().join(shim::DIR_NAME);
-            assert_eq!(shim.join("codex").is_file(), enabled);
-            assert_eq!(shim.join("devin").is_file(), enabled);
-            assert_eq!(shim.exists(), enabled, "no shim directory when off");
+            for program in ["claude", "codex", "devin"] {
+                assert!(
+                    shim.join(program).is_file(),
+                    "missing {program} shim, telemetry enabled={enabled}"
+                );
+            }
             let mut opts = crate::agent_pty::SpawnOptions {
                 command: Some("codex"),
                 env: crate::test_isolation::pin_unreachable_endpoints(Vec::new()),

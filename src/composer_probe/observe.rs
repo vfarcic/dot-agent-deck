@@ -2662,11 +2662,24 @@ mod linux {
                     .and_then(|codex| {
                         keymap::codex_dotenv_guard(&codex.read.dotenv).map(|()| codex)
                     })
+                    // Issue #2127: and inside no root its launch adds.
                     .and_then(|codex| {
-                        let (Some(home), Some(cwd)) = (keymap::codex_home(&env), cwd) else {
+                        let (Some(home), Some(cwd), Some(args)) =
+                            (keymap::codex_home(&env), cwd, args)
+                        else {
                             return Err(keymap::Hold::Unmeasured);
                         };
-                        keymap::codex_home_checkable(&home, cwd, env("TMPDIR").as_deref())
+                        let user_home = env("HOME")
+                            .filter(|home| !home.is_empty())
+                            .map(std::path::PathBuf::from);
+                        let roots = keymap::codex_writable_roots(
+                            &codex.sources,
+                            &codex.read,
+                            args,
+                            cwd,
+                            user_home.as_deref(),
+                        )?;
+                        keymap::codex_home_checkable(&home, cwd, env("TMPDIR").as_deref(), &roots)
                             .map(|()| codex)
                     }) {
                     // Issue #2130: the directory its status line is

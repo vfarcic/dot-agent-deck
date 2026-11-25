@@ -322,9 +322,9 @@ pub enum Edit {
 }
 
 /// A terminal report or reply a client forwards through the input channel:
-/// D3's focus and SGR mouse reports, D3′'s DA1 and OSC 10/11 colour replies,
-/// and CPR, which core exempts from nothing (OQ3) but whose reply the query
-/// ledger settles on.
+/// D3's focus and SGR mouse reports, and D3′'s DA1, OSC 10/11 colour and
+/// CPR replies (a CPR reply only when it can't be a modified F3, issue #2467;
+/// `super::query_ledger::QueryKind::exempt_reply`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Report {
     /// `CSI I`
@@ -333,8 +333,8 @@ pub enum Report {
     FocusOut,
     /// `CSI < b ; x ; y M` or `… m`.
     SgrMouse,
-    /// `CSI r ; c R`. A modified F3 (`CSI 1 ; 2 R`) has the same shape; the
-    /// caller tells them apart by the cursor the query saw.
+    /// `CSI r ; c R`. A modified F3 (`CSI 1 ; m R`, `m` ≥ 2) has the same
+    /// shape, so a reply in row 1 at column 2 or later is never exempt.
     Cpr { row: u16, col: u16 },
     /// `CSI ? … c`
     Da1,
