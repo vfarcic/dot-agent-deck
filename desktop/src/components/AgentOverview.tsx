@@ -1,5 +1,5 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Ellipsis, Filter, LayoutList, Layers, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { worktreePreview } from "../lib/worktreeClose";
 import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
@@ -41,9 +41,11 @@ import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
 import { ENDED_ROLE_WORDS, endedRoleOfCard, endedRolesOf } from "../lib/endedRoles";
 import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
-import { needsYouSentence, type PlacedCard } from "../lib/agentCards";
+import { needsYouSentence, placedCardKey, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
-import { AgentCardsDeckBody, AgentCardsSelectionBar, AgentCardsToolbar } from "./AgentCardsGrid";
+import { AgentCardsDeckBody, AgentCardsNotes, AgentCardsSelectionBar } from "./AgentCardsGrid";
+import { needsYouRowKeys } from "../lib/agentCardsTree";
+import { MoreMenu, type MoreMenuItem } from "./MoreMenu";
 import { AgentCardReviewDialog } from "./AgentCardReviewDialog";
 import type { PaneCardsChannel, PaneCardsView } from "../lib/paneCards";
 import { AgentCardBatchDialog } from "./AgentCardBatchDialog";
@@ -1885,11 +1887,15 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   /* PRD #2374 — in the Cards view, the cards of a deck whose daemon has them,
      after the dashboard filter; `undefined` for a deck that keeps its usual
      body (the Table view, or a daemon with no cards or not answering). */
-  const cardsOnScreen = (deck: (typeof decks)[number]): PlacedCard[] | undefined => {
+  const cardsOnScreen = (deck: (typeof decks)[number]): PlacedCard[] | undefined => (cards.mode === "cards" ? cardsOfDeck(deck) : undefined);
+  /* The cards of a deck whose daemon has them, after the dashboard filter,
+     whichever view is on screen: what Needs you only and the top bar's
+     needs-you count read in the Table view too (PR #2491 decision 2026-11-25). */
+  function cardsOfDeck(deck: (typeof decks)[number]): PlacedCard[] | undefined {
     const deckId = deck.snapshot.connection.deckId;
-    if (cards.mode !== "cards" || !deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
+    if (!deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
     return cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents)));
-  };
+  }
   /* PRD #1790 stage 2 — a deck's banner, while its daemon lists interrupted work and it was not hidden for this process. */
   const interruptedBannerFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
     const deckId = deck.snapshot.connection.deckId;
@@ -1922,18 +1928,66 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
   }, [decks, filtering]);
   const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, pane: agentPane, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
+  /* The cards on screen across the daemons, whichever view shows: the top
+     bar's needs-you count and the "nothing needs you" note read them. */
+  /* `cardsOfDeck` reads the cards, the decks and the filter, which are the memo's inputs. */
+  const cardsShown = useMemo(() => decks.flatMap((deck) => cardsOfDeck(deck) ?? []), [cards.decksWithCards, cards.placed, decks, filtering]);
+  const needYouCount = cardsShown.filter((card) => card.entry.needs_you).length;
+  /*
+    PR #2491 decision 2026-11-25 — Needs you only in the Table view: each
+    daemon that has cards shows only the rows whose card needs the user and
+    the rows of the agents above them in its card tree, the path the Cards
+    view keeps bright; the rest are hidden rather than faded, since a table
+    row has no tree to keep it in place. A group with none of those rows is
+    left out, and a daemon with none says so in one line. A daemon without
+    cards keeps its rows: it marks nothing as needing the user. The rows
+    numbered for voice are the rows shown, as under the dashboard filter.
+  */
+  const needsYouRows = useMemo(() => (cards.mode === "table" && cards.needsYouOnly ? needsYouRowKeys(cardsShown, cards.treeFor) : undefined), [cards.mode, cards.needsYouOnly, cards.treeFor, cardsShown]);
+  const shownDecks = useMemo(() => (needsYouRows === undefined ? decks : decks.map((deck): FleetDeck => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (deckId === undefined || !deck.connected || !cards.decksWithCards.has(deckId)) return deck;
+    const kept = deck.matchingAgents.filter((agent) => {
+      const card = cards.cardFor(deckId, agent.id, agent.incarnation);
+      return card !== undefined && needsYouRows.has(placedCardKey(card));
+    });
+    const shown = groupAgents(kept);
+    return {
+      ...deck,
+      sections: deck.groups.flatMap((group) => {
+        const matching = shown.find((candidate) => candidate.key === group.key);
+        return matching ? [{ group: matching, matching: true }] : [];
+      }),
+      shownCount: kept.length,
+      needsYouOnly: true,
+    };
+  })), [cards.cardFor, cards.decksWithCards, decks, needsYouRows]);
   /* PRD #2374 decision 2026-11-24 — the Card actions editor, over the daemons
-     whose cards the dashboard shows, in the dashboard's order (which puts the
-     selected daemon first, not necessarily the local one). Each carries
-     whether it is this machine's daemon, from its deck kind, so the editor
-     opens on the local one wherever it is listed, and on the first listed
-     when none is local (issue #2399 review 3). */
+     whose cards the dashboard shows, in the dashboard's order. Each daemon's
+     ⋯ menu opens it bound to that daemon (PR #2491 decision 2026-11-25). */
   const cardActionDaemons = useMemo<CardActionsDaemon[]>(() => decks.flatMap((deck) => {
     const deckId = deck.snapshot.connection.deckId;
     const snapshot = deckId !== undefined ? runtime.agentCards?.[deckId] : undefined;
-    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true, local: deck.snapshot.connection.deckKind === "local" }] : [];
+    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true }] : [];
   }), [decks, runtime.agentCards]);
   const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons });
+  /* PR #2491 decision 2026-11-25 — the items of a daemon's ⋯ menu: Card
+     actions, opening the editor bound to that daemon, while it shows cards
+     (read-only, with the reason, on a daemon whose release cannot edit them).
+     Later items join this list. */
+  const deckMoreItems = (deck: FleetDeck): MoreMenuItem[] | undefined => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (!cards.shown || deckId === undefined || !cardActionsEditor.offeredFor(deckId)) return undefined;
+    const editor = { ...cardActionsEditor.controls, reportRefused: cards.clickControls.reportRefused };
+    return [{
+      key: "card-actions",
+      label: "Card actions",
+      testId: "daemon-card-actions",
+      title: "Add, change, hide or remove the actions this daemon's agents offer on their cards",
+      onSelect: () => VOICE_ACTIONS.openCardActionsEditor.run(editor, deckId),
+    }];
+  };
+  const needYouCountId = useId();
   /* Issue #1965 — the exited role a card is for, from its own deck's reply: the Card panel says why in full. */
   const endedForCard = useCallback((card: PlacedCard) => endedRoleOfCard(decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.snapshot.endedRoles, card.entry), [decks]);
   /* Issue #2418 (D12) — a card's name opens its agent through `openAgent`
@@ -2000,8 +2054,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     !rowsShown
       ? undefined
       /* Issue #1496 — the rows SHOWING, so a number names a row on screen. */
-      : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.sections.flatMap((section) => (section.matching ? section.group.agents : [])) : [])).slice(0, MAX_NUMBERED_ROWS)
-  ), [decks, rowsShown]);
+      : shownDecks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.sections.flatMap((section) => (section.matching ? section.group.agents : [])) : [])).slice(0, MAX_NUMBERED_ROWS)
+  ), [shownDecks, rowsShown]);
   const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => {
     /* Issue #1668 — an orchestration's row by its run's title and its name,
        as Reading names it, so two runs' coders are two names in a choice. */
@@ -2376,8 +2430,49 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" aria-label="Open daemons" title="Open daemons" onClick={openDeck}><SquareTerminal size={14} /></button>}
             {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} consumeCards={runtime.consumeAgentCards} />}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
+            {/* PR #2491 decision 2026-11-25 — while Needs you only is on, a chip beside Filter says so, and one press anywhere on it turns it off. */}
+            {cards.shown && cards.needsYouOnly && (
+              <button
+                type="button"
+                className="button secondary compact needs-you-chip"
+                data-testid="needs-you-chip"
+                aria-label="Needs you only: show every agent"
+                title="Needs you only is on. Press to show every agent again."
+                onClick={() => VOICE_ACTIONS.toggleNeedsYouFilter.run(cards.clickControls, { needsYouOnly: false })}
+              ><span>Needs you only</span><X size={12} aria-hidden="true" /></button>
+            )}
             {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
+            {/*
+              PR #2491 decision 2026-11-25 — the Dashboard's ⋯ menu, right of
+              Refresh: Needs you only, checkable, for both views. The count on
+              it is how many agents on screen need the user, which the line
+              above the cards used to say.
+            */}
+            {cards.shown && (
+              <>
+                <MoreMenu
+                  label="More"
+                  menuLabel="More"
+                  testId="overview-more"
+                  className="more-menu"
+                  menuTestId="overview-more-menu"
+                  buttonClassName="button secondary compact more-menu-button"
+                  icon={<Ellipsis size={14} aria-hidden="true" />}
+                  describedBy={needYouCount > 0 ? needYouCountId : undefined}
+                  badge={needYouCount > 0 ? <span className="more-menu-count" data-testid="overview-needs-you-count" aria-hidden="true">{needYouCount}</span> : undefined}
+                  items={[{
+                    key: "needs-you-only",
+                    label: "Needs you only",
+                    testId: "overview-needs-you-only",
+                    checked: cards.needsYouOnly,
+                    title: cards.needsYouOnly ? "Show every agent again" : "Show only the agents that need you, with the agents they sit under",
+                    onSelect: () => VOICE_ACTIONS.toggleNeedsYouFilter.run(cards.clickControls, { needsYouOnly: !cards.needsYouOnly }),
+                  }]}
+                />
+                {needYouCount > 0 && <span id={needYouCountId} hidden>{needYouCount} {needYouCount === 1 ? "agent needs" : "agents need"} you</span>}
+              </>
+            )}
           </div>
         </header>
 
@@ -2443,12 +2538,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} editor={cardActionsEditor.shown ? { ...cardActionsEditor.controls, reportRefused: cards.clickControls.reportRefused } : undefined} />}
+          {cards.shown && <AgentCardsNotes cards={cardsShown} needsYouOnly={cards.needsYouOnly} cardsView={cards.mode === "cards"} />}
           {/* PRD #2374 — in the Cards view every deck keeps its own section and
               header, with the daemon's own controls; a deck whose daemon has
               cards shows them as the section's body, and one with no cards (or
               that is not answering) keeps its usual body. */}
-          {decks.map((deck) => (
+          {shownDecks.map((deck) => (
             <DeckGroup
               /*
                 PRD #742 M5: the KEY, not the label. `socketPath` is
@@ -2491,6 +2586,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
               onCloseHost={() => { if (deck.snapshot.connection.deckId !== undefined) closeHostMetrics(deck.snapshot.connection.deckId); }}
               interruptedBanner={interruptedBannerFor(deck)}
+              moreItems={deckMoreItems(deck)}
             />
           ))}
           {/* PR #2491 review — last in the scroll region, so it sticks to the region's foot while cards are selected and, scrolled to the end, sits below the last card rather than over it. */}
@@ -2549,6 +2645,8 @@ interface FleetDeck {
   shownCount: number;
   /** The agents the filter shows (all of {@link agents} while none is set): the Cards view shows their cards. */
   matchingAgents: OverviewAgent[];
+  /** PR #2491 decision 2026-11-25 — `sections` hold only the rows Needs you only keeps (the Table view). */
+  needsYouOnly?: boolean;
   counts: { status: StatusWord; count: number }[];
   connected: boolean;
 }
@@ -2613,9 +2711,11 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner }: {
+function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner, moreItems }: {
   /** PRD #1790 stage 2 — this deck's interrupted work banner, while its daemon lists any. */
   interruptedBanner?: ReactNode;
+  /** PR #2491 decision 2026-11-25 — the items of this daemon's ⋯ menu; no menu while it has none. */
+  moreItems?: readonly MoreMenuItem[];
   deck: FleetDeck;
   /** PRD #2374 — in the Cards view, this deck's cards, shown in place of its agent table. */
   cardsBody?: ReactNode;
@@ -2763,6 +2863,19 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={upgradeLabel ?? `Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={upgradeTitle} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {(onStopDaemon || stopDaemonReason) && <button type="button" className="button secondary compact daemon-stop" data-testid="daemon-stop" aria-label={`Stop the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={stopDaemonReason ? displayTitle(stopDaemonReason) : undefined} disabled={!onStopDaemon} onClick={onStopDaemon}><CircleStop size={13} /><span>Stop daemon</span></button>}
+        {/* PR #2491 decision 2026-11-25 — this daemon's ⋯ menu, just left of New agent. */}
+        {moreItems && moreItems.length > 0 && (
+          <MoreMenu
+            label={`More for ${deckName(connection)}`}
+            menuLabel={`More for ${deckName(connection)}`}
+            testId="daemon-more"
+            menuTestId="daemon-more-menu"
+            className="more-menu daemon-more"
+            buttonClassName="button secondary compact more-menu-button"
+            icon={<Ellipsis size={13} aria-hidden="true" />}
+            items={moreItems}
+          />
+        )}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
         </div>
         {/*
@@ -2789,6 +2902,7 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
           agents={deck.agents}
           sections={deck.sections}
           filtering={filtering}
+          needsYouOnly={deck.needsYouOnly === true}
           now={now}
           columns={columns}
           connection={connection}
@@ -2825,9 +2939,11 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent, onAddDaemon }: {
+function DaemonBody({ agents, sections, filtering, needsYouOnly, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent, onAddDaemon }: {
   agents: OverviewAgent[];
   sections: OverviewSection[];
+  /** PR #2491 decision 2026-11-25 — `sections` are what Needs you only keeps in the Table view. */
+  needsYouOnly: boolean;
   filtering: boolean;
   /** The one instant every relative cell on this screen is measured against. */
   now: number;
@@ -3001,6 +3117,10 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
     shows none of: while filtering it reads like every other empty daemon. The
     connection notes above stay first — they say why nothing can be listed.
   */
+  /* PR #2491 decision 2026-11-25 — under Needs you only, a daemon none of whose agents needs the user is one line too. */
+  if (needsYouOnly && !sections.length) {
+    return <p className="overview-filter-empty" data-testid="overview-needs-you-empty">{filterDaemonName(connection)}: no agent needs you</p>;
+  }
   if (filtering && !sections.some((section) => section.matching)) {
     return <p className="overview-filter-empty" data-testid="overview-filter-empty">{filterDaemonName(connection)}: no matching agents</p>;
   }

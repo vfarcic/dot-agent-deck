@@ -210,18 +210,55 @@ action = "remove_card_action"
 outcome = "dispatch"
 resolved_card_action = "deploy it"
 
-# Issue #2399 review 12: the editor's choices that write nothing — which
-# daemon's actions it lists (by the daemon's name), reading the list again, the
-# form's icon (by the icon's name, held to the transcript like the directory
-# filter) and its two checkboxes, one row per state, so each state is its own
-# fixture and a spoken "send without asking" can never land on the tick.
+# PR #2491 decision 2026-11-25: the editor belongs to one daemon, opened from
+# that daemon's ⋯ menu, so naming the daemon is `open_card_actions_editor`'s
+# optional `deck` (the retired Daemon picker's `choose_card_actions_daemon`
+# row is gone). A bare "open card actions" dispatches with no deck: the app
+# opens the only daemon showing cards, or asks which.
+[[fixtures]]
+name = "card-actions-editor-open-bare"
+utterance = "open card actions"
+screen = "overview"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-open-on-named-daemon"
+utterance = "open card actions on the build box"
+screen = "overview"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
 [[fixtures]]
 name = "card-actions-editor-daemon-by-name"
 utterance = "show the build box daemon's card actions"
 screen = "overview"
-action = "choose_card_actions_daemon"
+action = "open_card_actions_editor"
 outcome = "dispatch"
 resolved_deck = "deck-build-box"
+
+# PR #2491 decision 2026-11-25: Needs you only moved to the dashboard's ⋯ menu
+# and applies to the Table view too; its spoken forms keep working.
+[[fixtures]]
+name = "needs-you-only-on"
+utterance = "only the ones that need me"
+screen = "overview"
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "needs-you-only-off-show-all-cards"
+utterance = "show all cards"
+screen = "overview"
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+
+# Issue #2399 review 12: the editor's choices that write nothing — reading the
+# list again, the form's icon (by the icon's name, held to the transcript like
+# the directory filter) and its two checkboxes, one row per state, so each state
+# is its own fixture and a spoken "send without asking" can never land on the
+# tick.
 
 [[fixtures]]
 name = "card-actions-editor-refresh"

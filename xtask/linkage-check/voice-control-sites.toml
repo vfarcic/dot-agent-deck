@@ -880,6 +880,25 @@ handler = "onClick"
 code = "() => { onClose(); button.current?.focus(); }"
 reason = "The Host popover's close X: a dismissal; voice closes it with `close` (closeTopmost → closeHostMetrics)."
 
+# --- desktop/src/components/MoreMenu.tsx ---
+#
+# PR #2491 decision 2026-11-25 — the app's ⋯ ("More") menu, shared by every
+# daemon's header, the Dashboard's top bar and a Table row. Opening and
+# closing it is a view toggle; voice reaches each item's own registry entry
+# directly, so the menu itself is not a capability.
+
+[[site]]
+file = "desktop/src/components/MoreMenu.tsx"
+handler = "onClick"
+code = '() => (open ? close(false) : openWith("first"))'
+reason = "A ⋯ button opens or closes its menu: a view toggle with nothing behind it but the menu's items, each of which voice reaches directly through its own registry entry (`open_card_actions_editor`, `filter_needs_you_cards`, `show_agent_card`, `run_card_action`), so a row to open the menu would only add a step."
+
+[[site]]
+file = "desktop/src/components/MoreMenu.tsx"
+handler = "onClick"
+code = "() => { close(true); item.onSelect(); }"
+reason = "One item of a ⋯ menu: closes the menu and runs the item's `onSelect`, which every host passes as a single `VOICE_ACTIONS.<id>.run(…)` dispatch (Card actions, Needs you only, Show card, a card's primary action), so the capability is the registry entry the host names, already voice-reachable."
+
 # --- desktop/src/components/NavigationRail.tsx ---
 
 [[site]]

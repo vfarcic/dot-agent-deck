@@ -7,6 +7,7 @@ import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter
 import { OpenCardReference, type CardReferenceTarget } from "../lib/prBrowser";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardCheckedRef, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { OverviewWithCardPane } from "../test/cardPane";
+import { needsYouOnlyChecked, pressNeedsYouOnly } from "../test/needsYouMenu";
 import { AgentOverview } from "./AgentOverview";
 
 /*
@@ -450,24 +451,24 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(stale.getAttribute("title")).toMatch(/last checked/i);
   });
 
-  /// Scenario: press Needs you only with every tree closed. The trees on the path to each card that needs the user open, those cards and the cards on their paths stay bright, every other card fades, and pressing it again unfades them.
+  /// Scenario: press Needs you only in the top bar's ⋯ menu with every tree closed. The trees on the path to each card that needs the user open, those cards and the cards on their paths stay bright, every other card fades, and pressing it again unfades them.
   it("desktop/agent-cards/015: Needs you only opens the path to every card that needs you and fades the rest", () => {
     cardsView();
-    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
-    expect(screen.getByTestId("agent-cards-needs-you-filter").getAttribute("aria-pressed")).toBe("true");
+    pressNeedsYouOnly();
+    expect(needsYouOnlyChecked()).toBe(true);
     expect(toggle(QUEUE).getAttribute("aria-expanded")).toBe("true");
     expect(toggle(LEAD).getAttribute("aria-expanded")).toBe("true");
     expect(toggle(TRIAGE).getAttribute("aria-expanded")).toBe("true");
     const faded = (card: AgentCardEntry) => cardOf(card.key).getAttribute("data-faded") === "true";
     expect(TREE.filter(faded).map((card) => card.name)).toEqual(["coder", "unit", "solo"]);
-    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    pressNeedsYouOnly();
     expect(TREE.filter((card) => document.querySelector(`article[data-card-key="${card.key}"]`) !== null).filter(faded)).toEqual([]);
   });
 
   /// Scenario: with Needs you only on, close triage's tree, then the daemon sends a list in which a new card under solo and a new card one level under the open dispatcher's unit need the user. Solo's and the unit's trees open on their own and both new cards are bright, while triage stays closed because nothing under it newly needs the user; then close the orchestrator and the coder under it comes to need the user, and the orchestrator opens again.
   it("desktop/agent-cards/015: while Needs you only is on, a card that comes to need you has the way to it opened", () => {
     const view = cardsView();
-    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    pressNeedsYouOnly();
     fireEvent.click(toggle(TRIAGE));
     expect(toggle(TRIAGE).getAttribute("aria-expanded")).toBe("false");
 
@@ -676,7 +677,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     cardsView(runtime([first, second]));
     expect(roots()).toEqual([first.key]);
     expect(shownKeys()).toEqual([first.key, second.key]);
-    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    pressNeedsYouOnly();
     expect(shownKeys()).toEqual([first.key, second.key]);
     expect(cardOf(first.key).getAttribute("data-faded")).toBeNull();
     fireEvent.click(toggle(first));

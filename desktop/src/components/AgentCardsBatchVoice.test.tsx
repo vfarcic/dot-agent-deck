@@ -3,7 +3,8 @@ import { resolve } from "node:path";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DeckShell } from "../App";
-import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
+import { deckName } from "../lib/displayText";
 import { ANOTHER_BATCH_SENDING, BATCH_STILL_SENDING } from "../hooks/useAgentCardsView";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
@@ -31,6 +32,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 const INSTANCE = "daemon-instance-batch-voice";
+const REMOTE_INSTANCE = "daemon-instance-batch-voice-remote";
 const MODE_KEY = "dot-agent-deck.overview.mode";
 const commandsSource = readFileSync(resolve("src-tauri/src/voice/commands.toml"), "utf8");
 
@@ -95,7 +97,7 @@ const actionParam = (label: string): VoiceResolvedParamDto => ({ name: "action",
 type Said = { action: string; invoke: string; params: VoiceResolvedParamDto[] };
 
 /** The real shell on the dashboard's cards, one daemon whose cards are `entries`, and what each utterance resolves to. */
-function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (agents: { id: string }[]) => Record<string, Said>, { holdExecution = false, extra = {}, catalogEdit = true }: { holdExecution?: boolean; extra?: Record<string, unknown>; catalogEdit?: boolean } = {}) {
+function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (agents: { id: string }[]) => Record<string, Said>, { holdExecution = false, extra = {}, catalogEdit = true, remote = false }: { holdExecution?: boolean; extra?: Record<string, unknown>; catalogEdit?: boolean; remote?: boolean } = {}) {
   const voice = microphone();
   const base = createFixtureSnapshot("connected");
   const snapshot = { ...base, connection: { ...base.connection, incarnation: INSTANCE }, agents: base.agents.map((agent) => ({ ...agent, incarnation: INSTANCE })) };
@@ -134,6 +136,13 @@ function setup(entries: (agents: { id: string }[]) => AgentCardEntry[], said: (a
     agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: cards, catalogErrors: [], tree: true, batch: true, catalogEdit } },
     invokeCardAction, invokeCardActionBatch, resolveVoice, ...voice, ...extra,
   } as unknown as DeckRuntimeState;
+  /* PR #2491 decision 2026-11-25 — a second daemon with cards of its own, for the questions only several daemons raise. */
+  if (remote) {
+    const far = createFixtureFleet("fleet")[1];
+    const farDeck = { ...far, connection: { ...far.connection, incarnation: REMOTE_INSTANCE }, agents: [{ ...createFixtureStartedAgent({ id: "1", daemonId: FIXTURE_REMOTE_DAEMON_ID, displayName: "far-coder", command: "claude", cwd: "/w" }), incarnation: REMOTE_INSTANCE }] };
+    runtime.fleet = [snapshot, farDeck] as DeckRuntimeState["fleet"];
+    runtime.agentCards = { ...runtime.agentCards, [FIXTURE_REMOTE_DAEMON_ID]: { deckId: FIXTURE_REMOTE_DAEMON_ID, instanceId: REMOTE_INSTANCE, revision: 1, entries: [{ ...cardFor("1", "far-coder"), instance_id: REMOTE_INSTANCE }], catalogErrors: [], tree: true, batch: true, catalogEdit } } as DeckRuntimeState["agentCards"];
+  }
   const { rerender } = render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
   /* The daemon's next list of cards, as a new runtime state. */
   const setCards = (next: AgentCardEntry[]) => {
@@ -355,7 +364,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     );
     await turnOnVoice();
     await speak(run.voice, "open the card actions editor");
-    const editor = screen.getByRole("dialog", { name: "Card actions" });
+    const editor = screen.getByRole("dialog", { name: /^Card actions: / });
     expect(readCardCatalog).toHaveBeenCalledWith(FIXTURE_DAEMON_ID);
 
     await speak(run.voice, "add a card action");
@@ -377,7 +386,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     // The registry and the command table agree, row by row: each voice entry has one row invoking it, on the dashboard, with its parameters.
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
     const rows: [string, string, { name: string; kind: string }[]][] = [
-      ["openCardActionsEditor", "open_card_actions_editor", []],
+      ["openCardActionsEditor", "open_card_actions_editor", [{ name: "deck", kind: "deck_ref" }]],
       ["addCardAction", "add_card_action", []],
       ["editCardAction", "edit_card_action", [{ name: "action", kind: "card_action" }]],
       ["removeCardAction", "remove_card_action", [{ name: "action", kind: "card_action" }]],
@@ -387,9 +396,12 @@ describe("batch card actions by voice (issue 2399 review)", () => {
       expectRow(row, id, ["overview"], params);
     }
     // Every other control of the editor is reachable by voice through a row of its own, or says, in a reason someone can
-    // disagree with, why it is not (CLAUDE.md rule 23): the presses that write the daemon's config, choosing the daemon,
-    // choosing an icon, and closing the form or the editor.
-    for (const id of ["confirmRemoveCardAction", "saveCardAction", "hideCardAction", "restoreCardAction", "chooseCardActionsDaemon", "chooseCardActionIcon", "showCardActionOnCard", "showCardActionOnlyInCardPanel", "askBeforeSendingCardAction", "sendCardActionWithoutAsking", "offerCardActionOnEveryCard", "offerCardActionWhenAgentsChoose", "refreshCardActions", "cancelCardActionForm", "closeCardActionsEditor"]) {
+    // disagree with, why it is not (CLAUDE.md rule 23): the presses that write the daemon's config, choosing an icon, and
+    // closing the form or the editor. The editor's daemon is named when it opens (PR #2491 decision 2026-11-25), so the
+    // Daemon picker's entry is gone.
+    expect((VOICE_ACTIONS as unknown as Record<string, unknown>).chooseCardActionsDaemon, "the Daemon picker's entry is retired").toBeUndefined();
+    expect(commandRows().some((candidate) => candidate.id === "choose_card_actions_daemon"), "and so is its row").toBe(false);
+    for (const id of ["confirmRemoveCardAction", "saveCardAction", "hideCardAction", "restoreCardAction", "chooseCardActionIcon", "showCardActionOnCard", "showCardActionOnlyInCardPanel", "askBeforeSendingCardAction", "sendCardActionWithoutAsking", "offerCardActionOnEveryCard", "offerCardActionWhenAgentsChoose", "refreshCardActions", "cancelCardActionForm", "closeCardActionsEditor"]) {
       const entry = registry[id];
       expect(entry, `${id} is in the registry`).toBeDefined();
       if (entry?.voice) {
@@ -406,8 +418,8 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(registry.saveCardAction?.voice).not.toBe(true);
   });
 
-  /// Scenario: Open the editor and Ship it's form by voice, then say an icon's name ("icon git merge"), "ask before sending", "offer on every card", "only in the Card panel", their opposites, "refresh the card actions" and a daemon's name. The form's icon becomes git-merge and an unknown icon name is refused in words; each checkbox and the Placement choice follow what was said, whatever they were before; Refresh reads the list again and keeps the form; the editor's daemon is chosen by its name, and a daemon not on the dashboard is refused in words. Nothing is written, and each of these entries is a voice entry with exactly one row (issue #2399 review 12, re-review N4).
-  it("desktop/agent-cards/075: voice chooses the editor's daemon, reads it again and sets the form's icon and checkboxes, writing nothing", async () => {
+  /// Scenario: Open the editor and Ship it's form by voice, then say an icon's name ("icon git merge"), "ask before sending", "offer on every card", "only in the Card panel", their opposites, "refresh the card actions" and "open card actions" naming a daemon. The form's icon becomes git-merge and an unknown icon name is refused in words; each checkbox and the Placement choice follow what was said, whatever they were before; Refresh reads the list again and keeps the form; naming the daemon the editor is already on keeps it as it is, and a daemon not on the dashboard is refused in words. Nothing is written, and each of these entries is a voice entry with exactly one row (issue #2399 review 12, re-review N4; PR #2491 decision 2026-11-25).
+  it("desktop/agent-cards/075: voice names the editor's daemon, reads it again and sets the form's icon and checkboxes, writing nothing", async () => {
     const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };
     const readCardCatalog = vi.fn(async () => ({ actions: [ship], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
     const editCardCatalog = vi.fn();
@@ -428,15 +440,15 @@ describe("batch card actions by voice (issue 2399 review)", () => {
         "only in the Card panel": row("show_card_action_only_in_the_card_panel", "showCardActionOnlyInCardPanel"),
         "show it on the card": row("show_card_action_on_the_card", "showCardActionOnCard"),
         "refresh the card actions": row("refresh_card_actions", "refreshCardActions"),
-        "card actions of the local daemon": row("choose_card_actions_daemon", "chooseCardActionsDaemon", [deck(FIXTURE_DAEMON_ID, "Local daemon")]),
-        "card actions of the moon": row("choose_card_actions_daemon", "chooseCardActionsDaemon", [deck("deck-not-on-the-dashboard", "moon")]),
+        "open card actions on the local daemon": row("open_card_actions_editor", "openCardActionsEditor", [deck(FIXTURE_DAEMON_ID, "Local daemon")]),
+        "open card actions on the moon": row("open_card_actions_editor", "openCardActionsEditor", [deck("deck-not-on-the-dashboard", "moon")]),
       }),
       { extra: { readCardCatalog, editCardCatalog } },
     );
     await turnOnVoice();
     await speak(run.voice, "open the card actions editor");
     await speak(run.voice, "edit the ship it action");
-    const editor = screen.getByRole("dialog", { name: "Card actions" });
+    const editor = screen.getByRole("dialog", { name: /^Card actions: / });
     const box = (label: string) => within(editor).getByLabelText(label) as HTMLInputElement;
 
     await speak(run.voice, "icon git merge");
@@ -469,15 +481,15 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(readCardCatalog).toHaveBeenCalledTimes(reads + 1);
     expect((within(editor).getByLabelText("Name") as HTMLInputElement).value, "the form is kept").toBe("ship");
 
-    await speak(run.voice, "card actions of the local daemon");
+    await speak(run.voice, "open card actions on the local daemon");
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent(/not on the dashboard/);
-    await speak(run.voice, "card actions of the moon");
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("That daemon is not on the dashboard.");
+    expect((within(editor).getByLabelText("Name") as HTMLInputElement).value, "naming the daemon it is on keeps the form").toBe("ship");
+    await speak(run.voice, "open card actions on the moon");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That daemon is not on the dashboard, or shows no cards, so its card actions cannot be shown.");
     expect(editCardCatalog).not.toHaveBeenCalled();
 
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean }>;
     const rows: [string, string, { name: string; kind: string }[]][] = [
-      ["chooseCardActionsDaemon", "choose_card_actions_daemon", [{ name: "deck", kind: "deck_ref" }]],
       ["refreshCardActions", "refresh_card_actions", []],
       ["chooseCardActionIcon", "choose_card_action_icon", [{ name: "icon", kind: "filter_text" }]],
       ["askBeforeSendingCardAction", "ask_before_sending_card_action", []],
@@ -536,12 +548,12 @@ describe("batch card actions by voice (issue 2399 review)", () => {
       await speak(run.voice, "edit the deploy it action");
       await settled();
       expect(readCardCatalog).toHaveBeenCalledTimes(1);
-      expect(screen.getByRole("dialog", { name: "Card actions" })).toBeInTheDocument();
+      expect(screen.getByRole("dialog", { name: /^Card actions: / })).toBeInTheDocument();
       expect(report()).toHaveTextContent('No single card action is called "Deploy it" in the editor.');
       expect(screen.queryByLabelText("Name")).toBeNull();
       await speak(run.voice, "close the card actions editor");
       await settled();
-      expect(screen.queryByRole("dialog", { name: "Card actions" })).toBeNull();
+      expect(screen.queryByRole("dialog", { name: /^Card actions: / })).toBeNull();
       await speak(run.voice, "remove the deploy it action");
       await settled();
       expect(report()).toHaveTextContent('No single card action is called "Deploy it" in the editor.');
@@ -570,17 +582,81 @@ describe("batch card actions by voice (issue 2399 review)", () => {
       await turnOnVoice();
       await speak(run.voice, "edit the ship it action");
       await settled();
-      const editor = screen.getByRole("dialog", { name: "Card actions" });
+      const editor = screen.getByRole("dialog", { name: /^Card actions: / });
       expect((within(editor).getByLabelText("Name") as HTMLInputElement).value).toBe("ship");
       expect(report()).toHaveTextContent(CARD_ACTION_FORM_OPENED);
       await speak(run.voice, "close the card actions editor");
       await settled();
-      expect(screen.queryByRole("dialog", { name: "Card actions" })).toBeNull();
+      expect(screen.queryByRole("dialog", { name: /^Card actions: / })).toBeNull();
       await speak(run.voice, "remove the ship it action");
       await settled();
       expect(screen.getByRole("alertdialog", { name: "Remove Ship it?" })).toBeInTheDocument();
       expect(report()).toHaveTextContent(CARD_ACTION_REMOVAL_ASKED);
       expect(editCardCatalog).not.toHaveBeenCalled();
     }
+  });
+
+  /// Scenario: On the Table view, say "only the ones that need me" and then "show all cards". The first keeps the Table on screen and shows only the agent whose card needs you and the agent above it, with the Needs you only chip beside Filter; the second brings every row back and the chip goes (PR #2491 decision 2026-11-25).
+  it("desktop/agent-cards/114: the spoken Needs you only applies to the Table view and keeps it", async () => {
+    window.localStorage.setItem(MODE_KEY, "table");
+    const needsYou = (value: "on" | "off"): VoiceResolvedParamDto => ({ name: "needs_you", kind: "needs_you_filter", spoken: value, value, label: value });
+    const run = setup(
+      (agents) => {
+        const parent = cardFor(agents[0].id, "parent-card");
+        return [parent, cardFor(agents[1].id, "child-card", { parent: parent.key, needs_you: true, needs_you_reasons: ["question"], status: "waiting_for_input" }), ...agents.slice(2).map((agent, at) => cardFor(agent.id, `other-${at}`))];
+      },
+      () => ({
+        "only the ones that need me": { action: "filter_needs_you_cards", invoke: "toggleNeedsYouFilter", params: [needsYou("on")] },
+        "show all cards": { action: "filter_needs_you_cards", invoke: "toggleNeedsYouFilter", params: [needsYou("off")] },
+      }),
+    );
+    const rows = () => screen.queryAllByRole("row", { name: /Open .* agent$/ });
+    const before = rows().length;
+    expect(before).toBeGreaterThan(2);
+    await turnOnVoice();
+    await speak(run.voice, "only the ones that need me");
+    expect(screen.getByTestId("overview-mode-table")).toHaveAttribute("aria-checked", "true");
+    expect(document.querySelector("[data-testid^='agent-cards-deck-']"), "the Cards view is not shown").toBeNull();
+    expect(rows()).toHaveLength(2);
+    expect(screen.getByTestId("needs-you-chip")).toBeInTheDocument();
+    await speak(run.voice, "show all cards");
+    expect(rows()).toHaveLength(before);
+    expect(screen.queryByTestId("needs-you-chip")).toBeNull();
+    expect(screen.getByTestId("overview-mode-table")).toHaveAttribute("aria-checked", "true");
+  });
+
+  /// Scenario: With two daemons showing cards, say "open card actions" without naming one. Nothing opens; a dialog asks "Which daemon?" and lists both daemons by the names the dashboard gives them; choosing the second opens the Card actions editor bound to it, titled with its name, and reads only its card actions. Saying "open card actions on" the first daemon opens that one's editor straight away (PR #2491 decision 2026-11-25).
+  it("desktop/agent-cards/115: with several daemons, a bare open card actions asks which daemon, as naming an agent does", async () => {
+    const readCardCatalog = vi.fn(async () => ({ actions: [], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
+    const [local, far] = createFixtureFleet("fleet");
+    const localName = deckName(local.connection);
+    const farName = deckName(far.connection);
+    const deck = (value: string, label: string): VoiceResolvedParamDto => ({ name: "deck", kind: "deck_ref", spoken: label, value, label });
+    const run = setup(
+      (agents) => [cardFor(agents[0].id, "coder-card")],
+      () => ({
+        "open card actions": { action: "open_card_actions_editor", invoke: "openCardActionsEditor", params: [] },
+        "open card actions on the local daemon": { action: "open_card_actions_editor", invoke: "openCardActionsEditor", params: [deck(FIXTURE_DAEMON_ID, localName)] },
+      }),
+      { extra: { readCardCatalog, editCardCatalog: vi.fn() }, remote: true },
+    );
+    await turnOnVoice();
+    await speak(run.voice, "open card actions");
+    expect(screen.queryByRole("dialog", { name: /^Card actions: / })).toBeNull();
+    expect(readCardCatalog).not.toHaveBeenCalled();
+    const choice = screen.getByRole("dialog", { name: "Which daemon?" });
+    expect(within(choice).getByRole("button", { name: new RegExp(localName) })).toBeInTheDocument();
+    const second = within(choice).getByRole("button", { name: new RegExp(farName) });
+    await act(async () => { fireEvent.click(second); });
+    expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
+    const editor = screen.getByRole("dialog", { name: `Card actions: ${farName}` });
+    expect(editor).toBeInTheDocument();
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
+
+    await speak(run.voice, "open card actions on the local daemon");
+    expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: `Card actions: ${localName}` })).toBeInTheDocument();
+    expect(readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID);
   });
 });

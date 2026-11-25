@@ -6,6 +6,7 @@ import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview, agentKey } from "./AgentOverview";
 import { OverviewWithCardPane } from "../test/cardPane";
+import { cardsViewShown, pressNeedsYouOnly } from "../test/needsYouMenu";
 
 /*
  * PRD #2374 — the dashboard's cards as the overview wires them: the switch,
@@ -133,15 +134,15 @@ afterEach(() => {
 });
 
 describe("the dashboard's cards (PRD #2374)", () => {
-  /// Scenario: switch to Cards, then toggle Needs you only. The preference is remembered and the daemon's card order stays put while unmarked cards fade.
+  /// Scenario: switch to Cards, then toggle Needs you only from the top bar's ⋯ menu. The preference is remembered, the ⋯ counts the one agent that needs the user, and the daemon's card order stays put while unmarked cards fade.
   it("switches to cards, remembers it, and shows the daemon's cards in its order", () => {
     render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
     expect(window.localStorage.getItem(OVERVIEW_MODE_STORAGE_KEY)).toBe("cards");
     expect(shownNames()).toEqual(["coder", "tester", "lone"]);
-    expect(within(screen.getByTestId("agent-cards")).getByText("3 agents · 1 needs you")).toBeInTheDocument();
+    expect(screen.getByTestId("overview-needs-you-count").textContent).toBe("1");
     // Needs you only fades the cards the daemon did not mark, in place (issue #2418).
-    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    pressNeedsYouOnly();
     expect(shownNames()).toEqual(["coder", "tester", "lone"]);
     expect([...document.querySelectorAll("article[data-faded='true']")].map((node) => node.getAttribute("aria-label"))).toEqual(["tester", "lone"]);
   });
@@ -168,7 +169,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     try {
       render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
       expect(screen.getByTestId("overview-mode-table").getAttribute("aria-checked")).toBe("true");
-      expect(screen.queryByTestId("agent-cards")).toBeNull();
+      expect(cardsViewShown()).toBe(false);
     } finally {
       getItem.mockRestore();
     }
@@ -312,7 +313,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
     render(<AgentOverview runtime={runtime({ agentCards: undefined })} onNavigate={vi.fn()} />);
     expect(screen.queryByTestId("overview-mode-switch")).toBeNull();
-    expect(screen.queryByTestId("agent-cards")).toBeNull();
+    expect(cardsViewShown()).toBe(false);
     expect(screen.queryByTestId("overview-needs-you")).toBeNull();
     expect(screen.queryByTestId("overview-row-menu")).toBeNull();
   });

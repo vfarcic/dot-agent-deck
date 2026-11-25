@@ -2767,7 +2767,9 @@ description = """Switch the agent dashboard between its two views: the table (on
 and the cards (one card per agent, the agents each one started in a tree under it, showing what
 each agent is doing and what it needs). Use when the user asks to show cards, the card view, switch to
 cards, show the table, the list view, or back to the table. Set `view` to "table" or "cards".
-Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`."""
+Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`. "Show all
+cards", "show every card" and "show all the agents again" after Needs you only are NOT this one: they
+turn Needs you only off, which is `filter_needs_you_cards` with `needs_you` = "off"."""
 invoke      = "setOverviewMode"
 screens     = ["overview"]
 unavailable_hint = "the dashboard's view changes on the agent dashboard"
@@ -2836,16 +2838,25 @@ report      = "Next agent that needs you."
 asks_to     = "open the next agent that needs you"
 try_saying  = "next one that needs me"
 
+# PR #2491 decision 2026-11-25: Needs you only is in the dashboard's ⋯ (More)
+# menu and applies to the Table view as well as the Cards view, so turning it
+# on keeps the view the user is on.
 [[commands]]
 id          = "filter_needs_you_cards"
-description = """Turn the cards view's Needs you only on or off: on opens the way to every agent's
-card that needs the user and fades the others, off shows every card as usual. Use for only the ones that need me, show only the cards
-that need me, just the ones needing my attention (`needs_you` = "on"), or show all cards, every card,
-clear the needs you filter (`needs_you` = "off"). It shows the cards view when turned on. Filtering the
-table by status is `filter_dashboard`."""
+description = """Turn the agent dashboard's Needs you only on or off. "Show all cards", "show every
+card", "show all the cards again", "show every agent", "clear the needs you filter" and "turn off
+needs you only" turn it OFF (`needs_you` = "off"): they ask to see every card or agent again, not to
+switch views. "Only the ones that need me", "show only the cards that need me", "only the agents
+that need me", "just the ones needing my attention" and "needs you only" turn it ON (`needs_you` =
+"on"). On, the dashboard shows the agents that need the user with the agents they sit under (the
+Cards view opens the way to each such card and fades the others; the Table view shows only those
+rows); off, every agent as usual. It works in the Table view and the Cards view and keeps the view
+the user is on. It is the checkable Needs you only item in the dashboard's ⋯ (More) menu, and the
+Needs you only chip turns it off. Switching between the table and the cards ("show cards", "show the
+table") is `set_overview_mode`; filtering the table by status is `filter_dashboard`."""
 invoke      = "toggleNeedsYouFilter"
 screens     = ["overview"]
-unavailable_hint = "the Needs you filter is on the agent dashboard's cards"
+unavailable_hint = "the Needs you only filter is in the agent dashboard's ⋯ menu"
 report      = "Showing {needs_you}."
 asks_to     = "show only the cards that need you, or every card again"
 try_saying  = "only the ones that need me"
@@ -3086,19 +3097,36 @@ try_saying  = "{action} on the selected agents"
 # what writes nothing. Nothing said here writes the daemon's config — the form's Save, the removal's Remove, Hide and Restore
 # are presses by hand — so a misheard word never becomes text an agent is sent
 # or takes an action off the cards.
+#
+# PR #2491 decision 2026-11-25: the editor belongs to one daemon (each
+# daemon's ⋯ menu on the dashboard opens it bound to that daemon, and it has no
+# Daemon picker), so this row names the daemon with an optional `deck`. With
+# one daemon showing cards a bare "open card actions" opens it; with several,
+# the app asks which, as a bare "show host" does. `choose_card_actions_daemon`,
+# the picker's row, is retired with the picker.
 [[commands]]
 id          = "open_card_actions_editor"
-description = """Open the Card actions editor on the agent dashboard: the list of actions agents can
-offer on their cards (such as Go ahead and Merge it), where the user adds, changes, hides and removes
-them. Use for open the card actions editor, edit card actions, manage card actions, show the card
-actions. It only OPENS the editor and changes nothing. Pressing an action on an agent's card is
-`run_card_action`."""
+description = """Open one daemon's Card actions editor on the agent dashboard: the list of actions
+agents can offer on their cards (such as Go ahead and Merge it), where the user adds, changes, hides
+and removes them. It is what Card actions in a daemon's ⋯ (More) menu opens. Use for open card
+actions, open the card actions editor, edit card actions, manage card actions, show the card actions,
+and, naming the daemon (which a user may also call a deck; speech-to-text often writes daemon as
+demon), open card actions on the build box, the build box daemon's card actions, edit the local
+daemon's card actions. When the user names the daemon, set `deck` to the daemon they meant, exactly
+as listed in `decks`; otherwise leave `deck` out. It only OPENS the editor and changes nothing.
+Pressing an action on an agent's card is `run_card_action`; changing which daemon the dashboard shows
+is `switch_deck`."""
 invoke      = "openCardActionsEditor"
 screens     = ["overview"]
-unavailable_hint = "the Card actions editor opens from the agent dashboard's cards"
+unavailable_hint = "the Card actions editor opens from a daemon's ⋯ menu on the agent dashboard"
 report      = "Opened the Card actions editor."
-asks_to     = "open the Card actions editor"
-try_saying  = "open the card actions editor"
+asks_to     = "open a daemon's Card actions editor"
+try_saying  = "open card actions"
+
+  [[commands.params]]
+  name     = "deck"
+  kind     = "deck_ref"
+  optional = true
 
 [[commands]]
 id          = "add_card_action"
@@ -3149,30 +3177,12 @@ try_saying  = "remove the {action} action"
   kind = "card_action"
 
 # Issue #2399 review 12 — the rest of the Card actions editor's choices that
-# write nothing: which daemon's card actions it shows (by the daemon's name, a
-# `deck_ref` as the New agent dialog's Daemon field takes), reading the list
-# again, the form's icon (by the icon's name, held to the user's words as the
-# directory filter is) and its two checkboxes, one row per state so a spoken
-# "ask before sending" never unticks a box that was ticked. The form's Save
-# still writes, by hand.
-[[commands]]
-id          = "choose_card_actions_daemon"
-description = """In the open Card actions editor, show the card actions of another daemon: the editor's
-Daemon picker. Use for show the build box daemon's card actions, card actions of the local daemon,
-edit the remote daemon's card actions. Set `deck` to the daemon the user meant, exactly as listed in
-`decks`; a user may call a daemon a deck, and speech-to-text often writes daemon as demon. It only
-changes which daemon's actions the editor lists and closes an open form unsaved; it writes nothing.
-Changing which daemon the dashboard shows is `switch_deck`, not this one."""
-invoke      = "chooseCardActionsDaemon"
-screens     = ["overview"]
-unavailable_hint = "the Card actions editor's daemon is chosen while the editor is open, on the agent dashboard"
-report      = "Showing {deck}'s card actions."
-asks_to     = "show another daemon's card actions in the Card actions editor"
-try_saying  = "card actions of {deck}"
-  [[commands.params]]
-  name = "deck"
-  kind = "deck_ref"
-
+# write nothing: reading the list again, the form's icon (by the icon's name,
+# held to the user's words as the directory filter is) and its two checkboxes,
+# one row per state so a spoken "ask before sending" never unticks a box that
+# was ticked. The form's Save still writes, by hand. Which daemon's actions the
+# editor shows is `open_card_actions_editor`'s `deck` since PR #2491 decision
+# 2026-11-25 retired the Daemon picker and its row.
 [[commands]]
 id          = "refresh_card_actions"
 description = """Read the open Card actions editor's list again from its daemon, keeping whatever the

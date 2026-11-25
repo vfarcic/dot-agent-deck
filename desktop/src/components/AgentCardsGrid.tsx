@@ -1,4 +1,4 @@
-import { BellRing, SlidersHorizontal, X } from "lucide-react";
+import { X } from "lucide-react";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
@@ -27,45 +27,31 @@ export function batchIconName(choice: { icon?: string | null; kind?: string }): 
 }
 
 /**
- * PRD #2374 — the Cards view's line above every daemon's section: how many
- * agents the cards show and how many need the user, the Needs you filter, and
- * what to say when there is nothing to show. `cards` is every card on screen,
- * across the daemons, in the daemons' order.
+ * PRD #2374 — what the dashboard says above the daemons' sections when the
+ * cards have nothing to show: no agent has a card yet (the Cards view), or,
+ * with Needs you only on, nothing needs the user (either view). The line that
+ * counted the cards and held the Needs you only and Card actions buttons is
+ * gone (PR #2491 decision 2026-11-25): each daemon's header counts its
+ * agents, the top bar's ⋯ counts what needs the user and holds Needs you
+ * only, and each daemon's ⋯ opens its Card actions. `cards` is every card on
+ * screen, across the daemons.
  */
-export function AgentCardsToolbar({ cards, needsYouOnly, controls, editor }: {
+export function AgentCardsNotes({ cards, needsYouOnly, cardsView }: {
   cards: readonly PlacedCard[];
   needsYouOnly: boolean;
-  controls: Pick<VoiceActionContext, "setNeedsYouFilter"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
-  /** PRD #2374 decision 2026-11-24 — the Card actions editor's opener, while a daemon on screen has cards. */
-  editor?: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
+  /** Whether the Cards view is on screen (the Table says nothing about cards it does not draw). */
+  cardsView: boolean;
 }) {
   const total = cards.length;
   const needYou = cards.filter((card) => card.entry.needs_you).length;
+  const empty = cardsView && total === 0;
+  const noneNeedYou = !empty && needsYouOnly && needYou === 0;
+  if (!empty && !noneNeedYou) return null;
   return (
-    <section className="agent-cards" aria-label="Agent cards" data-testid="agent-cards">
-      <div className="agent-cards-toolbar">
-        <span className="agent-cards-count">{total} {total === 1 ? "agent" : "agents"} · {needYou} {needYou === 1 ? "needs" : "need"} you</span>
-        <button
-          type="button"
-          className={`button secondary compact agent-cards-filter${needsYouOnly ? " is-on" : ""}`}
-          data-testid="agent-cards-needs-you-filter"
-          aria-pressed={needsYouOnly}
-          title={needsYouOnly ? "Show every card as bright" : "Open the way to every card that needs you, and fade the rest"}
-          onClick={() => VOICE_ACTIONS.toggleNeedsYouFilter.run(controls, { needsYouOnly: !needsYouOnly })}
-        ><BellRing size={13} aria-hidden="true" /><span>Needs you only</span></button>
-        {editor && (
-          <button
-            type="button"
-            className="button secondary compact agent-cards-actions-editor-open"
-            data-testid="agent-cards-actions-editor-open"
-            title="Add, change, hide or remove the actions agents offer on their cards"
-            onClick={() => VOICE_ACTIONS.openCardActionsEditor.run(editor)}
-          ><SlidersHorizontal size={13} aria-hidden="true" /><span>Card actions</span></button>
-        )}
-      </div>
-      {total === 0 && <p className="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
-      {total > 0 && needsYouOnly && needYou === 0 && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">No card needs you right now.</p>}
-    </section>
+    <div className="agent-cards-notes">
+      {empty && <p className="agent-cards-empty" data-testid="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
+      {noneNeedYou && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">Nothing needs you right now. Needs you only is on: turn it off from the top bar to see every agent.</p>}
+    </div>
   );
 }
 

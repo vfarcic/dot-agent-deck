@@ -83,7 +83,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText, sanitizeText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
-import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type VoiceChoiceAsk, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceReadingStateDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceItemAnswerDto, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedOpens, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
@@ -3198,6 +3198,35 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     });
     return true;
   }, [setPanelState]);
+  /**
+   * PR #2491 decision 2026-11-25 — offer what a dispatch asked about
+   * ({@link askVoiceChoice}) as a `param_ambiguous` tie of the row it was
+   * dispatching, so the choice, its answers and its gates are the ones a name
+   * that fits several agents gets. `false` when no choice can be offered,
+   * which leaves the refusal already reported.
+   */
+  const offerAsked = useCallback((answer: VoiceResultDto, outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, asked: VoiceChoiceAsk, declared: VoiceContext) => {
+    if (outcome.invoke === undefined) return false;
+    const candidates: VoiceResolvedParamDto[] = asked.candidates.map((candidate) => ({ name: asked.param, kind: asked.kind, spoken: "", value: candidate.value, label: candidate.label, names: [candidate.label] }));
+    const tie: VoiceResultDto = {
+      ...answer,
+      outcome: {
+        kind: "param_ambiguous",
+        transcript: outcome.transcript,
+        action: outcome.action,
+        invoke: outcome.invoke,
+        param: asked.param,
+        spoken: "",
+        matches: candidates.map((candidate) => candidate.label),
+        candidates,
+        params: outcome.params.filter((param) => param.name !== asked.param),
+        sentence: asked.sentence,
+      },
+    };
+    if (!offerChoice(tie, declared)) return false;
+    setResult(tie);
+    return true;
+  }, [offerChoice]);
   /* PRD #1184 — `runChain`, for an answered choice to go on with its chain.
      A ref because `runChain` is built after `dispatchChoice`, which reads it. */
   const runChainRef = useRef<RunChain | undefined>(undefined);
@@ -3777,7 +3806,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         offerChoice(final, declared);
       } else if (final.outcome.kind === "dispatch") {
         refusedRef.current = false;
+        choiceAsked.current = undefined;
         const dispatched = dispatchDeclared(final.outcome, declared);
+        const asked = choiceAsked.current as VoiceChoiceAsk | undefined;
+        choiceAsked.current = undefined;
+        /* PR #2491 decision 2026-11-25 — the dispatch asked which one: offered
+           as the numbered choice, whose answer runs the row again with it. */
+        if (asked && offerAsked(final, final.outcome, asked, declared)) return;
         /* What the dispatch reached refused it, in its own sentence, so the
            outcome's sentence — "Showing …", written before anything ran — is
            now false, and an Undo would reverse nothing. The refusal is the
@@ -3793,7 +3828,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     } catch (cause) {
       if (ours()) setProblem(sentenceOf(cause));
     }
-  }, [answerNumber, answerQuestion, answerVoiceChoice, clearHeld, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerChoice, reportHeld, resolveVoice, runChain, setPhase]);
+  }, [answerNumber, answerQuestion, answerVoiceChoice, clearHeld, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerAsked, offerChoice, reportHeld, resolveVoice, runChain, setPhase]);
 
   /**
    * One whole utterance: take it, transcribe, resolve, listen again.
@@ -4219,6 +4254,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     refusalRef.current = reason;
     setProblem(reason);
   }, []);
+  /**
+   * PR #2491 decision 2026-11-25 — a dispatch that cannot tell which of
+   * several things on screen was meant ("open card actions" with several
+   * daemons) asks, as a spoken name that fits several agents does. Reported
+   * as its refusal at once; the dispatch's caller then offers the candidates
+   * as the numbered choice where one can be offered ({@link offerAsked}),
+   * and otherwise the refusal is what the user reads.
+   */
+  const choiceAsked = useRef<VoiceChoiceAsk | undefined>(undefined);
+  const askVoiceChoice = useCallback((ask: VoiceChoiceAsk) => {
+    reportRefused(ask.sentence);
+    choiceAsked.current = ask;
+  }, [reportRefused]);
   /**
    * PRD #1401 — a dispatch whose effect settles later: `pending` now, through
    * {@link reportRefused} so the resolver's sentence (written before anything
@@ -5056,6 +5104,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       reportNothingToClose,
       reportRefused,
       reportPending,
+      askVoiceChoice,
       ...(voiceCommands ? { showVoiceCommands } : {}),
       /* PRD #802 — published only while the overlay is OPEN, and that is how
          "an overlay is open" reaches a dispatch at all: it is a `useState`

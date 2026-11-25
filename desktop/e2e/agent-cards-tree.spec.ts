@@ -985,12 +985,14 @@ test.describe("desktop/agent-cards/061 — card action icons and the card action
       await expectNoSidewaysScroll(page);
     });
 
-    /// Scenario: At this width, press Card actions on the Cards view. The editor lists the deck's Go ahead and Merge it, each visibly labelled as the deck's; adding Deploy it with its text over two lines and the rocket chosen from the searched icon grid lists it, visibly labelled, as the user's, and the editor fits the window with no sideways scroll.
+    /// Scenario: At this width, press Card actions in the daemon's ⋯ menu on the Cards view. The editor, titled with the daemon's name, lists the deck's Go ahead and Merge it, each visibly labelled as the deck's; adding Deploy it with its text over two lines and the rocket chosen from the searched icon grid lists it, visibly labelled, as the user's, and the editor fits the window with no sideways scroll.
     test(`the card actions editor adds an action chosen with the icon picker at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
       await openCardsTree(page);
-      await page.getByRole("button", { name: "Card actions" }).click();
-      const editor = page.getByRole("dialog", { name: "Card actions" });
+      // PR #2491 decision 2026-11-25: Card actions is in the daemon's ⋯ menu, and the editor is titled with that daemon's name.
+      await page.getByTestId("daemon-more").first().click();
+      await page.getByRole("menuitem", { name: "Card actions" }).click();
+      const editor = page.getByRole("dialog", { name: /^Card actions: / });
       await expect(editor).toBeVisible();
       const row = (name: string) => editor.locator(`[data-testid="agent-card-actions-editor-row"][data-action="${name}"]`);
       await expect(row("go-ahead")).toHaveAttribute("data-source", "deck");

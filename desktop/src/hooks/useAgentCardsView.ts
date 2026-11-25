@@ -500,10 +500,10 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
     setNeedsYouFilter: (on) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       /* Needs you only opens the path to every card that needs the user
-         (the effect above, which also follows the cards while it is on). */
+         (the effect above, which also follows the cards while it is on). It
+         applies to the Table view too (PR #2491 decision 2026-11-25), so
+         turning it on keeps the view the user is on. */
       setNeedsYouOnly(on);
-      // The filter is the Cards view's: asking for it shows that view.
-      if (on) remember("cards");
       return undefined;
     },
     closeCardReview: () => {

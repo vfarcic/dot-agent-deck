@@ -4,6 +4,7 @@ import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview, agentKey } from "./AgentOverview";
 import { OverviewWithCardPane } from "../test/cardPane";
+import { cardsViewShown, dashboardMore, needsYouOnlyChecked, pressNeedsYouOnly } from "../test/needsYouMenu";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
 
 /*
@@ -211,12 +212,15 @@ afterEach(() => {
 });
 
 describe("desktop/agent-cards — the dashboard renders what the daemon sent (PRD #2374)", () => {
-  /// Scenario: open the Cards view on a list from a daemon that builds no tree, whose entries the daemon grouped by dispatcher and orchestration. Every card is drawn as a root in the daemon's order — no grouping by `group.id` is rebuilt — and the toolbar counts every card and every one the daemon marked.
+  /// Scenario: open the Cards view on a list from a daemon that builds no tree, whose entries the daemon grouped by dispatcher and orchestration. Every card is drawn as a root in the daemon's order — no grouping by `group.id` is rebuilt — and the top bar's ⋯ counts the cards the daemon marked as needing the user; there is no line above the cards (PR #2491 decision 2026-11-25).
   it("desktop/agent-cards/001: an untreed list draws every card as a root in the daemon's order, with the daemon's counts", () => {
     cardsView();
     expect(screen.queryByTestId("agent-cards-group")).toBeNull();
     expect([...document.querySelectorAll("article[data-card-key][data-depth='0']")].map((node) => node.getAttribute("data-card-key"))).toEqual(ORDER.map((card) => card.key));
-    expect(within(screen.getByTestId("agent-cards")).getByText("5 agents · 3 need you")).toBeInTheDocument();
+    expect(screen.getByTestId("overview-needs-you-count").textContent).toBe("3");
+    expect(dashboardMore()).toHaveAccessibleDescription("3 agents need you");
+    expect(document.querySelector(".agent-cards-toolbar")).toBeNull();
+    expect(screen.queryByText(/5 agents · 3 need you/)).toBeNull();
   });
 
   /// Scenario: show the Cards view for entries in an order that is neither alphabetical nor needs-you-first, then re-render with the daemon's new order. Each card shows the daemon's status words and needs-you marker even where they contradict the agent's own report, the cards follow each list's order, what the agent said is the Card panel's rather than the card's, and Needs you only fades every card the daemon did not mark, in place.
@@ -246,15 +250,14 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     view.rerender(<AgentOverview runtime={{ ...live, agentCards: { [FIXTURE_DAEMON_ID]: snapshot(reordered, 8) } }} onNavigate={vi.fn()} />);
     expect(shownNames()).toEqual(["bravo", "yankee", "alpha", "zulu", "mike"]);
 
-    const filter = screen.getByTestId("agent-cards-needs-you-filter");
-    expect(filter.getAttribute("aria-pressed")).toBe("false");
-    fireEvent.click(filter);
-    expect(screen.getByTestId("agent-cards-needs-you-filter").getAttribute("aria-pressed")).toBe("true");
+    expect(needsYouOnlyChecked()).toBe(false);
+    pressNeedsYouOnly();
+    expect(needsYouOnlyChecked()).toBe(true);
     // Every card stays in its place; the ones the daemon did not mark fade.
     expect(shownNames()).toEqual(["bravo", "yankee", "alpha", "zulu", "mike"]);
     expect(cardNodes().filter((node) => node.getAttribute("data-faded") === "true").map((node) => node.getAttribute("data-card-key"))).toEqual([BRAVO.key, ALPHA.key]);
-    expect(within(screen.getByTestId("agent-cards")).getByText("5 agents · 3 need you")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    expect(screen.getByTestId("overview-needs-you-count").textContent).toBe("3");
+    pressNeedsYouOnly();
     expect(cardNodes().filter((node) => node.getAttribute("data-faded") === "true")).toEqual([]);
   });
 
@@ -454,15 +457,15 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
   it("desktop/agent-cards/006: the view is remembered per client and a broken storage falls back to the table", () => {
     const first = render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
     expect(screen.getByTestId("overview-mode-table").getAttribute("aria-checked")).toBe("true");
-    expect(screen.queryByTestId("agent-cards")).toBeNull();
+    expect(cardsViewShown()).toBe(false);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
     expect(window.localStorage.getItem(MODE_KEY)).toBe("cards");
-    expect(screen.getByTestId("agent-cards")).toBeInTheDocument();
+    expect(cardsViewShown()).toBe(true);
     first.unmount();
 
     const second = render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
     expect(screen.getByTestId("overview-mode-cards").getAttribute("aria-checked")).toBe("true");
-    expect(screen.getByTestId("agent-cards")).toBeInTheDocument();
+    expect(cardsViewShown()).toBe(true);
     fireEvent.click(screen.getByTestId("overview-mode-table"));
     expect(window.localStorage.getItem(MODE_KEY)).toBe("table");
     second.unmount();
@@ -472,9 +475,9 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("storage blocked"); });
     render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
     expect(screen.getByTestId("overview-mode-table").getAttribute("aria-checked")).toBe("true");
-    expect(screen.queryByTestId("agent-cards")).toBeNull();
+    expect(cardsViewShown()).toBe(false);
     expect(() => fireEvent.click(screen.getByTestId("overview-mode-cards"))).not.toThrow();
-    expect(screen.getByTestId("agent-cards")).toBeInTheDocument();
+    expect(cardsViewShown()).toBe(true);
     getItem.mockRestore();
     setItem.mockRestore();
   });
@@ -487,8 +490,10 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     const { unmount } = render(<AgentOverview runtime={runtime({ agentCards: undefined, consumeAgentCards: consumeOff })} onNavigate={navigate} />);
     expect(screen.queryByTestId("overview-mode-switch")).toBeNull();
     expect(screen.queryByRole("radiogroup", { name: "Dashboard view" })).toBeNull();
-    expect(screen.queryByTestId("agent-cards")).toBeNull();
-    expect(screen.queryByTestId("agent-cards-needs-you-filter")).toBeNull();
+    expect(cardsViewShown()).toBe(false);
+    expect(screen.queryByRole("button", { name: "More" })).toBeNull();
+    expect(screen.queryByTestId("needs-you-chip")).toBeNull();
+    expect(screen.queryByTestId("daemon-more")).toBeNull();
     expect(screen.queryAllByTestId("overview-needs-you")).toHaveLength(0);
     expect(screen.queryAllByTestId("overview-row-menu")).toHaveLength(0);
     expect(screen.queryByTestId("agent-card-panel")).toBeNull();

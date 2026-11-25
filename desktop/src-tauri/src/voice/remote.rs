@@ -917,7 +917,6 @@ mod tests {
                 "add_card_action",
                 "edit_card_action",
                 "remove_card_action",
-                "choose_card_actions_daemon",
                 "refresh_card_actions",
                 "choose_card_action_icon",
                 "ask_before_sending_card_action",

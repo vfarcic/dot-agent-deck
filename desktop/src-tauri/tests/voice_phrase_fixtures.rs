@@ -457,7 +457,9 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 // `dictate-a-submit-word-in-passing-finished` and
 // `dismiss-antigravity-notice-by-its-label` each failed in at least three of
 // those four (rates on #2138) — so it stays ignored until those are fixed and
-// the rest is deterministic enough.
+// the rest is deterministic enough. `needs-you-only-off-show-all-cards` (PR
+// #2491, 2026-11-25) is read as `set_overview_mode` in 5 of 5 runs, and was in
+// 3 of 3 with the table before that PR too: a misread of the same kind.
 #[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
     run_fixtures(manifest()).await;

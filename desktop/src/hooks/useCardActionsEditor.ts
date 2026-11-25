@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CARD_ICON_NAMES, searchCardIcons } from "../lib/cardIcons";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
-import type { CardActionsEditorMember, VoiceActionContext } from "../lib/voiceActions";
+import type { CardActionsEditorMember, CardActionsWhich, VoiceActionContext } from "../lib/voiceActions";
 import type { CardActionInput, CardCatalogEdit, DeckRuntimeState, EditableCardAction, EditableCardCatalog } from "../types";
 
 /** A daemon the editor can show: its deck id, the name the dashboard gives it, and whether it advertised the editor. */
@@ -10,8 +10,6 @@ export interface CardActionsDaemon {
   deckId: string;
   name: string;
   editable: boolean;
-  /** The daemon of this machine: the editor opens on it, wherever the dashboard lists it. */
-  local?: boolean;
 }
 
 /** Where the catalog places an action, as the form offers it. */
@@ -48,7 +46,7 @@ export interface CardActionForm {
 
 /** The editor on screen. */
 export interface CardActionsEditorView {
-  daemons: readonly CardActionsDaemon[];
+  /** The daemon the editor is bound to: the one whose ⋯ menu opened it, or the one voice named. */
   daemon: CardActionsDaemon;
   /** The daemon's card actions, once read. */
   catalog?: EditableCardCatalog;
@@ -81,8 +79,10 @@ export interface CardActionsReread {
 
 /** What {@link useCardActionsEditor} hands the overview. */
 export interface CardActionsEditor {
-  /** Whether the runtime can read card actions at all, so the Cards toolbar offers the editor. */
+  /** Whether the runtime can read card actions at all, so a daemon's ⋯ menu offers the editor. */
   shown: boolean;
+  /** Whether `deckId`'s ⋯ menu offers Card actions: its daemon shows cards and the runtime can read them. */
+  offeredFor: (deckId: string) => boolean;
   view: CardActionsEditorView | undefined;
   /** The editor's members, for its controls and for voice. */
   controls: Pick<VoiceActionContext, CardActionsEditorMember>;
@@ -97,7 +97,11 @@ const NOT_ASKING = "The editor is not asking to remove anything.";
 const STILL_SAVING = "The last change is still being saved; wait for it before making another.";
 const readOnly = (name: string) => `${name}'s daemon is from a release whose card actions cannot be edited from the app.`;
 const NOT_LOADED = "The card actions are still being read; try again in a moment.";
-const NO_DAEMON_NAMED = "Say which daemon's card actions to show, by the name the dashboard gives it.";
+const NOT_SHOWN = "That daemon is not on the dashboard, or shows no cards, so its card actions cannot be shown.";
+/** Several daemons show cards and none was named: the user is asked which, as a spoken "show host" asks. */
+export function cardActionsWhich(names: readonly string[]): string {
+  return `Several daemons are on the dashboard: say which one, like “open card actions on ${displayText(names[0] ?? "", DISPLAY_LIMITS.name)}”.`;
+}
 const SAVING_FORM = "The form is being saved; wait for it before opening another.";
 
 /* PR #2491 review (Qodo 3): why a spoken edit or removal that waited for the list did not happen, when the editor stops waiting for another reason. */
@@ -119,9 +123,20 @@ function formPlacement(placement: string | null | undefined): CardActionPlacemen
   return placement === "compact" || placement === "detail" ? placement : "card";
 }
 
-/** The daemon the editor opens on: the local one, else the first the dashboard lists. */
-function homeDaemon(daemons: readonly CardActionsDaemon[]): CardActionsDaemon | undefined {
-  return daemons.find((candidate) => candidate.local) ?? daemons[0];
+/**
+ * PR #2491 decision 2026-11-25 — the daemon an opening means: the one named
+ * (by its ⋯ menu, or by voice), else the only daemon showing cards. With
+ * several and none named, the user is asked which rather than one being
+ * guessed, the way a spoken "show host" asks.
+ */
+function chooseDaemon(daemons: readonly CardActionsDaemon[], wanted: string | undefined): { daemon: CardActionsDaemon } | { refused: string; which?: CardActionsWhich["which"] } {
+  if (wanted !== undefined) {
+    const named = daemons.find((candidate) => candidate.deckId === wanted);
+    return named ? { daemon: named } : { refused: NOT_SHOWN };
+  }
+  if (daemons.length === 0) return { refused: NOT_AVAILABLE };
+  if (daemons.length > 1) return { refused: cardActionsWhich(daemons.map((candidate) => candidate.name)), which: daemons.map(({ deckId, name }) => ({ deckId, name })) };
+  return { daemon: daemons[0] };
 }
 
 /** A spoken edit or removal, by the action's name or label. */
@@ -175,9 +190,9 @@ export function cardIconByName(said: string): string | undefined {
 }
 
 /**
- * PRD #2374 decision 2026-11-24 — the Card actions editor: which daemon it
- * shows (the local one, wherever the dashboard lists it, unless the user picks
- * another), that daemon's card actions as it lists them, the form for a new
+ * PRD #2374 decision 2026-11-24 — the Card actions editor: the daemon it is
+ * bound to (PR #2491 decision 2026-11-25: the one whose ⋯ menu opened it, or
+ * the one voice named), that daemon's card actions as it lists them, the form for a new
  * or listed action, and the removal it is asking to confirm. Every change is
  * the daemon's: the editor sends one edit and shows the actions the daemon
  * answers, or the reason it refused, and decides nothing about the catalog
@@ -226,7 +241,7 @@ export function useCardActionsEditor({ runtime, daemons }: {
     pending.current = undefined;
     asked?.settle(refused);
   }, []);
-  const daemon = daemons.find((candidate) => candidate.deckId === deckId) ?? homeDaemon(daemons);
+  const daemon = daemons.find((candidate) => candidate.deckId === deckId);
 
   const load = useCallback((target: CardActionsDaemon | undefined) => {
     const seq = ++readSeq.current;
@@ -288,24 +303,18 @@ export function useCardActionsEditor({ runtime, daemons }: {
     });
   }, [read]);
 
-  /* The daemons on the dashboard changed while the editor is open: one that
-     is shown and leaves is replaced by the local (or first) one; when every
-     daemon left, the editor waits, and loads the first that comes back
-     (issue #2399 review 5). */
+  /* The editor is bound to its daemon (PR #2491 decision 2026-11-25): while
+     that daemon is off the dashboard the editor is not drawn, and when it
+     comes back the still-open editor reads its card actions again (issue
+     #2399 review 5). It never moves to another daemon on its own. */
+  const present = daemon !== undefined;
+  const wasPresent = useRef(present);
   useEffect(() => {
-    if (!open) return;
-    if (deckId === undefined) {
-      if (daemons.length === 0) return;
-      const home = homeDaemon(daemons);
-      setDeckId(home?.deckId);
-      load(home);
-      return;
-    }
-    if (daemons.some((candidate) => candidate.deckId === deckId)) return;
-    const home = homeDaemon(daemons);
-    setDeckId(home?.deckId);
-    load(home);
-  }, [daemons, deckId, load, open]);
+    const before = wasPresent.current;
+    wasPresent.current = present;
+    if (!open || !present || before) return;
+    load(daemon);
+  }, [daemon, load, open, present]);
 
   const latest = useRef({ open, daemon, catalog, form, removing, busy, shown, refreshing, loading });
   latest.current = { open, daemon, catalog, form, removing, busy, shown, refreshing, loading };
@@ -388,9 +397,10 @@ export function useCardActionsEditor({ runtime, daemons }: {
     if (!now.shown) return NOT_AVAILABLE;
     if (!now.open) {
       if (!voiceAsk) return NOT_OPEN;
-      const home = homeDaemon(daemons);
-      openEditor();
-      if (!home?.editable) return readOnly(displayText(home?.name ?? "This", DISPLAY_LIMITS.name));
+      const chosen = chooseDaemon(daemons, undefined);
+      if ("refused" in chosen) return chosen.refused;
+      openEditor(chosen.daemon.deckId);
+      if (!chosen.daemon.editable) return readOnly(displayText(chosen.daemon.name, DISPLAY_LIMITS.name));
       return queue(voiceAsk);
     }
     if (!now.daemon?.editable) return readOnly(displayText(now.daemon?.name ?? "This", DISPLAY_LIMITS.name));
@@ -411,13 +421,21 @@ export function useCardActionsEditor({ runtime, daemons }: {
     return undefined;
   };
 
-  function openEditor(): string | undefined {
+  /* Open the editor bound to `wanted` (its ⋯ menu's daemon, or voice's), or
+     to the only daemon showing cards. Already open on another daemon, it
+     moves to this one, closing an open form unsaved; on the same one, it
+     stays as it is. */
+  function openEditor(wanted?: string): string | CardActionsWhich | undefined {
     if (!latest.current.shown) return NOT_AVAILABLE;
-    if (latest.current.open) return undefined;
-    const home = homeDaemon(daemons);
+    const chosen = chooseDaemon(daemons, wanted);
+    if ("refused" in chosen) return chosen.which ? { refused: chosen.refused, which: chosen.which } : chosen.refused;
+    const target = chosen.daemon;
+    if (latest.current.open && latest.current.daemon?.deckId === target.deckId) return undefined;
+    if (latest.current.open) dropPending(OTHER_DAEMON);
     setOpen(true);
-    setDeckId(home?.deckId);
-    load(home);
+    setDeckId(target.deckId);
+    wasPresent.current = true;
+    load(target);
     return undefined;
   }
 
@@ -445,17 +463,6 @@ export function useCardActionsEditor({ runtime, daemons }: {
       setRefreshing(false);
       return undefined;
     },
-    chooseCardActionsDaemon: (wanted) => {
-      if (!latest.current.open) return NOT_OPEN;
-      if (!wanted) return NO_DAEMON_NAMED;
-      const target = daemons.find((candidate) => candidate.deckId === wanted);
-      if (!target) return "That daemon is not on the dashboard.";
-      if (target.deckId === latest.current.daemon?.deckId) return undefined;
-      dropPending(OTHER_DAEMON);
-      setDeckId(target.deckId);
-      load(target);
-      return undefined;
-    },
     refreshCardActions: () => {
       const now = latest.current;
       if (!now.open) return NOT_OPEN;
@@ -468,8 +475,13 @@ export function useCardActionsEditor({ runtime, daemons }: {
       const now = latest.current;
       if (!now.shown) return NOT_AVAILABLE;
       if (now.busy) return SAVING_FORM;
-      const target = now.open ? now.daemon : homeDaemon(daemons);
-      if (!now.open) openEditor();
+      let target = now.daemon;
+      if (!now.open) {
+        const chosen = chooseDaemon(daemons, undefined);
+        if ("refused" in chosen) return chosen.refused;
+        target = chosen.daemon;
+        openEditor(target.deckId);
+      }
       if (!target?.editable) return readOnly(displayText(target?.name ?? "This", DISPLAY_LIMITS.name));
       startForm(undefined);
       return undefined;
@@ -549,8 +561,10 @@ export function useCardActionsEditor({ runtime, daemons }: {
   }, []);
 
   const view = useMemo<CardActionsEditorView | undefined>(() => (open && shown && daemon
-    ? { daemons, daemon, ...(catalog ? { catalog } : {}), loading, refreshing, ...(rereadState ? { reread: rereadState } : {}), ...(error ? { error } : {}), ...(form ? { form } : {}), ...(removing ? { removing } : {}), busy }
-    : undefined), [busy, catalog, daemon, daemons, error, form, loading, open, refreshing, rereadState, removing, shown]);
+    ? { daemon, ...(catalog ? { catalog } : {}), loading, refreshing, ...(rereadState ? { reread: rereadState } : {}), ...(error ? { error } : {}), ...(form ? { form } : {}), ...(removing ? { removing } : {}), busy }
+    : undefined), [busy, catalog, daemon, error, form, loading, open, refreshing, rereadState, removing, shown]);
 
-  return { shown, view, controls, setField };
+  const offeredFor = useCallback((wanted: string) => shown && daemons.some((candidate) => candidate.deckId === wanted), [daemons, shown]);
+
+  return { shown, offeredFor, view, controls, setField };
 }

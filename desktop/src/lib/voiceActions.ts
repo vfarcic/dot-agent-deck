@@ -296,6 +296,15 @@ export type VoiceActionContext = {
    */
   reportPending: (pending: string, work: Promise<string | undefined>, done: string) => void;
   /**
+   * PR #2491 decision 2026-11-25 — ask which one, the way a spoken name that
+   * fits several agents is asked about: the voice panel offers `ask`'s
+   * candidates as the numbered "Which daemon?" choice, and the row being
+   * dispatched runs again with the one chosen as its `param`. Said as a
+   * refusal (`ask.sentence`) where no choice can be offered (a confirmation
+   * open, too many candidates, or a press rather than speech).
+   */
+  askVoiceChoice: (ask: VoiceChoiceAsk) => void;
+  /**
    * Close the New agent dialog (PRD #1223 U5) — every close route the dialog
    * has, reached by voice. Answers `undefined` when it closed, or the dialog's
    * own sentence when it would not: while a start is in flight every route is
@@ -727,17 +736,19 @@ export type VoiceActionContext = {
   /*
    * PRD #2374 decision 2026-11-24 — the card actions editor. Each answers the
    * sentence saying why it did nothing, or `undefined`. Opening the editor and
-   * its forms, choosing its daemon, reading it again and setting the form's
+   * its forms, reading it again and setting the form's
    * icon and checkboxes are voice's (issue #2399 review 12); every press that
    * writes a daemon's config (Save, a removal's confirmation, Hide, Restore)
    * is the user's own, by hand.
    */
-  /** Open the Card actions editor on the local daemon's card actions. */
-  openCardActionsEditor: () => string | undefined;
+  /**
+   * Open the Card actions editor bound to the daemon `deckId` (its ⋯ menu's,
+   * or the one voice named); `undefined`: the only daemon showing cards, and
+   * with several the sentence asking which (PR #2491 decision 2026-11-25).
+   */
+  openCardActionsEditor: (deckId?: string) => string | CardActionsWhich | undefined;
   /** Close the editor, or the removal it is asking to confirm. */
   closeCardActionsEditor: () => string | undefined;
-  /** Show the card actions of the daemon `deckId` in the editor; `undefined` when voice named none. */
-  chooseCardActionsDaemon: (deckId: string | undefined) => string | undefined;
   /** Read the shown daemon's card actions again, keeping the form. Writes nothing. */
   refreshCardActions: () => string | undefined;
   /** Open the editor's form for a new action. */
@@ -1615,7 +1626,7 @@ export const VOICE_ACTIONS = {
   },
 
   toggleNeedsYouFilter: {
-    label: "Show only the cards that need you, or every card",
+    label: "Show only the agents that need you, or every agent, in either view",
     voice: true,
     needs: ["setNeedsYouFilter"],
     run: (context: Pick<VoiceActionContext, "setNeedsYouFilter"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: Pick<VoiceDispatchTarget, "needsYouOnly">) => {
@@ -1818,19 +1829,26 @@ export const VOICE_ACTIONS = {
 
   /* PRD #2374 decision 2026-11-24 — the card actions editor. Voice opens
      the editor, its form for a new action, an action's form and a removal's
-     confirmation, chooses its daemon, reads it again and sets the form's icon
+     confirmation (the editor of the daemon named), reads it again and sets the form's icon
      and checkboxes (issue #2399 review 12); nothing it says writes the
      daemon's config. Every write —
      Save, the removal's Remove, Hide and Restore — is a press by hand, so a
      misheard word can neither change what an agent is sent nor take an
      action away. */
+  /* PR #2491 decision 2026-11-25 — a daemon's ⋯ menu passes its own deck;
+     voice, the deck its optional `deck_ref` resolved to (`preselectDeckId`),
+     or none, when the only daemon showing cards is meant. */
   openCardActionsEditor: {
-    label: "Open the Card actions editor",
+    label: "Open one daemon's Card actions editor",
     voice: true,
     needs: ["openCardActionsEditor"],
-    run: (context: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
-      const refused = context.openCardActionsEditor();
-      if (refused !== undefined) context.reportRefused?.(refused);
+    run: (context: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused" | "askVoiceChoice">>, target?: string | Pick<VoiceDispatchTarget, "preselectDeckId">) => {
+      const answer = context.openCardActionsEditor(typeof target === "string" ? target : target?.preselectDeckId || undefined);
+      if (answer === undefined) return;
+      if (typeof answer === "string") { context.reportRefused?.(answer); return; }
+      /* Several daemons and none named: asked which, as a name that fits several agents is. */
+      if (context.askVoiceChoice) context.askVoiceChoice({ param: "deck", kind: "deck_ref", candidates: answer.which.map((daemon) => ({ value: daemon.deckId, label: daemon.name })), sentence: answer.refused });
+      else context.reportRefused?.(answer.refused);
     },
   },
 
@@ -1839,17 +1857,6 @@ export const VOICE_ACTIONS = {
     no_voice: "the editor's Close and `Escape`; the editor is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\") closes it, or the removal it is asking to confirm, as the thing on top through `closeTopmost` — a row of its own would be a second reading of words `close` already answers",
     needs: ["closeCardActionsEditor"],
     run: (context: Pick<VoiceActionContext, "closeCardActionsEditor">) => { context.closeCardActionsEditor(); },
-  },
-
-  chooseCardActionsDaemon: {
-    label: "Show another daemon's card actions in the editor",
-    voice: true,
-    needs: ["chooseCardActionsDaemon"],
-    /* The Daemon picker passes the deck it lists; voice, the deck its `deck_ref` resolved to (`preselectDeckId`). */
-    run: (context: Pick<VoiceActionContext, "chooseCardActionsDaemon"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: string | Pick<VoiceDispatchTarget, "preselectDeckId">) => {
-      const refused = context.chooseCardActionsDaemon(typeof target === "string" ? target : target.preselectDeckId || undefined);
-      if (refused !== undefined) context.reportRefused?.(refused);
-    },
   },
 
   refreshCardActions: {
@@ -2638,7 +2645,20 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused" | "reportPending">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused" | "reportPending" | "askVoiceChoice">;
+
+/**
+ * PR #2491 decision 2026-11-25 — what a dispatch the screen could not settle
+ * asks the user to choose from: the row's `param` of `kind`, one candidate
+ * per thing on screen (its value, as the param's resolver gives it, and the
+ * name the screen shows), and the sentence said when no choice is offered.
+ */
+export interface VoiceChoiceAsk {
+  param: string;
+  kind: "deck_ref";
+  candidates: { value: string; label: string }[];
+  sentence: string;
+}
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -2699,7 +2719,13 @@ export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "cl
 export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeCardReview" | "runCardAction" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
 
 /** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
-export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag" | "setCardActionPlacement";
+/** PR #2491 decision 2026-11-25 — "open card actions" with several daemons and none named: the sentence, and the daemons to choose from. */
+export interface CardActionsWhich {
+  refused: string;
+  which: { deckId: string; name: string }[];
+}
+
+export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag" | "setCardActionPlacement";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

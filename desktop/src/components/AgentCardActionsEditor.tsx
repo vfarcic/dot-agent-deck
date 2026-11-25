@@ -21,8 +21,8 @@ function sourceWords(action: EditableCardAction): string {
 
 /**
  * PRD #2374 decision 2026-11-24 — the Card actions editor: the card actions
- * of one daemon (the local one at first; with several connected, a Daemon picker
- * chooses), each with where it came from, the exact text it sends and what
+ * of one daemon, the one whose ⋯ menu opened it (PR #2491 decision
+ * 2026-11-25), named in its title, each with where it came from, the exact text it sends and what
  * it may be changed by — Edit on every one, Remove on the user's own, Hide on
  * a deck default in use and Restore on one hidden or changed. Add action and
  * Edit open a form whose icon is chosen from a searchable grid of the icons
@@ -58,19 +58,11 @@ export function AgentCardActionsEditor({ view, editor }: { view: CardActionsEdit
         onKeyDown={onKeyDown}
       >
         <header className="card-actions-editor-header">
-          <h2 id="card-actions-editor-title">Card actions</h2>
+          <h2 id="card-actions-editor-title" data-testid="agent-card-actions-editor-title">Card actions: {daemonName}</h2>
           <button type="button" className="icon-button" aria-label="Close Card actions" title="Close (Escape)" data-testid="agent-card-actions-editor-close" onClick={() => VOICE_ACTIONS.closeCardActionsEditor.run(controls)}><X size={15} aria-hidden="true" /></button>
         </header>
         <div className="card-actions-editor-body">
           <p className="agent-card-hint">The actions agents can offer on their cards. A change reaches every card of this daemon at once.</p>
-          {view.daemons.length > 1 && (
-            <label className="card-actions-editor-daemon">
-              <span>Daemon</span>
-              <select aria-label="Daemon" value={daemon.deckId} data-testid="agent-card-actions-editor-daemon" onChange={(event) => VOICE_ACTIONS.chooseCardActionsDaemon.run(controls, event.target.value)}>
-                {view.daemons.map((candidate) => <option key={candidate.deckId} value={candidate.deckId}>{displayText(candidate.name, DISPLAY_LIMITS.name)}</option>)}
-              </select>
-            </label>
-          )}
           {!daemon.editable && (
             <p className="card-actions-editor-readonly" role="status" data-testid="agent-card-actions-editor-readonly">
               {daemonName}'s daemon is from an earlier release, so its card actions cannot be edited from the app. Upgrade that daemon, or edit the <code>[catalog]</code> table of the user config file on its machine.

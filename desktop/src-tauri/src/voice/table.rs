@@ -1582,11 +1582,6 @@ mod tests {
                 ("edit_card_action", "editCardAction", vec!["overview"]),
                 ("remove_card_action", "removeCardAction", vec!["overview"]),
                 (
-                    "choose_card_actions_daemon",
-                    "chooseCardActionsDaemon",
-                    vec!["overview"]
-                ),
-                (
                     "refresh_card_actions",
                     "refreshCardActions",
                     vec!["overview"]
@@ -2631,7 +2626,6 @@ mod tests {
                 "add_card_action",
                 "edit_card_action",
                 "remove_card_action",
-                "choose_card_actions_daemon",
                 "refresh_card_actions",
                 "choose_card_action_icon",
                 "ask_before_sending_card_action",
