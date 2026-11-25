@@ -43,9 +43,12 @@
 //! directory, **and** every entry the scan reached was readable, its owner
 //! included, **and** none of a live process read empty. Anything less keeps
 //! it: a process of this user whose entries can't be read keeps every
-//! directory, so on a host with such a process nothing is removed
-//! ([`removable`]), and so does one whose entry reads empty while it lives,
-//! as a process's `environ` does while its exec is under way (Q82). Removal works beneath the directory
+//! directory ([`removable`]), unless it has no controlling terminal
+//! ([`scan_processes`], issue #2467), and so does one whose entry reads empty
+//! while it lives, as a process's `environ` does while its exec is under way
+//! (Q82). One directory needs no scan: a gone daemon's that was
+//! never installed ([`never_installed`]) is removed whatever the scan says,
+//! since no agent was ever given anything in it. Removal works beneath the directory
 //! identified, through the descriptor it was identified by
 //! ([`remove_identified`]). Whether its name still leads to it is checked
 //! before the recursive pass and around the final unlinks, not before each
@@ -296,9 +299,11 @@ impl Instance {
     /// says), the instance directory itself (which mustn't exist), `daemon`,
     /// `inv/`, and the helper, copied from `source` and checked against it
     /// byte for byte before it is renamed into place without replacing
-    /// anything. A failure once `daemon` is written leaves what it made for
-    /// retention to remove once this daemon is gone; one before it leaves a
-    /// directory retention never identifies, so it stays.
+    /// anything. A failure once the directory is made removes it and what it
+    /// holds (issue #2467), so a later attempt by the same daemon can make it
+    /// again; one whose removal fails leaves it, for retention to remove once
+    /// this daemon is gone if its `daemon` record was written, and never if
+    /// it wasn't.
     pub fn create(
         root: &Path,
         daemon: DaemonId,
@@ -318,10 +323,20 @@ impl Instance {
         let dir_fd = open_dir_at(root_fd.as_fd(), &name_c)?;
         trusted_dir(&dir_fd, true)?;
         let dir = root.join(&name);
-        create_file_at(dir_fd.as_fd(), &cstring(DAEMON_FILE), 0o400)?
-            .write_all(daemon.encode().as_bytes())?;
-        mkdir_at(dir_fd.as_fd(), &cstring(INV_DIR), 0o700)?;
-        let helper_id = copy_helper(dir_fd.as_fd(), source)?;
+        let mut made = || -> Result<FileId, SetupError> {
+            create_file_at(dir_fd.as_fd(), &cstring(DAEMON_FILE), 0o400)?
+                .write_all(daemon.encode().as_bytes())?;
+            mkdir_at(dir_fd.as_fd(), &cstring(INV_DIR), 0o700)?;
+            copy_helper(dir_fd.as_fd(), source)
+        };
+        let helper_id = made().inspect_err(|_| {
+            // Issue #2467: take back what this attempt made, so a later one
+            // can make the directory again rather than meet `InstanceExists`
+            // for the daemon's life, and a partial helper copy doesn't hold
+            // a RAM-backed root's space. Only the directory this attempt
+            // made and still holds open is removed.
+            let _ = remove_own(root_fd.as_fd(), &name_c, dir_fd.as_fd());
+        })?;
         Ok(Instance {
             helper: dir.join(HELPER_NAME),
             dir,
@@ -711,13 +726,14 @@ pub struct Sweep {
     /// The directories removed.
     pub removed: Vec<String>,
     /// Directories kept: a live daemon's, one a process names, one that
-    /// isn't identified as an instance ([`identify`]), or every one when the
-    /// scan failed or saw an empty entry. The caller's own and anything not a
-    /// directory aren't counted.
+    /// isn't identified as an instance ([`identify`]), or every one that was
+    /// installed when the scan failed or saw an empty entry. The caller's own
+    /// and anything not a directory aren't counted.
     pub kept: usize,
     /// Why the scan couldn't be trusted, if it couldn't: every directory is
-    /// then kept. A scan that succeeded but saw an empty entry keeps every
-    /// one too, with this `None` and the entries in `unknown`.
+    /// then kept but a gone daemon's that was never installed
+    /// ([`never_installed`]). A scan that succeeded but saw an empty entry
+    /// keeps the same ones, with this `None` and the entries in `unknown`.
     pub scan_error: Option<ScanError>,
     /// Entries of live processes that read empty, in a scan that succeeded.
     /// Such an entry could name any directory, so while there is one no gone
@@ -834,28 +850,32 @@ pub fn sweep_root(
         directories += 1;
         identified.extend(identify(root_fd, &name, uid));
     }
-    let candidates: Vec<(String, Vec<u8>)> = identified
+    // A gone daemon's instance that was never installed is removed whatever
+    // the scan says (issue #2467, [`never_installed`]); the rest need it.
+    let (unused, scanned): (Vec<Identified>, Vec<Identified>) = identified
+        .into_iter()
+        .partition(|id| id.never_installed && !alive(id.daemon.pid, id.daemon.start));
+    let candidates: Vec<(String, Vec<u8>)> = scanned
         .iter()
         .map(|id| {
             let path = root.join(&id.name).into_os_string().into_vec();
             (id.name.clone(), path)
         })
         .collect();
-    match removable_counted(&candidates, alive, scan) {
+    let mut remove = unused;
+    match removable_counted(&candidates, &alive, scan) {
         Ok((names, unknown)) => {
-            sweep.kept = directories - names.len();
             sweep.unknown = unknown;
-            for id in identified.into_iter().filter(|id| names.contains(&id.name)) {
-                let name = id.name.clone();
-                match remove_identified(root_fd, id) {
-                    Ok(()) => sweep.removed.push(name),
-                    Err(_) => sweep.failed += 1,
-                }
-            }
+            remove.extend(scanned.into_iter().filter(|id| names.contains(&id.name)));
         }
-        Err(error) => {
-            sweep.kept = directories;
-            sweep.scan_error = Some(error);
+        Err(error) => sweep.scan_error = Some(error),
+    }
+    sweep.kept = directories - remove.len();
+    for id in remove {
+        let name = id.name.clone();
+        match remove_identified(root_fd, id) {
+            Ok(()) => sweep.removed.push(name),
+            Err(_) => sweep.failed += 1,
         }
     }
     sweep
@@ -868,6 +888,7 @@ pub struct Identified {
     dir: OwnedFd,
     id: FileId,
     daemon: DaemonId,
+    never_installed: bool,
 }
 
 impl Identified {
@@ -880,6 +901,37 @@ impl Identified {
     pub fn daemon(&self) -> &DaemonId {
         &self.daemon
     }
+
+    /// Whether no generation was ever made in it ([`never_installed`]).
+    pub fn never_installed(&self) -> bool {
+        self.never_installed
+    }
+}
+
+/// Whether the instance directory `dir` never had a generation made in it:
+/// it holds nothing but its `daemon` record, an empty `inv/`, and the helper
+/// or the helper's partial copy. Every installation makes `inv/G/` before it
+/// hands an agent the helper (`Instance::generation`, then `install`'s
+/// `VISUAL`), and generations' files stay after they retire, so no agent was
+/// ever given this instance's helper or a file in it. Issue #2467: a daemon
+/// whose helper copy failed (a full runtime tmpfs) leaves exactly this, and
+/// retention removes it once that daemon is gone without asking the process
+/// scan, which a process it can't read refuses. Anything it can't read is
+/// taken as installed.
+pub fn never_installed(dir: BorrowedFd<'_>) -> bool {
+    let Ok(names) = names_at(dir) else {
+        return false;
+    };
+    names.iter().all(|name| {
+        let name = name.as_bytes();
+        if name == INV_DIR.as_bytes() {
+            return open_dir_at(dir, &cstring(INV_DIR))
+                .is_ok_and(|inv| names_at_most(inv.as_fd(), 0).is_ok_and(|(_, more)| !more));
+        }
+        [DAEMON_FILE, HELPER_NAME, PART_NAME]
+            .iter()
+            .any(|known| name == known.as_bytes())
+    })
 }
 
 /// `name` in `root` when it is an instance directory of `uid`'s: a
@@ -918,6 +970,7 @@ pub fn identify(root: BorrowedFd<'_>, name: &str, uid: u32) -> Option<Identified
     Some(Identified {
         name: name.to_string(),
         id: stat_id(&after),
+        never_installed: never_installed(dir.as_fd()),
         dir,
         daemon,
     })
@@ -944,6 +997,21 @@ pub fn remove_identified(root: BorrowedFd<'_>, identified: Identified) -> io::Re
     unlink_at(identified.dir.as_fd(), &cstring(DAEMON_FILE), 0)?;
     still_there()?;
     unlink_at(root, &name, libc::AT_REMOVEDIR)
+}
+
+/// Remove `name` from `root` when it is still `dir`, a directory this
+/// process made and holds open: everything beneath it, then it.
+fn remove_own(root: BorrowedFd<'_>, name: &CStr, dir: BorrowedFd<'_>) -> io::Result<()> {
+    let same = || -> io::Result<()> {
+        if stat_id(&stat_at(root, name)?) != stat_id(&stat_fd(dir)?) {
+            return Err(io::Error::other("replaced since it was made"));
+        }
+        Ok(())
+    };
+    same()?;
+    remove_beneath(dir, None, REMOVE_DEPTH)?;
+    same()?;
+    unlink_at(root, name, libc::AT_REMOVEDIR)
 }
 
 /// How deep [`remove_beneath`] goes before it refuses.
@@ -1045,8 +1113,23 @@ pub fn scan_proc(visit: &mut dyn FnMut(&[u8])) -> Result<(), ScanError> {
 }
 
 /// Visit the environment and maps of each of `pids` that is this user's. A
-/// process that is gone by the time it is read is skipped; any other
-/// failure to read one, its owner included, is [`ScanError::Unreadable`].
+/// process that is gone by the time it is read is skipped, and so is one
+/// whose `environ` or `maps` read is refused (`EACCES`, `EPERM`) while its
+/// `stat` shows no controlling terminal (issue #2467). Every deck agent runs
+/// on its pane's terminal, and the processes this skips on a real host are
+/// `systemd --user`, `(sd-pam)`, `ssh-agent` and `sshd-session`; until #2467
+/// any one of them kept every instance on the host for good, which filled a
+/// RAM-backed runtime directory and left later daemons with no helper.
+/// **What this gives up:** a descendant of an installed agent that detached
+/// from its terminal and made itself unreadable (a daemonising tool such as
+/// an `ssh-agent` the agent's shell started) still holds the helper path in
+/// its environment, and once that agent's daemon is gone its instance can be
+/// removed under it; an editor it launches through that path then fails.
+/// Such a process has no terminal to show an editor in, and the instance
+/// goes only after the daemon that would read its checks is gone. Any other
+/// failure to read one, its owner included, is [`ScanError::Unreadable`]: a
+/// refused process on a terminal, or one whose `stat` can't be read, still
+/// keeps everything.
 /// Ownership is the real uid in `/proc/<pid>/status` ([`owned_by`]), not the
 /// owner of `/proc/<pid>`, which reads as root for a process that made
 /// itself non-dumpable. An entry that reads empty is visited as empty when
@@ -1083,7 +1166,9 @@ pub fn scan_processes_with(
 ) -> Result<(), ScanError> {
     // SAFETY: `getuid` has no preconditions.
     let uid = unsafe { libc::getuid() };
-    let mut read = |pid, file| proc_read(read(pid, file));
+    let read_raw = std::cell::RefCell::new(read);
+    let read_raw = |pid, file: &str| (read_raw.borrow_mut())(pid, file);
+    let read = |pid, file: &str| proc_read(read_raw(pid, file));
     for pid in pids {
         let status = match read(pid, "status")? {
             Some(status) => status,
@@ -1093,11 +1178,27 @@ pub fn scan_processes_with(
             continue;
         }
         let mut empty = 0;
+        let mut refused = false;
         for file in ["environ", "maps"] {
-            match read(pid, file)? {
+            let entry = read_raw(pid, file);
+            if entry
+                .as_ref()
+                .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)))
+            {
+                refused = true;
+                break;
+            }
+            match proc_read(entry)? {
                 Some(bytes) if bytes.is_empty() => empty += 1,
                 Some(bytes) => visit(&bytes),
                 None => {}
+            }
+        }
+        if refused {
+            match proc_read(read_raw(pid, "stat"))? {
+                Some(stat) if stat_tty(&stat).ok_or(ScanError::Unreadable)? == 0 => continue,
+                Some(_) => return Err(ScanError::Unreadable),
+                None => continue,
             }
         }
         // Read after the entries, so a process that exited before they were
@@ -1140,6 +1241,18 @@ fn exited(status: &[u8]) -> bool {
         && field(b"Threads:")
             .and_then(ascii_number::<u32>)
             .is_some_and(|threads| threads == 1)
+}
+
+/// The controlling terminal (`tty_nr`, field 7) on a `stat` file, 0 for
+/// none. Read after `comm`'s closing parenthesis, since `comm` can hold any
+/// byte.
+pub fn stat_tty(stat: &[u8]) -> Option<i64> {
+    let close = stat.iter().rposition(|b| *b == b')')?;
+    let field = stat[close + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|f| !f.is_empty())
+        .nth(4)?;
+    ascii_number(field)
 }
 
 /// A read of a `/proc` file, `None` when its process is gone.

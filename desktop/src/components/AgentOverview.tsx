@@ -1625,6 +1625,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       showReports: (said) => reach((open) => open.showReports(said)),
       nextReports: () => reach((open) => open.nextReports()),
       previousReports: () => reach((open) => open.previousReports()),
+      askRestore: (said) => reach((open) => open.askRestore(said)),
+      restoreAndContinue: () => reach((open) => open.restoreAndContinue()),
+      restoreOnly: () => reach((open) => open.restoreOnly()),
+      startOver: () => reach((open) => open.startOver()),
       back: () => { reach((open) => open.back()); },
       close: () => { reach((open) => open.close()); },
     };
@@ -2319,7 +2323,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               </OverviewInstrument>
             </DashboardCounters>
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
-            {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
+            {/* Icon-only (issue #1308): with its label the top bar ran past 1440px on CI's font. The rail's Daemons entry is the labelled door. */}
+            {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" aria-label="Open daemons" title="Open daemons" onClick={openDeck}><SquareTerminal size={14} /></button>}
             {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} consumeCards={runtime.consumeAgentCards} />}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
             {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}

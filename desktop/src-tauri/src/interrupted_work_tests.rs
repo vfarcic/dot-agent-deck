@@ -4,11 +4,12 @@
 
 use super::*;
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK, KIND_REQ, KIND_RESP,
-    PROTOCOL_VERSION, read_frame, write_frame,
+    AttachRequest, AttachResponse, CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK, CAP_RESTORE_AGENTS,
+    KIND_REQ, KIND_RESP, PROTOCOL_VERSION, read_frame, write_frame,
 };
 use dot_agent_deck::interrupted_work::{
     DismissStopReason, DismissStopped, RECLAIM_WOULD_REMOVE, ReclaimVerdict, RefusalReason,
+    RestoreRefusal, RestoreRefused, RestoredAgent,
 };
 
 const INSTANCE: &str = "daemon-process-a";
@@ -412,5 +413,158 @@ async fn a_daemon_replaced_between_batches_is_sent_no_further_batch() {
             refusal: None,
             not_sent: 1,
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD #1790 stage 3: restore and start over.
+// ---------------------------------------------------------------------------
+
+fn restoring() -> Vec<&'static str> {
+    vec![
+        CAP_INTERRUPTED_WORK,
+        CAP_HELLO_FOLLOW_ON,
+        CAP_RESTORE_AGENTS,
+    ]
+}
+
+/// One agent a restore started, as the daemon sends it.
+fn restored_agent() -> RestoredAgent {
+    serde_json::from_value(serde_json::json!({
+        "attempt": "run/7",
+        "agent_id": "41",
+        "pane_id": "pane-41",
+        "name": "fix-login",
+        "first_message_posted": true,
+        "recorded": true,
+    }))
+    .expect("a restored agent")
+}
+
+/// A daemon that serves interrupted work but advertises no `restore-agents`
+/// — one from before stage 3 — is sent neither a restore nor a start-over:
+/// both answer `unsupported`, and nothing but the gate's `Hello` reaches it.
+#[tokio::test]
+async fn a_daemon_without_restore_agents_is_sent_no_restore() {
+    for verb in 0..2 {
+        let (_dir, socket) = scratch();
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(daemon(listener, supported(), INSTANCE, |_| {
+            panic!("a restore reached a daemon that does not restore agents")
+        }));
+        let client = DaemonClient::new(socket.clone());
+        let unsupported = match verb {
+            0 => restore(
+                &client,
+                INSTANCE,
+                "w-1",
+                vec!["run/7".into()],
+                RestoreMode::Only,
+                false,
+            )
+            .await
+            .map(|r| r == InterruptedWorkReply::Unsupported),
+            _ => start_over(&client, INSTANCE, "w-1", "run/7", false)
+                .await
+                .map(|r| r == InterruptedWorkReply::Unsupported),
+        };
+        assert_eq!(unsupported, Ok(true), "verb {verb}");
+        drop(client);
+        assert!(
+            sent_after_hello(&server.await.unwrap()).is_empty(),
+            "verb {verb}"
+        );
+    }
+}
+
+/// A restore names the item, the attempt and the mode the person chose,
+/// with no pane claim, to the daemon process the webview named; its final
+/// answer comes back tagged with that process.
+#[tokio::test]
+async fn a_restore_is_sent_as_chosen_with_no_pane_claim() {
+    for mode in [RestoreMode::Continue, RestoreMode::Only] {
+        let (_dir, socket) = scratch();
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(daemon(listener, restoring(), INSTANCE, |_| {
+            let mut response = AttachResponse::ok();
+            response.interrupted_restore = Some(RestoreOutcome {
+                restored: vec![restored_agent()],
+                ..RestoreOutcome::default()
+            });
+            response
+        }));
+        let client = DaemonClient::new(socket.clone());
+        let answer = restore(&client, INSTANCE, "w-1", vec!["run/7".into()], mode, false)
+            .await
+            .expect("answered");
+        let InterruptedWorkReply::Answered { instance, answer } = answer else {
+            panic!("expected an answer, got {answer:?}");
+        };
+        assert_eq!(instance, INSTANCE);
+        assert_eq!(answer.restored, vec![restored_agent()]);
+        drop(client);
+        let seen = server.await.unwrap();
+        assert!(
+            matches!(
+                sent_after_hello(&seen)[..],
+                [AttachRequest::RestoreInterrupted { id, agents, mode: sent, dry_run: false, caller: None }]
+                    if id == "w-1" && agents.len() == 1 && agents[0] == "run/7" && *sent == mode
+            ),
+            "{seen:?}"
+        );
+    }
+}
+
+/// A start-over names the one attempt, with no pane claim, and is withheld
+/// from another daemon process than the one named; a refusal comes back as
+/// the daemon worded it.
+#[tokio::test]
+async fn a_start_over_is_sent_to_the_named_process_only() {
+    let (_dir, socket) = scratch();
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    let server = tokio::spawn(daemon(listener, restoring(), "daemon-process-b", |_| {
+        panic!("a start-over reached another daemon process")
+    }));
+    let client = DaemonClient::new(socket.clone());
+    assert_eq!(
+        start_over(&client, INSTANCE, "w-1", "run/7", false).await,
+        Ok(InterruptedWorkReply::Unsupported)
+    );
+    drop(client);
+    assert!(sent_after_hello(&server.await.unwrap()).is_empty());
+
+    let (_dir, socket) = scratch();
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    let server = tokio::spawn(daemon(listener, restoring(), INSTANCE, |_| {
+        let mut response = AttachResponse::ok();
+        response.interrupted_start_over = Some(StartOverOutcome {
+            refused: Some(RestoreRefused::new(
+                Some(restored_agent().attempt),
+                RestoreRefusal::StillRunning,
+            )),
+            ..StartOverOutcome::default()
+        });
+        response
+    }));
+    let client = DaemonClient::new(socket.clone());
+    let answer = start_over(&client, INSTANCE, "w-1", "run/7", false)
+        .await
+        .expect("answered");
+    let InterruptedWorkReply::Answered { answer, .. } = answer else {
+        panic!("expected an answer, got {answer:?}");
+    };
+    assert_eq!(
+        answer.refused.map(|r| r.reason),
+        Some(RestoreRefusal::StillRunning)
+    );
+    drop(client);
+    let seen = server.await.unwrap();
+    assert!(
+        matches!(
+            sent_after_hello(&seen)[..],
+            [AttachRequest::StartOverInterrupted { id, agent, dry_run: false, caller: None }]
+                if id == "w-1" && agent == "run/7"
+        ),
+        "{seen:?}"
     );
 }

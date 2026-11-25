@@ -20,6 +20,7 @@ mod agent_hook_config;
 pub mod agent_notice;
 pub mod agent_pty;
 pub mod agent_registry;
+pub mod agent_restore;
 // PRD #211: the Antigravity CLI's hook installer.
 pub mod antigravity_hooks_manage;
 // PRD #211: the Antigravity experimental notice's words, shared by both clients.
@@ -218,6 +219,8 @@ pub mod retained_store;
 // Issue #2110: spacing between orchestration workers' agent starts.
 pub mod role_start_pacing;
 pub mod roles_cli;
+// Issue #1897: each agent run in a cgroup of its own, where systemd delegated one.
+pub mod run_cgroup;
 pub mod schedule_cli;
 // PRD #1885: a schedule's last fire, when it was refused as not approved.
 pub mod schedule_outcome;

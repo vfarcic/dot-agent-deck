@@ -642,7 +642,17 @@ async fn return_019_a_differing_terminal_repeat_is_delivered_as_an_update() {
             && !text.contains("dispatch: a unit you dispatched has completed"),
         "{text}"
     );
-    assert!(text.contains("update 1 of at most 3"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "update 1 of at most {}",
+            crate::report_recovery::MAX_REPORT_UPDATES
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains(crate::dispatch_return::LOOPING_NOTE),
+        "a first update is no sign of a loop: {text}"
+    );
     assert!(
         text.contains("earlier report still stands") && text.contains("does not replace it"),
         "{text}"
@@ -764,18 +774,43 @@ async fn return_019_the_legacy_verb_delivers_a_differing_repeat_as_an_update() {
     );
 }
 
-/// Scenario: A unit reports, then sends three different updates, each delivered as its own numbered update. A fourth different report is refused `report_updates_exhausted`, exit 1, and delivers and saves nothing; an identical repeat of an earlier update is still answered with that update's result.
+/// Scenario: A unit reports, then sends twenty different updates, each delivered once as its own numbered update; the first three arrive without a note, and the fourth to twentieth each tell the dispatcher the unit may be looping. A twenty-first different report is refused `report_updates_exhausted`, exit 1, and delivers and saves nothing; identical repeats of an update within the usual count and of one past it are still answered with that update's result and deliver nothing.
 #[spec("dispatch/return/029")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn return_029_a_units_report_updates_are_bounded() {
     let unit = unit("r029", false).await;
+    let delivered = |needle: &str| {
+        unit.registry()
+            .inbox()
+            .rendered(&unit.caller_pane)
+            .into_iter()
+            .filter(|delivery| delivery.text.contains(needle))
+            .map(|delivery| delivery.text)
+            .collect::<Vec<_>>()
+    };
     accepted(unit.report("R029-REPORT-0").await);
     let max = crate::report_recovery::MAX_REPORT_UPDATES;
+    let usual = crate::report_recovery::USUAL_REPORT_UPDATES;
+    assert_eq!((usual, max), (3, 20), "the limits issue #2485 set");
     let mut ids = Vec::new();
     for n in 1..=max {
-        let update = accepted(unit.report(&format!("R029-REPORT-{n}")).await);
+        let body = format!("R029-REPORT-{n}.");
+        let update = accepted(unit.report(&body).await);
         assert_eq!(update.update, Some(n as u32), "{update:?}");
         ids.push(update.report_id);
+        let posts = delivered(&body);
+        assert_eq!(posts.len(), 1, "update {n} is delivered once: {posts:?}");
+        assert!(
+            posts[0].contains(&format!("update {n} of at most {max}.")),
+            "{}",
+            posts[0]
+        );
+        assert_eq!(
+            posts[0].contains(crate::dispatch_return::LOOPING_NOTE),
+            n > usual,
+            "update {n}: {}",
+            posts[0]
+        );
     }
     assert_eq!(unit.count("dispatch report updated"), max);
     let files = super::report_tests::store_files(&unit.deck.store);
@@ -791,17 +826,27 @@ async fn return_029_a_units_report_updates_are_bounded() {
         answer
             .stderr
             .as_deref()
-            .is_some_and(|e| e.contains("NOT delivered") && e.contains(&format!("{max} updates"))),
+            .is_some_and(|e| e.contains("NOT delivered") && e.contains("sent 20 updates")),
         "{answer:?}"
     );
     assert_eq!(inbox_of(&unit.deck, &unit.caller_pane), caller);
     assert_eq!(super::report_tests::store_files(&unit.deck.store), files);
 
-    let again = reply(unit.report("R029-REPORT-2").await);
-    assert_eq!(
-        (again.disposition, again.report_id),
-        (WorkDoneDisposition::AlreadyAccepted, ids[1].clone())
-    );
+    // Identical repeats, of an update within the usual count and of one past
+    // it, are answered with that update's own result and deliver nothing.
+    for n in [2, usual + 4] {
+        let again = reply(unit.report(&format!("R029-REPORT-{n}.")).await);
+        assert_eq!(
+            (again.disposition, again.report_id, again.update),
+            (
+                WorkDoneDisposition::AlreadyAccepted,
+                ids[n - 1].clone(),
+                Some(n as u32)
+            )
+        );
+        assert_eq!(delivered(&format!("R029-REPORT-{n}.")).len(), 1);
+    }
+    assert_eq!(inbox_of(&unit.deck, &unit.caller_pane), caller);
     assert_eq!(unit.completed(), 1);
     assert_eq!(unit.count("dispatch report updated"), max);
 }

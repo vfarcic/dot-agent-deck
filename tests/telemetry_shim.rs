@@ -359,3 +359,75 @@ fn a_configuration_home_it_cannot_read_exactly_gets_nothing() {
         ["x", "guard=codex"]
     );
 }
+
+/// PRD #1790 stage 3 (review R3): a launch script that asks the agent for
+/// its version before it starts the agent does not spend the restore's
+/// resume request on that question. The version call reaches the real Claude
+/// unchanged and claims nothing; the script's second call, the real start,
+/// gets the resume arguments in front of its own, owns the acknowledgement,
+/// and no longer carries the request.
+#[test]
+fn a_wrapper_that_asks_for_the_version_first_resumes_on_its_real_start() {
+    const ID: &str = "01234567-89ab-4cde-8fab-0123456789ab";
+    let root = test_temp::tempdir().unwrap();
+    let deck = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let telemetry = root.path().join("telemetry");
+    let shim_dir = shim::install(&telemetry, deck).unwrap();
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let python = on_path("python3").expect("python3 on PATH for the Claude stand-in");
+    let claude = real.join("claude");
+    std::fs::write(
+        &claude,
+        format!(
+            "#!{}\nimport os, sys\nprint('call ' + ' '.join(sys.argv[1:]) + ' token=' + os.environ.get('DOT_AGENT_DECK_RESUME_TOKEN', ''))\n",
+            python.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let wrapper = root.path().join("start-claude.sh");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nclaude --version\nexec claude --model haiku \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = shim::mint_token(now, 120).expect("OS randomness");
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let mut cmd = Command::new(&wrapper);
+    cmd.env_clear()
+        .env("PATH", path_of(&[&shim_dir, &real]))
+        .env("HOME", &home)
+        .env(shim::RESUME_AGENT_ENV, "claude")
+        .env(shim::RESUME_SESSION_ENV, ID)
+        .env(shim::RESUME_TOKEN_ENV, &token);
+    let out = output_within(&mut cmd);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let calls: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        calls,
+        [
+            "call --version token=".to_string(),
+            format!("call --resume {ID} --model haiku token="),
+        ],
+        "the version call is unchanged and the real start resumes"
+    );
+    let acks = telemetry.join(shim::RESUME_ACKS_DIR);
+    assert_eq!(
+        std::fs::read_to_string(acks.join(&token)).unwrap(),
+        "claude\n",
+        "the real start owns the acknowledgement"
+    );
+    assert!(
+        !acks
+            .join(format!("{token}{}", shim::REFUSED_SUFFIX))
+            .exists()
+    );
+}
