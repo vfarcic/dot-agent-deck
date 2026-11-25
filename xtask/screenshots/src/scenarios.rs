@@ -103,12 +103,17 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "agent-cards",
-        description: "The desktop Dashboard's Cards view as a tree: an orchestrator opened to show its two roles beside a standalone agent, three needing you (PRD #2374, issue #2418).",
+        description: "The desktop Dashboard's Cards view as a tree: an orchestrator opened to show its two roles beside a standalone agent, three needing you, every card with its checkbox and its action icons in a tinted group, Go ahead on three and Merge it on one (PRD #2374, issue #2418, PR #2491 review).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-action-hover",
+        description: "A card's Merge it icon hovered in the desktop Cards view: its tooltip with the action's label and the exact text it sends (PR #2491 review).",
         clients: &[Client::Desktop],
     },
     Scenario {
         name: "agent-cards-select",
-        description: "The desktop Cards view selecting agents for a batch: Select on, the orchestrator root (which selects its two roles) and a standalone agent ticked, and the selection bar's count with Go ahead and Close (issue #2399).",
+        description: "The desktop Cards view selecting agents for a batch: the orchestrator root (which selects its two roles) and a standalone agent ticked, and the selection bar at the foot of the Dashboard with its count, Go ahead, Close and Merge it in the action group, and Clear (issue #2399, PR #2491 review).",
         clients: &[Client::Desktop],
     },
     Scenario {

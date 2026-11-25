@@ -90,29 +90,9 @@ desktopScenario("dashboard-filter", async (page) => {
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
 });
 
-// PRD #2374 — desktop-only: the TUI has no cards view. The `docs` state's
-// four agents as the daemon's cards (`docsAgentCards` in the fixture), served
-// only with `cards=1`, shown through the Dashboard's Table | Cards switch.
-// Issue #2418: two roots, the orchestrator's tree opened to show its two roles.
-desktopScenario("agent-cards", async (page) => {
-  await page.goto("/?fixture=1&state=docs&cards=1");
-  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
-  await page.getByTestId("open-overview").click();
-  await page.getByTestId("overview-mode-cards").click();
-  await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(2);
-  await page.getByRole("button", { name: "Open Plan / architecture's tree" }).click();
-  await expect(page.locator("article[data-card-key]")).toHaveCount(4);
-  await expect(page.getByTestId("agent-card-issue-label").first()).toHaveText("enhancement");
-  await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
-  // PRD #2374 decision 2026-11-24: each card's prompt actions are icons in its bottom row (issue #2399 review 2), drawn whole.
-  const icons = page.getByTestId("agent-card-action-icon");
-  expect(await icons.count()).toBeGreaterThan(0);
-  for (const icon of await icons.all()) await expect(icon).toBeInViewport({ ratio: 1 });
-});
-
 // Issue #2399 — desktop-only: the TUI has no cards view. The `agent-cards`
 // scene's cards from a daemon that does batches (`docsBatchAgentCards`, served
-// only with `cards=batch`), in the Cards view.
+// only with `cards=batch`), in the Cards view: every card has its checkbox.
 async function openBatchCards(page: Page): Promise<void> {
   await page.goto("/?fixture=1&state=docs&cards=batch");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
@@ -121,12 +101,52 @@ async function openBatchCards(page: Page): Promise<void> {
   await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(2);
 }
 
-// Select, then the closed orchestrator root (which selects it and its two
-// roles) and the standalone agent: the selection bar offers Go ahead, which
-// the three orchestration cards offer, and Close, which every card offers.
+// PRD #2374, issue #2418, PR #2491 review — the Cards view as a tree, the
+// orchestrator's tree opened to show its two roles beside a standalone agent.
+// Every card has its checkbox (none ticked, so no selection bar), and each
+// card's actions are icons in their tinted group: Go ahead on the
+// orchestration's three cards and Merge it on the reviewer's.
+async function openCardsTree(page: Page): Promise<void> {
+  await openBatchCards(page);
+  await page.getByRole("button", { name: "Open Plan / architecture's tree" }).click();
+  await expect(page.locator("article[data-card-key]")).toHaveCount(4);
+}
+
+desktopScenario("agent-cards", async (page) => {
+  await openCardsTree(page);
+  await expect(page.getByTestId("agent-card-issue-label").first()).toHaveText("enhancement");
+  await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
+  await expect(page.getByTestId("agent-card-select")).toHaveCount(4);
+  for (const box of await page.getByTestId("agent-card-select").all()) await expect(box).not.toBeChecked();
+  await expect(page.getByTestId("agent-cards-selection-bar")).toHaveCount(0);
+  // Each card's prompt actions are icons in its bottom row, inside the group, drawn whole.
+  const groups = page.locator("article[data-card-key] [data-testid='action-icon-group']");
+  await expect(groups).toHaveCount(3);
+  for (const group of await groups.all()) await expect(group).toBeInViewport({ ratio: 1 });
+  await expect(page.locator("[data-testid='agent-card-action-icon'][data-action='go-ahead']")).toHaveCount(3);
+  await expect(page.locator("[data-testid='agent-card-action-icon'][data-action='merge']")).toHaveCount(1);
+});
+
+// A card's icon hovered: its tooltip names the action and quotes the exact text it sends.
+desktopScenario("agent-cards-action-hover", async (page) => {
+  await openCardsTree(page);
+  const merge = page.locator("[data-testid='agent-card-action-icon'][data-action='merge']");
+  await merge.hover();
+  // Focus too: the capture's own options end a hover, and a focused icon keeps its tooltip shown.
+  await merge.focus();
+  const tip = page.getByTestId("action-tip");
+  await expect(tip).toBeVisible();
+  await expect(tip).toContainText("Merge it");
+  await expect(tip).toContainText("Merge it, following this project's own merge procedure, then update your card.");
+  await expect(tip).toBeInViewport({ ratio: 1 });
+}, { tooltip: true });
+
+// The closed orchestrator root (which selects it and its two roles) and the
+// standalone agent ticked: the selection bar at the foot of the Dashboard
+// offers Go ahead, which the three orchestration cards offer, Close, which
+// every card offers, and the reviewer's Merge it.
 async function selectBatchCards(page: Page): Promise<void> {
   await openBatchCards(page);
-  await page.getByTestId("agent-cards-select").click();
   await page.getByRole("checkbox", { name: "Select Plan / architecture" }).check();
   await page.getByRole("checkbox", { name: "Select User-path verification" }).check();
   await expect(page.getByTestId("agent-cards-selection-count")).toHaveText("4 selected");
@@ -139,9 +159,12 @@ async function openCardsBatch(page: Page): Promise<void> {
 }
 
 // Decision 2026-11-24: batch buttons are icons named by the action's label,
-// with no text; each is drawn whole, with its icon, and its hover (`data-tip`) names it.
+// with no text; each is drawn whole, with its icon, and its hover (`data-tip`)
+// names it. PR #2491 review: they sit in the action group.
 async function expectBatchIcons(scope: Locator, labels: readonly string[]): Promise<void> {
-  const buttons = scope.getByRole("button");
+  const group = scope.getByTestId("action-icon-group");
+  await expect(group).toBeVisible();
+  const buttons = group.getByRole("button");
   await expect(buttons).toHaveCount(labels.length);
   for (const [index, label] of labels.entries()) {
     const button = buttons.nth(index);
@@ -153,22 +176,24 @@ async function expectBatchIcons(scope: Locator, labels: readonly string[]): Prom
   }
 }
 
-// How cards are selected: Select pressed (it reads as on), each card's
-// checkbox, the two ticked, and the selection bar's count with a button per
-// action the selected cards offer. No dialog is open.
+// How cards are selected: each card's checkbox, two ticked, and the selection
+// bar at the foot of the Dashboard with the count, a button per action the
+// selected cards offer in the action group, and Clear. No dialog is open.
 desktopScenario("agent-cards-select", async (page) => {
   await selectBatchCards(page);
-  await expect(page.getByTestId("agent-cards-select")).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByTestId("agent-card-select")).toHaveCount(2);
   await expect(page.getByRole("checkbox", { name: "Select Plan / architecture" })).toBeChecked();
   await expect(page.getByRole("checkbox", { name: "Select User-path verification" })).toBeChecked();
-  await expectBatchIcons(page.getByTestId("agent-cards-selection"), ["Go ahead", "Close"]);
+  const bar = page.getByTestId("agent-cards-selection-bar");
+  await expect(bar).toBeInViewport({ ratio: 1 });
+  await expectBatchIcons(bar, ["Go ahead", "Close", "Merge it"]);
+  await expect(bar.getByRole("button", { name: "Clear", exact: true })).toBeVisible();
   await expect(page.getByTestId("agent-cards-batch-confirm")).toHaveCount(0);
 });
 
 // The other way to start a batch: the orchestrator's own card, opened from
 // the Cards view, has a section named after it and the agents under it, with
-// a button per action that opens the same confirmation.
+// a button per action, in the action group, that opens the same confirmation.
 desktopScenario("agent-cards-tree-batch", async (page) => {
   await openBatchCards(page);
   await page.getByRole("button", { name: /: show Plan \/ architecture's card$/ }).click();
@@ -178,7 +203,7 @@ desktopScenario("agent-cards-tree-batch", async (page) => {
   await expect(batch.getByRole("heading")).toHaveText("Plan / architecture and the 2 agents under it");
   await batch.scrollIntoViewIfNeeded();
   await expect(batch).toBeInViewport({ ratio: 1 });
-  await expectBatchIcons(batch, ["Go ahead", "Close"]);
+  await expectBatchIcons(batch, ["Go ahead", "Close", "Merge it"]);
 });
 
 desktopScenario("agent-cards-batch", async (page) => {

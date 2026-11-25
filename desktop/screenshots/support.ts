@@ -57,7 +57,7 @@ export async function fontsSettled(page: Page): Promise<void> {
  * the two disagree. `prepare` puts the screen in the state the image shows and
  * waits for it; it must wait on state, never on a timer.
  */
-export function desktopScenario(name: string, prepare: (page: Page) => Promise<void>): void {
+export function desktopScenario(name: string, prepare: (page: Page) => Promise<void>, { tooltip = false }: { tooltip?: boolean } = {}): void {
   test(`desktop ${name}`, async ({ page }) => {
     // A run told it needs no web build starts no server, so a desktop scenario
     // selected anyway would only fail on a refused connection; say why instead.
@@ -67,9 +67,14 @@ export function desktopScenario(name: string, prepare: (page: Page) => Promise<v
     await page.clock.setFixedTime(FROZEN_NOW);
     await prepare(page);
     // Park the pointer where nothing reacts to it, so a hover tooltip from the
-    // last click is not in the picture.
-    await page.mouse.move(0, page.viewportSize()!.height - 1);
-    await expect(page.locator("[role=tooltip]:visible")).toHaveCount(0);
+    // last click is not in the picture — unless the picture is of a tooltip
+    // (`tooltip: true`), which `prepare` left shown and which must still be.
+    if (tooltip) {
+      await expect(page.locator("[role=tooltip]:visible")).toHaveCount(1);
+    } else {
+      await page.mouse.move(0, page.viewportSize()!.height - 1);
+      await expect(page.locator("[role=tooltip]:visible")).toHaveCount(0);
+    }
     await fontsSettled(page);
     await page.screenshot({ ...SHOT_OPTIONS, path: imagePath(name, "desktop") });
   });
