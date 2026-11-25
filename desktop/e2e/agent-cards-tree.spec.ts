@@ -1327,13 +1327,98 @@ test.describe("desktop/agent-cards/089 — Clear pressed with the keyboard keeps
   });
 });
 
+/** A computed `rgb(…)`/`rgba(…)` colour as channels 0–255 and an alpha 0–1. */
+function rgbaOf(colour: string): { r: number; g: number; b: number; a: number } {
+  const parts = colour.match(/^rgba?\(([^)]*)\)$/)?.[1].split(/[\s,/]+/).filter(Boolean).map(parseFloat);
+  if (!parts || parts.length < 3) throw new Error(`not an rgb colour: ${colour}`);
+  return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
+}
+
+/** `top` painted over the opaque `under`. */
+function over(top: ReturnType<typeof rgbaOf>, under: ReturnType<typeof rgbaOf>): ReturnType<typeof rgbaOf> {
+  const mix = (a: number, b: number) => a * top.a + b * (1 - top.a);
+  return { r: mix(top.r, under.r), g: mix(top.g, under.g), b: mix(top.b, under.b), a: 1 };
+}
+
+/** WCAG 2 contrast ratio of two opaque colours. */
+function contrast(one: ReturnType<typeof rgbaOf>, two: ReturnType<typeof rgbaOf>): number {
+  const channel = (value: number) => { const c = value / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const luminance = (c: ReturnType<typeof rgbaOf>) => 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b);
+  const [light, dark] = [luminance(one), luminance(two)].sort((a, b) => b - a);
+  return (light + 0.05) / (dark + 0.05);
+}
+
+/**
+ * PR #2491, the maintainer on 2026-11-25 — the selection bar is a floating
+ * toolbar of its own, not more of the page: an accent tint unlike the
+ * dashboard and the daemon sections behind it, an accent border and a shadow,
+ * with its count, icons and Clear readable on it.
+ */
+async function expectBarStandsOut(page: Page, theme: "light" | "dark"): Promise<void> {
+  const look = await page.evaluate(() => {
+    const bar = document.querySelector<HTMLElement>("[data-testid='agent-cards-selection-bar']")!;
+    const painted = (from: Element | null) => {
+      for (let node = from; node; node = node.parentElement) {
+        const background = getComputedStyle(node).backgroundColor;
+        if (!/^rgba\([^)]*,\s*0\)$|^transparent$/.test(background) && !/\/\s*0\)$/.test(background)) return background;
+      }
+      return getComputedStyle(document.documentElement).backgroundColor;
+    };
+    const own = getComputedStyle(bar);
+    const section = document.querySelector(".daemon-group");
+    const header = document.querySelector(".daemon-group-header");
+    const icon = bar.querySelector("[data-testid='action-icon-group'] button")!;
+    const clear = bar.querySelector("[data-testid='agent-cards-selection-clear']")!;
+    return {
+      background: own.backgroundColor,
+      border: { width: parseFloat(own.borderTopWidth), style: own.borderTopStyle, colour: own.borderTopColor },
+      shadow: own.boxShadow,
+      dashboard: painted(bar.closest(".overview-body")),
+      sections: [section && getComputedStyle(section).backgroundColor, header && getComputedStyle(header).backgroundColor].filter((value): value is string => !!value),
+      count: getComputedStyle(bar.querySelector("[data-testid='agent-cards-selection-count']")!).color,
+      icon: getComputedStyle(icon).color,
+      clearBorder: getComputedStyle(clear).borderTopColor,
+    };
+  });
+  const where = `${theme} selection bar`;
+  const dashboard = rgbaOf(look.dashboard);
+  const background = rgbaOf(look.background);
+  expect(background.a, `${where}: its background is painted (${look.background})`).toBeGreaterThan(0);
+  expect(look.background, `${where}: its background differs from the dashboard's (${look.dashboard})`).not.toBe(look.dashboard);
+  expect(look.sections.length, `${where}: a daemon section is drawn`).toBeGreaterThan(0);
+  for (const section of look.sections) expect(look.background, `${where}: its background differs from a daemon section's (${section})`).not.toBe(section);
+  expect(look.border.width, `${where}: it has a border`).toBeGreaterThan(0);
+  expect(look.border.style, `${where}: its border is drawn`).not.toBe("none");
+  expect(look.shadow, `${where}: it casts a shadow`).not.toBe("none");
+  const ground = over(background, dashboard);
+  const accent = await page.evaluate(() => {
+    const probe = document.createElement("span");
+    probe.style.color = "var(--teal)";
+    document.querySelector("[data-testid='agent-cards-selection-bar']")!.appendChild(probe);
+    const colour = getComputedStyle(probe).color;
+    probe.remove();
+    return colour;
+  });
+  expect(look.border.colour, `${where}: its border is the theme's accent`).toBe(accent);
+  const ratios = {
+    count: contrast(over(rgbaOf(look.count), ground), ground),
+    icon: contrast(over(rgbaOf(look.icon), ground), ground),
+    clearBorder: contrast(over(rgbaOf(look.clearBorder), ground), ground),
+    border: contrast(over(rgbaOf(look.border.colour), dashboard), dashboard),
+  };
+  console.log(`${where} contrast: ${JSON.stringify(Object.fromEntries(Object.entries(ratios).map(([k, v]) => [k, Math.round(v * 100) / 100])))}`);
+  expect(ratios.count, `${where}: the count against the bar (${look.count} on ${look.background})`).toBeGreaterThanOrEqual(4.5);
+  expect(ratios.icon, `${where}: an icon against the bar (${look.icon} on ${look.background})`).toBeGreaterThanOrEqual(3);
+  expect(ratios.clearBorder, `${where}: Clear's border against the bar (${look.clearBorder} on ${look.background})`).toBeGreaterThanOrEqual(3);
+}
+
 /*
  * PR #2491 review — the action icons sit in one visible box, the same on a
  * card, in the selection bar and in the batch row of an overlay.
  */
 test.describe("desktop/agent-cards/088 — action icons are grouped in a box that stands out", () => {
   for (const width of [375, 1440] as const) {
-    /// Scenario: At this width, on a daemon that does batches, give a root with agents under it three actions. Its icons sit in a box painted in the theme's tint, unlike the card, with the card's own Close outside it, and the same box holds the selection bar's icons once the root is ticked (the bar at the dashboard's foot even when the cards do not fill it) and the batch row's icons in the root's overlay. In the light and the dark theme, each box's background is that theme's tint, not transparent, and differs from what it sits on.
+    /// Scenario: At this width, on a daemon that does batches, give a root with agents under it three actions. Its icons sit in a box painted in the theme's tint, unlike the card, with the card's own Close outside it, and the same box holds the selection bar's icons once the root is ticked (the bar at the dashboard's foot even when the cards do not fill it) and the batch row's icons in the root's overlay. In the light and the dark theme, each box's background is that theme's tint, not transparent, and differs from what it sits on, and the selection bar itself is a toolbar of its own: a painted background unlike the dashboard's and the daemon section's, an accent border and a shadow, with its count at least 4.5:1 and its icons and Clear's border at least 3:1 against it.
     test(`the icon group on a card, in the bar and in the overlay is visible and differs from the card at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
       await openCardsTree(page);
@@ -1416,6 +1501,7 @@ test.describe("desktop/agent-cards/088 — action icons are grouped in a box tha
         expect(inTheme.bar.background, `${colorScheme}: the bar's group looks like the card's`).toBe(inTheme.card.background);
         expect(inTheme.overlay.background, `${colorScheme}: the overlay's group looks like the card's`).toBe(inTheme.card.background);
         tints.push(inTheme.card.background);
+        await expectBarStandsOut(page, colorScheme);
       }
       expect(tints[1], "the dark theme's tint is its own, not the light one's").not.toBe(tints[0]);
     });

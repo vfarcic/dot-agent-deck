@@ -59,6 +59,11 @@
   --teal-edge: #bed5cf;
   --teal-soft: #d9ebe5;
   --teal-wash: #edf5f1;
+  /* PR #2491 (2026-11-25): the floating selection bar's ground, a toolbar that
+     must not read as more of the page. A step deeper than --teal-soft, so the
+     action group inside it still shows as its own box; --ink on it is 10.9:1,
+     --teal (its border and Clear's) 4.1:1, --muted 6.2:1. */
+  --teal-toolbar: #bfded4;
 
   /* Green: passed / done. */
   --green: #28724d;
@@ -271,6 +276,7 @@
     --teal-edge: #33564f;
     --teal-soft: #1c332e;
     --teal-wash: #16241f;
+    --teal-toolbar: #1f453c;  /* lighter than --teal-soft, as raised is lighter in dark: --ink 8.8:1, --teal 4.9:1, --muted 4.9:1 */
     /* Green: passed / done. */
     --green: #5cbb87;
     --green-rim: #4f8266;
@@ -391,6 +397,7 @@
   --teal-edge: #33564f;
   --teal-soft: #1c332e;
   --teal-wash: #16241f;
+  --teal-toolbar: #1f453c;  /* lighter than --teal-soft, as raised is lighter in dark: --ink 8.8:1, --teal 4.9:1, --muted 4.9:1 */
   /* Green: passed / done. */
   --green: #5cbb87;
   --green-rim: #4f8266;
@@ -2334,11 +2341,15 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
    wherever the region is scrolled; scrolled to the end it sits below the last card, which is the room the cards get for it. It is inside the region,
    which ends above the voice row, so it never covers that. `margin-top: auto` puts it at the region's foot when the cards are fewer than fill it.
    Its actions wrap inside their group on a narrow window. */
-.agent-cards-selection-bar { position: sticky; bottom: 0; z-index: 5; flex: none; margin-top: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--paper-strong); box-shadow: 0 -6px 18px rgb(var(--scrim-rgb) / .12); }
+/* PR #2491 (the maintainer, 2026-11-25): the bar is a floating toolbar, not more of the page, so it has a look of its own: the accent tint, an accent
+   border and an elevation shadow. The action group inside it keeps the group's own look, the same as on a card and in an overlay. Clear's border is the
+   accent too, because the page's line colour does not show on the tint (3:1 is the bar for it). */
+.agent-cards-selection-bar { position: sticky; bottom: 0; z-index: 5; flex: none; margin-top: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; padding: 8px 12px; border: 1.5px solid var(--teal); border-radius: 8px; background: var(--teal-toolbar); box-shadow: 0 10px 28px rgb(var(--scrim-rgb) / .24), 0 2px 6px rgb(var(--scrim-rgb) / .18); }
 .agent-cards-selection-count { flex: none; color: var(--ink); font-size: var(--text-sm); font-weight: 700; }
-.agent-cards-selection-hint { flex: 1 1 auto; min-width: 0; color: var(--faint); font-size: var(--text-sm); }
+.agent-cards-selection-hint { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: var(--text-sm); }
 .agent-cards-selection-actions { flex: 0 1 auto; }
 .agent-cards-selection-clear { flex: none; margin-left: auto; }
+.agent-cards-selection-bar .agent-cards-selection-clear { border-color: var(--teal); }
 .agent-card-select { flex: none; display: inline-flex; align-items: center; }
 .agent-card-select input { margin: 0; width: 14px; height: 14px; accent-color: var(--teal); cursor: pointer; }
 .agent-card.is-selected { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
