@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ButtonHTMLAttributes, type CSSProperties, type FocusEvent, type KeyboardEvent, type MouseEvent } from "react";
+import { useEffect, useId, useRef, useState, type ButtonHTMLAttributes, type CSSProperties, type FocusEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 /** The gap between the button and its tooltip, and the tooltip's margin from the window's edges, in pixels. */
@@ -191,4 +191,14 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
       )}
     </>
   );
+}
+
+/**
+ * PR #2491 review — the box around a set of action icons: a card's own, the
+ * selection bar's and the batch row of a card's overlay all draw their icons
+ * inside one, so a user who learns where a card's actions are finds them in
+ * the same box everywhere. Close is not an action and stays outside it.
+ */
+export function ActionIconGroup({ className = "", label, children }: { className?: string; label: string; children: ReactNode }) {
+  return <span className={`action-icon-group${className ? ` ${className}` : ""}`} role="group" aria-label={label} data-testid="action-icon-group">{children}</span>;
 }

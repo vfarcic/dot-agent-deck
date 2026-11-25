@@ -694,8 +694,8 @@ export type VoiceActionContext = {
    * preview and opens the confirmation. Sends nothing.
    */
   runCardActionBatch: (target: AgentCardRef, action: { actionId?: string; label?: string }) => string | undefined;
-  /** Turn the Cards view's selection on or off; turning it off clears the selection. */
-  toggleCardSelecting: () => void;
+  /** PR #2491 review — empty the Cards view's selection; says so in words when nothing is selected. */
+  clearCardSelection: () => string | undefined;
   /**
    * Select or unselect one card; a closed card takes every card under it
    * along. `want` says which (voice's "select" / "unselect"); without it the
@@ -1719,11 +1719,16 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  toggleCardSelecting: {
-    label: "Turn the Cards view's selection on or off",
-    no_voice: "the toolbar's Select button only shows or hides the checkboxes, and leaving clears them; voice selects a named card directly (`select_agent_card`, which turns the selection on) and takes one back out (`unselect_agent_card`), so a spoken switch for the checkboxes themselves would add a step and reach nothing new",
-    needs: ["toggleCardSelecting"],
-    run: (context: Pick<VoiceActionContext, "toggleCardSelecting">) => context.toggleCardSelecting(),
+  /* PR #2491 review — every card's checkbox is always shown, so there is no
+     selection to turn on; the selection bar's Clear, and voice, empty it. */
+  clearCardSelection: {
+    label: "Clear the Cards view's selection",
+    voice: true,
+    needs: ["clearCardSelection"],
+    run: (context: Pick<VoiceActionContext, "clearCardSelection"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.clearCardSelection();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
   },
 
   toggleCardSelected: {
@@ -2671,7 +2676,7 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | "showInterruptedWork" | "hideInterruptedWork" | "interruptedDialog" | AgentCardMember>;
 
 /** PRD #2374 — the agent cards' members, served by the overview. */
-export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
+export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
 
 /** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
 export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "chooseCardActionsDaemon" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag" | "setCardActionPlacement";

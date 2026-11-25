@@ -54,7 +54,7 @@ export const CODE_BATCH_DAEMON_UNREACHABLE = "daemon_unreachable";
 export const ANOTHER_BATCH_SENDING = "A batch is still being sent; wait for its results before starting another.";
 
 /** The card members the overview serves, every one of them. */
-type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch">;
+type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch">;
 
 /**
  * Issue #2399 — an action a batch can send: its id and the label and icon its
@@ -101,9 +101,8 @@ export interface CardBatchView {
   refusal?: string;
 }
 
-/** Issue #2399 — the Cards view's selection: whether it is on, and the cards in it by placed key. */
+/** Issue #2399 — the Cards view's selection: the cards in it by placed key (PR #2491 review: every card's checkbox is always shown, so there is no selecting mode). */
 export interface CardSelection {
-  selecting: boolean;
   selected: ReadonlySet<string>;
   /** The actions the selected cards offer a batch, in the order they are first met. */
   choices: CardBatchChoice[];
@@ -259,7 +258,6 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   const [openCards, setOpenCards] = useState<ReadonlySet<string>>(readOpenCards);
   /* Issue #2399 — the selection and the batch on screen. */
   const batchFor = useCallback((deckId: string) => runtime.agentCards?.[deckId]?.batch === true, [runtime.agentCards]);
-  const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   const [batch, setBatch] = useState<CardBatchView>();
   /* Bumped by every batch started or closed, so a late answer to an earlier one changes nothing. */
@@ -268,8 +266,8 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
      a new batch asked for before the next render is refused too. */
   const batchSending = useRef(false);
   /* The latest committed state, for members a dispatch calls after a render. */
-  const latest = useRef({ placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selecting, selected, batch, batchFor });
-  latest.current = { placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selecting, selected, batch, batchFor };
+  const latest = useRef({ placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selected, batch, batchFor });
+  latest.current = { placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selected, batch, batchFor };
   /* Every change to the open cards is remembered; one this window cannot
      store still applies until it closes. */
   const changeOpenCards = useCallback((change: (current: ReadonlySet<string>) => ReadonlySet<string>) => {
@@ -555,11 +553,10 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       if (!choice) return wanted.label !== undefined ? `Neither ${name} nor any card under it has an action called "${displayText(wanted.label, DISPLAY_LIMITS.name)}", so nothing was sent.` : CARD_GONE;
       return startBatch(cards, choice.id, choice.label, subtreeScope(card, cards));
     },
-    toggleCardSelecting: () => {
-      const on = !latest.current.selecting;
-      setSelecting(on);
-      // Leaving the selection clears it.
-      if (!on) setSelected(new Set());
+    clearCardSelection: () => {
+      if (latest.current.selected.size === 0) return NOTHING_SELECTED;
+      setSelected(new Set());
+      return undefined;
     },
     toggleCardSelected: (ref, want) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
@@ -570,7 +567,6 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       /* A closed card stands for everything under it, so it takes its whole tree along; an open one is itself. */
       const closed = !latest.current.openCards.has(cardKey);
       const keys = (closed ? cardSubtree(latest.current.placed, card, latest.current.treeFor(card.deckId)) : [card]).map(placedCardKey);
-      setSelecting(true);
       /* The selection is the Cards view's: selecting by voice from the table shows that view. */
       remember("cards");
       setSelected((current) => {
@@ -734,7 +730,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   const anyBatches = shown && placed.some((card) => batchFor(card.deckId));
   const selection = useMemo<CardSelection | undefined>(() => {
     if (!anyBatches) return undefined;
-    return { selecting, selected, choices: batchChoices(placed.filter((card) => selected.has(placedCardKey(card)))) };
-  }, [anyBatches, placed, selected, selecting]);
+    return { selected, choices: batchChoices(placed.filter((card) => selected.has(placedCardKey(card)))) };
+  }, [anyBatches, placed, selected]);
   return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, overlay, notice, dismissNotice, rowMenu, controls, clickControls, voice, cardFor, resultsFor, batchFor, selection, batch: shown ? batch : undefined };
 }

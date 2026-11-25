@@ -1000,11 +1000,13 @@ export function docsAgentCards(): AgentCardsSnapshot {
  * to all four previews three included agents and one skipped. Every card
  * keeps the deck's Close, so the selection offers Go ahead and Close. Its
  * execution fails for one agent, as a daemon refuses a press on an agent that
- * stopped after the preview, so the results show a partial failure. Served
- * only for `cards=batch`, so neither the `agent-cards` scene nor any other
- * shows a Select button.
+ * stopped after the preview, so the results show a partial failure. PR #2491
+ * review: the reviewer (Contract review), whose pull request is open, also
+ * offers the deck's Merge it, so the cards show both kinds of icon. Served
+ * only for `cards=batch`, so no other scene shows a checkbox.
  */
 const DOCS_BATCH_OFFERED = new Set(["1", "2", "3"]);
+const DOCS_BATCH_MERGE = "3";
 /** The agent whose press the scene's daemon refuses at Send, and the sentence it refuses with (the daemon's `action_disabled` wording, `invoke_once` in `src/agent_cards.rs`). */
 const DOCS_BATCH_EXECUTE_FAILURES: Readonly<Record<string, { code: string; message: string }>> = {
   "2": { code: "action_disabled", message: "Go ahead is disabled: the agent is not running" },
@@ -1013,9 +1015,14 @@ const DOCS_BATCH_EXECUTE_FAILURES: Readonly<Record<string, { code: string; messa
 /** Issue #2399 — the `cards=batch` scene's cards: `docsAgentCards()` from a daemon that does batches. */
 export function docsBatchAgentCards(): AgentCardsSnapshot {
   const snapshot = docsAgentCards();
-  const entries = snapshot.entries.map((entry) => DOCS_BATCH_OFFERED.has(entry.agent_id) && !entry.actions.some((action) => action.id === "go-ahead")
-    ? { ...entry, actions: [docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", prompt_source: "catalog", icon: "play" }), ...entry.actions] }
-    : entry);
+  const merge = docsCardAction("merge", { label: "Merge it", prompt: "Merge it, following this project's own merge procedure, then update your card.", prompt_source: "catalog", icon: "git-merge" });
+  const entries = snapshot.entries.map((entry) => {
+    const goAhead = DOCS_BATCH_OFFERED.has(entry.agent_id) && !entry.actions.some((action) => action.id === "go-ahead")
+      ? [docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", prompt_source: "catalog", icon: "play" })]
+      : [];
+    const merging = entry.agent_id === DOCS_BATCH_MERGE ? [merge] : [];
+    return goAhead.length + merging.length > 0 ? { ...entry, actions: [...goAhead, ...merging, ...entry.actions] } : entry;
+  });
   return { ...snapshot, entries, batch: true };
 }
 

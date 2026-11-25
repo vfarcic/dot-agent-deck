@@ -3032,6 +3032,18 @@ try_saying  = "unselect {agent}'s card"
   kind = "agent_ref"
 
 [[commands]]
+id          = "clear_card_selection"
+description = """Clear the batch selection on the agent dashboard, so no agent's card is selected any more.
+Use for clear the selection, unselect everything, deselect all the cards, start the selection over.
+To take ONE agent's card out of the selection, use `unselect_agent_card`. It sends nothing."""
+invoke      = "clearCardSelection"
+screens     = ["overview"]
+unavailable_hint = "the selection is cleared on the agent dashboard's cards"
+report      = "Cleared the selection."
+asks_to     = "clear the batch selection"
+try_saying  = "clear the selection"
+
+[[commands]]
 id          = "run_card_action_on_selection"
 description = """Send one of the card actions to every SELECTED agent on the agent dashboard, after
 the user reviews it. Use when the user names an action and the selection: "go ahead on the

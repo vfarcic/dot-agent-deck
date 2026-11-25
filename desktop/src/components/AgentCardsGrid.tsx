@@ -1,4 +1,4 @@
-import { BellRing, ListChecks, SlidersHorizontal, X } from "lucide-react";
+import { BellRing, SlidersHorizontal, X } from "lucide-react";
 import { useLayoutEffect, useMemo, useState } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
@@ -9,7 +9,7 @@ import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "..
 import type { CardSelection } from "../hooks/useAgentCardsView";
 import type { EndedRole } from "../types";
 import { CardActionIcon, cardIconName } from "../lib/cardIcons";
-import { ActionTipButton } from "./ActionTipButton";
+import { ActionIconGroup, ActionTipButton } from "./ActionTipButton";
 import { AgentCard, batchChoiceHover, type CardControls, type CardPlace } from "./AgentCard";
 
 /**
@@ -32,19 +32,15 @@ export function batchIconName(choice: { icon?: string | null; kind?: string }): 
  * what to say when there is nothing to show. `cards` is every card on screen,
  * across the daemons, in the daemons' order.
  */
-export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection, editor }: {
+export function AgentCardsToolbar({ cards, needsYouOnly, controls, editor }: {
   cards: readonly PlacedCard[];
   needsYouOnly: boolean;
-  controls: Pick<VoiceActionContext, "setNeedsYouFilter" | "toggleCardSelecting" | "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
-  /** Issue #2399 — the selection, offered while a deck on screen does batch actions. */
-  selection?: CardSelection;
+  controls: Pick<VoiceActionContext, "setNeedsYouFilter"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
   /** PRD #2374 decision 2026-11-24 — the Card actions editor's opener, while a daemon on screen has cards. */
   editor?: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
 }) {
   const total = cards.length;
   const needYou = cards.filter((card) => card.entry.needs_you).length;
-  const selecting = selection?.selecting === true;
-  const count = selection?.selected.size ?? 0;
   return (
     <section className="agent-cards" aria-label="Agent cards" data-testid="agent-cards">
       <div className="agent-cards-toolbar">
@@ -57,16 +53,6 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection, ed
           title={needsYouOnly ? "Show every card as bright" : "Open the way to every card that needs you, and fade the rest"}
           onClick={() => VOICE_ACTIONS.toggleNeedsYouFilter.run(controls, { needsYouOnly: !needsYouOnly })}
         ><BellRing size={13} aria-hidden="true" /><span>Needs you only</span></button>
-        {selection && (
-          <button
-            type="button"
-            className={`button secondary compact agent-cards-select${selecting ? " is-on" : ""}`}
-            data-testid="agent-cards-select"
-            aria-pressed={selecting}
-            title={selecting ? "Stop selecting cards, and clear the selection" : "Select cards to send one action to all of them; a closed card selects every card under it"}
-            onClick={() => VOICE_ACTIONS.toggleCardSelecting.run(controls)}
-          ><ListChecks size={13} aria-hidden="true" /><span>Select</span></button>
-        )}
         {editor && (
           <button
             type="button"
@@ -77,26 +63,54 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection, ed
           ><SlidersHorizontal size={13} aria-hidden="true" /><span>Card actions</span></button>
         )}
       </div>
-      {selecting && selection && (
-        <div className="agent-cards-selection" role="group" aria-label="Send to the selected cards" data-testid="agent-cards-selection">
-          <span className="agent-cards-selection-count" data-testid="agent-cards-selection-count">{count} selected</span>
-          {count > 0 && selection.choices.length === 0 && <span className="agent-cards-selection-hint">No action is offered by the selected cards.</span>}
-          {count > 0 && selection.choices.map((choice) => (
-            <ActionTipButton
-              key={choice.id}
-              className="icon-button agent-cards-batch-icon"
-              data-testid={`agent-cards-batch-action-${domIdentity(choice.id)}`}
-              data-icon={batchIconName(choice)}
-              aria-label={displayText(choice.label, DISPLAY_LIMITS.name)}
-              tip={batchChoiceHover(choice, `the ${count} selected ${count === 1 ? "agent" : "agents"}`)}
-              onClick={() => VOICE_ACTIONS.runSelectionBatch.run(controls, { cardActionId: choice.id })}
-            ><BatchChoiceIcon choice={choice} /></ActionTipButton>
-          ))}
-        </div>
-      )}
       {total === 0 && <p className="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
       {total > 0 && needsYouOnly && needYou === 0 && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">No card needs you right now.</p>}
     </section>
+  );
+}
+
+/**
+ * PR #2491 review — the selection bar: shown at the foot of the Dashboard as
+ * soon as a card is selected, and gone when the selection is emptied. It says
+ * how many cards are selected, offers each action the selected cards offer as
+ * an icon (pressing one opens the batch's confirmation; nothing is sent
+ * before it), and Clear. It floats over the end of the dashboard's scroll
+ * region, which leaves room for it below the last card.
+ */
+export function AgentCardsSelectionBar({ selection, controls }: {
+  selection: CardSelection;
+  controls: Pick<VoiceActionContext, "clearCardSelection" | "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
+}) {
+  const count = selection.selected.size;
+  if (count === 0) return null;
+  return (
+    <div className="agent-cards-selection-bar" role="region" aria-label="Selected cards" data-testid="agent-cards-selection-bar">
+      <span className="agent-cards-selection-count" data-testid="agent-cards-selection-count">{count} selected</span>
+      {selection.choices.length === 0
+        ? <span className="agent-cards-selection-hint">No action is offered by the selected cards.</span>
+        : (
+          <ActionIconGroup className="agent-cards-selection-actions" label={`Send to the ${count} selected ${count === 1 ? "card" : "cards"}`}>
+            {selection.choices.map((choice) => (
+              <ActionTipButton
+                key={choice.id}
+                className="icon-button agent-cards-batch-icon"
+                data-testid={`agent-cards-batch-action-${domIdentity(choice.id)}`}
+                data-icon={batchIconName(choice)}
+                aria-label={displayText(choice.label, DISPLAY_LIMITS.name)}
+                tip={batchChoiceHover(choice, `the ${count} selected ${count === 1 ? "agent" : "agents"}`)}
+                onClick={() => VOICE_ACTIONS.runSelectionBatch.run(controls, { cardActionId: choice.id })}
+              ><BatchChoiceIcon choice={choice} /></ActionTipButton>
+            ))}
+          </ActionIconGroup>
+        )}
+      <button
+        type="button"
+        className="button secondary compact agent-cards-selection-clear"
+        data-testid="agent-cards-selection-clear"
+        title="Unselect every card"
+        onClick={() => VOICE_ACTIONS.clearCardSelection.run(controls)}
+      >Clear</button>
+    </div>
   );
 }
 
@@ -244,7 +258,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
   openTarget?: (card: PlacedCard) => AgentViewTarget;
   /** Issue #1965 — this deck's exited orchestration roles, whose cards say why. */
   endedRoles?: readonly EndedRole[];
-  /** Issue #2399 — the selection, when this deck's daemon does batch actions: each card then carries its checkbox. */
+  /** Issue #2399 — the selection, when this deck's daemon does batch actions: each card then carries its checkbox, always (PR #2491 review). */
   selection?: CardSelection;
 }) {
   /* The frame as a state, set by its ref: it is not mounted while there are
@@ -286,7 +300,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
       open,
       faded: path !== undefined && !path.has(placedCardKey(node.card)),
       tree,
-      ...(selection?.selecting ? { selected: selection.selected.has(placedCardKey(node.card)) } : {}),
+      ...(selection ? { selected: selection.selected.has(placedCardKey(node.card)) } : {}),
     }),
   };
   return (

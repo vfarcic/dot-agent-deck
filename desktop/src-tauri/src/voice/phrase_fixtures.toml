@@ -34,6 +34,29 @@ action = "unselect_agent_card"
 outcome = "dispatch"
 resolved_agent = "agent-tester"
 
+# PR #2491 review: every card's checkbox is always shown, so the selection is
+# cleared rather than switched off.
+[[fixtures]]
+name = "card-selection-clear-the-selection"
+utterance = "clear the selection"
+screen = "overview"
+action = "clear_card_selection"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-selection-deselect-all-cards"
+utterance = "deselect all the cards"
+screen = "overview"
+action = "clear_card_selection"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-selection-clear-unavailable-on-agent"
+utterance = "clear the selection"
+screen = "agent"
+action = "clear_card_selection"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "card-selection-go-ahead-on-selected-agents"
 utterance = "go ahead on the selected agents"

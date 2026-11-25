@@ -808,6 +808,7 @@ pub(crate) mod tests {
                 "run_card_action_batch".to_string(),
                 "select_agent_card".to_string(),
                 "unselect_agent_card".to_string(),
+                "clear_card_selection".to_string(),
                 "run_card_action_on_selection".to_string(),
                 "reply_to_agent_card".to_string(),
                 "open_card_actions_editor".to_string(),

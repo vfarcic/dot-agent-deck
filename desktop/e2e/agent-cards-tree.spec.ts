@@ -41,7 +41,7 @@ const WIDTHS = [375, 768, 1024, 1440, 1920] as const;
 const TOLERANCE = 0.5;
 
 for (const width of WIDTHS) {
-  /// Scenario: At this window width, select a closed root containing six nested cards and start a batch. The preview shows the seven agents, wraps each exact prompt within the dialog and keeps Send and Cancel usable; Cancel sends nothing, and a subsequent Send opens the results.
+  /// Scenario: At this window width, tick the checkbox of a closed root containing six nested cards and start a batch from the selection bar. The preview shows the seven agents, wraps each exact prompt within the dialog and keeps Send and Cancel usable; Cancel sends nothing, and a subsequent Send opens the results.
   test(`desktop/agent-cards/033 — a closed subtree's batch confirmation fits and works at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await openCardsTree(page);
@@ -57,7 +57,6 @@ for (const width of WIDTHS) {
     `);
     const root = await cardNamed(page, "issue-queue");
     await expect(page.locator("article[data-card-key][data-depth='1']")).toHaveCount(0);
-    await page.getByTestId("agent-cards-select").click();
     await root.getByRole("checkbox", { name: "Select issue-queue" }).check();
     await expect(page.getByTestId("agent-cards-selection-count")).toHaveText("7 selected");
     await expect(page.locator("article[data-card-key][data-depth='1']")).toHaveCount(0);
@@ -1100,9 +1099,9 @@ test.describe("desktop/agent-cards/083 — a cut hover keeps the review after th
  * room; Needs you shrinks to its bell, so a root's name keeps as much room as
  * the regular maximum-content case requires.
  */
-test.describe("desktop/agent-cards/081 — a root at its fullest while selecting keeps its name", () => {
+test.describe("desktop/agent-cards/081 — a root at its fullest with its checkbox keeps its name", () => {
   for (const width of [375, 1440] as const) {
-    /// Scenario: At this width, turn Select on and give a root with agents under it a long name, Needs you, a long status and five actions. Its header holds the checkbox, the name, the Needs you bell (whose tooltip still explains it), the tree toggle and Close; the name shows at least 48 pixels of itself, no two controls overlap, all are inside the card, and the checkbox and Close can be pressed; the page never scrolls sideways.
+    /// Scenario: At this width, on a daemon that does batches (so every card has its checkbox, with no Select to press), give a root with agents under it a long name, Needs you, a long status and five actions. Its header holds the checkbox, the name, the Needs you bell (whose tooltip still explains it), the tree toggle and Close; the name shows at least 48 pixels of itself, no two controls overlap, all are inside the card, and the checkbox and Close can be pressed; the page never scrolls sideways.
     test(`a root with the checkbox, Needs you, the tree toggle and Close keeps its name readable at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
       await openCardsTree(page);
@@ -1118,7 +1117,7 @@ test.describe("desktop/agent-cards/081 — a root at its fullest while selecting
           confirm: false, confirm_detail: null, icon: null, placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: "tok-" + id }, extra);
         root.actions = [offered("s1", "Go ahead", { icon: "play" }), offered("s2", "Merge it", { icon: "git-merge" }), offered("s3", "Deploy it", { icon: "rocket" }), offered("s4", "Fourth"), offered("s5", "Fifth"), ...root.actions];
       `);
-      await page.getByTestId("agent-cards-select").click();
+      await expect(page.getByTestId("agent-cards-select"), "there is no Select to press").toHaveCount(0);
       const card = page.locator(`article[data-card-key="${key}"]`);
       const checkbox = card.getByTestId("agent-card-select");
       await expect(checkbox).toBeVisible();
@@ -1140,7 +1139,7 @@ test.describe("desktop/agent-cards/081 — a root at its fullest while selecting
             .map((element) => ({ what: element.getAttribute("data-testid") ?? element.textContent ?? "", at: box(element) })),
         };
       });
-      expect(geometry.nameVisible, "the name shows more than a few characters while selecting").toBeGreaterThanOrEqual(48);
+      expect(geometry.nameVisible, "the name shows more than a few characters beside the checkbox").toBeGreaterThanOrEqual(48);
       expect(geometry.controls.map((control) => control.what)).toEqual(expect.arrayContaining(["agent-card-select", "agent-card-open-agent", "agent-card-needs-you", "agent-card-toggle", "agent-card-close-agent"]));
       for (const control of geometry.controls) {
         expect(control.at.width, `${control.what} is drawn`).toBeGreaterThan(0);
@@ -1156,7 +1155,193 @@ test.describe("desktop/agent-cards/081 — a root at its fullest while selecting
       }
       await checkbox.click();
       await expect(checkbox).toBeChecked();
+      await expect(page.getByTestId("agent-card-overlay"), "ticking the checkbox opens nothing").toHaveCount(0);
       await card.getByRole("button", { name: /^Close/ }).click({ trial: true });
+      await expectNoSidewaysScroll(page);
+    });
+  }
+});
+
+/*
+ * PR #2491 review — the selection bar floats at the foot of the dashboard's
+ * scroll region: it appears with the first ticked card wherever the region is
+ * scrolled, stays in reach while it scrolls, never covers the last card once
+ * scrolled to the end, never covers the voice row, and its actions wrap inside
+ * their group rather than past the window.
+ */
+
+/** Forty more roots on a daemon that does batches, each offering twelve actions, so the page is taller than the window and the bar has many icons. */
+async function pushManyBatchCards(page: Page): Promise<void> {
+  await pushCards(page, `
+    next.batch = true;
+    const offered = (id, label, icon) => ({ id, label, kind: "prompt", prompt: "BAR-2491 " + id + ": do it.", prompt_source: "catalog", text_input: false,
+      confirm: false, confirm_detail: null, icon, placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: "tok-bar-" + id });
+    const icons = ["play", "git-merge", "rocket", "bug", "check", "eye", "file-text", "git-pull-request", "message-square", "refresh-cw", "send", "zap"];
+    const actions = icons.map((icon, at) => offered("bar-" + at, "Bar action " + at, icon));
+    const base = byName("bench");
+    for (let at = 0; at < 40; at++) {
+      const id = String(900 + at);
+      next.entries.push({ ...base, key: "docs-pane-" + id + "/" + id, pane_id: "docs-pane-" + id, agent_id: id, name: "extra-" + at, actions: [...actions, ...base.actions] });
+    }
+  `);
+  await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(48);
+}
+
+/** The boxes the bar's checks compare, in the window's coordinates. */
+async function barGeometry(page: Page) {
+  return page.evaluate(() => {
+    const box = (element: Element | null) => {
+      if (!element) return null;
+      const at = element.getBoundingClientRect();
+      return { left: at.left, right: at.right, top: at.top, bottom: at.bottom, width: at.width, height: at.height };
+    };
+    const region = document.querySelector<HTMLElement>(".overview-body")!;
+    const bar = document.querySelector("[data-testid='agent-cards-selection-bar']");
+    const roots = [...document.querySelectorAll("article[data-card-key][data-depth='0']")];
+    return {
+      window: { width: window.innerWidth, height: window.innerHeight },
+      region: { ...box(region)!, scrollTop: region.scrollTop, scrollHeight: region.scrollHeight, clientHeight: region.clientHeight },
+      bar: box(bar),
+      group: box(bar?.querySelector("[data-testid='action-icon-group']") ?? null),
+      icons: [...(bar?.querySelectorAll("[data-testid='action-icon-group'] button") ?? [])].map((icon) => box(icon)!),
+      clear: box(bar?.querySelector("[data-testid='agent-cards-selection-clear']") ?? null),
+      lastCard: box(roots[roots.length - 1]),
+      voice: box(document.querySelector("[data-testid='voice-row']")),
+    };
+  });
+}
+
+test.describe("desktop/agent-cards/087 — the selection bar floats at the foot of the dashboard", () => {
+  for (const [width, height] of [[375, 700], [1440, 900]] as const) {
+    /// Scenario: At this window size, with forty-eight cards on a daemon that does batches, the dashboard is taller than the window. Scroll down, tick a card there: the bar appears at the foot of the dashboard in view, without scrolling back, above the voice row. It stays in view scrolled to the top, and scrolled to the end it sits below the last card instead of over it. Its thirteen action icons (twelve and Close) wrap inside their group, inside the window, with Clear beside them; pressing one opens the batch's confirmation, and Clear takes the bar away.
+    test(`the bar appears where the user scrolled, keeps clear of the last card and the voice row, and opens the confirmation at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height });
+      await openCardsTree(page);
+      await pushManyBatchCards(page);
+      await expect(page.getByTestId("agent-cards-selection-bar"), "nothing selected, no bar").toHaveCount(0);
+      const before = await barGeometry(page);
+      expect(before.region.scrollHeight, "the dashboard is taller than the window").toBeGreaterThan(before.region.clientHeight + 200);
+
+      const far = await cardNamed(page, "extra-30");
+      await far.scrollIntoViewIfNeeded();
+      const scrolled = await page.locator(".overview-body").evaluate((node) => node.scrollTop);
+      expect(scrolled, "the dashboard was scrolled down").toBeGreaterThan(100);
+      await far.getByTestId("agent-card-select").click();
+      await expect(far.getByTestId("agent-card-select")).toBeChecked();
+      const bar = page.getByTestId("agent-cards-selection-bar");
+      await expect(bar).toBeVisible();
+      await expect(bar.getByTestId("agent-cards-selection-count")).toHaveText("1 selected");
+      await expect(bar, "the bar is in view where the user scrolled").toBeInViewport({ ratio: 1 });
+      const ticked = await barGeometry(page);
+      expect(Math.abs(ticked.region.scrollTop - scrolled), "ticking did not scroll the dashboard back").toBeLessThanOrEqual(2);
+      expect(ticked.voice, "the voice row is drawn").not.toBeNull();
+      expect(ticked.bar!.bottom, "the bar is above the voice row").toBeLessThanOrEqual(ticked.voice!.top + TOLERANCE);
+      expect(ticked.bar!.bottom, "the bar is at the dashboard's foot").toBeGreaterThan(ticked.region.bottom - 40);
+
+      // Its icons wrap inside their group, inside the bar and the window, with Clear in the bar.
+      // The twelve actions and the deck's Close, which every card offers.
+      expect(ticked.icons).toHaveLength(13);
+      expect(ticked.bar!.left).toBeGreaterThanOrEqual(-TOLERANCE);
+      expect(ticked.bar!.right, "the bar fits the window").toBeLessThanOrEqual(width + TOLERANCE);
+      for (const icon of ticked.icons) {
+        expect(icon.left, "an icon starts inside its group").toBeGreaterThanOrEqual(ticked.group!.left - TOLERANCE);
+        expect(icon.right, "an icon ends inside its group").toBeLessThanOrEqual(ticked.group!.right + TOLERANCE);
+        expect(icon.bottom, "an icon is inside its group").toBeLessThanOrEqual(ticked.group!.bottom + TOLERANCE);
+      }
+      expect(ticked.group!.right, "the group fits the bar").toBeLessThanOrEqual(ticked.bar!.right + TOLERANCE);
+      if (width === 375) expect(ticked.group!.height, "thirteen icons wrap onto more than one line at 375px").toBeGreaterThan(ticked.icons[0].height * 1.5);
+      expect(ticked.clear, "Clear is in the bar").not.toBeNull();
+      expect(ticked.clear!.right).toBeLessThanOrEqual(ticked.bar!.right + TOLERANCE);
+      await expect(bar.getByRole("button", { name: "Clear" })).toBeInViewport({ ratio: 1 });
+
+      // Scrolled to the top, the bar stays in reach.
+      await page.locator(".overview-body").evaluate((node) => { node.scrollTop = 0; });
+      await expect(bar).toBeInViewport({ ratio: 1 });
+
+      // Scrolled to the end, the last card is clear of the bar.
+      await page.locator(".overview-body").evaluate((node) => { node.scrollTop = node.scrollHeight; });
+      const end = await barGeometry(page);
+      expect(end.region.scrollTop + end.region.clientHeight, "scrolled to the end").toBeGreaterThanOrEqual(end.region.scrollHeight - 1);
+      expect(end.lastCard!.bottom, "the last card ends above the bar").toBeLessThanOrEqual(end.bar!.top + TOLERANCE);
+      expect(end.bar!.bottom, "the bar is above the voice row").toBeLessThanOrEqual(end.voice!.top + TOLERANCE);
+      await expect(bar).toBeInViewport({ ratio: 1 });
+      await expectNoSidewaysScroll(page);
+
+      // An icon in the bar opens the batch's confirmation; nothing is sent before it.
+      await bar.getByRole("button", { name: "Bar action 0" }).click();
+      const dialog = page.getByTestId("agent-cards-batch-confirm");
+      await expect(dialog).toBeVisible();
+      await expect(dialog.getByTestId("agent-cards-batch-entry")).toHaveCount(1);
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(dialog).toHaveCount(0);
+      await bar.getByRole("button", { name: "Clear" }).click();
+      await expect(bar).toHaveCount(0);
+      await expect(far.getByTestId("agent-card-select")).not.toBeChecked();
+    });
+  }
+});
+
+/*
+ * PR #2491 review — the action icons sit in one visible box, the same on a
+ * card, in the selection bar and in the batch row of an overlay.
+ */
+test.describe("desktop/agent-cards/088 — action icons are grouped in a box that stands out", () => {
+  for (const width of [375, 1440] as const) {
+    /// Scenario: At this width, on a daemon that does batches, give a root with agents under it three actions. Its icons sit in a box whose background or border differs from the card's, Close stays outside it, and the same box holds the selection bar's icons once the root is ticked (the bar at the dashboard's foot even when the cards do not fill it) and the batch row's icons in the root's overlay.
+    test(`the icon group on a card, in the bar and in the overlay is visible and differs from the card at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await openCardsTree(page);
+      await pushCards(page, `
+        next.batch = true;
+        const offered = (id, label, icon) => ({ id, label, kind: "prompt", prompt: "GROUP-2491 " + id + ": do it.", prompt_source: "catalog", text_input: false,
+          confirm: false, confirm_detail: null, icon, placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: "tok-group-" + id });
+        for (const entry of next.entries) entry.actions = [offered("g1", "Go ahead", "play"), offered("g2", "Merge it", "git-merge"), offered("g3", "Deploy it", "rocket"), ...entry.actions];
+      `);
+      const card = await cardNamed(page, "docs-site");
+      const looks = (group: ReturnType<Page["locator"]>) => group.evaluate((node) => {
+        const own = getComputedStyle(node);
+        const article = getComputedStyle(node.closest("article, [data-testid='agent-cards-selection-bar'], [data-testid='agent-card-overlay']")!);
+        const at = node.getBoundingClientRect();
+        return { background: own.backgroundColor, border: own.borderTopColor, borderWidth: parseFloat(own.borderTopWidth), radius: parseFloat(own.borderTopLeftRadius), around: article.backgroundColor, width: at.width, height: at.height };
+      });
+      const expectStandsOut = (look: Awaited<ReturnType<typeof looks>>, where: string) => {
+        expect(look.width, `${where}: the group is drawn`).toBeGreaterThan(0);
+        expect(look.borderWidth, `${where}: the group has a border`).toBeGreaterThan(0);
+        expect(look.radius, `${where}: the group's corners are rounded`).toBeGreaterThan(0);
+        expect(look.background !== look.around || look.border !== look.around, `${where}: the group differs from what it sits on`).toBe(true);
+        expect(look.background, `${where}: the group is tinted`).not.toBe(look.around);
+      };
+      const onCard = card.getByTestId("action-icon-group");
+      await expect(onCard).toBeVisible();
+      await expect(onCard.getByRole("button")).toHaveCount(3);
+      await expect(onCard.getByRole("button", { name: /^Close/ }), "Close is outside the group").toHaveCount(0);
+      await expect(card.getByRole("button", { name: /^Close/ })).toBeVisible();
+      const cardLook = await looks(onCard);
+      expectStandsOut(cardLook, "card");
+
+      await card.getByTestId("agent-card-select").click();
+      // With fewer cards than fill the dashboard, the bar is still at its foot, not under the last card.
+      const foot = await page.evaluate(() => ({
+        region: document.querySelector(".overview-body")!.getBoundingClientRect().bottom,
+        bar: document.querySelector("[data-testid='agent-cards-selection-bar']")!.getBoundingClientRect().bottom,
+        tall: document.querySelector<HTMLElement>(".overview-body")!.scrollHeight > document.querySelector<HTMLElement>(".overview-body")!.clientHeight,
+      }));
+      if (!foot.tall) expect(foot.bar, "the bar is at the dashboard's foot on a short page").toBeGreaterThan(foot.region - 40);
+      const inBar = page.getByTestId("agent-cards-selection-bar").getByTestId("action-icon-group");
+      await expect(inBar).toBeVisible();
+      const barLook = await looks(inBar);
+      expectStandsOut(barLook, "bar");
+      expect(barLook.background, "the bar's group looks like the card's").toBe(cardLook.background);
+      expect(barLook.border).toBe(cardLook.border);
+
+      await card.getByTestId("agent-card-details").click();
+      const inOverlay = page.getByTestId("agent-card-batch").getByTestId("action-icon-group");
+      await inOverlay.scrollIntoViewIfNeeded();
+      await expect(inOverlay).toBeVisible();
+      const overlayLook = await looks(inOverlay);
+      expectStandsOut(overlayLook, "overlay");
+      expect(overlayLook.background, "the overlay's group looks like the card's").toBe(cardLook.background);
+      expect(overlayLook.border).toBe(cardLook.border);
       await expectNoSidewaysScroll(page);
     });
   }

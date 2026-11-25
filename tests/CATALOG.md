@@ -17289,7 +17289,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/028: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** selection mode lets the user select a closed root, counts the root, child and grandchild without opening them, leaves the unrelated root unselected, previews precisely the selected subtree and clears the selection when the root is unchecked.
+- **Asserts:** the checkbox every card carries (no Select to press, PR #2491 review) selects a closed root, counts the root, child and grandchild without opening them, leaves the unrelated root unselected, previews precisely the selected subtree, and clears the selection, and with it the selection bar, when the root is unchecked.
 - **Does not assert:** browser geometry (033).
 
 ##### desktop/agent-cards/029 — An overlay batch reaches the card's whole subtree.
@@ -17450,7 +17450,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/051: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed batch bridge.
-- **Asserts:** the selection toolbar's and a root overlay's Go ahead are icon buttons named Go ahead with no text and an SVG, whose hover holds the label and, when every selected card lists the same text, that text; when a child's text differs, both surfaces' hover says "text differs per agent" and quotes neither; on both surfaces an action with the catalog icon `git-merge` draws it, and one with no icon or an icon the app does not bundle draws the generic icon, the same drawing on both; pressing the toolbar icon only opens the confirmation, and nothing is invoked as a single press (PRD #2374 decision 2026-11-24 (3); issue #2399 review, finding 8). `desktop/agent-cards/028`–`045` find these buttons by the same accessible name.
+- **Asserts:** the selection bar's and a root overlay's Go ahead are icon buttons named Go ahead with no text and an SVG, whose hover holds the label and, when every selected card lists the same text, that text; when a child's text differs, both surfaces' hover says "text differs per agent" and quotes neither; on both surfaces an action with the catalog icon `git-merge` draws it, and one with no icon or an icon the app does not bundle draws the generic icon, the same drawing on both; pressing the bar's icon only opens the confirmation, and nothing is invoked as a single press (PRD #2374 decision 2026-11-24 (3); issue #2399 review, finding 8). `desktop/agent-cards/028`–`045` find these buttons by the same accessible name.
 - **Does not assert:** the daemon's preview text (030).
 
 ##### desktop/agent-cards/052 — The confirmation quotes text every agent shares once, and ties each agent to its own text.
@@ -17656,11 +17656,11 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** a catalog action that does not ask first, whose text is a short line, eighty empty lines and a sentinel instruction — under the hover's 1,200 characters — draws, on hover and on keyboard focus alike, a tooltip whose box is inside the window on both axes and which ends, in view, by saying it is too long to show here; a click and an Enter each open the review with the whole text, sentinel included, and send nothing; the page never scrolls sideways (issue #2399 re-review N2, re-audit new 2).
 - **Does not assert:** a spoken action, which sends as it always did (the review is a safeguard for icon presses).
 
-##### desktop/agent-cards/081 — A root at its fullest while selecting keeps its name.
+##### desktop/agent-cards/081 — A root at its fullest with its checkbox keeps its name.
 
 - **Test:** Playwright `desktop/agent-cards/081 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
 - **Layer:** desktop browser (production build, `vite preview`).
-- **Asserts:** with Select on, a root with agents under it, a long name, Needs you, a long status and five actions draws the checkbox, the name, Needs you as its bell (whose tooltip and screen-reader words remain), the tree toggle and Close in its header; the name shows at least 48 px of itself, as `076` requires without Select; no header control overlaps another and all are inside the card; the checkbox can be ticked and Close pressed; the page never scrolls sideways (issue #2399 re-review N6).
+- **Asserts:** on a daemon that does batches, with no Select to press (PR #2491 review), a root with agents under it, a long name, Needs you, a long status and five actions draws the checkbox, the name, Needs you as its bell (whose tooltip and screen-reader words remain), the tree toggle and Close in its header; the name shows at least 48 px of itself, as `076` requires without the checkbox; no header control overlaps another and all are inside the card; the checkbox can be ticked, which opens no overlay, and Close pressed; the page never scrolls sideways (issue #2399 re-review N6).
 - **Does not assert:** other widths.
 
 ##### desktop/agent-cards/082 — A shown hover is drawn again when its text changes.
@@ -17683,6 +17683,34 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech; a stubbed catalog read.
 - **Asserts:** with the Card actions editor closed, `edit_card_action` and `remove_card_action` on a daemon that did not advertise the editor are refused at once in words saying its card actions cannot be edited from the app, with no catalog read, no form and no confirmation; on a daemon that did, a read listing no action of the spoken label ends in the sentence that no single card action is called that, for an edit and for a removal; a read that fails ends in the sentence that the card actions could not be read, with its reason; a listed action opens its form, and then (editor closed again) the removal's confirmation, each with voice saying so; nothing is written (PR #2491 review, Qodo 3).
 - **Does not assert:** that the model picks these rows for the words (`desktop/agent-cards/060`'s phrase fixtures).
+
+##### desktop/agent-cards/085 — Checkboxes are always there, and a bar at the foot appears with the selection.
+
+- **Test:** vitest `desktop/agent-cards/085: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom).
+- **Asserts:** on a daemon that does batches every card shows its checkbox with no Select button and no selection line under the toolbar; with nothing selected there is no selection bar; Needs you is the compact bell, its words kept as tooltip and screen-reader text; a card's own action icons sit in the action group, with Close outside it; ticking a card opens no overlay and shows the bar with `1 selected`, the selected cards' actions inside one action group, and Clear outside it; Clear empties the selection and removes the bar, sending nothing; the overlay's batch row is the same group; a daemon without batches shows no checkbox and no bar (PR #2491 review).
+- **Does not assert:** where the bar is drawn or how the group looks (`087`, `088`).
+
+##### desktop/agent-cards/086 — Voice clears the selection, and there is no selection switch left to say.
+
+- **Test:** vitest `desktop/agent-cards/086: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
+- **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
+- **Asserts:** two cards selected by voice are both unselected by `clear_card_selection` and the selection bar goes; said again with nothing selected, voice says "No card is selected."; nothing is sent; `clearCardSelection` is `voice: true` with exactly one `commands.toml` row on `overview` with no parameters; the registry has no `toggleCardSelecting` and no row invokes it (PR #2491 review).
+- **Does not assert:** that the model picks the row for the words: the `card-selection-clear-*` phrase fixtures do, against the real default backend (lane 2, `voice_desktop_phrases_001`).
+
+##### desktop/agent-cards/087 — The selection bar floats at the foot of the dashboard.
+
+- **Test:** Playwright `desktop/agent-cards/087 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375×700 and 1440×900), against `cards=tree` through the fixture bridge with forty more roots pushed, each offering twelve actions, chromium and webkit.
+- **Layer:** desktop browser (production build, `vite preview`).
+- **Asserts:** the dashboard is taller than its region; with nothing selected there is no bar; after scrolling down and ticking a card there, the bar is wholly in view without the region scrolling back, at the region's foot and above the voice row; its thirteen icons (the twelve and Close) are inside their group, the group inside the bar and the bar inside the window, wrapping onto more than one line at 375 px, with Clear in view; scrolled to the top it stays in view; scrolled to the end the last card ends above the bar and the bar above the voice row; the page never scrolls sideways; an icon in the bar opens the batch confirmation, and Clear removes the bar and unticks the card (PR #2491 review).
+- **Does not assert:** a voice row grown taller while voice is on, which the region already ends above.
+
+##### desktop/agent-cards/088 — Action icons are grouped in a box that stands out.
+
+- **Test:** Playwright `desktop/agent-cards/088 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (375 and 1440 px), against `cards=tree` through the fixture bridge, chromium and webkit.
+- **Layer:** desktop browser (production build, `vite preview`).
+- **Asserts:** a root's three action icons sit in a group with a border, rounded corners and a background unlike the card's, and Close is outside it; the selection bar's group, once the root is ticked, and the batch row's group in the root's overlay each have a border, rounded corners and a background unlike what they sit on, and the same background and border colour as the card's group; the page never scrolls sideways (PR #2491 review).
+- **Does not assert:** the dark theme's colours, which come from the same tokens.
 
 ## Desktop native driver scenarios
 

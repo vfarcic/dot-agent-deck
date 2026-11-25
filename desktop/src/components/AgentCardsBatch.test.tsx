@@ -46,7 +46,7 @@ const INCLUDED: BatchEntry[] = [
 ];
 const SKIPPED: BatchEntry = { pane_id: STOPPED.pane_id, agent_id: STOPPED.agent_id, name: STOPPED.name, outcome: "skipped", code: "agent_stopped", message: "This agent is no longer running." };
 
-function setup({ partial = false, entries = ENTRIES, preview = [...INCLUDED, SKIPPED] }: { partial?: boolean; entries?: AgentCardEntry[]; preview?: BatchEntry[] } = {}) {
+function setup({ partial = false, entries = ENTRIES, preview = [...INCLUDED, SKIPPED], batch = true }: { partial?: boolean; entries?: AgentCardEntry[]; preview?: BatchEntry[]; batch?: boolean } = {}) {
   const first = createFixtureFleet("fleet")[0];
   const deck = { ...first, connection: { ...first.connection, incarnation: INSTANCE }, agents: entries.filter((card) => card.status !== "stopped").map((card) => createFixtureStartedAgent({
     id: card.agent_id, daemonId: FIXTURE_DAEMON_ID, displayName: card.name, command: "claude", cwd: "/w",
@@ -67,7 +67,7 @@ function setup({ partial = false, entries = ENTRIES, preview = [...INCLUDED, SKI
     reconnect: vi.fn(async () => undefined), listProjects: vi.fn(async () => ({ projects: [] })), resolveProject: vi.fn(async () => { throw new Error("unresolved"); }),
     getSettings: vi.fn(), saveSettings: vi.fn(), testEndpoint: vi.fn(), secretStatus: vi.fn(), storeSecret: vi.fn(), forgetSecret: vi.fn(),
     setZoom: vi.fn(async (level: number) => level), desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES },
-    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries, catalogErrors: [], tree: true, batch: true } },
+    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries, catalogErrors: [], tree: true, batch } },
     invokeCardAction, invokeCardActionBatch,
   } as unknown as DeckRuntimeState;
   render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
@@ -86,11 +86,10 @@ function card(card: AgentCardEntry) {
  * that name, which a text button and an icon button both carry; what the icon
  * form itself must look like is `desktop/agent-cards/051`'s.
  */
-const selectionAction = (label: string) => within(screen.getByTestId("agent-cards-selection")).getByRole("button", { name: label });
+const selectionAction = (label: string) => within(screen.getByTestId("agent-cards-selection-bar")).getByRole("button", { name: label });
 const overlayBatchAction = (label: string) => within(screen.getByTestId("agent-card-batch")).getByRole("button", { name: label });
 
 function selectRoot() {
-  fireEvent.click(screen.getByTestId("agent-cards-select"));
   fireEvent.click(card(ROOT).getByRole("checkbox", { name: "Select root" }));
 }
 
@@ -154,7 +153,7 @@ beforeEach(() => {
 afterEach(() => { cleanup(); window.localStorage.clear(); });
 
 describe("batch card actions (#2399)", () => {
-  /// Scenario: Enter selection mode and select a closed root with a child and grandchild. The selection counts the whole subtree while its cards remain closed; clearing the root clears the selection, and an unrelated root stays unselected.
+  /// Scenario: Tick the checkbox of a closed root with a child and grandchild. The selection counts the whole subtree while its cards remain closed; clearing the root clears the selection and its bar, and an unrelated root stays unselected.
   it("desktop/agent-cards/028: selecting a closed root selects its whole subtree", async () => {
     const calls = setup();
     expect(document.querySelector(`article[data-card-key="${CHILD.key}"]`)).toBeNull();
@@ -168,7 +167,59 @@ describe("batch card actions (#2399)", () => {
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("agent-cards-batch-cancel"));
     fireEvent.click(card(ROOT).getByRole("checkbox", { name: "Select root" }));
-    expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("0 selected");
+    // PR #2491 review: an empty selection has no bar.
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
+  });
+
+  /// Scenario: Open the Cards view on a daemon that does batches. Every card shows its checkbox with no Select button to press, nothing selected shows no selection bar, and ticking a card opens neither its overlay nor anything else but shows a bar at the foot with the count, the actions as icons inside one group, and Clear, which empties the selection and takes the bar away. A card's own icons and the overlay's batch row sit in the same kind of group, Needs you is the compact bell with its words kept, and a daemon without batches shows no checkbox and no bar.
+  it("desktop/agent-cards/085: checkboxes are always there, and a bar at the foot appears with the selection", async () => {
+    const onCard = { ...action, id: "card-merge", label: "Merge it", placement: "card" as const, icon: "git-merge", token: "tok-merge" };
+    const needy = { ...OUTSIDE, needs_you: true, needs_you_reasons: ["waiting"], actions: [onCard, action] };
+    const calls = setup({ entries: [{ ...ROOT, actions: [onCard, action] }, CHILD, STOPPED, needy] });
+    expect(screen.queryByTestId("agent-cards-select"), "no Select button").toBeNull();
+    expect(screen.queryByRole("button", { name: /^Select$/ })).toBeNull();
+    expect(screen.queryByTestId("agent-cards-selection"), "the old selection line under the toolbar is gone").toBeNull();
+    expect(card(ROOT).getByRole("checkbox", { name: "Select root" })).not.toBeChecked();
+    expect(card(OUTSIDE).getByRole("checkbox", { name: "Select outside" })).not.toBeChecked();
+    expect(screen.queryByTestId("agent-cards-selection-bar"), "nothing selected, no bar").toBeNull();
+
+    // Needs you is the compact bell, its words kept for the tooltip and a screen reader.
+    const bell = card(OUTSIDE).getByTestId("agent-card-needs-you");
+    expect(bell).toHaveClass("is-compact");
+    expect(bell).toHaveAttribute("title", expect.stringMatching(/\S/));
+    expect(bell).toHaveTextContent(/^Needs you$/);
+
+    // A card's own icons sit in the action group.
+    const cardGroup = card(ROOT).getByTestId("action-icon-group");
+    expect(within(cardGroup).getByRole("button", { name: "Merge it" })).toHaveAttribute("data-action", "card-merge");
+    expect(within(cardGroup).queryByRole("button", { name: /^Close/ }), "Close stays outside the group").toBeNull();
+
+    // Ticking a card opens nothing but shows the bar.
+    fireEvent.click(card(OUTSIDE).getByRole("checkbox", { name: "Select outside" }));
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+    const bar = screen.getByTestId("agent-cards-selection-bar");
+    expect(within(bar).getByTestId("agent-cards-selection-count")).toHaveTextContent("1 selected");
+    const barGroup = within(bar).getByTestId("action-icon-group");
+    expect(within(barGroup).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Merge it", "Go ahead"]);
+    expect(within(barGroup).queryByRole("button", { name: "Clear" }), "Clear is not an action").toBeNull();
+
+    // Clear empties the selection and takes the bar away.
+    fireEvent.click(within(bar).getByRole("button", { name: "Clear" }));
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
+    expect(card(OUTSIDE).getByRole("checkbox", { name: "Select outside" })).not.toBeChecked();
+    expect(calls.invokeCardActionBatch).not.toHaveBeenCalled();
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
+
+    // The overlay's batch row is the same group.
+    fireEvent.click(card(ROOT).getByTestId("agent-card-details"));
+    const overlayGroup = within(screen.getByTestId("agent-card-batch")).getByTestId("action-icon-group");
+    expect(within(overlayGroup).getByRole("button", { name: "Go ahead" })).toBeInTheDocument();
+    cleanup();
+
+    // A daemon without batches: no checkbox, no bar.
+    setup({ batch: false });
+    expect(card(ROOT).queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
   });
 
   /// Scenario: Open a root card's overlay while its subtree is closed, then choose its batch action. The daemon previews the root, child and grandchild, excluding an unrelated root, and nothing is executed.
@@ -235,7 +286,6 @@ describe("batch card actions (#2399)", () => {
   it("desktop/agent-cards/034: a batch across two daemons keeps each agent's daemon, even with the same ids", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const calls = setupTwoDaemons();
-    fireEvent.click(screen.getByTestId("agent-cards-select"));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
     expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("2 selected");
@@ -368,7 +418,6 @@ describe("batch card actions (#2399)", () => {
       if (deckId === FIXTURE_DAEMON_ID && options.mode === "preview") throw new Error("the deck is not reachable");
       return answer(deckId, actionId, options);
     });
-    fireEvent.click(screen.getByTestId("agent-cards-select"));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
     await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
@@ -438,7 +487,6 @@ describe("batch card actions (#2399)", () => {
       }
       return answer(deckId, actionId, options);
     });
-    fireEvent.click(screen.getByTestId("agent-cards-select"));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
     await act(async () => { fireEvent.click(selectionAction("Go ahead")); });

@@ -272,6 +272,37 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(registry.sendCardBatch?.no_voice).toBeTruthy();
   });
 
+  /// Scenario: With three cards on the dashboard, say to select two of them, then "clear the selection". Both checkboxes are cleared and the selection bar goes away, with nothing sent; saying it again with nothing selected says so in words. The registry's clear entry is voice-enabled with one command row on the dashboard, and the old switch for showing the checkboxes is gone.
+  it("desktop/agent-cards/086: voice clears the selection, and there is no selection switch left to say", async () => {
+    const run = setup(
+      (agents) => [cardFor(agents[0].id, "first-card"), cardFor(agents[1].id, "second-card"), cardFor(agents[2].id, "third-card")],
+      (agents) => ({
+        "select the first card": { action: "select_agent_card", invoke: "selectAgentCard", params: [agentParam(agents[0].id, "first-card")] },
+        "select the third card": { action: "select_agent_card", invoke: "selectAgentCard", params: [agentParam(agents[2].id, "third-card")] },
+        "clear the selection": { action: "clear_card_selection", invoke: "clearCardSelection", params: [] },
+      }),
+    );
+    const [first, , third] = run.cards;
+    await turnOnVoice();
+    await speak(run.voice, "select the first card");
+    await speak(run.voice, "select the third card");
+    expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("2 selected");
+    await speak(run.voice, "clear the selection");
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
+    expect(cardNode(first).getByRole("checkbox", { name: "Select first-card" })).not.toBeChecked();
+    expect(cardNode(third).getByRole("checkbox", { name: "Select third-card" })).not.toBeChecked();
+    await speak(run.voice, "clear the selection");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("No card is selected.");
+    expect(run.invokeCardActionBatch).not.toHaveBeenCalled();
+    expect(run.invokeCardAction).not.toHaveBeenCalled();
+
+    const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string } | undefined>;
+    expect(registry.clearCardSelection?.voice).toBe(true);
+    expectRow("clear_card_selection", "clearCardSelection", ["overview"], []);
+    expect(registry.toggleCardSelecting, "no Select switch to say").toBeUndefined();
+    expect(commandRows().some((row) => row.invoke === "toggleCardSelecting")).toBe(false);
+  });
+
   /// Scenario: By voice, open the card actions editor, open the form for a new action, open Ship it for editing, and ask to remove Ship it. The editor opens on the local daemon's catalog, each request opens what it names, and the removal only opens the editor's own confirmation: nothing is written until it is pressed by hand. The registry entries behind each are voice-enabled with one matching command row each, parsed row by row with its screen and parameter, Ship it resolves from the editor although no card offers it, and every other control of the editor — Save, the removal's Remove, Hide, Restore, choosing the daemon, choosing an icon — is either a row or carries a written reason it is not.
   it("desktop/agent-cards/060: voice opens the card actions editor, its forms and a removal's confirmation, and writes nothing", async () => {
     const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };

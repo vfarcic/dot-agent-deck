@@ -417,6 +417,7 @@ mod tests {
                 "run_card_action_batch",
                 "select_agent_card",
                 "unselect_agent_card",
+                "clear_card_selection",
                 "run_card_action_on_selection",
                 "reply_to_agent_card",
                 "open_card_actions_editor",

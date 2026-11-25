@@ -2194,11 +2194,13 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 /* PRD #2374 decision 2026-11-24: the status line keeps its height whatever it holds. */
 .agent-card-meta-row { flex: none; height: 18px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .agent-card-meta-row .agent-card-meta { flex: 1 1 auto; width: auto; min-width: 0; }
-/* Issue #2399 review 2 — the card's bottom row: the roll-up (or nothing), then the action icons at its right end. Its height is fixed, so a card with icons is the height of one without. */
-.agent-card-foot { flex: none; height: 18px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* Issue #2399 review 2 — the card's bottom row: the roll-up (or nothing), then the action icons at its right end. Its height is fixed, so a card with icons is the height of one without; it is the height of the icons' group (PR #2491 review). */
+.agent-card-foot { flex: none; height: 22px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .agent-card-foot > .agent-card-rollup-block { flex: 1 1 auto; min-width: 0; }
 .agent-card-foot-actions { flex: none; margin-left: auto; }
-.agent-card-action-icons { flex: none; display: inline-flex; align-items: center; gap: 2px; }
+/* PR #2491 review — one box around every set of action icons, drawn the same on a card, in the selection bar and in an overlay's batch row, so the actions are found in the same place everywhere; each icon keeps its own outline and focus ring inside it. */
+.action-icon-group { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px; justify-self: start; width: fit-content; min-width: 0; max-width: 100%; padding: 1px; border: 1px solid var(--teal-rim); border-radius: 6px; background: var(--teal-soft); }
+.agent-card-action-icons { flex: none; flex-wrap: nowrap; }
 .agent-card-action-icon { width: 22px; height: 18px; color: var(--muted); }
 .agent-card-action-icon:hover:not(:disabled):not([aria-disabled="true"]), .agent-card-action-icon:focus-visible { color: var(--teal); border-color: var(--teal); }
 .agent-card-action-icon:disabled, .agent-card-action-icon[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
@@ -2328,14 +2330,18 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
    card's checkbox, and the batch's confirmation and results. The dialog never
    grows past the window: its list scrolls, and Cancel and Send stay in view.
    Each exact prompt wraps inside it rather than scrolling sideways. */
-.agent-cards-selection { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 8px; }
-.agent-cards-selection-count { color: var(--muted); font-size: var(--text-sm); font-weight: 700; }
-.agent-cards-selection-hint { color: var(--faint); font-size: var(--text-sm); }
-.agent-cards-select.is-on { color: var(--teal); border-color: var(--teal-edge); background: var(--teal-wash); }
+/* PR #2491 review — the selection bar: the last thing in the dashboard's scroll region, stuck to its foot while cards are selected, so it stays in reach
+   wherever the region is scrolled; scrolled to the end it sits below the last card, which is the room the cards get for it. It is inside the region,
+   which ends above the voice row, so it never covers that. `margin-top: auto` puts it at the region's foot when the cards are fewer than fill it.
+   Its actions wrap inside their group on a narrow window. */
+.agent-cards-selection-bar { position: sticky; bottom: 0; z-index: 5; flex: none; margin-top: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--paper-strong); box-shadow: 0 -6px 18px rgb(var(--scrim-rgb) / .12); }
+.agent-cards-selection-count { flex: none; color: var(--ink); font-size: var(--text-sm); font-weight: 700; }
+.agent-cards-selection-hint { flex: 1 1 auto; min-width: 0; color: var(--faint); font-size: var(--text-sm); }
+.agent-cards-selection-actions { flex: 0 1 auto; }
+.agent-cards-selection-clear { flex: none; margin-left: auto; }
 .agent-card-select { flex: none; display: inline-flex; align-items: center; }
 .agent-card-select input { margin: 0; width: 14px; height: 14px; accent-color: var(--teal); cursor: pointer; }
 .agent-card.is-selected { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
-.agent-card-batch .agent-card-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .agent-cards-batch-backdrop { padding-top: 6vh; }
 .agent-cards-batch { width: min(640px, 100%); max-height: 100%; min-width: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
 .agent-cards-batch:focus { outline: none; }

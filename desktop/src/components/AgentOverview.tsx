@@ -43,7 +43,7 @@ import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import { needsYouSentence, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
-import { AgentCardsDeckBody, AgentCardsToolbar } from "./AgentCardsGrid";
+import { AgentCardsDeckBody, AgentCardsSelectionBar, AgentCardsToolbar } from "./AgentCardsGrid";
 import { AgentCardOverlay } from "./AgentCardOverlay";
 import { AgentCardBatchDialog } from "./AgentCardBatchDialog";
 import { AgentCardActionsEditor } from "./AgentCardActionsEditor";
@@ -2418,7 +2418,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} selection={cards.selection} editor={cardActionsEditor.shown ? { ...cardActionsEditor.controls, reportRefused: cards.clickControls.reportRefused } : undefined} />}
+          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} editor={cardActionsEditor.shown ? { ...cardActionsEditor.controls, reportRefused: cards.clickControls.reportRefused } : undefined} />}
           {/* PRD #2374 — in the Cards view every deck keeps its own section and
               header, with the daemon's own controls; a deck whose daemon has
               cards shows them as the section's body, and one with no cards (or
@@ -2468,6 +2468,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               interruptedBanner={interruptedBannerFor(deck)}
             />
           ))}
+          {/* PR #2491 review — last in the scroll region, so it sticks to the region's foot while cards are selected and, scrolled to the end, sits below the last card rather than over it. */}
+          {cards.mode === "cards" && cards.selection && <AgentCardsSelectionBar selection={cards.selection} controls={cards.clickControls} />}
         </section>
       </main>
       {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} ended={overlayEnded} />}

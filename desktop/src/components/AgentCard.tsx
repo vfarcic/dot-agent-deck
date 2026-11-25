@@ -9,7 +9,7 @@ import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "..
 import { CardActionIcon, cardActionHover, cardIconName, hoverCutsPrompt } from "../lib/cardIcons";
 import { endedRoleLine } from "../lib/endedRoles";
 import type { AgentCardAction, AgentCardCheckedRef, AgentCardEntry, AgentCardRollup, EndedRole } from "../types";
-import { ActionTipButton } from "./ActionTipButton";
+import { ActionIconGroup, ActionTipButton } from "./ActionTipButton";
 import { PullRequestBadge } from "./PullRequestBadge";
 
 /**
@@ -275,7 +275,7 @@ export interface CardPlace {
   faded: boolean;
   /** Whether the deck's daemon builds the tree: an older one's cards carry no roll-up or checked references. */
   tree: boolean;
-  /** Issue #2399 — while the Cards view is selecting, whether this card is selected; absent otherwise, and the card has no checkbox. */
+  /** Issue #2399 — whether this card is selected, when its daemon does batch actions; absent otherwise, and the card has no checkbox. */
   selected?: boolean;
 }
 
@@ -380,10 +380,8 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
             onClick={() => VOICE_ACTIONS.openAgent.run(controls, openTarget?.(card) ?? { deckId: card.deckId, agentId: entry.agent_id, from: "overview", ...(entry.instance_id ? { incarnation: entry.instance_id } : {}) })}
           >{name}</button>
         </span>
-        {/* Issue #2399 re-review N6: while cards are being selected, the checkbox takes header room, so Needs you is its bell alone; its words stay its tooltip and what a screen reader reads, and the name keeps its room. */}
-        {entry.needs_you && (place.selected !== undefined
-          ? <span className="agent-card-needs-you is-compact" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" /><span className="overview-sr-only">Needs you</span></span>
-          : <span className="agent-card-needs-you" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" />Needs you</span>)}
+        {/* Issue #2399 re-review N6, PR #2491 review: Needs you is its bell alone on every card, so the name keeps its room beside the checkbox; its words stay its tooltip and what a screen reader reads. */}
+        {entry.needs_you && <span className="agent-card-needs-you is-compact" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" /><span className="overview-sr-only">Needs you</span></span>}
         {place.hasChildren && (
           <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
             <button
@@ -431,7 +429,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
         {place.tree && (rollup ? <CardRollup rollup={rollup} /> : <div className="agent-card-rollup-block is-empty" aria-hidden="true" />)}
         {icons.length > 0 && (
           <span className="agent-card-control agent-card-foot-actions" onClick={(event) => event.stopPropagation()}>
-            <span className="agent-card-action-icons">
+            <ActionIconGroup className="agent-card-action-icons" label={`${name}'s actions`}>
               {icons.map((action) => (
                 <ActionTipButton
                   key={action.id}
@@ -455,7 +453,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
                   onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
                 >+{moreActions}</button>
               )}
-            </span>
+            </ActionIconGroup>
           </span>
         )}
       </div>

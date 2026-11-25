@@ -10,7 +10,7 @@ import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
 import type { AgentCardAction, AgentCardCheckedRef, EndedRole } from "../types";
 import { batchChoiceHover, CardReference, cardRef, ExactText, ExactTextNote, IssueLabelChip, SourceBadge, type ReferenceControls } from "./AgentCard";
 import { BatchChoiceIcon, batchIconName } from "./AgentCardsGrid";
-import { ActionTipButton } from "./ActionTipButton";
+import { ActionIconGroup, ActionTipButton } from "./ActionTipButton";
 
 /** The members the overlay's controls dispatch through. */
 export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused" | "runCardActionBatch">>;
@@ -314,7 +314,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
               <section className="agent-card-section agent-card-batch" aria-label={`Send to ${name} and every agent under it`} data-testid="agent-card-batch">
                 <h3>{name} and the {batch.under} {batch.under === 1 ? "agent" : "agents"} under it</h3>
                 <p className="agent-card-hint">Sends one action to all of them. You see who gets what, and who is skipped and why, before anything is sent.</p>
-                <div className="agent-card-actions">
+                <ActionIconGroup className="agent-card-batch-actions" label={`Send to ${name} and every agent under it`}>
                   {batch.choices.map((choice) => (
                     <ActionTipButton
                       key={choice.id}
@@ -326,7 +326,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                       onClick={() => VOICE_ACTIONS.runCardActionBatch.run(controls as Pick<VoiceActionContext, "runCardActionBatch">, { ...cardRef(card), cardActionId: choice.id })}
                     ><BatchChoiceIcon choice={choice} /></ActionTipButton>
                   ))}
-                </div>
+                </ActionIconGroup>
               </section>
             )}
 
