@@ -17471,7 +17471,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/054: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed catalog bridge.
-- **Asserts:** Add action's form takes Name, Label, a two-line "Text it sends", "When agents should offer it" and "Ask before sending"; Choose icon opens the "Icons" grid, which holds at least `play`, `git-merge` and `rocket`, and searching "rock" keeps `rocket` and drops `git-merge`; picking `rocket` closes the grid and shows it; Save sends exactly one `add` with those values to the local daemon, and the list shows the new action as the user's.
+- **Asserts:** Add action's form takes Name, Label, a two-line "Text it sends", "Tell agents when to offer it" and "Ask before sending"; Choose icon opens the "Icons" grid, which holds at least `play`, `git-merge` and `rocket`, and searching "rock" keeps `rocket` and drops `git-merge`; picking `rocket` closes the grid and shows it; Save sends exactly one `add` with those values to the local daemon, and the list shows the new action as the user's.
 - **Does not assert:** the daemon's validation (`agent-report/catalog-edit/003`).
 
 ##### desktop/agent-cards/055 — Editing keeps the name fixed, and an edited default becomes the user's version.

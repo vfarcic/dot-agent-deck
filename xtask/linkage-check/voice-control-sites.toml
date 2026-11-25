@@ -1330,7 +1330,7 @@ reason = "A keystroke into the Card actions form's Text it sends field — the e
 file = "desktop/src/components/AgentCardActionsEditor.tsx"
 handler = "onChange"
 code = '(event) => setField("description", event.target.value)'
-reason = "A keystroke into the Card actions form's When agents should offer it field. The form opens by voice (`add_card_action`, `edit_card_action`); its fields are typed by hand and written only by the form's Save."
+reason = "A keystroke into the Card actions form's Tell agents when to offer it field. The form opens by voice (`add_card_action`, `edit_card_action`); its fields are typed by hand and written only by the form's Save."
 
 [[site]]
 file = "desktop/src/components/AgentCardActionsEditor.tsx"

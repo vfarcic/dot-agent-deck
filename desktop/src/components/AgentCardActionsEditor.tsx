@@ -232,9 +232,9 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
         <small id={`${id("prompt")}-hint`}>Sent to the agent exactly as written, line breaks included.</small>
       </div>
       <div className="card-actions-editor-field">
-        <label htmlFor={id("description")}>When agents should offer it</label>
+        <label htmlFor={id("description")}>Tell agents when to offer it</label>
         <input id={id("description")} value={values.description} maxLength={300} aria-describedby={`${id("description")}-hint`} onChange={(event) => setField("description", event.target.value)} />
-        <small id={`${id("description")}-hint`}>Agents read this to decide when to put the action on their card.</small>
+        <small id={`${id("description")}-hint`}>Agents read this to decide when to put the action on their card; it is not shown on the card.</small>
       </div>
       <div className="card-actions-editor-field">
         <span className="card-actions-editor-field-name">Icon</span>

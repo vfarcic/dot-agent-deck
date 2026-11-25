@@ -27,7 +27,7 @@ import { AgentOverview } from "./AgentOverview";
  *   "Remove <label>" (the user's own), "Hide <label>" (a deck default in use)
  *   and "Restore <label>" (a deck default hidden or overridden);
  * - the form's fields are labelled Name (fixed once created), Label, "Text it
- *   sends", "When agents should offer it", "Ask before sending" and "Offer on
+ *   sends", "Tell agents when to offer it", "Ask before sending" and "Offer on
  *   every card"; its icon is chosen with "Choose icon", which opens a
  *   searchable grid (listbox "Icons", search box "Search icons") of the icons
  *   the app bundles; "Save" sends the edit;
@@ -214,7 +214,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(calls.editCardCatalog).not.toHaveBeenCalled();
   });
 
-  /// Scenario: In the editor, press Add action, fill in the name, label, the text it sends over two lines and when agents should offer it, tick Ask before sending, then press Choose icon, search the icon grid for "rock" and pick the rocket. Save sends one add with exactly those values to the local daemon, and the list then shows the new action as the user's.
+  /// Scenario: In the editor, press Add action, fill in the name, label, the text it sends over two lines and Tell agents when to offer it, tick Ask before sending, then press Choose icon, search the icon grid for "rock" and pick the rocket. Save sends one add with exactly those values to the local daemon, and the list then shows the new action as the user's.
   it("desktop/agent-cards/054: adding an action with an icon from the picker sends one add and lists it", async () => {
     const calls = setup();
     const editor = await openEditor();
@@ -222,7 +222,8 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     fireEvent.change(field(editor, "Name"), { target: { value: "deploy" } });
     fireEvent.change(field(editor, "Label"), { target: { value: "Deploy it" } });
     fireEvent.change(field(editor, "Text it sends"), { target: { value: "Deploy it.\nThen update your card." } });
-    fireEvent.change(field(editor, "When agents should offer it"), { target: { value: "Offer when the change can be deployed." } });
+    fireEvent.change(field(editor, "Tell agents when to offer it"), { target: { value: "Offer when the change can be deployed." } });
+    expect(field(editor, "Tell agents when to offer it")).toHaveAccessibleDescription("Agents read this to decide when to put the action on their card; it is not shown on the card.");
     fireEvent.click(field(editor, "Ask before sending"));
     expect(field(editor, "Offer on every card")).not.toBeChecked();
 
@@ -261,7 +262,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(name.readOnly || name.disabled).toBe(true);
     expect(field(editor, "Label").value).toBe("Ship it");
     expect(field(editor, "Text it sends").value).toBe("Ship it.\nThen update your card.");
-    expect(field(editor, "When agents should offer it").value).toBe("Offer when it is ready.");
+    expect(field(editor, "Tell agents when to offer it").value).toBe("Offer when it is ready.");
     expect(field(editor, "Ask before sending")).toBeChecked();
     expect(within(editor).getByTestId("agent-card-actions-editor-icon")).toHaveAttribute("data-icon", "rocket");
     fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
@@ -322,7 +323,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     fireEvent.click(within(editor).getByRole("button", { name: "Add action" }));
     fireEvent.change(field(editor, "Name"), { target: { value: "Bad Name" } });
     fireEvent.change(field(editor, "Text it sends"), { target: { value: "Do it." } });
-    fireEvent.change(field(editor, "When agents should offer it"), { target: { value: "Offer always." } });
+    fireEvent.change(field(editor, "Tell agents when to offer it"), { target: { value: "Offer always." } });
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
     expect(calls.editCardCatalog).toHaveBeenCalledTimes(1);
     expect(within(editor).getByRole("alert")).toHaveTextContent("bad name; use 1 to 40 lowercase letters");
@@ -424,7 +425,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     fireEvent.click(within(editor).getByRole("button", { name: "Add action" }));
     fireEvent.change(field(editor, "Name"), { target: { value: "deploy" } });
     fireEvent.change(field(editor, "Text it sends"), { target: { value: "Deploy it." } });
-    fireEvent.change(field(editor, "When agents should offer it"), { target: { value: "Offer when it can be deployed." } });
+    fireEvent.change(field(editor, "Tell agents when to offer it"), { target: { value: "Offer when it can be deployed." } });
     fireEvent.change(placement(), { target: { value: "detail" } });
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
     expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "add", action: expect.objectContaining({ name: "deploy", placement: "detail", always: false }) });

@@ -248,7 +248,7 @@ desktopScenario("agent-cards-actions-editor", async (page) => {
   await editor.getByLabel("Name", { exact: true }).fill("deploy");
   await editor.getByLabel("Label", { exact: true }).fill("Deploy it");
   await editor.getByLabel("Text it sends", { exact: true }).fill("Deploy it to staging.\nThen update your card.");
-  await editor.getByLabel("When agents should offer it", { exact: true }).fill("Offer when the change can be deployed.");
+  await editor.getByLabel("Tell agents when to offer it", { exact: true }).fill("Offer when the change can be deployed.");
   await editor.getByLabel("Ask before sending", { exact: true }).check();
   await editor.getByRole("button", { name: "Choose icon", exact: true }).click();
   await editor.getByRole("listbox", { name: "Icons" }).getByRole("option", { name: "rocket", exact: true }).click();
