@@ -168,14 +168,19 @@ export function quotationInView(quote: Pick<DOMRectReadOnly, "top" | "bottom" | 
  * have been in view at least once, by their key (`keys`, in the order they
  * are quoted). Each quotation carries `data-batch-text={index}`. Watched with
  * an `IntersectionObserver` on the scrolling body where the webview has one,
- * else measured on mount, on the body's scroll and on a window resize. While
- * `watch` is false nothing is watched; a new preview starts unseen.
+ * else measured two frames after the dialog opens, the body scrolls, the
+ * window resizes or Show next text scrolls, so the frame between has painted
+ * what is measured. A quotation counts as seen only there: never in the task
+ * that asked for the scroll (PR #2491 final verification P1). While `watch`
+ * is false nothing is watched; a new preview starts unseen.
  */
 function useSeenTexts(body: RefObject<HTMLElement | null>, keys: readonly string[], watch: boolean, previewing: boolean) {
   // voice-registry-exempt: which quoted texts the user has had in view, an invariant of the open confirmation and not a control
   const [seen, setSeen] = useState<ReadonlySet<string>>(() => new Set());
   const current = useRef(keys);
   current.current = keys;
+  /* The fallback's "measure after the next painted frame", while it is the one watching; null under an observer, which reports after a paint itself. */
+  const remeasure = useRef<(() => void) | null>(null);
   const mark = useCallback((key: string) => {
     // voice-registry-exempt: records that a quoted text was in view; nothing is sent or changed
     setSeen((held) => (held.has(key) ? held : new Set([...held, key])));
@@ -207,21 +212,41 @@ function useSeenTexts(body: RefObject<HTMLElement | null>, keys: readonly string
         if (key !== undefined && quotationInView(node.getBoundingClientRect(), bounds)) mark(key);
       }
     };
-    measure();
-    root.addEventListener("scroll", measure, { passive: true });
-    window.addEventListener("resize", measure);
+    /* Two frames after the last change: the first paints it, the second
+       measures what that paint showed. A later change starts the wait again,
+       so a position is measured only once it has been on screen. */
+    let frame = 0;
+    const later = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        frame = window.requestAnimationFrame(() => {
+          frame = 0;
+          measure();
+        });
+      });
+    };
+    later();
+    remeasure.current = later;
+    root.addEventListener("scroll", later, { passive: true });
+    window.addEventListener("resize", later);
     return () => {
-      root.removeEventListener("scroll", measure);
-      window.removeEventListener("resize", measure);
+      window.cancelAnimationFrame(frame);
+      remeasure.current = null;
+      root.removeEventListener("scroll", later);
+      window.removeEventListener("resize", later);
     };
   }, [body, mark, signature, watch]);
-  /** Scroll the first text not yet seen into view, and count it as seen: it is now in front of the user. */
+  /**
+   * Scroll the first text not yet seen into view, and only that: it counts as
+   * seen when the observer or the fallback's measurement finds it in view
+   * after a paint, so pressing this several times in one go enables nothing.
+   */
   const showNext = useCallback(() => {
     const at = current.current.findIndex((key) => !seen.has(key));
     if (at < 0) return;
     body.current?.querySelector<HTMLElement>(`[data-batch-text="${at}"]`)?.scrollIntoView?.({ block: "center" });
-    mark(current.current[at]);
-  }, [body, mark, seen]);
+    remeasure.current?.();
+  }, [body, seen]);
   return { seen, showNext };
 }
 

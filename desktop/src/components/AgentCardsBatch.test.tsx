@@ -94,16 +94,56 @@ function showSkipped(dialog: HTMLElement) {
   if (toggle && toggle.getAttribute("aria-expanded") === "false") fireEvent.click(toggle);
 }
 
+/** A rectangle `height` px tall whose top is `top` px down the window. */
+const box = (top: number, height: number) => ({ top, bottom: top + height, height, left: 0, right: 400, width: 400, x: 0, y: top, toJSON: () => ({}) }) as DOMRect;
+
+/**
+ * PR #2491 audit K1 — jsdom has no layout, so a test lays the batch
+ * confirmation out: its body is a 324 px view, and a quotation is inside it
+ * once something has scrolled that quotation into view, below it otherwise.
+ * jsdom has no `IntersectionObserver` either, so the dialog measures these
+ * rectangles, in a frame after the scroll, as a webview without one does.
+ */
+function layOutBatch() {
+  let shown: Element | null = null;
+  const scrolled = vi.fn(function scrollIntoView(this: Element) { shown = this; });
+  Element.prototype.scrollIntoView = scrolled;
+  const bounds = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function getBoundingClientRect(this: Element) {
+    if (this.classList.contains("agent-cards-batch-body")) return box(0, 324);
+    return this === shown ? box(100, 60) : box(900, 60);
+  });
+  return {
+    scrolled,
+    restore() {
+      bounds.mockRestore();
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    },
+  };
+}
+
+/** Let a few animation frames run, as the webview paints between a scroll and what it then measures. */
+async function frames(count = 3) {
+  await act(async () => {
+    for (let frame = 0; frame < count; frame += 1) await new Promise<void>((resolve) => { window.requestAnimationFrame(() => resolve()); });
+  });
+}
+
 /**
  * PR #2491 audit K1 — press Send as the user can: a batch of several distinct
- * texts first brings each into view (Show next text, until Send stops
- * waiting), then Send.
+ * texts first brings each into view (Show next text, then the frames that show
+ * it, until Send stops waiting), then Send.
  */
 async function pressSend(dialog: HTMLElement) {
-  for (let shown = 0; shown < 50; shown += 1) {
-    const next = within(dialog).queryByRole("button", { name: "Show next text" });
-    if (!next) break;
-    fireEvent.click(next);
+  const layout = layOutBatch();
+  try {
+    for (let shown = 0; shown < 50; shown += 1) {
+      const next = within(dialog).queryByRole("button", { name: "Show next text" });
+      if (!next) break;
+      fireEvent.click(next);
+      await frames();
+    }
+  } finally {
+    layout.restore();
   }
   await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
 }
@@ -793,9 +833,21 @@ describe("batch card actions (#2399)", () => {
     expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(32);
   });
 
-  /// Scenario: Start a batch whose preview gives three agents three different texts, two of them below the dialog's fold. Send stays disabled, with "Scroll to see all 3 texts" and a Show next text button beside it, until each text has been in view: the first is in view at once, Show next text brings the second into view, and scrolling brings the third. Send is then enabled and sends exactly the previewed agents. A batch whose agents all get one text has Send enabled at once.
+  /// Scenario: Start a batch whose preview gives agents three different texts, two of them below the dialog's fold, once with the webview's IntersectionObserver and once with only the measured fallback. Send stays disabled, with "Scroll to see all 3 texts" and Show next text beside it; three Show next text presses in a row only scroll and enable nothing, and a text counts as seen only once the observer reports it, or a frame after the scroll measures it, in view. With each text shown, Send is enabled and sends exactly the previewed agents. A batch whose agents all get one text has Send enabled at once.
   it("desktop/agent-cards/109: with several distinct texts, Send waits until each has been in view", async () => {
-    /* The webview's IntersectionObserver, driven by the test: `show` reports one quotation as fully in view. */
+    const TEXTS = ["TEXT-109-A: catalog go ahead.", "AGENT-109-B: also delete the scratch branch.", "AGENT-109-C: push to main directly."];
+    const preview: BatchEntry[] = [
+      ...Array.from({ length: 30 }, (_, at): BatchEntry => ({ pane_id: `pane-s${at}`, agent_id: `s${at}`, name: `shared-${at}`, outcome: "included", prompt: TEXTS[0], prompt_source: "catalog", action_token: `tok-s${at}`, instance_id: INSTANCE })),
+      { pane_id: "pane-b", agent_id: "b", name: "agent-b", outcome: "included", prompt: TEXTS[1], prompt_source: "agent", action_token: "tok-b", instance_id: INSTANCE },
+      { pane_id: "pane-c", agent_id: "c", name: "agent-c", outcome: "included", prompt: TEXTS[2], prompt_source: "agent", action_token: "tok-c", instance_id: INSTANCE },
+    ];
+    const executed = preview.map(({ pane_id, agent_id, action_token, instance_id }) => ({ pane_id, agent_id, action_token, instance_id }));
+    const pressNextThrice = (dialog: HTMLElement) => {
+      /* Three presses in one go, before any frame can show what the first scrolled to (the audit's probe). */
+      for (let press = 0; press < 3; press += 1) fireEvent.click(within(dialog).getByRole("button", { name: "Show next text" }));
+    };
+
+    /* With the webview's IntersectionObserver, driven by the test: `show` reports one quotation as fully in view. */
     const observed: { callback: IntersectionObserverCallback; targets: Element[] }[] = [];
     class TestIntersectionObserver {
       readonly targets: Element[] = [];
@@ -809,20 +861,12 @@ describe("batch card actions (#2399)", () => {
     const scrolled = vi.fn();
     Element.prototype.scrollIntoView = scrolled;
     const show = (text: string) => {
-      const box = { top: 100, bottom: 160, height: 60, left: 0, right: 400, width: 400, x: 0, y: 100, toJSON: () => ({}) } as DOMRectReadOnly;
-      const root = { top: 0, bottom: 324, height: 324, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRectReadOnly;
       for (const observer of observed) {
         const target = observer.targets.find((node) => node.textContent === text);
-        if (target) act(() => observer.callback([{ target, isIntersecting: true, intersectionRatio: 1, boundingClientRect: box, intersectionRect: box, rootBounds: root, time: 0 }], observer as unknown as IntersectionObserver));
+        if (target) act(() => observer.callback([{ target, isIntersecting: true, intersectionRatio: 1, boundingClientRect: box(100, 60), intersectionRect: box(100, 60), rootBounds: box(0, 324), time: 0 }], observer as unknown as IntersectionObserver));
       }
     };
     try {
-      const TEXTS = ["TEXT-109-A: catalog go ahead.", "AGENT-109-B: also delete the scratch branch.", "AGENT-109-C: push to main directly."];
-      const preview: BatchEntry[] = [
-        ...Array.from({ length: 30 }, (_, at): BatchEntry => ({ pane_id: `pane-s${at}`, agent_id: `s${at}`, name: `shared-${at}`, outcome: "included", prompt: TEXTS[0], prompt_source: "catalog", action_token: `tok-s${at}`, instance_id: INSTANCE })),
-        { pane_id: "pane-b", agent_id: "b", name: "agent-b", outcome: "included", prompt: TEXTS[1], prompt_source: "agent", action_token: "tok-b", instance_id: INSTANCE },
-        { pane_id: "pane-c", agent_id: "c", name: "agent-c", outcome: "included", prompt: TEXTS[2], prompt_source: "agent", action_token: "tok-c", instance_id: INSTANCE },
-      ];
       const calls = setup({ preview });
       const dialog = await startSelectedBatch();
       const send = () => within(dialog).getByRole("button", { name: /^Send$/ });
@@ -832,29 +876,63 @@ describe("batch card actions (#2399)", () => {
       // The first text is in view with the heading: still two to see.
       show(TEXTS[0]);
       expect(send()).toBeDisabled();
-      // Show next text brings the second into view.
-      fireEvent.click(within(dialog).getByRole("button", { name: "Show next text" }));
-      expect(scrolled).toHaveBeenCalledTimes(1);
-      expect(scrolled.mock.contexts[0]).toHaveProperty("textContent", TEXTS[1]);
+      // Show next text scrolls the second into view, and only scrolls: pressed three times, it enables nothing.
+      pressNextThrice(dialog);
+      expect(scrolled).toHaveBeenCalledTimes(3);
+      expect(scrolled.mock.contexts.map((node) => (node as Element).textContent)).toEqual([TEXTS[1], TEXTS[1], TEXTS[1]]);
       expect(send()).toBeDisabled();
-      // Scrolling brings the third.
+      await frames();
+      expect(send()).toBeDisabled();
+      // The observer reports the second in view; scrolling brings the third.
+      show(TEXTS[1]);
+      expect(send()).toBeDisabled();
       show(TEXTS[2]);
       expect(send()).toBeEnabled();
       expect(within(dialog).queryByTestId("agent-cards-batch-unseen")).toBeNull();
       expect(within(dialog).queryByRole("button", { name: "Show next text" })).toBeNull();
       await act(async () => { fireEvent.click(send()); });
-      expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", entries: preview.map(({ pane_id, agent_id, action_token, instance_id }) => ({ pane_id, agent_id, action_token, instance_id })) }));
+      expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", entries: executed }));
       cleanup();
-
-      // One text, however many agents share it: Send at once, no hint.
-      setup({ preview: preview.slice(0, 30) });
-      const single = await startSelectedBatch();
-      expect(within(single).getByRole("button", { name: /^Send$/ })).toBeEnabled();
-      expect(within(single).queryByTestId("agent-cards-batch-unseen")).toBeNull();
     } finally {
       vi.unstubAllGlobals();
       delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
     }
+
+    /* Without one (jsdom has none): a frame after the scroll measures what is in view. */
+    expect(typeof IntersectionObserver).toBe("undefined");
+    const layout = layOutBatch();
+    try {
+      const calls = setup({ preview });
+      const dialog = await startSelectedBatch();
+      const send = () => within(dialog).getByRole("button", { name: /^Send$/ });
+      await frames();
+      expect(send()).toBeDisabled();
+      pressNextThrice(dialog);
+      expect(layout.scrolled.mock.contexts.map((node) => (node as Element).textContent)).toEqual([TEXTS[0], TEXTS[0], TEXTS[0]]);
+      expect(send()).toBeDisabled();
+      // The frames that show the first text count it, and only it.
+      await frames();
+      expect(send()).toBeDisabled();
+      for (const text of TEXTS.slice(1)) {
+        fireEvent.click(within(dialog).getByRole("button", { name: "Show next text" }));
+        expect(layout.scrolled.mock.contexts.at(-1)).toHaveProperty("textContent", text);
+        expect(send()).toBeDisabled();
+        await frames();
+      }
+      expect(send()).toBeEnabled();
+      expect(within(dialog).queryByTestId("agent-cards-batch-unseen")).toBeNull();
+      await act(async () => { fireEvent.click(send()); });
+      expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", entries: executed }));
+      cleanup();
+    } finally {
+      layout.restore();
+    }
+
+    // One text, however many agents share it: Send at once, no hint.
+    setup({ preview: preview.slice(0, 30) });
+    const single = await startSelectedBatch();
+    expect(within(single).getByRole("button", { name: /^Send$/ })).toBeEnabled();
+    expect(within(single).queryByTestId("agent-cards-batch-unseen")).toBeNull();
   });
 
   /// Scenario: Start a batch whose preview gives the root and the child the same exact text, the root's written by the catalog and the child's by its agent. The confirmation quotes the text once, then lists both agents, and the child's row still carries the badge saying its agent wrote the text (issue #2399 review 9).
