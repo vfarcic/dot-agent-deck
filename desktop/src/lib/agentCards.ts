@@ -220,6 +220,16 @@ export function actionBySpokenLabel(entry: AgentCardEntry, spoken: string): Agen
   const norm = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
   const wanted = norm(spoken);
   if (!wanted) return undefined;
+  const found = matchSpokenLabel(entry, wanted, norm);
+  if (found !== undefined) return found;
+  /* PR #2491 voice fixtures: for "answer main to the coder" the command model
+     gives back "answer main" — the verb the user said, then the button's
+     words. A label that itself starts with the verb matched above. */
+  const bare = wanted.replace(/^(answer|press|send|say)\s+/, "");
+  return bare !== wanted && bare ? matchSpokenLabel(entry, bare, norm) : undefined;
+}
+
+function matchSpokenLabel(entry: AgentCardEntry, wanted: string, norm: (value: string) => string): AgentCardAction | undefined {
   const optionLabels = new Map<string, string>();
   for (const question of entry.questions) for (const option of question.options) optionLabels.set(option.action_id, option.label);
   const labelOf = (action: AgentCardAction) => optionLabels.get(action.id) ?? action.label;

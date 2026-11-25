@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentCardEntry, AgentCardsSnapshot } from "../types";
-import { acceptCardsSnapshot, deliverySentence, exactTextSegments, exactTextString, placedCardKey, primaryNeedsReview, promptPreview, pruneCardResults, reconcileCards, type CardResults, type PlacedCard } from "./agentCards";
+import { acceptCardsSnapshot, actionBySpokenLabel, deliverySentence, exactTextSegments, exactTextString, placedCardKey, primaryNeedsReview, promptPreview, pruneCardResults, reconcileCards, type CardResults, type PlacedCard } from "./agentCards";
 
 /*
  * PRD #2374 review round 1 — the pure halves of the cards' safety fixes: the
@@ -123,5 +123,29 @@ describe("deliverySentence (PRD #2374 review: uncertain deliveries)", () => {
     expect(deliverySentence({ state: "uncertain", detail: "not_started" })).toBe("Delivery uncertain (the agent has not started on it; see the agent's inbox)");
     expect(deliverySentence({ state: "not_delivered", detail: "agent_exited" })).toBe("Not delivered (the agent exited)");
     expect(deliverySentence({ state: "uncertain", detail: "some_new_flag" })).toBe("Delivery uncertain (some new flag)");
+  });
+});
+
+/*
+ * PR #2491 — a spoken label as the command model gives it back: for "answer
+ * main to the coder" it answers "answer main", which is the button's words
+ * with the verb the user said in front.
+ */
+describe("actionBySpokenLabel (PR #2491 voice fixtures)", () => {
+  const action = (id: string, label: string) => ({ id, label, kind: "prompt", prompt: `Do ${id}.`, text_input: false, confirm: false, confirm_detail: null, icon: null, placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: `tok-${id}` });
+  const card = {
+    actions: [action("question/base/main", "main"), action("question/base/rel", "Release branch"), action("go-ahead", "Go ahead"), action("answer-it", "Answer it")],
+    questions: [{ id: "base", text: "Which base branch?", source: "agent", answered: null, options: [{ id: "main", label: "main", action_id: "question/base/main" }, { id: "rel", label: "Release branch", action_id: "question/base/rel" }] }],
+  } as unknown as AgentCardEntry;
+  it("finds an answer, a press or a send named with the verb the user said in front of the button's words", () => {
+    expect(actionBySpokenLabel(card, "answer main")?.id).toBe("question/base/main");
+    expect(actionBySpokenLabel(card, "Answer: release branch")?.id).toBe("question/base/rel");
+    expect(actionBySpokenLabel(card, "press go ahead")?.id).toBe("go-ahead");
+    expect(actionBySpokenLabel(card, "send Go ahead")?.id).toBe("go-ahead");
+  });
+  it("keeps a label that starts with the verb itself, and refuses what names no button", () => {
+    expect(actionBySpokenLabel(card, "answer it")?.id).toBe("answer-it");
+    expect(actionBySpokenLabel(card, "main")?.id).toBe("question/base/main");
+    expect(actionBySpokenLabel(card, "answer deploy")).toBeUndefined();
   });
 });

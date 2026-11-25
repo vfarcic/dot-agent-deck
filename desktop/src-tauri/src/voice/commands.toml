@@ -2957,7 +2957,8 @@ description = """Press one of the buttons on an agent's card: an action the agen
 offers (such as "Merge it", "Go ahead", "Close") or an answer to a question the agent asked on
 its card. Use when the user names both the action and the agent — "send merge it to the coder",
 "press go ahead on the tester's card", "answer main to the coder". Set `agent` to the user's
-words for the agent and `action` to the button's label as the user said it. A catalog action is
+words for the agent and `action` to the button's label alone, as the user said it, without the verb in
+front of it: `main` for "answer main to the coder", `go ahead` for "press go ahead". A catalog action is
 sent to that agent; an answer to the agent's question, an action whose text the agent wrote, one
 that asks for confirmation, and closing an agent, only open a review showing exactly what it does,
 where the user presses Send. Stopping an agent is `stop_agent`; with an agent's pane open, typing
