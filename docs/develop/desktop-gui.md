@@ -2052,6 +2052,29 @@ env PATH="/usr/bin:/bin:$PATH" pnpm test:browser
 
 **Its relationship to the palette guards.** They are not redundant and neither replaces the other. `xtask/linkage-check/src/desktop_palette.rs` reads the stylesheet as text — no hard-coded colour outside the palette, the three `:root` blocks agreeing — and runs in the **required** `build` job. This tier resolves colours in an engine and runs in an advisory one. PRD #743's 399-declaration comparison in `chrome-headless-shell` was a one-off measurement rather than a checked-in gate, and nothing here reimplements it.
 
+### Fonts: why a layout test passes locally and fails in CI
+
+Several browser specs measure text: whether a label fits, whether a row wraps, whether a list needs a page marker. Text width depends on which fonts the browser finds, and on Linux both engines find them through fontconfig. The `desktop-browser` job's `ubuntu-latest` image has a different set of font packages from a developer machine, so a layout that fits locally can overflow in CI, and the reverse. A machine with extra fonts installed under the home directory is the common case.
+
+[`desktop/e2e/fonts/ci-fonts.conf`](../../desktop/e2e/fonts/ci-fonts.conf) is a fontconfig file that loads only the font directories that match CI. Run the suite under it from `desktop/`:
+
+```sh
+FONTCONFIG_FILE="$PWD/e2e/fonts/ci-fonts.conf" pnpm test:browser
+```
+
+Measured on 2026-11-25 on PR #2491's branch, the run under it matched CI's measurements in both engines. The file expects the Debian/Ubuntu font paths under `/usr/share/fonts/` (`dejavu`, `liberation`, `freefont`, `noto`, `wqy`, `ipafont-gothic`, `tlwg`). Fontconfig skips a missing directory without a warning, so check that `FONTCONFIG_FILE="$PWD/e2e/fonts/ci-fonts.conf" fc-list` lists fonts from all seven before trusting a run. It does nothing on macOS, where the browsers do not use fontconfig.
+
+**A single-font config does not match CI.** A config with DejaVu alone looks like a reasonable stand-in for a minimal runner, and it misled two rounds of debugging on that PR. On the same commit, where the suite passed under both the developer fonts and `ci-fonts.conf` (712 passed, 1 skipped), these six failed under DejaVu alone. A failure in this list under a DejaVu-only config is the config, not a regression:
+
+- `[chromium] overview-grouping.spec.ts` › the fleet view (PRD #742 M4) › the counters button › shows every counter on hover or click and fits every width
+- `[webkit] agent-pane-overlay.spec.ts` › occupies the window over a still-mounted deck and closes on Escape
+- `[webkit] agent-pane-overlay.spec.ts` › keeps the overview mounted below the pane and returns there on Escape
+- `[webkit] decks.spec.ts` › the Daemons settings section › a bidi override in a settings-supplied host cannot reverse the daemon label
+- `[webkit] scroll-indicators.spec.ts` › an agent terminal's scrollbar is shown at rest only when it has output to scroll
+- `[webkit] voice-paged-lists.spec.ts` › visible pages for voice-selected lists › voice-on modes are visible or paged in a short window
+
+**Verify a layout fix under both font sets.** Run the specs it touches once with your own fonts and once with `FONTCONFIG_FILE` set as above, in both engines. A fix that passes only under one has not fixed the layout; it has fitted one set of glyph widths.
+
 ## The driver tier
 
 Issue [#953](https://github.com/vfarcic/dot-agent-deck/issues/953) is the rung above [the browser tier](#the-browser-tier): the **real Tauri window**, driven over WebDriver, against a **real daemon**. The browser tier loads the production bundle into Playwright's engines with fixture data, so it has no IPC, no `desktop://` event stream, no daemon and no PTY. This tier has all four. It is deliberately narrow — seven smoke scenarios, each there for something no other tier reaches — because a native window under xvfb is the flake-prone end of the ladder, and a working narrow rung beats a broad unfinished one.
