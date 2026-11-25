@@ -43,7 +43,7 @@ import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import { needsYouSentence, placedCardKey, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
-import { AgentCardsDeckBody, AgentCardsNotes, AgentCardsSelectionBar, type SelectionBarEditor } from "./AgentCardsGrid";
+import { AgentCardsDeckBody, AgentCardsNotes, AgentCardsSelectionBar, NO_UNCOUNTED, needsYouCountDescription, type SelectionBarEditor, type UncountedDaemons } from "./AgentCardsGrid";
 import { needsYouRowKeys } from "../lib/agentCardsTree";
 import { MoreMenu, type MoreMenuItem } from "./MoreMenu";
 import { AgentCardReviewDialog } from "./AgentCardReviewDialog";
@@ -1938,6 +1938,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   /* `cardsOfDeck` reads the cards, the decks and the filter, which are the memo's inputs. */
   const cardsShown = useMemo(() => decks.flatMap((deck) => cardsOfDeck(deck) ?? []), [cards.decksWithCards, cards.placed, decks, filtering]);
   const needYouCount = cardsShown.filter((card) => card.entry.needs_you).length;
+  /* PR #2491 review S1 — the daemons on screen the cards do not speak for: a
+     connected one that reports no cards (and has an agent on screen), and one
+     that is not answering. While any is listed, neither the note above the
+     daemons nor the ⋯ says that nothing needs the user. */
+  const uncountedDecks = useMemo<UncountedDaemons>(() => {
+    const notReporting = new Set<string>();
+    const notAnswering = new Set<string>();
+    for (const deck of decks) {
+      if (cardsOfDeck(deck) !== undefined) continue;
+      if (!deck.connected) notAnswering.add(deckName(deck.snapshot.connection));
+      else if (deck.matchingAgents.length > 0) notReporting.add(deckName(deck.snapshot.connection));
+    }
+    return notReporting.size === 0 && notAnswering.size === 0 ? NO_UNCOUNTED : { notReporting: [...notReporting], notAnswering: [...notAnswering] };
+  }, [cards.decksWithCards, cards.placed, decks, filtering]);
+  const needYouDescription = needsYouCountDescription(needYouCount, uncountedDecks);
   /*
     PR #2491 decision 2026-11-25 — Needs you only in the Table view: each
     daemon that has cards shows only the rows whose card needs the user and
@@ -2485,7 +2500,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
                   menuTestId="overview-more-menu"
                   buttonClassName="button secondary compact more-menu-button"
                   icon={<Ellipsis size={14} aria-hidden="true" />}
-                  describedBy={needYouCount > 0 ? needYouCountId : undefined}
+                  describedBy={needYouDescription !== undefined ? needYouCountId : undefined}
                   badge={needYouCount > 0 ? <span className="more-menu-count" data-testid="overview-needs-you-count" aria-hidden="true">{needYouCount}</span> : undefined}
                   items={[{
                     key: "needs-you-only",
@@ -2496,7 +2511,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
                     onSelect: () => VOICE_ACTIONS.toggleNeedsYouFilter.run(cards.clickControls, { needsYouOnly: !cards.needsYouOnly }),
                   }]}
                 />
-                {needYouCount > 0 && <span id={needYouCountId} hidden>{needYouCount} {needYouCount === 1 ? "agent needs" : "agents need"} you</span>}
+                {needYouDescription !== undefined && <span id={needYouCountId} hidden>{needYouDescription}</span>}
               </>
             )}
           </div>
@@ -2564,7 +2579,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {cards.shown && <AgentCardsNotes cards={cardsShown} needsYouOnly={cards.needsYouOnly} cardsView={cards.mode === "cards"} />}
+          {cards.shown && <AgentCardsNotes cards={cardsShown} needsYouOnly={cards.needsYouOnly} cardsView={cards.mode === "cards"} uncounted={uncountedDecks} />}
           {/* PRD #2374 — in the Cards view every deck keeps its own section and
               header, with the daemon's own controls; a deck whose daemon has
               cards shows them as the section's body, and one with no cards (or

@@ -28,30 +28,89 @@ export function batchIconName(choice: { icon?: string | null; kind?: string }): 
 }
 
 /**
+ * PR #2491 review S1 — the daemons on screen whose agents the cards do not
+ * account for, by name: connected daemons that report no cards (their rows
+ * stay as they are under Needs you only) and daemons that are not answering.
+ * Needs you only and the top bar's count read only cards, so neither may say
+ * nothing needs the user while one of these is on screen.
+ */
+export interface UncountedDaemons {
+  notReporting: readonly string[];
+  notAnswering: readonly string[];
+}
+
+export const NO_UNCOUNTED: UncountedDaemons = { notReporting: [], notAnswering: [] };
+
+const hasUncounted = (uncounted: UncountedDaemons) => uncounted.notReporting.length > 0 || uncounted.notAnswering.length > 0;
+
+/** "A", "A and B", "A, B and C". */
+function nameList(names: readonly string[]): string {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/**
+ * What the dashboard says about the daemons the cards do not count: their
+ * agents are "shown as usual" (the note above the daemons) or "not counted"
+ * (the top bar's ⋯). Empty when every daemon on screen reports cards.
+ */
+export function uncountedDaemonsText(uncounted: UncountedDaemons, agents: "shown as usual" | "not counted"): string {
+  const { notReporting, notAnswering } = uncounted;
+  const parts: string[] = [];
+  if (notReporting.length > 0) {
+    parts.push(`Agents on ${nameList(notReporting)} are ${agents}: ${notReporting.length === 1 ? "that daemon does" : "those daemons do"} not report cards.`);
+  }
+  if (notAnswering.length > 0) {
+    const one = notAnswering.length === 1;
+    parts.push(`${nameList(notAnswering)} ${one ? "is" : "are"} not answering, so ${one ? "its" : "their"} agents are not counted.`);
+  }
+  return parts.join(" ");
+}
+
+/**
+ * The top bar's ⋯ description: how many agents' cards need the user, and,
+ * while a daemon on screen is not counted, which. `undefined` when there is
+ * nothing to say (no card needs the user and every daemon is counted).
+ */
+export function needsYouCountDescription(count: number, uncounted: UncountedDaemons): string | undefined {
+  const counted = count > 0 ? `${count} ${count === 1 ? "agent needs" : "agents need"} you` : undefined;
+  if (!hasUncounted(uncounted)) return counted;
+  return `${counted ? `${counted}.` : "No card needs you."} ${uncountedDaemonsText(uncounted, "not counted")}`;
+}
+
+/**
  * PRD #2374 — what the dashboard says above the daemons' sections when the
  * cards have nothing to show: no agent has a card yet (the Cards view), or,
- * with Needs you only on, nothing needs the user (either view). The line that
+ * with Needs you only on, no card needs the user (either view). The line that
  * counted the cards and held the Needs you only and Card actions buttons is
  * gone (PR #2491 decision 2026-11-25): each daemon's header counts its
  * agents, the top bar's ⋯ counts what needs the user and holds Needs you
  * only, and each daemon's ⋯ opens its Card actions. `cards` is every card on
  * screen, across the daemons.
+ *
+ * "Nothing needs you right now" is said only when every daemon on screen
+ * reports cards; otherwise the note says no card needs the user and names
+ * the daemons it cannot speak for (PR #2491 review S1).
  */
-export function AgentCardsNotes({ cards, needsYouOnly, cardsView }: {
+export function AgentCardsNotes({ cards, needsYouOnly, cardsView, uncounted = NO_UNCOUNTED }: {
   cards: readonly PlacedCard[];
   needsYouOnly: boolean;
   /** Whether the Cards view is on screen (the Table says nothing about cards it does not draw). */
   cardsView: boolean;
+  /** The daemons on screen whose agents have no cards to count. */
+  uncounted?: UncountedDaemons;
 }) {
   const total = cards.length;
   const needYou = cards.filter((card) => card.entry.needs_you).length;
   const empty = cardsView && total === 0;
   const noneNeedYou = !empty && needsYouOnly && needYou === 0;
   if (!empty && !noneNeedYou) return null;
+  const scoped = hasUncounted(uncounted);
   return (
     <div className="agent-cards-notes">
       {empty && <p className="agent-cards-empty" data-testid="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
-      {noneNeedYou && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">Nothing needs you right now. Needs you only is on: turn it off from the top bar to see every agent.</p>}
+      {noneNeedYou && !scoped && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">Nothing needs you right now. Needs you only is on: turn it off from the top bar to see every agent.</p>}
+      {noneNeedYou && scoped && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you-scoped">No card needs you. {uncountedDaemonsText(uncounted, "shown as usual")}</p>}
     </div>
   );
 }

@@ -151,5 +151,32 @@ for (const width of WIDTHS) {
       await page.getByTestId("needs-you-chip").click();
       await expect.poll(() => tableNames(page)).toEqual(every);
     });
+
+    /// Scenario: At this width, open the `state=docs` scene, whose daemon reports no cards and whose agent User-path verification needs input, and turn Needs you only on from the top bar's ⋯ on the Table view. Every row stays, the agent that needs input among them; the dashboard never says "Nothing needs you", and its note says no card needs you and that the daemon's agents are shown as usual because it does not report cards.
+    test(`desktop/agent-cards/112 — with a daemon that reports no cards, Needs you only does not say nothing needs you at ${width}px`, async ({ page }) => {
+      await page.addInitScript(() => {
+        try {
+          window.localStorage.setItem("dot-agent-deck.overview.mode", "table");
+        } catch {
+          // A blocked storage leaves the default view, which is the Table.
+        }
+      });
+      await page.goto("/?fixture=1&state=docs");
+      await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+      await page.getByTestId("open-overview").click();
+      const asking = page.getByRole("row", { name: "Open User-path verification agent" });
+      await expect(asking).toBeVisible();
+      const every = await tableNames(page);
+      await page.getByRole("button", { name: "More", exact: true }).click();
+      await page.getByRole("menuitemcheckbox", { name: "Needs you only" }).click();
+      await expect(page.getByTestId("needs-you-chip")).toBeVisible();
+      const note = page.getByTestId("agent-cards-none-need-you-scoped");
+      await expect(note).toBeVisible();
+      await expect(note).toHaveText(/^No card needs you\. Agents on .+ are shown as usual: that daemon does not report cards\.$/);
+      await expect(page.getByText("Nothing needs you", { exact: false })).toHaveCount(0);
+      expect(await tableNames(page), "a daemon without cards keeps its rows").toEqual(every);
+      await expect(asking, "the agent that needs input is still listed").toBeVisible();
+      await expect(page.getByTestId("overview-needs-you-count")).toHaveCount(0);
+    });
   });
 }

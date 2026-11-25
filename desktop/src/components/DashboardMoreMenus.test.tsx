@@ -4,8 +4,9 @@ import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTU
 import { OVERVIEW_MODE_STORAGE_KEY } from "../lib/agentCards";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { deckName, domIdentity } from "../lib/displayText";
-import { DEFAULT_DESKTOP_FEATURES, type AgentCardEntry, type AgentCardsSnapshot, type DeckRuntimeState } from "../types";
+import { DEFAULT_DESKTOP_FEATURES, type AgentCardEntry, type AgentCardsSnapshot, type AgentSession, type DeckRuntimeState } from "../types";
 import { AgentOverview, agentKey } from "./AgentOverview";
+import { NO_UNCOUNTED, needsYouCountDescription, uncountedDaemonsText } from "./AgentCardsGrid";
 import { cardsViewShown, dashboardMore, needsYouOnlyChecked, pressNeedsYouOnly } from "../test/needsYouMenu";
 
 /*
@@ -47,14 +48,19 @@ function snapshot(entries: AgentCardEntry[], extra: Partial<AgentCardsSnapshot> 
   return { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries, catalogErrors: [], tree: true, ...extra };
 }
 
-function runtime({ entries = TREE, remote, catalogEdit = true }: { entries?: AgentCardEntry[]; remote?: { entries: AgentCardEntry[]; catalogEdit: boolean }; catalogEdit?: boolean } = {}): DeckRuntimeState {
+/*
+ * `cards: false` on either daemon leaves it out of `agentCards`: a daemon
+ * that does not report cards, whose rows Needs you only leaves as they are.
+ * `status` sets each of its agents' status, by agent id.
+ */
+function runtime({ entries = TREE, remote, catalogEdit = true, cards = true, status = {} }: { entries?: AgentCardEntry[]; remote?: { entries: AgentCardEntry[]; catalogEdit: boolean; cards?: boolean }; catalogEdit?: boolean; cards?: boolean; status?: Record<string, AgentSession["status"]> } = {}): DeckRuntimeState {
   const [local, far] = createFixtureFleet("fleet");
-  const agentsOf = (list: AgentCardEntry[], daemonId: string, incarnation: string) => list.map((card) => ({ ...createFixtureStartedAgent({ id: card.agent_id, daemonId, displayName: card.name, command: "claude", cwd: "/w" }), incarnation }));
+  const agentsOf = (list: AgentCardEntry[], daemonId: string, incarnation: string) => list.map((card) => ({ ...createFixtureStartedAgent({ id: card.agent_id, daemonId, displayName: card.name, command: "claude", cwd: "/w" }), incarnation, ...(status[card.agent_id] ? { status: status[card.agent_id] } : {}) }));
   const fleet = [{ ...local, connection: { ...local.connection, incarnation: INSTANCE }, agents: agentsOf(entries, FIXTURE_DAEMON_ID, INSTANCE) }];
-  const agentCards: Record<string, AgentCardsSnapshot> = { [FIXTURE_DAEMON_ID]: snapshot(entries, { catalogEdit }) };
+  const agentCards: Record<string, AgentCardsSnapshot> = cards ? { [FIXTURE_DAEMON_ID]: snapshot(entries, { catalogEdit }) } : {};
   if (remote) {
     fleet.push({ ...far, connection: { ...far.connection, incarnation: REMOTE_INSTANCE }, agents: agentsOf(remote.entries, FIXTURE_REMOTE_DAEMON_ID, REMOTE_INSTANCE) });
-    agentCards[FIXTURE_REMOTE_DAEMON_ID] = { deckId: FIXTURE_REMOTE_DAEMON_ID, instanceId: REMOTE_INSTANCE, revision: 1, entries: remote.entries.map((card) => ({ ...card, instance_id: REMOTE_INSTANCE })), catalogErrors: [], tree: true, catalogEdit: remote.catalogEdit };
+    if (remote.cards !== false) agentCards[FIXTURE_REMOTE_DAEMON_ID] = { deckId: FIXTURE_REMOTE_DAEMON_ID, instanceId: REMOTE_INSTANCE, revision: 1, entries: remote.entries.map((card) => ({ ...card, instance_id: REMOTE_INSTANCE })), catalogErrors: [], tree: true, catalogEdit: remote.catalogEdit };
   }
   return {
     mode: "fixture", snapshot: fleet[0], fleet, terminalData: {}, clearError: vi.fn(), runAction: vi.fn(),
@@ -152,6 +158,42 @@ describe("the Dashboard's ⋯ menus (PR #2491 decision 2026-11-25)", () => {
     expect(dashboardMore()).not.toHaveAttribute("aria-describedby");
   });
 
+  /// Scenario: On the Table view, the only daemon reports no cards, and one of its agents needs input. Turn Needs you only on from the top bar's ⋯. Every row stays, the agent that needs input among them; the dashboard does not say nothing needs you, but that no card needs you and that the daemon's agents are shown as usual because it does not report cards. The ⋯ carries no count, and its description says the daemon's agents are not counted.
+  it("desktop/agent-cards/112: with no daemon reporting cards, Needs you only does not say nothing needs you", () => {
+    const calm = TREE.map((card) => ({ ...card, needs_you: false, needs_you_reasons: [] }));
+    render(<AgentOverview runtime={runtime({ entries: calm, cards: false, status: { [CODER.agent_id]: "needs_input" } })} onNavigate={vi.fn()} />);
+    const name = deckName(createFixtureFleet("fleet")[0].connection);
+    pressNeedsYouOnly();
+    expect([...tableRows()].sort(), "a daemon without cards keeps its rows").toEqual(TREE.map((card) => card.name).sort());
+    expect(screen.queryByTestId("agent-cards-none-need-you")).toBeNull();
+    expect(document.body).not.toHaveTextContent("Nothing needs you");
+    const note = screen.getByTestId("agent-cards-none-need-you-scoped");
+    expect(note).toHaveTextContent(`No card needs you. Agents on ${name} are shown as usual: that daemon does not report cards.`);
+    expect(screen.queryByTestId("overview-needs-you-count")).toBeNull();
+    expect(dashboardMore()).toHaveAccessibleDescription(`No card needs you. Agents on ${name} are not counted: that daemon does not report cards.`);
+  });
+
+  /// Scenario: On the Table view, two daemons: one reports cards and none of them needs you, the other reports none and one of its agents needs input. Turn Needs you only on from the top bar's ⋯. The quiet card daemon says no agent needs you, the other keeps its rows; the dashboard names the daemon without cards rather than saying nothing needs you. With a card that needs you, the ⋯ counts it and its description says the other daemon's agents are not counted.
+  it("desktop/agent-cards/112: in a mixed fleet, a quiet card daemon does not make the dashboard say nothing needs you", () => {
+    const calm = TREE.map((card) => ({ ...card, needs_you: false, needs_you_reasons: [], status: "working" }));
+    const legacy = [entry("11", "legacy-lead"), entry("12", "legacy-asker")];
+    const view = render(<AgentOverview runtime={runtime({ entries: calm, remote: { entries: legacy, catalogEdit: false, cards: false }, status: { "12": "needs_input" } })} onNavigate={vi.fn()} />);
+    const name = deckName(createFixtureFleet("fleet")[1].connection);
+    pressNeedsYouOnly();
+    expect(within(daemonSection(FIXTURE_DAEMON_ID)).getByTestId("overview-needs-you-empty")).toHaveTextContent(/no agent needs you/);
+    expect([...tableRows()].sort()).toEqual(["legacy-asker", "legacy-lead"]);
+    expect(screen.queryByTestId("agent-cards-none-need-you")).toBeNull();
+    expect(document.body).not.toHaveTextContent("Nothing needs you");
+    expect(screen.getByTestId("agent-cards-none-need-you-scoped")).toHaveTextContent(`No card needs you. Agents on ${name} are shown as usual: that daemon does not report cards.`);
+    expect(screen.queryByTestId("overview-needs-you-count")).toBeNull();
+    expect(dashboardMore()).toHaveAccessibleDescription(`No card needs you. Agents on ${name} are not counted: that daemon does not report cards.`);
+
+    view.rerender(<AgentOverview runtime={runtime({ remote: { entries: legacy, catalogEdit: false, cards: false }, status: { "12": "needs_input" } })} onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("agent-cards-none-need-you-scoped")).toBeNull();
+    expect(screen.getByTestId("overview-needs-you-count").textContent).toBe("2");
+    expect(dashboardMore()).toHaveAccessibleDescription(`2 agents need you. Agents on ${name} are not counted: that daemon does not report cards.`);
+  });
+
   /// Scenario: With two daemons on the dashboard, a newer one and one from an older release, open each daemon's ⋯ menu, just left of its New agent button. Each is named "More for <daemon>" and holds Card actions, which opens the editor titled "Card actions: <daemon>" with no Daemon picker — editable for the newer daemon, read-only with the explanation for the older one.
   it("desktop/agent-cards/113: each daemon's ⋯ menu opens Card actions bound to that daemon, read-only on an older release", async () => {
     const live = runtime({ remote: { entries: [entry("1", "remote-coder")], catalogEdit: false } });
@@ -179,5 +221,16 @@ describe("the Dashboard's ⋯ menus (PR #2491 decision 2026-11-25)", () => {
       fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close"));
     }
     expect(live.readCardCatalog).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("what the dashboard says about daemons the cards do not count (PR #2491 review S1)", () => {
+  it("names daemons without cards and daemons not answering, in the note and in the ⋯'s description", () => {
+    const uncounted = { notReporting: ["old-a", "old-b"], notAnswering: ["far"] };
+    expect(uncountedDaemonsText(uncounted, "shown as usual")).toBe("Agents on old-a and old-b are shown as usual: those daemons do not report cards. far is not answering, so its agents are not counted.");
+    expect(needsYouCountDescription(1, uncounted)).toBe("1 agent needs you. Agents on old-a and old-b are not counted: those daemons do not report cards. far is not answering, so its agents are not counted.");
+    expect(needsYouCountDescription(0, { notReporting: [], notAnswering: ["x", "y", "z"] })).toBe("No card needs you. x, y and z are not answering, so their agents are not counted.");
+    expect(needsYouCountDescription(0, NO_UNCOUNTED)).toBeUndefined();
+    expect(needsYouCountDescription(3, NO_UNCOUNTED)).toBe("3 agents need you");
   });
 });
