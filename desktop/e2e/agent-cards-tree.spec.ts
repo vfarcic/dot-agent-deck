@@ -890,10 +890,17 @@ for (const width of [375, 1440] as const) {
         const first = document.createRange();
         first.setStart(text, 0);
         first.setEnd(text, 1);
+        /* WebKit can return no box for part of a text it ellipsizes (seen with
+           a DejaVu-only fontconfig, PR #2491): the whole text's
+           box then says where its first character starts, as the text runs
+           left to right. */
+        const whole = document.createRange();
+        whole.selectNodeContents(text);
+        const firstBox = first.getClientRects().length > 0 ? first.getBoundingClientRect() : whole.getClientRects()[0];
         const style = getComputedStyle(button);
         const box = button.getBoundingClientRect();
         return {
-          firstLeft: first.getBoundingClientRect().left,
+          firstLeft: firstBox?.left ?? Number.NaN,
           left: box.left + parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft),
           right: box.right,
           cut: button.scrollWidth > button.clientWidth,
