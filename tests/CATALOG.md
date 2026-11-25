@@ -17124,13 +17124,13 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 ##### desktop/agent-cards/001 — A daemon list without the tree draws every card as a root, in the daemon's order, with the daemon's counts.
 - **Test:** vitest `desktop/agent-cards/001: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), real `AgentOverview` against a daemon card list.
-- **Asserts:** no grouping by `group.id` is rebuilt (issue #2418 replaced the grouped grid with the tree); every card of a list that does not advertise the tree is a root, in the order received; the toolbar's total `5 agents · 3 need you`.
+- **Asserts:** no grouping by `group.id` is rebuilt (issue #2418 replaced the grouped grid with the tree); every card of a list that does not advertise the tree is a root, in the order received; the top bar's ⋯ counts the 3 cards the daemon marked (`overview-needs-you-count`, described as "3 agents need you"), and no line of counts sits above the cards (PR #2491 decision 2026-11-25 removed the Cards toolbar row).
 - **Does not assert:** the tree itself (009); the daemon's ordering (`agent-report/cli/002`).
 
 ##### desktop/agent-cards/002 — Cards keep the daemon's order, status words and needs-you; Needs you only fades the rest in place.
 - **Test:** vitest `desktop/agent-cards/002: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status in the daemon's words as the table shows them (`working`, `needs input`, `thinking`, `stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and fields are not on the compact card; Needs you only (`aria-pressed`) keeps every card in place and fades exactly the cards the daemon did not mark, and turning it off unfades them.
+- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status in the daemon's words as the table shows them (`working`, `needs input`, `thinking`, `stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and fields are not on the compact card; Needs you only (the top bar's ⋯ menu item, `aria-checked`) keeps every card in place and fades exactly the cards the daemon did not mark, and turning it off unfades them.
 - **Does not assert:** the hover text of the needs-you reasons; the tree's layout (019).
 
 ##### desktop/agent-cards/003 — The compact card's Close sits beside its action icons, with its confirmation, token and disabled states.
@@ -17208,7 +17208,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Does not assert:** the daemon's failure classification (`agent-report/refs/002`).
 
 ##### desktop/agent-cards/015 — Needs you only opens the path to every card that needs you and fades the rest.
-- **Test:** vitest `desktop/agent-cards/015: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Test:** vitest `desktop/agent-cards/015: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`, Needs you only pressed in the top bar's ⋯ menu.
 - **Layer:** desktop component (jsdom).
 - **Asserts:** with every tree closed, turning it on opens every card that has a daemon-marked card under it, at any depth; the marked cards and the cards on their paths stay bright and exactly the others fade (`data-faded`); turning it off unfades every card. While it stays on, a live list that adds a marked card under a card with no tree before and a marked card one level under an open card's child opens the way to each, and both are bright; a tree the user closed stays closed when nothing under it newly needs them; and a card that comes to need the user under a tree the user closed reopens that tree.
 - **Does not assert:** the fade's opacity (CSS).
@@ -17457,7 +17457,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/053: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), stubbed `readCardCatalog` / `editCardCatalog`.
-- **Asserts:** the Cards toolbar's Card actions button (`agent-cards-actions-editor-open`) opens the editor, which reads the local daemon's catalog once; rows list Go ahead and a hidden Merge it as `deck` and Ship it as `user`, in order, each with a visible source label (`agent-card-actions-editor-source`) saying deck for the defaults and yours/user for Ship it, its label and exact text, and the user config path; Ship it offers Edit and Remove, Go ahead Edit and Hide, the hidden Merge it Restore, and no row exists for Reply, Open or either Close; nothing is written.
+- **Asserts:** the Cards toolbar's Card actions button is gone; the daemon's ⋯ (`daemon-more`, "More for <daemon>") offers Card actions, which opens the editor named "Card actions: <daemon>" with no Daemon picker, reading that daemon's catalog once; rows list Go ahead and a hidden Merge it as `deck` and Ship it as `user`, in order, each with a visible source label (`agent-card-actions-editor-source`) saying deck for the defaults and yours/user for Ship it, its label and exact text, and the user config path; Ship it offers Edit and Remove, Go ahead Edit and Hide, the hidden Merge it Restore, and no row exists for Reply, Open or either Close; nothing is written.
 - **Does not assert:** the daemon's listing (`agent-report/catalog-edit/001`).
 
 ##### desktop/agent-cards/054 — Adding an action with an icon from the picker sends one add.
@@ -17488,25 +17488,25 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** saving an add the daemon refuses shows its reason in an alert, keeps the form with what was typed, and leaves the list unchanged.
 - **Does not assert:** which edits the daemon refuses (`agent-report/catalog-edit/003`).
 
-##### desktop/agent-cards/058 — With several daemons the editor edits the one picked, the local one by default.
+##### desktop/agent-cards/058 — Each daemon's ⋯ menu opens the editor bound to that daemon, with no Daemon picker.
 
 - **Test:** vitest `desktop/agent-cards/058: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), two fixture daemons, stubbed catalog bridge.
-- **Asserts:** with the remote daemon first in the fleet, the Daemon picker still starts on the local daemon, whose catalog alone is read and listed; choosing the remote daemon reads and lists its own catalog and user config path, and a Hide then goes to the remote daemon only.
+- **Asserts:** with the remote daemon first in the fleet, Card actions in the local daemon's ⋯ menu opens the editor titled with the local daemon's name, with no Daemon picker, reading and listing only that daemon's catalog; closed, and opened from the remote daemon's ⋯ menu, it is titled with the remote daemon's name, reads and lists its own catalog and user config path, and a Hide then goes to the remote daemon only (PR #2491 decision 2026-11-25).
 - **Does not assert:** a real remote daemon's file (the daemon writes the file of the machine it runs on; `agent-report/catalog-edit/*` run one daemon).
 
 ##### desktop/agent-cards/059 — A daemon without the editor is shown read-only and sent nothing.
 
 - **Test:** vitest `desktop/agent-cards/059: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), one older fixture daemon, then that one beside a newer one.
-- **Asserts:** for a daemon whose cards snapshot lacks `catalogEdit`, the editor says its release cannot be edited from the app (`agent-card-actions-editor-readonly`), offers no Add, Edit, Remove, Hide or Restore, and neither reads nor edits it; picking the newer daemon offers editing and reads only that daemon.
+- **Asserts:** for a daemon whose cards snapshot lacks `catalogEdit`, the editor says its release cannot be edited from the app (`agent-card-actions-editor-readonly`), offers no Add, Edit, Remove, Hide or Restore, and neither reads nor edits it; its ⋯ menu still offers Card actions, and the newer daemon's ⋯ menu opens an editor that offers editing and reads only that daemon.
 - **Does not assert:** the shared client's gate (`daemon_client` unit test `a_catalog_edit_is_sent_only_to_a_daemon_that_advertises_it`).
 
 ##### desktop/agent-cards/060 — Voice opens the card actions editor, its forms and a removal's confirmation.
 
-- **Test:** vitest `desktop/agent-cards/060: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`; phrase fixtures `card-actions-editor-open`, `card-actions-editor-add`, `card-actions-editor-edit-by-label` and `card-actions-editor-remove-by-label` in `desktop/src-tauri/src/voice/phrase_fixtures.toml`.
+- **Test:** vitest `desktop/agent-cards/060: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`; phrase fixtures `card-actions-editor-open`, `card-actions-editor-open-bare`, `card-actions-editor-open-on-named-daemon`, `card-actions-editor-add`, `card-actions-editor-edit-by-label` and `card-actions-editor-remove-by-label` in `desktop/src-tauri/src/voice/phrase_fixtures.toml`.
 - **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
-- **Asserts:** `open_card_actions_editor` opens the editor on the local daemon's catalog; `add_card_action` opens an empty form; `edit_card_action` opens Ship it's form; `remove_card_action` opens the "Remove Ship it?" confirmation and writes nothing; Ship it, which the editor lists and no card offers, resolves by label; `openCardActionsEditor`, `addCardAction`, `editCardAction` and `removeCardAction` are `voice: true`, each with exactly one `commands.toml` row, parsed row by row, invoking it on `overview` with its parameters (`action` of kind `card_action` for edit and remove); Save, the removal's Remove, Hide, Restore, choosing the daemon, choosing an icon, Cancel and Close each have one row or a written `no_voice` reason, and Save and Remove stay off voice (CLAUDE.md rule 23; issue #2399 review, finding 9). Pressing a card's action icon by voice is the existing `run_card_action` row (`desktop/agent-cards/008`).
+- **Asserts:** `open_card_actions_editor` (an optional `deck` of kind `deck_ref`) opens the editor on the only daemon's catalog; `add_card_action` opens an empty form; `edit_card_action` opens Ship it's form; `remove_card_action` opens the "Remove Ship it?" confirmation and writes nothing; Ship it, which the editor lists and no card offers, resolves by label; `openCardActionsEditor`, `addCardAction`, `editCardAction` and `removeCardAction` are `voice: true`, each with exactly one `commands.toml` row, parsed row by row, invoking it on `overview` with its parameters (`action` of kind `card_action` for edit and remove); the Daemon picker's `chooseCardActionsDaemon` entry and `choose_card_actions_daemon` row are gone (PR #2491 decision 2026-11-25); Save, the removal's Remove, Hide, Restore, choosing an icon, Cancel and Close each have one row or a written `no_voice` reason, and Save and Remove stay off voice (CLAUDE.md rule 23; issue #2399 review, finding 9). Pressing a card's action icon by voice is the existing `run_card_action` row (`desktop/agent-cards/008`).
 - **Does not assert:** that the model picks these rows for the words (the phrase fixtures, run with a credential).
 
 ##### desktop/agent-cards/061 — Card action icons and the card actions editor work in the browser.
@@ -17555,7 +17555,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** vitest `desktop/agent-cards/067: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
 - **Layer:** desktop overview (jsdom), two fixture daemons, a catalog bridge whose reads and edits answer when the test says, in any order.
-- **Asserts:** switching to the remote daemon before the local read answers shows the remote catalog, and the late local answer does not replace it; a form open when the daemon changes is closed; a local save answering after switching to the remote daemon changes nothing shown, and the next edit goes to the remote daemon only; switching, with a form open, to a daemon that cannot be edited offers no Save, sends nothing, and switching back brings no stale form (issue #2399 review, finding 10).
+- **Asserts:** (moving between daemons is closing the editor and opening Card actions from the other daemon's ⋯ menu, PR #2491 decision 2026-11-25) moving to the remote daemon before the local read answers shows the remote catalog, and the late local answer does not replace it; a form open when the daemon changes is closed; a local save answering after switching to the remote daemon changes nothing shown, and the next edit goes to the remote daemon only; switching, with a form open, to a daemon that cannot be edited offers no Save, sends nothing, and switching back brings no stale form (issue #2399 review, finding 10).
 - **Does not assert:** the backend's routing (062).
 
 ##### desktop/agent-cards/068 — The same text from different sources is quoted once in a batch confirmation.
@@ -17607,11 +17607,11 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** pressing Remove opens the confirmation with focus inside it and the editor behind it inert; Escape closes only the confirmation, lifts the fence, gives focus back to the Remove that opened it, and sends nothing (issue #2399 review 13).
 - **Does not assert:** a screen reader's announcement.
 
-##### desktop/agent-cards/075 — Voice chooses the editor's daemon, refreshes it and sets the form's icon, checkboxes and Placement.
+##### desktop/agent-cards/075 — Voice names the editor's daemon, refreshes it and sets the form's icon, checkboxes and Placement.
 
 - **Test:** vitest `desktop/agent-cards/075: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
 - **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
-- **Asserts:** "icon git merge" (a `filter_text`) sets the form's icon to `git-merge` and an unknown name is refused in words; "ask before sending" ticks the box and saying it again leaves it ticked, and each of the four checkbox rows sets its box as said; "only in the Card panel" sets Placement to Only in the Card panel, saying it again keeps it, and "show it on the card" sets it back; "refresh the card actions" reads the list again keeping the form; a `deck_ref` naming the daemon shown is accepted and one naming no daemon on the dashboard is refused in words; nothing is written; `chooseCardActionsDaemon`, `refreshCardActions`, `chooseCardActionIcon`, the four checkbox entries and the two Placement entries (`showCardActionOnCard`, `showCardActionOnlyInCardPanel`) are `voice: true`, each with exactly one `commands.toml` row on `overview` with its parameters; `060` checks that every other editor control is a row or carries a written reason (issue #2399 review 12, re-review N4).
+- **Asserts:** "icon git merge" (a `filter_text`) sets the form's icon to `git-merge` and an unknown name is refused in words; "ask before sending" ticks the box and saying it again leaves it ticked, and each of the four checkbox rows sets its box as said; "only in the Card panel" sets Placement to Only in the Card panel, saying it again keeps it, and "show it on the card" sets it back; "refresh the card actions" reads the list again keeping the form; `open_card_actions_editor` with a `deck_ref` naming the daemon shown keeps the editor and its form as they are, and one naming no daemon on the dashboard is refused in words; nothing is written; `refreshCardActions`, `chooseCardActionIcon`, the four checkbox entries and the two Placement entries (`showCardActionOnCard`, `showCardActionOnlyInCardPanel`) are `voice: true`, each with exactly one `commands.toml` row on `overview` with its parameters; `060` checks that every other editor control is a row or carries a written reason (issue #2399 review 12, re-review N4).
 - **Does not assert:** that the model picks these rows for the words: the `card-actions-editor-*` phrase fixtures do, against the real default backend (lane 2, `voice_desktop_phrases_001`).
 
 ##### desktop/agent-cards/076 — The card's action row at its fullest keeps the name and status readable.
@@ -17831,6 +17831,42 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed batch bridge, once with a stubbed `IntersectionObserver` and once with the measured fallback over a stubbed layout; real browser with the real observer, and with it removed so the real fallback measures.
 - **Asserts:** with three distinct texts, Send is disabled with "Scroll to see all 3 texts" and Show next text beside it; the first text in view leaves it disabled; three Show next text presses in a row only scroll, to the first unseen text each time, and leave Send disabled, also after frames have run with that text unreported (observer) or with only it measured in view (fallback); Send is enabled only once each text has been reported or measured in view, which removes the hint, and Send executes exactly the previewed entries; a preview replaced while the old observer is still connected, its sample of the old texts delivered after the replacement rendered into the same rows, credits none of the new texts, nor does that sample delivered again after the old observer disconnected, and Send waits for the new observer's reports; a batch with one shared text has Send enabled at once with no hint. In the browser, with and without the observer, the body starts at the top with both agent-written texts below its fold, a forced click on the disabled Send sends nothing, three Show next text presses and a Send press in one task, before any frame, leave Send disabled and send nothing, and after Show next text with the frames that paint each text Send is enabled and the results list every counted agent once, "Queued for all N" (PR #2491 audit K1 and final verification P1). With the real observer's reports held by a wrapper, a report of the old agent-written texts in view, delivered as the replaced preview's texts render with the body reset to the top, leaves Send disabled until Show next text has brought each new text into view, and Send then queues for every counted agent (PR #2491 observer race).
 - **Does not assert:** a text that only passes through view during a continuous scroll (the fallback measures once scrolling has paused for a frame); a Tauri webview.
+
+##### desktop/agent-cards/110 — The ⋯ menu opens, moves and closes from the keyboard, with menu roles, and fits the window.
+- **Test:** vitest `desktop/agent-cards/110: …` in `desktop/src/components/MoreMenu.test.tsx`; Playwright `desktop/agent-cards/110 — …` in `desktop/e2e/dashboard-more-menus.spec.ts` (375 and 1440 px), against `cards=tree`, chromium and webkit.
+- **Layer:** the shared `MoreMenu` component (jsdom); real browser on the dashboard.
+- **Asserts:** the ⋯ button is named and titled, carries `aria-haspopup="menu"` and `aria-expanded`, and `aria-controls` names its menu while open; Enter, Space and ArrowDown open it on its first item and ArrowUp on its last; the menu is `role="menu"` with `menuitem` items and a `menuitemcheckbox` carrying `aria-checked`; ArrowDown and ArrowUp move and wrap, Home and End go to the ends; Escape closes it with focus back on ⋯, Tab closes it, and a press outside closes it; choosing an item closes the menu, returns focus to ⋯ and runs the item. In the browser the top bar's ⋯ is reached with Tab from the Filter box and each daemon's ⋯ with Tab after it, each menu opens with its first item focused and lies inside the window with no sideways scroll, Escape returns focus to its ⋯, and Enter on a daemon's Card actions opens the editor titled with that daemon's name, inside the window, with no Daemon picker (PR #2491 decision 2026-11-25).
+- **Does not assert:** a Tauri webview; screen reader output.
+
+##### desktop/agent-cards/111 — The top bar's ⋯ holds Needs you only, a chip turns it off, and the Cards toolbar row is gone.
+- **Test:** vitest `desktop/agent-cards/111: …` in `desktop/src/components/DashboardMoreMenus.test.tsx`; Playwright `desktop/agent-cards/111 — …` in `desktop/e2e/dashboard-more-menus.spec.ts` (375 and 1440 px), against `cards=tree`, chromium and webkit.
+- **Layer:** desktop overview (jsdom); real browser.
+- **Asserts:** no line of counts, Needs you only button or Card actions button sits above the cards; the ⋯ right of Refresh is named and titled "More", counts the agents whose card needs the user (`overview-needs-you-count`, described as "N agents need you") and holds Needs you only as a `menuitemcheckbox`; turning it on ticks it, fades the cards that do not need the user and shows the "Needs you only" chip beside Filter, which never shows while it is off; one press on the chip turns it off and the chip goes. In the browser the first daemon's section starts right under the top bar, the count is drawn at both widths, and the chip lies inside the window (PR #2491 decision 2026-11-25).
+- **Does not assert:** the order of the top bar's other controls.
+
+##### desktop/agent-cards/112 — Needs you only in the Table keeps the rows that need you and the rows above them.
+- **Test:** vitest `desktop/agent-cards/112: …` (two cases) in `desktop/src/components/DashboardMoreMenus.test.tsx`; Playwright `desktop/agent-cards/112 — …` in `desktop/e2e/dashboard-more-menus.spec.ts` (375 and 1440 px), against `cards=tree`, chromium and webkit.
+- **Layer:** desktop overview (jsdom) with a card tree; real browser.
+- **Asserts:** on the Table view, turning Needs you only on keeps the Table on screen and lists only the agents whose card needs the user and every agent above them in the card tree, hiding the rest and fading no row; the chip turns it off and every row is back; with it on and nobody needing the user, the daemon's section says "no agent needs you", the dashboard says "Nothing needs you right now.", and the ⋯ carries no count. In the browser the `cards=tree` scene lists exactly issue-queue, prd-2374, tester, issue-2310, docs-site and editor (PR #2491 decision 2026-11-25).
+- **Does not assert:** a daemon without cards, whose rows Needs you only leaves as they are.
+
+##### desktop/agent-cards/113 — Each daemon's ⋯ menu opens Card actions bound to that daemon, read-only on an older release.
+- **Test:** vitest `desktop/agent-cards/113: …` in `desktop/src/components/DashboardMoreMenus.test.tsx`.
+- **Layer:** desktop overview (jsdom), two fixture daemons, one without `catalogEdit`.
+- **Asserts:** each daemon's ⋯ is named and titled "More for <daemon>", has `aria-haspopup="menu"` and sits just before its New agent button; its menu, named the same, holds Card actions, which opens the editor named "Card actions: <daemon>" with no Daemon picker — reading the newer daemon's catalog, and read-only with the earlier-release explanation for the older one, which is not read (PR #2491 decision 2026-11-25).
+- **Does not assert:** the editor's own behaviour (053–084).
+
+##### desktop/agent-cards/114 — The spoken Needs you only applies to the Table view and keeps it.
+- **Test:** vitest `desktop/agent-cards/114: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`; phrase fixtures `needs-you-only-on` and `needs-you-only-off-show-all-cards` in `desktop/src-tauri/src/voice/phrase_fixtures.toml`.
+- **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
+- **Asserts:** on the Table view, "only the ones that need me" (`filter_needs_you_cards`, `needs_you` on) keeps the Table, shows only the agent that needs the user and the agent above it, and shows the chip; "show all cards" (`needs_you` off) brings every row back and removes the chip, still on the Table (PR #2491 decision 2026-11-25).
+- **Does not assert:** that the model picks the row for the words (the phrase fixtures, run with a credential).
+
+##### desktop/agent-cards/115 — "Open card actions" opens the only daemon's editor, and with several asks which.
+- **Test:** vitest `desktop/agent-cards/115: …` in `desktop/src/hooks/useCardActionsEditor.test.ts` and in `desktop/src/components/AgentCardsBatchVoice.test.tsx` (through the real shell, voice panel and choice dialog); phrase fixtures `card-actions-editor-open-bare`, `card-actions-editor-open-on-named-daemon` and `card-actions-editor-daemon-by-name` in `desktop/src-tauri/src/voice/phrase_fixtures.toml`.
+- **Layer:** the editor hook, through the `openCardActionsEditor` registry entry.
+- **Asserts:** with one daemon showing cards, a bare open opens its editor and reads it; with two, a bare open opens nothing and reads nothing: it hands both daemons (`deck_ref` candidates) to the voice panel's `askVoiceChoice`, which opens the numbered "Which daemon?" dialog listing them, and choosing one opens the editor titled with that daemon's name and reads only its catalog; with no panel to ask, it says "Several daemons are on the dashboard: say which one, like “open card actions on <first daemon>”."; "open card actions on" a named daemon opens it with no question; a `preselectDeckId` naming one opens the editor on it; one naming a daemon not on the dashboard is refused in words and leaves the editor where it was; `offeredFor` says which daemons' ⋯ menus offer Card actions (PR #2491 decision 2026-11-25).
+- **Does not assert:** the voice panel's rendering of the question.
 
 ## Desktop native driver scenarios
 

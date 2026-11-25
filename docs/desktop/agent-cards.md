@@ -45,9 +45,11 @@ The app remembers which cards you opened, for each daemon, in this window's stor
 
 ### Needs you only
 
-**Needs you only**, above the cards, opens the way to every card that needs you and fades every card that neither needs you nor leads to one. Press it again to show every card as usual.
+**Needs you only** is in the **⋯** menu at the right end of the Dashboard's top bar, beside **Refresh**. A small number on that **⋯** says how many agents need you. Choose **Needs you only** and the Cards view opens the way to every card that needs you and fades every card that neither needs you nor leads to one. A tick beside it in the menu, and a **Needs you only ×** chip beside **Filter**, show that it is on. Press the chip, or choose the item again, to show every card as usual.
 
 While it stays on, a card that comes to need you is opened up to as well. A tree you close stays closed until an agent under it newly needs you, and then it opens again.
+
+It works in the Table view too, where it lists only the agents that need you and the agents above them in their tree, and hides the other rows instead of fading them. The setting is the same in both views: switching between them keeps it. When nothing needs you, the Dashboard says so.
 
 ### The dashboard's filter
 
@@ -178,7 +180,7 @@ With voice control on, you can say:
 | "open the pull request on the coder's card", "open the issue on the coder's card" | Opens, inside the app, the pull request or issue that agent reported, as the deck checked it. |
 | "next agent", "previous agent" | In an agent's pane, opens the next or previous agent's pane. |
 | "next one that needs me" | Opens the pane of the next agent that needs you, from the Dashboard or an agent's pane. |
-| "only the ones that need me", "show all cards" | Turns **Needs you only** on or off. |
+| "only the ones that need me", "show all cards" | Turns **Needs you only** on or off, in the Table view or the Cards view, keeping the view you are on. |
 | "show the card", "close the card" | In an agent's pane, shows or hides its Card panel. "Back to dashboard" or "close" leaves the pane. |
 | "open the coder" | Opens that agent's pane, with the Card panel as you last had it. |
 | "press go ahead on the coder's card", "answer main to the coder", "press close on the coder's card" | Presses that action or answer, named by the label on its button. Close, and an action that asks first or whose text the agent wrote, open the review, as the card's buttons do. |
@@ -186,11 +188,10 @@ With voice control on, you can say:
 | "select the coder's card", "add the tester to the selection", "unselect the tester's card" | Selects that agent's card for a batch, or takes it out of the selection, as its checkbox does: a card whose tree is closed takes every agent under it along. Selecting shows the cards. Say "card" or "selection": "select the coder" on its own opens the coder. |
 | "clear the selection", "deselect all the cards" | Unticks every selected card and hides the selection bar. |
 | "go ahead on the selected agents", "close the selected ones" | Starts a batch for every selected agent and opens its confirmation. Nothing is sent until you press **Send**. |
-| "open the card actions editor" | Opens the **Card actions** editor. |
+| "open card actions", "open card actions on build box" | Opens the **Card actions** editor of that daemon. With one daemon on the Dashboard you need not name it; with several, the app asks which. |
 | "add a card action" | Opens the editor's form for a new action, empty, for you to fill in and save. |
 | "edit the ship it action" | Opens that action's form in the editor, named by its label. |
 | "remove the ship it action" | Opens the editor's confirmation for removing that action of yours. Nothing is removed until you press **Remove**. |
-| "card actions of build box" | In the open editor, shows that daemon's card actions. |
 | "refresh the card actions" | Reads the open editor's list again, keeping what the form holds. |
 | "icon rocket" | In the editor's form, chooses that icon, by the name its grid shows. |
 | "ask before sending" / "send without asking" | In the editor's form, ticks or unticks **Ask before sending**. |
@@ -201,7 +202,7 @@ When the agent reported more than one pull request, or more than one issue, voic
 
 With **All daemons** selected, you can name an agent on any daemon the Dashboard shows. When the name fits agents on more than one daemon, the app asks which; add the daemon's name, as in "show the coder's card on build box", to pick it straight away (see [Naming an agent](voice.md#naming-an-agent)).
 
-Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the review showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the review opens and you press the button yourself. A batch is never sent by voice alone: voice opens its confirmation, and you press **Send**. By voice, you select agents by name, or name the agent whose tree the batch reaches. With **All daemons** selected, a selection can take agents from every daemon the dashboard shows. In the **Card actions** editor, voice opens the editor and its forms, picks the daemon, reads the list again and sets the form's icon, checkboxes and placement, but every change to the file is a press of yours: **Save**, **Remove**, **Hide** and **Restore** are never done by voice, so a misheard word never becomes text an agent is sent. To reply in your own words, open the agent ("open the coder") and say "tell it …": your words are typed into its terminal without pressing Enter, so you see what was heard before it goes.
+Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the review showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the review opens and you press the button yourself. A batch is never sent by voice alone: voice opens its confirmation, and you press **Send**. By voice, you select agents by name, or name the agent whose tree the batch reaches. With **All daemons** selected, a selection can take agents from every daemon the dashboard shows. In the **Card actions** editor, voice opens the editor of the daemon you name and its forms, reads the list again and sets the form's icon, checkboxes and placement, but every change to the file is a press of yours: **Save**, **Remove**, **Hide** and **Restore** are never done by voice, so a misheard word never becomes text an agent is sent. To reply in your own words, open the agent ("open the coder") and say "tell it …": your words are typed into its terminal without pressing Enter, so you see what was heard before it goes.
 
 ## Which agents publish a card
 
@@ -215,7 +216,7 @@ The fields agents fill in and the actions they can offer you come from a catalog
 
 ### The Card actions editor
 
-Press **Card actions** in the Cards toolbar to add, change, hide or remove the actions agents can offer, without editing a file. The editor lists every action of the catalog with:
+Each daemon's header on the Dashboard has a **⋯** button just left of **New agent**. Choose **Card actions** in its menu to add, change, hide or remove the actions that daemon's agents can offer, without editing a file. The editor's title names the daemon, such as **Card actions: Local daemon**. It lists every action of the catalog with:
 
 - its icon, label, the exact text it sends and when agents should offer it;
 - where it came from: **deck default**, **deck default, your version** for a default you changed, or **yours**; a default you hid is listed too, marked **hidden**;
@@ -223,7 +224,7 @@ Press **Card actions** in the Cards toolbar to add, change, hide or remove the a
 
 **Add action** and **Edit** open a form with **Name** (lower-case letters, digits and dashes; it cannot change once the action exists), **Label**, **Text it sends** (sent exactly as written, line breaks included), **Tell agents when to offer it** (agents read it to decide when to put the action on their card; it is not shown on the card), an **Icon** chosen with **Choose icon** from a grid you can search, **Placement** (**Show on the card**, the default, draws the action as an icon on the cards that offer it; **Only in the Card panel** lists it only when you open a card), **Ask before sending**, and **Offer on every card**. **Save** writes the action; while it is saved the form cannot be changed and no other form opens. If the daemon refuses it, the form says why and keeps what you typed. If the daemon's answer never arrives, the change may or may not have been saved: the editor says so, keeps your form, and reads the list again so you can see which, saying when it has, or that it could not, in which case press **Refresh** to try again. **Refresh** reads the list again whenever you want, keeping the form. **Remove** asks first, naming the action. A change reaches the cards at once, with no restart.
 
-The editor edits the catalog of the daemon that runs the agents: its own user configuration file, on its own machine. It shows where that file is. With several daemons on the Dashboard, a **Daemon** list picks which one's actions you see and change; the editor starts on the local daemon, wherever the Dashboard lists it. When none of them is the local daemon, it starts on the first one listed. If the editor cannot read a daemon's actions, it says why and lists none, rather than showing the deck's defaults as if they were that daemon's; when the daemon reads its file but finds problems in it, the editor lists them above the actions. Other settings, the catalog's fields and the comments in the file are kept as they are, including a comment on a setting the form leaves at its default. A file the daemon cannot read is never overwritten: the editor says what is wrong, and you fix the file by hand.
+The editor edits the catalog of the daemon whose **⋯** you opened it from: that daemon's own user configuration file, on its own machine. It shows where that file is. To change another daemon's actions, close the editor and open **Card actions** from that daemon's **⋯**. If the editor cannot read a daemon's actions, it says why and lists none, rather than showing the deck's defaults as if they were that daemon's; when the daemon reads its file but finds problems in it, the editor lists them above the actions. Other settings, the catalog's fields and the comments in the file are kept as they are, including a comment on a setting the form leaves at its default. A file the daemon cannot read is never overwritten: the editor says what is wrong, and you fix the file by hand.
 
 A save is refused, with nothing written, when:
 

@@ -8,11 +8,11 @@ The Dashboard can also show each agent as a card that says what it reported, whe
 
 1. Choose what to watch with the **Daemon** selector under the title: **All daemons**, **This machine** (the default on a fresh install), or one remote daemon. To add a daemon on another machine, choose **Add a daemon…** at the bottom of the selector ([Daemons](daemons.md#watch-a-daemon-on-another-machine)).
 2. Read the counters button at the top, beside **New agent**. It shows how many agents the daemons that answered are running, for example `7 agents`, and adds a count only when something needs you: amber `1 needs input`, red `1 error`, and red `2/4 daemons` when some of the daemons shown have not answered. Hover over it, or click it, to see every count: **AGENTS**, **WORKING**, **THINKING**, **COMPACTING**, **NEEDS INPUT**, **ERROR**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered, and **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When no daemon answered, the counts read `—`. After a click the list stays open until you click the button again, press `Esc` or click elsewhere; with voice on, "show the counters" opens it ([Voice Control → Checking the counters](voice.md#checking-the-counters)). In a window narrower than 1240 pixels the button shows its numbers without the words. The TUI's dashboard shows the same counts on one line.
-3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again. When there are more daemons and agents than fit the window, a scrollbar stays on the right edge: its length shows how much of the dashboard is on screen and its position shows where you are. Scroll with the mouse, the trackpad or the keyboard, or, with voice on, [by voice](voice.md#scrolling-the-dashboard).
+3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again. The **⋯** button right of **Refresh** opens a menu with [Needs you only](#show-only-the-agents-that-need-you); while the daemons show agent cards, a small number on it says how many agents need you. When there are more daemons and agents than fit the window, a scrollbar stays on the right edge: its length shows how much of the dashboard is on screen and its position shows where you are. Scroll with the mouse, the trackpad or the keyboard, or, with voice on, [by voice](voice.md#scrolling-the-dashboard).
 
 ## One section per daemon
 
-Each daemon being shown gets its own section, headed with its name (**Local daemon** for this machine, the ssh user and host for a remote one), its own **Stop daemon** button, which stops that daemon ([Daemons → Stop a daemon](daemons.md#stop-a-daemon)), and its own **New agent** button, which creates the agent on that daemon. A remote daemon that runs an older release than the app also gets an **Upgrade** button there ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)). Inside a section, agents are grouped:
+Each daemon being shown gets its own section, headed with its name (**Local daemon** for this machine, the ssh user and host for a remote one), its own **Stop daemon** button, which stops that daemon ([Daemons → Stop a daemon](daemons.md#stop-a-daemon)), and its own **New agent** button, which creates the agent on that daemon. Just left of **New agent**, a **⋯** button opens that daemon's menu; its **Card actions** item opens the editor for the actions that daemon's agents offer on their cards ([Agent Cards → The Card actions editor](agent-cards.md#the-card-actions-editor)). The menu is there while the daemon shows agent cards. A remote daemon that runs an older release than the app also gets an **Upgrade** button there ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)). Inside a section, agents are grouped:
 
 - **Standalone agents** (kicker **NO TAB**): agents that belong to no orchestration and no workspace mode.
 - One group per orchestration (kicker **ORCHESTRATION**), named after the run. Its rows are numbered in role order, and the start role, the one you message, carries an **ORCHESTRATOR** badge.
@@ -58,6 +58,17 @@ While a filter is set, a line under the header says how much of the fleet you ar
 A daemon none of whose agents match shows one line in its place, for example `build-box: no matching agents`, and so does an orchestration or other group with no matching agents, so nothing disappears without a word.
 
 The filter stays while you move between screens and lasts until you clear it or quit the app; the next time the app starts, the Dashboard shows every agent. You can also set and clear it [by voice](voice.md#filtering-the-dashboard). The TUI's dashboard has no filter.
+
+## Show only the agents that need you
+
+While the daemons show [agent cards](agent-cards.md), open the **⋯** menu right of **Refresh** and choose **Needs you only**:
+
+- In the Table view, the Dashboard lists only the agents that need you, together with the agents above them, such as the orchestrator a role runs under or the dispatcher that started it, so you can see where each one sits. The other rows are hidden. A daemon with nobody needing you shows one line saying so.
+- In the Cards view, the cards stay where they are and the ones that neither need you nor lead to one fade ([Agent Cards → Needs you only](agent-cards.md#needs-you-only)).
+
+While it is on, the item is ticked and a **Needs you only ×** chip sits beside **Filter**. Press the chip, or choose the item again, to see every agent. Switching between Table and Cards keeps the setting. It works together with the filter above: you see the agents that match both. A daemon from a release without agent cards marks nobody as needing you, so its rows stay as they are. With voice on, say "only the ones that need me" or "show all cards".
+
+The TUI's dashboard has no Needs you only; its cards show each agent's status.
 
 ## Statuses
 
