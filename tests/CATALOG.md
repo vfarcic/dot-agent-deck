@@ -17317,7 +17317,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 
 - **Test:** Playwright `desktop/agent-cards/033 — a closed subtree's batch confirmation fits and works at <width>px` in `desktop/e2e/agent-cards-tree.spec.ts`.
 - **Layer:** desktop browser at 375, 768, 1024, 1440 and 1920 px, using the production build and tree fixture.
-- **Asserts:** a closed root selects seven nested agents without expanding; the preview's seven quoted prompts wrap without horizontal clipping and can each be scrolled into view, the dialog fits the window and Send and Cancel are in view, Cancel dismisses without showing results, and a subsequent Send shows results without sideways page scrolling.
+- **Asserts:** a closed root selects seven nested agents without expanding; the preview's seven quoted prompts wrap without horizontal clipping and can each be scrolled into view, the dialog fits the window and Send and Cancel are in view; Send is disabled with "Scroll to see all 7 texts" until each prompt has been in view, then enabled (PR #2491 audit K1); Cancel dismisses without showing results, and a subsequent Send, after Show next text has brought each of the new preview's texts into view, shows results without sideways page scrolling.
 - **Does not assert:** actual daemon delivery (agent-report/batch/002); a real agent (agent-report/live/003).
 
 ##### desktop/agent-cards/034 — A batch across two daemons keeps each agent's daemon, even with the same ids.
@@ -17797,9 +17797,9 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Does not assert:** that the deck-checked reference badges still open their pages (`025`, `018`).
 
 ##### desktop/agent-cards/104 — A kept card whose agent is gone opens a read-only pane with its Card panel.
-- **Test:** vitest `desktop/agent-cards/104: …` in `desktop/src/AgentPaneCardPanel.test.tsx`; the browser half is Playwright `025`.
-- **Layer:** desktop shell (jsdom), real `DeckShell` with a stand-in terminal, the card's agent absent from the deck's agents.
-- **Asserts:** clicking a stopped card whose agent the deck does not list opens a pane whose header names it with `last seen: stopped` and has no Close agent; no terminal is mounted, and the terminal's place (`data-terminal-state="ended"`) says "<name> has ended, and its terminal is gone."; the Card panel is open with the exited role's reason and last output, its checked reference and its report; its action icon is `aria-disabled`, as the daemon disabled it; Next agent moves to another agent's pane and Previous agent comes back to the ended one (PR #2491 review J1).
+- **Test:** vitest `desktop/agent-cards/104: …` (two cases) in `desktop/src/AgentPaneCardPanel.test.tsx`; Playwright `desktop/agent-cards/104 — …` (two cases) in `desktop/e2e/agent-card-panel.spec.ts` (1440 px), against `cards=tree` with bench's card kept for an agent the deck does not list and the deck taken offline and back (`__dadFixtureCards.connected`), chromium and webkit; the opening's browser half is also Playwright `025`.
+- **Layer:** desktop shell (jsdom), real `DeckShell` with a stand-in terminal, the card's agent absent from the deck's agents; real browser.
+- **Asserts:** clicking a stopped card whose agent the deck does not list opens a pane whose header names it with `last seen: stopped` and has no Close agent; no terminal is mounted, and the terminal's place (`data-terminal-state="ended"`) says "<name> has ended, and its terminal is gone."; the Card panel is open with the exited role's reason and last output, its checked reference and its report; it offers no action icon and says "<name> has ended, so its actions and answers are not available."; Next agent moves to another agent's pane and Previous agent comes back to the ended one (PR #2491 review J1, audit M1). The daemon stopping answering keeps the pane, saying the card is not available, and answering again with the card keeps the pane and shows the card. In the second case, a reconnected daemon whose cards are not listed yet keeps the pane, and one whose listing leaves the card out closes it, back to the dashboard; the browser does the same through the fixture (PR #2491 review L1).
 - **Does not assert:** a real daemon retaining the card (the daemon's own `ended_role` tests).
 
 ##### desktop/agent-cards/105 — A disconnect keeps the open Card panel's place and says the card is not available.
@@ -17813,6 +17813,24 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed card bridge, re-rendered with the card changed.
 - **Asserts:** after Send in the single-action review, a successful Close whose card then goes reads "Closed."; a sent prompt whose action the agent then withdraws, or whose card goes, keeps its quoted text and reads "Sent (message …)."; a press still pending when the card goes reads "Sending…"; none of them says "Nothing was sent", and each offers Close; a review whose Send was never pressed still says "This agent was closed. Nothing was sent." when its card goes (PR #2491 review J4).
 - **Does not assert:** a changed-token review after Send (`S1` in the same file).
+
+##### desktop/agent-cards/107 — The read-only pane of an ended agent offers none of its card's actions or answers.
+- **Test:** vitest `desktop/agent-cards/107: …` in `desktop/src/AgentPaneCardPanel.test.tsx`.
+- **Layer:** desktop shell (jsdom), real `DeckShell` with a stand-in terminal, the card's agent absent from the deck's agents.
+- **Asserts:** a kept card whose agent the deck does not list, still marking an action and a question's answer enabled, opens the read-only pane whose Card panel shows the question's text but no Actions section, no answer button and no button named after either, and says "<name> has ended, so its actions and answers are not available."; every button left in the pane is a move or Back to dashboard; `invokeCardAction` is never called (PR #2491 audit M1).
+- **Does not assert:** the daemon refusing a press on a stopped agent (`src/agent_cards.rs`).
+
+##### desktop/agent-cards/108 — An agent that ended keeps its ended pane through a disconnect, until the deck lists it again.
+- **Test:** vitest `desktop/agent-cards/108: …` in `desktop/src/AgentPaneCardPanel.test.tsx`.
+- **Layer:** desktop shell (jsdom), real `DeckShell` with a stand-in terminal.
+- **Asserts:** a working agent's pane opened from its card becomes the read-only ended pane when the deck stops listing the agent and keeps its stopped card; the daemon stopping answering keeps the ended pane, with no terminal and no "its daemon is not answering" live presentation from the record held before it ended; answering again without the agent keeps it, showing the card; the deck listing the agent again shows its live pane with its terminal (PR #2491 review L2).
+- **Does not assert:** a real daemon's agent restart.
+
+##### desktop/agent-cards/109 — With several distinct texts, a batch's Send waits until each has been in view.
+- **Test:** vitest `desktop/agent-cards/109: …` in `desktop/src/components/AgentCardsBatch.test.tsx`; Playwright `desktop/agent-cards/109 — …` in `desktop/e2e/agent-cards-tree.spec.ts` (1440 × 500 px), against `cards=tree` with every card offered Go ahead and two agents wording their own, chromium and webkit.
+- **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed batch bridge and a stubbed `IntersectionObserver`; real browser with the real one.
+- **Asserts:** with three distinct texts, Send is disabled with "Scroll to see all 3 texts" and Show next text beside it; the first text in view leaves it disabled; Show next text scrolls the second into view; the third in view enables Send and removes the hint, and Send executes exactly the previewed entries; a batch with one shared text has Send enabled at once with no hint. In the browser the body starts at the top with both agent-written texts below its fold, a forced click on the disabled Send sends nothing, scrolling each text into view enables it, and the results list every counted agent once, "Queued for all N" (PR #2491 audit K1).
+- **Does not assert:** the measured fallback where the webview has no `IntersectionObserver`.
 
 ## Desktop native driver scenarios
 
