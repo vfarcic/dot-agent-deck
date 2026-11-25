@@ -107,13 +107,13 @@ async function startSelectedBatch() {
 const REMOTE_INSTANCE = "daemon-instance-batch-remote";
 const SHARED = { pane_id: "pane-shared", agent_id: "shared" };
 
-function setupTwoDaemons() {
+function setupTwoDaemons({ localActions = [action] }: { localActions?: AgentCardAction[] } = {}) {
   const [local, remote] = createFixtureFleet("fleet");
   const fleet = [
     { ...local, connection: { ...local.connection, incarnation: INSTANCE } },
     { ...remote, connection: { ...remote.connection, incarnation: REMOTE_INSTANCE } },
   ];
-  const localCard = entry("shared", "local-coder", { key: "pane-shared/shared", pane_id: SHARED.pane_id });
+  const localCard = entry("shared", "local-coder", { key: "pane-shared/shared", pane_id: SHARED.pane_id, actions: localActions });
   const remoteCard = entry("shared", "remote-coder", { key: "pane-shared/shared", pane_id: SHARED.pane_id, instance_id: REMOTE_INSTANCE });
   const invokeCardActionBatch = vi.fn(async (deckId: string, _actionId: string, options: BatchOptions) => {
     const onLocal = deckId === FIXTURE_DAEMON_ID;
@@ -139,8 +139,15 @@ function setupTwoDaemons() {
     },
     invokeCardAction: vi.fn(), invokeCardActionBatch,
   } as unknown as DeckRuntimeState;
-  render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
-  return { invokeCardActionBatch, localName: deckName(fleet[0].connection), remoteName: deckName(fleet[1].connection) };
+  const { rerender } = render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+  /* A daemon's next answer advertising batches or not, as after a downgrade or a reconnect to an older daemon. */
+  let current = live;
+  const setBatch = (deckId: string, batch: boolean) => {
+    const cards = current.agentCards!;
+    current = { ...current, agentCards: { ...cards, [deckId]: { ...cards[deckId]!, revision: cards[deckId]!.revision + 1, batch } } } as DeckRuntimeState;
+    rerender(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
+  };
+  return { invokeCardActionBatch, setBatch, localName: deckName(fleet[0].connection), remoteName: deckName(fleet[1].connection) };
 }
 
 const targets = (cards: AgentCardEntry[]) => cards.map(({ pane_id, agent_id }) => ({ pane_id, agent_id }));
@@ -313,6 +320,40 @@ describe("batch card actions (#2399)", () => {
     expect(calls.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", instanceId: REMOTE_INSTANCE }));
     expect(errors.mock.calls.filter((call) => String(call[0]).includes("same key"))).toEqual([]);
     errors.mockRestore();
+  });
+
+  /// Scenario: Tick one card on each of two daemons, the local card also offering an action the remote one does not, then the local daemon stops advertising batches. The local card loses its checkbox and leaves the bar's count and its actions, and an action from the bar previews only the remote daemon's card. With only the local card ticked, its daemon losing batches takes the bar away and hands focus to the dashboard, and the card is not ticked again when batches come back.
+  it("desktop/agent-cards/091: a daemon that stops doing batches takes its cards out of the selection bar", async () => {
+    const localOnly: AgentCardAction = { ...action, id: "batch-local-only", label: "Local only", token: "tok-local-only" };
+    const calls = setupTwoDaemons({ localActions: [action, localOnly] });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
+    expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("2 selected");
+    expect(selectionAction("Local only")).toBeInTheDocument();
+
+    act(() => calls.setBatch(FIXTURE_DAEMON_ID, false));
+    expect(screen.queryByRole("checkbox", { name: "Select local-coder" })).toBeNull();
+    expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("1 selected");
+    expect(within(screen.getByTestId("agent-cards-selection-bar")).queryByRole("button", { name: "Local only" })).toBeNull();
+    await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
+    expect(screen.getByTestId("agent-cards-batch-confirm")).toBeInTheDocument();
+    const previewed = calls.invokeCardActionBatch.mock.calls.filter(([, , options]) => options.mode === "preview");
+    expect(previewed.map(([deckId]) => deckId)).toEqual([FIXTURE_REMOTE_DAEMON_ID]);
+    fireEvent.click(screen.getByTestId("agent-cards-batch-cancel"));
+
+    // Only the local card ticked: its daemon losing batches takes the bar away, with focus handed to the dashboard.
+    fireEvent.click(screen.getByTestId("agent-cards-selection-clear"));
+    act(() => calls.setBatch(FIXTURE_DAEMON_ID, true));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
+    expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("1 selected");
+    act(() => { screen.getByTestId("agent-cards-selection-clear").focus(); });
+    act(() => calls.setBatch(FIXTURE_DAEMON_ID, false));
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
+    expect(document.activeElement, "focus is on the dashboard").toBe(document.querySelector(".overview-body"));
+    // The card left the selection rather than being hidden from it: batches coming back do not tick it again.
+    act(() => calls.setBatch(FIXTURE_DAEMON_ID, true));
+    expect(screen.getByRole("checkbox", { name: "Select local-coder" })).not.toBeChecked();
+    expect(screen.queryByTestId("agent-cards-selection-bar")).toBeNull();
   });
 
   /// Scenario: With a batch confirmation open and nothing being sent, press Escape. The dialog closes and nothing is sent, as Cancel does.

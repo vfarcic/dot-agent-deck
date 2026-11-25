@@ -17726,6 +17726,13 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** with two cards selected by voice and focus on Clear, `clear_card_selection` removes the bar and leaves focus on the checkbox of the card selected last; with one card selected and focus on Clear, that card leaving the daemon's list removes the bar and leaves focus on the dashboard's scroll region (PR #2491 review, H1).
 - **Does not assert:** the scroll position or the next `Tab`, which jsdom does not lay out (`089`).
 
+##### desktop/agent-cards/091 — A daemon that stops doing batches takes its cards out of the selection bar.
+
+- **Test:** vitest `desktop/agent-cards/091: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom), `AgentOverview` over two fixture daemons with a stubbed batch bridge.
+- **Asserts:** with one card ticked on each of two daemons and the local card offering an action the remote one does not, the local daemon's next answer without batches removes that card's checkbox, the bar's count drops to 1 and its local-only action goes, and an action from the bar previews only the remote daemon; with only the local card ticked and focus on Clear, that daemon losing batches removes the bar and leaves focus on the dashboard's scroll region; batches coming back do not tick the card again (PR #2491 review).
+- **Does not assert:** the scroll position or the next `Tab`, which jsdom does not lay out (`089`).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

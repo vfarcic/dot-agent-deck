@@ -224,6 +224,17 @@ export interface AgentCardsView {
   batch: CardBatchView | undefined;
 }
 
+/**
+ * PR #2491 review — the selected cards a selection batch can reach: those
+ * still listed whose daemon advertises batches. The bar's count and actions,
+ * a batch started from it and the pruning of the selection all read this one
+ * rule, so a card the bar counts is a card an action from it reaches.
+ */
+function selectedBatchCards(placed: readonly PlacedCard[], selected: ReadonlySet<string>, batchFor: (deckId: string) => boolean): PlacedCard[] {
+  if (selected.size === 0) return [];
+  return placed.filter((card) => selected.has(placedCardKey(card)) && batchFor(card.deckId));
+}
+
 function sameIncarnation(card: PlacedCard, incarnation: string | undefined): boolean {
   return incarnation === undefined || card.entry.instance_id === "" || card.entry.instance_id === incarnation;
 }
@@ -324,15 +335,17 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   useEffect(() => {
     setResults((current) => pruneCardResults(current, placed));
   }, [placed]);
-  /* A selected card its daemon no longer lists leaves the selection. */
+  /* A selected card its daemon no longer lists, or whose daemon stopped
+     advertising batches (a downgrade, a reconnect to an older daemon), leaves
+     the selection: it has no checkbox and no batch reaches it, so it is not
+     kept hidden in the selection either, to come back ticked later. */
   useEffect(() => {
     setSelected((current) => {
       if (current.size === 0) return current;
-      const listed = new Set(placed.map(placedCardKey));
-      const kept = [...current].filter((cardKey) => listed.has(cardKey));
+      const kept = selectedBatchCards(placed, current, batchFor).map(placedCardKey);
       return kept.length === current.size ? current : new Set(kept);
     });
-  }, [placed]);
+  }, [batchFor, placed]);
   const invoke = runtime.invokeCardAction;
   const invokeBatch = runtime.invokeCardActionBatch;
   /* Issue #2399 — ask each daemon for its preview of `actionId` on its share
@@ -585,7 +598,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     runSelectionBatch: (wanted) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       const { placed: listed, selected: chosen, batchFor: does } = latest.current;
-      const cards = listed.filter((card) => chosen.has(placedCardKey(card)) && does(card.deckId));
+      const cards = selectedBatchCards(listed, chosen, does);
       if (cards.length === 0) return NOTHING_SELECTED;
       const choices = batchChoices(cards);
       let choice = wanted.actionId !== undefined ? choices.find((candidate) => candidate.id === wanted.actionId) : undefined;
@@ -734,7 +747,10 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   const anyBatches = shown && placed.some((card) => batchFor(card.deckId));
   const selection = useMemo<CardSelection | undefined>(() => {
     if (!anyBatches) return undefined;
-    return { selected, last: lastToggled, choices: batchChoices(placed.filter((card) => selected.has(placedCardKey(card)))) };
-  }, [anyBatches, placed, selected, lastToggled]);
+    /* Read through the same rule as a batch, so the render before the pruning above lands never counts a card no action reaches. */
+    const cards = selectedBatchCards(placed, selected, batchFor);
+    const reachable = cards.length === selected.size ? selected : new Set(cards.map(placedCardKey));
+    return { selected: reachable, last: lastToggled, choices: batchChoices(cards) };
+  }, [anyBatches, batchFor, placed, selected, lastToggled]);
   return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, overlay, notice, dismissNotice, rowMenu, controls, clickControls, voice, cardFor, resultsFor, batchFor, selection, batch: shown ? batch : undefined };
 }
