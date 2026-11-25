@@ -25,7 +25,7 @@ import { CardActionIconRow, CardReference, cardRef, ExactText, ExactTextNote, Is
  * terminal's, which the agent sees as a resize, so the pane shows it only on
  * the user's choice or when the pane opens.
  */
-export function AgentCardPanel({ card, name, results, tree, ended, notice, section, controls }: {
+export function AgentCardPanel({ card, name, results, tree, ended, notice, section, controls, readOnly = false }: {
   /** The agent's card; `undefined` when the dashboard lists none for it (any more). */
   card: PlacedCard | undefined;
   /** What the pane calls the agent, for a panel with no card. */
@@ -40,6 +40,12 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
   /** The part of the panel the pane was opened at: a card's `+N` opens it at the references. */
   section?: "references";
   controls: PaneCardControls;
+  /**
+   * PR #2491 audit M1 — the pane of an agent that has ended: the panel shows
+   * the card but offers none of its actions and none of its answers, however
+   * the card marks them, and says so.
+   */
+  readOnly?: boolean;
 }) {
   const entry = card?.entry;
   const shownName = entry ? displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id) : displayText(name, DISPLAY_LIMITS.name);
@@ -63,7 +69,8 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
   }, [section, cardKey, hasRefs]);
   const checkedRefs = tree ? entry?.checked_refs ?? [] : [];
   const pullRequest = entry?.facts.pull_request as { number?: number; title?: string; state?: string } | null | undefined;
-  const icons = entry ? panelIconActions(entry) : [];
+  const icons = entry && !readOnly ? panelIconActions(entry) : [];
+  const offersSomething = entry !== undefined && (panelIconActions(entry).length > 0 || entry.questions.some((question) => question.options.length > 0));
   /* What became of each press from this card, in the order the actions are listed. */
   const answered = entry ? entry.actions.flatMap((action) => (results[action.token] ? [{ action, result: results[action.token]! }] : [])) : [];
   return (
@@ -150,7 +157,7 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
                 {entry.questions.map((question) => (
                   <div key={question.id} className="agent-card-question" data-question={question.id}>
                     <p className="agent-card-question-text">{multilineText(question.text)}</p>
-                    <div className="agent-card-options">
+                    {!readOnly && <div className="agent-card-options">
                       {question.options.map((option) => {
                         const action = entry.actions.find((candidate) => candidate.id === option.action_id);
                         const chosen = question.answered?.option_id === option.id;
@@ -166,13 +173,14 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
                           >{displayText(option.label, DISPLAY_LIMITS.name)}{chosen ? " (answered)" : ""}</button>
                         );
                       })}
-                    </div>
+                    </div>}
                   </div>
                 ))}
               </div>
             )}
           </section>
 
+          {readOnly && offersSomething && <p className="agent-card-hint agent-card-panel-read-only" role="note" data-testid="agent-card-panel-read-only">{`${shownName} has ended, so its actions and answers are not available.`}</p>}
           {icons.length > 0 && (
             <section className="agent-card-section agent-card-panel-part agent-card-panel-actions" aria-label="Actions" data-testid="agent-card-panel-actions">
               <h3>Actions</h3>

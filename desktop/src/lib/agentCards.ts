@@ -434,6 +434,26 @@ export function acceptCardsSnapshot(held: AgentCardsSnapshot | undefined, next: 
 }
 
 /**
+ * PR #2491 review L1 — what a deck's CURRENT cards listing says of one
+ * agent's card, for a pane kept on that card while its agent is gone:
+ *
+ * - `listed`: the listing holds it;
+ * - `omitted`: a listing from the daemon process the deck is connected to
+ *   now leaves it out, or that process is not the one the card was for — the
+ *   card is gone, and only this retires the pane;
+ * - `awaiting`: no listing from the current process yet (a deck that has just
+ *   reconnected answers its agents before its cards are read). The agents'
+ *   list says nothing about the cards, so the pane waits.
+ */
+export type CardListing = "listed" | "omitted" | "awaiting";
+
+export function cardListing(snapshot: AgentCardsSnapshot | undefined, connection: { incarnation?: string }, agentId: string, incarnation: string | undefined): CardListing {
+  if (incarnation !== undefined && connection.incarnation !== undefined && connection.incarnation !== incarnation) return "omitted";
+  if (!snapshot || (connection.incarnation !== undefined && snapshot.instanceId !== connection.incarnation)) return "awaiting";
+  return snapshot.entries.some((entry) => entry.agent_id === agentId && (incarnation === undefined || entry.instance_id === "" || entry.instance_id === incarnation)) ? "listed" : "omitted";
+}
+
+/**
  * The cards still valid for `connections`: a deck that left the fleet or is
  * not connected keeps none, and neither does one whose connection now names
  * another daemon process than the one that listed its cards (a daemon

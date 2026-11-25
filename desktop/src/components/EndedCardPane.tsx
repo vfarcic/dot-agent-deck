@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useMemo, useRef } from "react";
 import { BellRing, ChevronLeft, ChevronRight, Unplug, X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
@@ -21,8 +21,11 @@ import { AgentCardPanel } from "./AgentCardPanel";
  *   button (the panel is the whole of what it shows);
  * - the terminal's place says, in one sentence, that the agent has ended and
  *   its terminal is gone;
- * - the Card panel is open, and draws the card's actions as the card does:
- *   the daemon disables those that need a running agent.
+ * - the Card panel is open, and read-only (PR #2491 audit M1): it offers
+ *   none of the card's actions or answers, however the card marks them —
+ *   the agent list and the cards are separate listings, so a card can still
+ *   say enabled for a moment after its agent has gone — and a press that
+ *   reached the panel's members anyway is refused here, before the send.
  *
  * While the card's daemon is not answering, the panel keeps its place and
  * says the card is not available (J2), under the name it last showed.
@@ -40,6 +43,8 @@ export function EndedCardPane({ view, paneCards, onClose }: {
   if (card) last.current = { name: displayIdentity(card.entry.name, DISPLAY_LIMITS.name, card.entry.pane_id), status: card.entry.status };
   const { name, status } = last.current;
   const controls = cards?.controls;
+  /* The panel's members with every card action refused (audit M1): the moves and the references still work. */
+  const readOnlyControls = useMemo(() => (controls ? { ...controls, runCardAction: () => `${name} has ended, so nothing was sent.` } : undefined), [controls, name]);
   return (
     <div ref={paneRef} className="agent-pane-overlay" data-testid="agent-pane-overlay" role="dialog" aria-modal="true" aria-label={`${name} agent`} tabIndex={-1}>
       <article className="agent-tile is-selected" data-presentation="overlay" data-agent-record="ended" data-testid="ended-card-pane" aria-label={name}>
@@ -82,7 +87,8 @@ export function EndedCardPane({ view, paneCards, onClose }: {
               ended={card ? cards.endedFor(card) : undefined}
               notice={card ? cards.notice : undefined}
               section={view.cardSection}
-              controls={cards.controls}
+              controls={readOnlyControls ?? cards.controls}
+              readOnly
             />
           )}
         </div>

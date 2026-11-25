@@ -54,6 +54,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
 import { OpenCardReference, OpenPullRequest, PrBrowserHostContext, type CardReferenceTarget } from "./lib/prBrowser";
+import { cardListing } from "./lib/agentCards";
 import { openableReference } from "./lib/agentCardsTree";
 import { LocalUpgradeFlow } from "./components/LocalUpgradeFlow";
 import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
@@ -983,12 +984,34 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const retainedCard = useSyncExternalStore(paneCards.subscribe, () => (
     agentView?.from === "overview" && paneCards.get()?.cardFor(agentView.deckId, agentView.agentId, agentView.incarnation) !== undefined
   ));
+  /*
+   * PR #2491 review L1 and L2 — once a view has been shown card-backed, it
+   * stays so until the card is really gone or the agent really back:
+   *
+   * - while its deck is not answering, it stays the ended pane, even when a
+   *   live record of the same agent was held from before it ended (L2): what
+   *   the user last saw is that it ended;
+   * - on a deck answering again, it is retired only when a current listing of
+   *   that deck's cards, from the daemon process it is connected to now,
+   *   leaves the card out ({@link cardListing}). The decision reads the
+   *   runtime's listing in this render, never the cards channel, which the
+   *   dashboard publishes a render later (L1): a reconnect answers its agents
+   *   before its cards, and that gap is not an absence;
+   * - a fresh live record of the agent makes it the live pane again, and
+   *   forgets that it was card-backed.
+   */
   // voice-registry-exempt: which open view was last shown as a card-backed pane, so it is kept while its daemon is not answering; an invariant, not a control
   const [endedPaneView, setEndedPaneView] = useState<DeckView>();
+  const wasCardBacked = agentView !== undefined && endedPaneView === agentView;
+  const keptCardListing = wasCardBacked && paneDeckAttachable && paneDeck
+    ? cardListing(runtime.agentCards?.[agentView.deckId], paneDeck.connection, agentView.agentId, agentView.incarnation)
+    : undefined;
   const cardBackedPane = agentView !== undefined && agentView.from === "overview" && paneAgent === undefined && !paneAgentReplaced
     && stoppingAttempt.current?.view !== agentView
-    && (paneDeckAttachable ? retainedCard : endedPaneView === agentView && heldPaneAgent === undefined);
+    && (paneDeckAttachable ? retainedCard || (wasCardBacked && keptCardListing !== "omitted") : wasCardBacked);
   if (cardBackedPane && endedPaneView !== agentView) setEndedPaneView(agentView);
+  // The agent is listed again: its view is the live pane's, no longer card-backed.
+  if (paneAgent !== undefined && endedPaneView !== undefined) setEndedPaneView(undefined);
   const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined && !cardBackedPane;
   useEffect(() => {
     if (!paneAgentRetired) return;

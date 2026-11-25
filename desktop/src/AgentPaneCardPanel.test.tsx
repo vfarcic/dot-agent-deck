@@ -53,8 +53,13 @@ function settingsStore() {
   };
 }
 
-/** How the deck looks in one render: connected (the default) or not answering, and extra fields of its snapshot. */
-type DeckState = { connected?: boolean; endedRoles?: EndedRole[]; tree?: boolean };
+/**
+ * How the deck looks in one render: connected (the default) or not answering,
+ * extra fields of its snapshot, the agent ids it no longer lists (`gone`), and
+ * whether its cards listing has not been read yet since it connected
+ * (`unlisted`: connected, with no cards listing at all).
+ */
+type DeckState = { connected?: boolean; endedRoles?: EndedRole[]; tree?: boolean; gone?: string[]; unlisted?: boolean };
 
 /** The real shell on the dashboard, with a card for each of the fixture deck's first three agents; the third needs you. */
 function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {}) {
@@ -67,7 +72,8 @@ function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {
   /* A deck that stops answering lists no agents and no cards, as the daemon's disconnected snapshot does. */
   const snapshotOf = (deck: DeckState) => (deck.connected === false
     ? { ...live, connection: { ...live.connection, status: "disconnected" as const, message: "The daemon stopped answering." }, agents: [], endedRoles: deck.endedRoles }
-    : { ...live, endedRoles: deck.endedRoles });
+    : { ...live, agents: live.agents.filter((agent) => !deck.gone?.includes(agent.id)), endedRoles: deck.endedRoles });
+  const invokeCardAction = vi.fn(async (_target: unknown, _actionId: string, options?: { requestId?: string }) => ({ request_id: options?.requestId ?? "r", outcome: "sent" as const, message_id: "m-pane-1" }));
   const runtime = (cards: AgentCardEntry[], revision: number, deck: DeckState = initial.deck ?? {}) => ({
     mode: "fixture",
     desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
@@ -86,14 +92,15 @@ function renderShell(initial: { extra?: AgentCardEntry[]; deck?: DeckState } = {
     setZoom: vi.fn(async (level: number) => level),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
-    agentCards: deck.connected === false ? {} : { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision, entries: cards, catalogErrors: [], ...(deck.tree ? { tree: true } : {}) } },
-    invokeCardAction: vi.fn(async (_target: unknown, _actionId: string, options?: { requestId?: string }) => ({ request_id: options?.requestId ?? "r", outcome: "sent" as const, message_id: "m-pane-1" })),
+    agentCards: deck.connected === false || deck.unlisted ? {} : { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision, entries: cards, catalogErrors: [], ...(deck.tree ? { tree: true } : {}) } },
+    invokeCardAction,
   }) as unknown as DeckRuntimeState;
   const view = render(createElement(DeckShell, { runtime: runtime(entries, 1), initialView: { kind: "overview" } }));
   return {
     agents: [first, second, third],
     entries,
     resizeTerminal,
+    invokeCardAction,
     update: (cards: AgentCardEntry[], revision: number, deck?: DeckState) => view.rerender(createElement(DeckShell, { runtime: runtime(cards, revision, deck), initialView: { kind: "overview" } })),
   };
 }
@@ -241,7 +248,7 @@ describe("the agent pane's Card panel (PR #2491 decision 2026-11-25)", () => {
     expect(panel()?.getAttribute("data-card-key")).toBe(shell.entries[0].key);
   });
 
-  /// Scenario: A card the deck keeps for an orchestration role that has exited: its agent is not in the daemon's list of agents any more, its status is stopped, and its actions are disabled because the agent is not running. Click the card. A read-only pane opens: its header names the agent with its last status and offers no Close agent; the Card panel is open with why the role exited, its last output, its pull requests and issues and its report; the terminal area says in one sentence that the agent has ended and its terminal is gone, and no terminal is attached. Next agent moves on from it, and Previous agent comes back.
+  /// Scenario: A card the deck keeps for an orchestration role that has exited: its agent is not in the daemon's list of agents any more, its status is stopped, and its actions are disabled because the agent is not running. Click the card. A read-only pane opens: its header names the agent with its last status and offers no Close agent; the Card panel is open with why the role exited, its last output, its pull requests and issues and its report, and offers none of its actions; the terminal area says in one sentence that the agent has ended and its terminal is gone, and no terminal is attached. Next agent moves on from it, and Previous agent comes back. Its daemon then stops answering and answers again still keeping the card: the pane stays.
   it("desktop/agent-cards/104: a kept card whose agent is gone opens a read-only pane with its Card panel", () => {
     window.localStorage.setItem(MODE_KEY, "cards");
     const goneId = "gone-104";
@@ -268,13 +275,90 @@ describe("the agent pane's Card panel (PR #2491 decision 2026-11-25)", () => {
     expect(within(opened).getByTestId("agent-card-panel-ended")).toHaveTextContent("error: 3 tests failed");
     expect(within(opened).getAllByTestId("agent-card-panel-ref")).toHaveLength(1);
     expect(within(opened).getByText("Stopped after the tests failed")).toBeInTheDocument();
-    // Its actions need a live agent: as on the card, the daemon disabled them.
-    expect(within(opened).getByRole("button", { name: "Go ahead" })).toHaveAttribute("aria-disabled", "true");
+    // Its actions need a live agent: the read-only pane offers none of them, and says so (audit M1).
+    expect(within(opened).queryByRole("button", { name: "Go ahead" })).toBeNull();
+    expect(within(opened).getByTestId("agent-card-panel-read-only")).toHaveTextContent("ended-role has ended, so its actions and answers are not available.");
     // The moves still work from it.
     fireEvent.click(within(shown).getByRole("button", { name: "Next agent" }));
     expect(within(pane()).getByTestId(`terminal-${shell.agents[0].id}`)).toBeInTheDocument();
     fireEvent.click(within(pane()).getByRole("button", { name: "Previous agent" }));
     expect(within(pane()).getByTestId("terminal-ended")).toBeInTheDocument();
+
+    // Its daemon stops answering, then answers again still keeping the card: the pane stays, and shows the card again (review L1).
+    shell.update(shell.entries, 3, { connected: false, endedRoles, tree: true });
+    expect(within(pane()).getByTestId("terminal-ended")).toBeInTheDocument();
+    expect(within(panel()!).getByTestId("agent-card-gone")).toBeInTheDocument();
+    shell.update(shell.entries, 4, { endedRoles, tree: true });
+    expect(within(pane()).getByTestId("terminal-ended")).toBeInTheDocument();
+    expect(panel()?.getAttribute("data-card-key")).toBe(ended.key);
+  });
+
+  /// Scenario: Open the read-only pane of a card the deck keeps for an agent that has gone, then let its daemon stop answering and answer again. While the reconnected daemon has not listed its cards yet, the pane stays and says the card is not available; once it lists its cards without that one, the pane closes and the dashboard is back.
+  it("desktop/agent-cards/104: a kept card's pane closes once its reconnected daemon lists its cards without it", () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const goneId = "gone-104-retire";
+    const ended = cardFor(goneId, "ended-role", { status: "stopped", actions: [action("go-ahead", { label: "Go ahead", enabled: false, disabled_reason: "agent_stopped" })] });
+    const shell = renderShell({ extra: [ended] });
+    fireEvent.click(card(ended));
+    expect(within(pane()).getByTestId("terminal-ended")).toBeInTheDocument();
+    shell.update(shell.entries, 2, { connected: false });
+    expect(within(pane()).getByTestId("terminal-ended")).toBeInTheDocument();
+    // Answering again, before its cards are listed: the agents' list says nothing about the cards, so the pane waits.
+    shell.update(shell.entries, 3, { unlisted: true });
+    expect(within(pane()).getByTestId("terminal-ended")).toBeInTheDocument();
+    expect(within(panel()!).getByTestId("agent-card-gone")).toBeInTheDocument();
+    // Its cards listed, without this one: the pane goes.
+    shell.update(shell.entries.filter((entry) => entry.key !== ended.key), 4);
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.queryByTestId("ended-card-pane")).toBeNull();
+  });
+
+  /// Scenario: A card the deck keeps for an agent that is gone still lists an enabled action and a question with an answer button, as a card can for a moment while the deck catches up. Open it: the read-only pane shows the card's report and question but no action icon and no answer button, says its actions need a running agent, and nothing is ever sent.
+  it("desktop/agent-cards/107: the read-only pane of an ended agent offers none of its card's actions or answers", () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const goneId = "gone-107";
+    const ended = cardFor(goneId, "ended-107", {
+      status: "stopped",
+      actions: [action("go-ahead", { label: "Go ahead", prompt: "EXACT-107 go ahead.", enabled: true }), action("answer-yes", { label: "Yes", prompt: "Yes.", placement: "question", enabled: true })],
+      questions: [{ id: "q-107", text: "Ship it?", source: "agent", options: [{ id: "yes", label: "Yes", action_id: "answer-yes" }], answered: null }],
+    } as Partial<AgentCardEntry>);
+    const shell = renderShell({ extra: [ended] });
+    fireEvent.click(card(ended));
+    const shown = screen.getByTestId("ended-card-pane");
+    const opened = panel()!;
+    expect(opened.getAttribute("data-card-key")).toBe(ended.key);
+    expect(within(opened).getByText("Ship it?")).toBeInTheDocument();
+    expect(within(opened).queryByTestId("agent-card-panel-actions")).toBeNull();
+    expect(within(opened).queryAllByTestId("agent-card-option")).toHaveLength(0);
+    expect(within(opened).queryByRole("button", { name: /Go ahead|Yes/ })).toBeNull();
+    expect(within(opened).getByTestId("agent-card-panel-read-only")).toHaveTextContent("ended-107 has ended, so its actions and answers are not available.");
+    // Every button the pane still offers moves or leaves; none of them reaches the agent.
+    for (const button of within(shown).getAllByRole("button")) expect(button.getAttribute("aria-label") ?? button.textContent).toMatch(/Previous agent|Next agent|Next needing you|Back to dashboard/);
+    expect(shell.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Open a working agent's pane from its card. The agent goes while the deck keeps its stopped card, so the pane becomes the read-only ended pane. The daemon stops answering: the pane stays the ended pane, not the agent's earlier live pane. The daemon answers again, still without the agent: still the ended pane. When the deck lists the agent again, its live pane with its terminal is back.
+  it("desktop/agent-cards/108: an agent that ended keeps its ended pane through a disconnect, until the deck lists it again", () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const shell = renderShell();
+    const [first] = shell.agents;
+    fireEvent.click(card(shell.entries[0]));
+    expect(within(pane()).getByTestId(`terminal-${first.id}`)).toBeInTheDocument();
+    const stopped = cardFor(first.id, "first-card", { status: "stopped", revision: 2, actions: [action("go-ahead", { label: "Go ahead", enabled: false, disabled_reason: "agent_stopped" })] });
+    const cards = [stopped, shell.entries[1], shell.entries[2]];
+    shell.update(cards, 2, { gone: [first.id] });
+    expect(screen.getByTestId("ended-card-pane")).toBeInTheDocument();
+    shell.update(cards, 3, { connected: false });
+    expect(screen.getByTestId("ended-card-pane")).toBeInTheDocument();
+    expect(within(pane()).queryByTestId(`terminal-${first.id}`)).toBeNull();
+    expect(within(pane()).queryByText(/daemon is not answering/)).toBeNull();
+    shell.update(cards, 4, { gone: [first.id] });
+    expect(screen.getByTestId("ended-card-pane")).toBeInTheDocument();
+    expect(panel()?.getAttribute("data-card-key")).toBe(stopped.key);
+    // A fresh record of the same agent: its live pane again.
+    shell.update(shell.entries, 5);
+    expect(screen.queryByTestId("ended-card-pane")).toBeNull();
+    expect(within(pane()).getByTestId(`terminal-${first.id}`)).toBeInTheDocument();
   });
 
   /// Scenario: Open the first agent from its card, so its Card panel is open, then let its daemon stop answering, and answer again. While it does not answer, the pane keeps the panel's place, which says the card is not available right now and offers none of its actions, and the terminal is never resized; when the daemon answers again, the panel shows the card again in the same place.

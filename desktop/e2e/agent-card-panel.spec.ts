@@ -22,7 +22,10 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  *   a mark under the pointer and a ring under the keyboard in both themes, and
  *   its tooltip sits just below or above it (100);
  * - an open panel keeps its place while the agent's daemon stops answering and
- *   comes back, and the terminal's box never moves (105).
+ *   comes back, and the terminal's box never moves (105);
+ * - a kept card's read-only pane stays through its daemon reconnecting with
+ *   the card, and closes once the reconnected daemon lists its cards without
+ *   it (104).
  */
 
 const TOLERANCE = 1;
@@ -220,6 +223,50 @@ for (const width of [375, 1440] as const) {
     });
   });
 }
+
+test.describe("desktop/agent-cards/104 — a kept card's pane through its daemon reconnecting", () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+  const connected = (page: Page, online: boolean) => page.evaluate((value) => (window as unknown as { __dadFixtureCards: { connected(online: boolean): void } }).__dadFixtureCards.connected(value), online);
+  /** bench's card kept, stopped, for an agent the deck no longer lists; its read-only pane opened from the card. */
+  async function openEnded(page: Page): Promise<{ pane: Locator; key: string }> {
+    await openTree(page);
+    await pushCards(page, `const bench = byName("bench"); bench.agent_id = "bench-ended-104"; bench.status = "stopped";`);
+    const key = await keyOf(page, "bench");
+    await (await cardNamed(page, "bench")).getByTestId("agent-card-details").click();
+    const pane = page.getByTestId("ended-card-pane");
+    await expect(pane).toBeVisible();
+    await expect(pane.getByTestId("agent-card-panel")).toHaveAttribute("data-card-key", key);
+    return { pane, key };
+  }
+
+  /// Scenario: Open the read-only pane of bench's card, kept for an agent the deck no longer lists. Its daemon stops answering: the pane stays and says the card is not available right now. The daemon answers again, still keeping the card: the pane stays and shows the card again.
+  test("the pane stays when its daemon answers again still keeping the card (review L1)", async ({ page }) => {
+    const { pane, key } = await openEnded(page);
+    await connected(page, false);
+    await expect(pane.getByTestId("agent-card-gone")).toHaveText("This card is not available right now.");
+    await connected(page, true);
+    await expect(pane.getByTestId("agent-card-panel")).toHaveAttribute("data-card-key", key);
+    await expect(pane.getByTestId("agent-card-gone")).toHaveCount(0);
+    await expect(page.getByTestId("ended-card-pane")).toBeVisible();
+  });
+
+  /// Scenario: Open the same read-only pane, let its daemon stop answering, and drop bench's card while it does. When the daemon answers again and lists its cards without bench's, the pane closes and the dashboard is back.
+  test("the pane closes when its daemon answers again without the card", async ({ page }) => {
+    const { pane } = await openEnded(page);
+    await connected(page, false);
+    await expect(pane.getByTestId("agent-card-gone")).toBeVisible();
+    await page.evaluate(() => {
+      const hook = (window as unknown as { __dadFixtureCards: { snapshot(): { revision: number; entries: { name: string }[] }; push(next: unknown): void } }).__dadFixtureCards;
+      const next = hook.snapshot();
+      next.entries = next.entries.filter((entry) => entry.name !== "bench");
+      next.revision += 1;
+      hook.push(next);
+    });
+    await connected(page, true);
+    await expect(page.getByTestId("ended-card-pane")).toHaveCount(0);
+    await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);
+  });
+});
 
 test.describe("desktop/agent-cards/098 — the pane's header moves between agents", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
