@@ -791,6 +791,25 @@ const DOCS_IMPL_TRANSCRIPT = [
   "Next: wire it into CheckoutView and cover the failed-payment path.",
   "",
 ].join("\r\n");
+/*
+ * PR #2491 review J7 — Contract review's terminal in the `cards=tree` scenes,
+ * whose Card panel screenshots show it: the reviewer comparing the payment
+ * API's responses and running the checkout tests, as its card reports, so the
+ * pane beside the panel reads as an agent at work rather than one that failed
+ * to load. Deterministic: no clock, no paths outside the scene's project.
+ */
+const DOCS_REVIEW_TRANSCRIPT = [
+  "\u001b[1m›\u001b[0m Check the payment API for breaking changes.",
+  "\u001b[36m•\u001b[0m Compared v2 and v3 responses",
+  "    \u001b[33m~ payment.status\u001b[0m  new value \"retrying\"",
+  "    \u001b[32m= payment.amount\u001b[0m  unchanged",
+  "\u001b[36m•\u001b[0m Ran cargo test checkout_retry",
+  "    \u001b[32mok\u001b[0m  14 passed; 1 ignored",
+  "",
+  "One breaking change: the new status.",
+  "Asked on the card: ship it behind a flag?",
+  "",
+].join("\r\n");
 const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "idle", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
   { ...crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }), transcript: DOCS_IMPL_TRANSCRIPT },
@@ -1609,7 +1628,13 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   const treeAgents = treeScene === "tree" || treeScene === "tree-nested"
     ? treeAgentCards(treeScene).entries.map((entry) => crowdedAgent({ id: entry.agent_id, displayName: entry.name, role: "Claude code", cli: "claude", status: "idle", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: `Work as ${entry.name}.`, tab: { kind: "dashboard" } }))
     : [];
-  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? [...docsAgents, ...treeAgents] : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
+  /* PR #2491 review J7: in the card scenes, whose Card panel screenshots show
+     an agent's pane, the agents carry the project as their worktree, and
+     Contract review its terminal, so the pane is not read as a failed one. */
+  const docsInScene = treeScene !== null
+    ? [...docsAgents, ...treeAgents].map((agent) => ({ ...agent, worktree: "storefront", ...(agent.displayName === "Contract review" ? { transcript: DOCS_REVIEW_TRANSCRIPT } : {}) }))
+    : docsAgents;
+  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsInScene : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
   const docs = state === "docs" || state === "docs-question" || state === "docs-restart";

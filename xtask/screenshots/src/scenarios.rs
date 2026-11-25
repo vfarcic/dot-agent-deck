@@ -193,6 +193,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards-batch-texts",
+        description: "The same large batch with two agents that worded their own Go ahead: each distinct text quoted with its source mark (catalog, agent says), the catalog text's long list of names folded behind +N more, and the heading counting the agents and the 3 different texts (PR #2491 audit K1).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "agent-cards-batch-many-expanded",
         description: "The same confirmation with the skipped line pressed: the skipped agents listed, grouped by reason (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],

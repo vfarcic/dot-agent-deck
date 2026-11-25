@@ -281,12 +281,12 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
                       ? <><p className="agent-cards-batch-text-source"><GroupSource rows={group} /></p><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt"><ExactText text={first.entry.prompt} /></blockquote><ExactTextNote text={first.entry.prompt} /></>
                       : <p className="agent-cards-batch-what">{closeWords(first.entry.kind, label, several)}</p>);
                     const badge = (row: BatchRow) => row.entry.prompt_source === "agent" && <SourceBadge source="agent" />;
-                    /* One agent: its row holds the text, as it always did. */
+                    /* One agent: its row holds the text, as it always did; the quotation's mark says who wrote it. */
                     if (group.length === 1) {
                       return (
                         <li key={groupKey} className="agent-cards-batch-group" data-testid="agent-cards-batch-group">
                           <div className="agent-cards-batch-entry is-included" data-testid="agent-cards-batch-entry">
-                            {who(first, badge(first))}
+                            {who(first, first.entry.prompt ? undefined : badge(first))}
                             {what(false)}
                           </div>
                         </li>

@@ -29,9 +29,10 @@ desktopScenario("dashboard-empty", async (page) => {
 
 // The same synthetic permission stop as the TUI capture: one Antigravity
 // agent, with its own wording beneath the tile's Needs Input status.
-desktopScenario("antigravity-needs-input", async (page) => {
-  // Use xterm's supported DOM renderer: the sandbox's headless WebGL
-  // canvas stays blank even after its buffer contains the permission menu.
+// Use xterm's supported DOM renderer: the sandbox's headless WebGL canvas
+// stays blank, or is drawn at the wrong scale, even when its buffer holds the
+// agent's output.
+async function useDomTerminal(page: Page): Promise<void> {
   await page.addInitScript(() => {
     const getContext = HTMLCanvasElement.prototype.getContext;
     Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
@@ -41,6 +42,10 @@ desktopScenario("antigravity-needs-input", async (page) => {
       },
     });
   });
+}
+
+desktopScenario("antigravity-needs-input", async (page) => {
+  await useDomTerminal(page);
   await page.goto("/?fixture=1&state=docs-antigravity");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByRole("row", { name: "Open probe agent" }).click({ position: { x: 4, y: 4 } });
@@ -199,6 +204,7 @@ desktopScenario("agent-cards-select", async (page) => {
 // deck-checked status and pull request, the agent's summary, why it needs you
 // and its question with its two answers, and its actions as icons.
 async function openContractReviewPanel(page: Page): Promise<Locator> {
+  await useDomTerminal(page);
   await openCardsTree(page);
   await page.locator("article[data-card-key]").filter({ hasText: "Contract review" }).getByTestId("agent-card-details").click();
   const pane = page.getByTestId("agent-pane-overlay");
@@ -218,7 +224,13 @@ desktopScenario("agent-card-panel", async (page) => {
   await panel.evaluate((node) => { node.scrollTop = node.scrollHeight; });
   await expect(panel.getByTestId("action-icon-group")).toBeInViewport({ ratio: 1 });
   await expect(panel.getByRole("button", { name: "Yes, behind a flag" })).toBeInViewport({ ratio: 1 });
-  await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
+  // PR #2491 review J7: the pane beside the panel reads as an agent at work, its footer naming the project, not "Unavailable".
+  const rows = page.getByTestId("agent-pane-overlay").locator(".xterm-rows");
+  await expect(rows).toContainText("Compared v2 and v3 responses");
+  // Written once: the mount's replay is not repeated over a buffer that already holds it.
+  expect(await rows.evaluate((node) => (node.textContent ?? "").split("Compared v2 and v3 responses").length - 1)).toBe(1);
+  await expect(page.getByTestId("agent-pane-overlay").locator(".agent-footer")).toContainText("storefront");
+  await expect(page.getByTestId("agent-pane-overlay").locator(".agent-footer")).not.toContainText("Unavailable");
 });
 
 // The same pane in a phone-wide window: the Card panel between the pane's
@@ -240,25 +252,28 @@ desktopScenario("agent-card-panel-narrow", async (page) => {
 // stopped ones and not offered by the rest. The skipped agents fold into one
 // line counting them by reason, and the included names past the first few
 // behind "+N more".
-async function openManyBatch(page: Page): Promise<Locator> {
+async function openManyBatch(page: Page, distinctTexts = false): Promise<Locator> {
   await page.goto("/?fixture=1&state=docs&cards=tree");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await page.getByTestId("overview-mode-cards").click();
-  await page.evaluate(() => {
+  await page.evaluate((distinct) => {
     type Entry = Record<string, unknown> & { name: string; agent_id: string; actions: unknown[] };
     const hook = (window as unknown as { __dadFixtureCards: { snapshot(): { revision: number; batch?: boolean; entries: Entry[] }; push(next: unknown): void } }).__dadFixtureCards;
     const next = hook.snapshot();
     next.batch = true;
+    /* PR #2491 audit K1: two agents worded their own Go ahead, each differently. */
+    const own = distinct ? new Map([[2, "Go ahead, then also delete the scratch branch."], [7, "Go ahead and push straight to main."]]) : new Map<number, string>();
     next.entries.forEach((entry, at) => {
       if (at % 5 === 3) return;
       const stopped = at % 5 === 1;
-      entry.actions = [{ id: "go-ahead", label: "Go ahead", kind: "prompt", prompt: "Go ahead.", prompt_source: "catalog", text_input: false, confirm: false, confirm_detail: null, icon: "play",
-        placement: "card", custom: false, source: "catalog", enabled: !stopped, disabled_reason: stopped ? "agent_stopped" : null, last_delivery: null, token: `tok-many-${entry.agent_id}` }, ...entry.actions];
+      const text = own.get(at);
+      entry.actions = [{ id: "go-ahead", label: "Go ahead", kind: "prompt", prompt: text ?? "Go ahead.", prompt_source: text ? "agent" : "catalog", text_input: false, confirm: false, confirm_detail: null, icon: "play",
+        placement: "card", custom: text !== undefined, source: text ? "agent" : "catalog", enabled: !stopped, disabled_reason: stopped ? "agent_stopped" : null, last_delivery: null, token: `tok-many-${entry.agent_id}` }, ...entry.actions];
     });
     next.revision += 1;
     hook.push(next);
-  });
+  }, distinctTexts);
   for (const box of await page.locator("article[data-card-key][data-depth='0']").getByTestId("agent-card-select").all()) await box.check();
   await page.getByTestId("agent-cards-batch-action-go-ahead").click();
   const dialog = page.getByTestId("agent-cards-batch-confirm");
@@ -271,6 +286,18 @@ desktopScenario("agent-cards-batch-many", async (page) => {
   const dialog = await openManyBatch(page);
   await expect(dialog.getByTestId("agent-cards-batch-skipped-toggle")).toHaveAttribute("aria-expanded", "false");
   await expect(dialog.getByTestId("agent-cards-batch-skipped-group")).toHaveCount(0);
+});
+
+// PR #2491 audit K1 — the same batch with two agents that worded their own Go
+// ahead: every distinct text is quoted with who wrote it, the catalog's text
+// first with its long list folded behind +N more, and the heading counts the
+// agents and the texts.
+desktopScenario("agent-cards-batch-texts", async (page) => {
+  const dialog = await openManyBatch(page, true);
+  await expect(dialog.getByTestId("agent-cards-batch-prompt")).toHaveText(["Go ahead.", "Go ahead, then also delete the scratch branch.", "Go ahead and push straight to main."]);
+  await expect(dialog.getByTestId("agent-cards-batch-source")).toHaveText(["catalog", "agent says", "agent says"]);
+  await expect(dialog.getByRole("heading", { level: 3 }).first()).toContainText("3 different texts");
+  await expect(dialog.getByTestId("agent-cards-batch-more")).toHaveText(/^\+\d+ more$/);
 });
 
 desktopScenario("agent-cards-batch-many-expanded", async (page) => {

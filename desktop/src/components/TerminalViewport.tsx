@@ -229,6 +229,11 @@ export function TerminalViewport({
   // than output the agent is producing now, so an OSC 52 copy inside them is
   // not honoured a second time.
   const replayRef = useRef<((data: string | Uint8Array) => void) | undefined>(undefined);
+  /* The transcript the buffer was last rebuilt from. xterm's `write` is
+     queued, so a `reset()` right after the mount's replay clears the buffer
+     before that write lands, and the transcript ends up on screen twice; the
+     effect below rebuilds only for a transcript the buffer does not hold. */
+  const replayedTranscriptRef = useRef<string | undefined>(undefined);
   transcriptRef.current = transcript;
   onInputRef.current = onInput;
   onResizeRef.current = onResize;
@@ -421,6 +426,7 @@ export function TerminalViewport({
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
     registerTerminal(deckId, agentId, terminal, incarnation);
     replay(transcriptRef.current);
+    replayedTranscriptRef.current = transcriptRef.current;
 
     // Issue #1457 — a selection, or a drag still in progress, survives the
     // daemon reshaping this grid; see `keepSelectionAcrossResize`.
@@ -655,9 +661,10 @@ export function TerminalViewport({
   useEffect(() => {
     const terminal = terminalRef.current;
     const replay = replayRef.current;
-    if (!terminal || !replay || lastStreamRef.current) return;
+    if (!terminal || !replay || lastStreamRef.current || replayedTranscriptRef.current === transcript) return;
     terminal.reset();
     replay(transcript);
+    replayedTranscriptRef.current = transcript;
   }, [transcript]);
 
   // Bytes arrive straight from the bridge feed and go straight into xterm —
