@@ -280,8 +280,8 @@ test.describe("desktop/agent-cards/100 — an action icon shows the pointer and 
         expect(hovered.background !== rest.background || hovered.shadow !== rest.shadow, `${where}: the hovered icon is marked (${JSON.stringify(rest)} → ${JSON.stringify(hovered)})`).toBe(true);
         await expectTipBesideIcon(page, icon, `${where} by pointer`);
         await page.mouse.move(0, 0);
-        // The keyboard was used last, so focus shows the keyboard's ring.
-        await page.keyboard.press("Shift");
+        // The keyboard was used last (a Tab, which both engines count, unlike a bare modifier), so focus shows the keyboard's ring.
+        await page.keyboard.press("Tab");
         await icon.focus();
         await expect(icon).toBeFocused();
         expect(await icon.evaluate((node) => node.matches(":focus-visible")), `${where}: focus is the keyboard's`).toBe(true);
