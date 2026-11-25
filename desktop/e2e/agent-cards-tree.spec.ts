@@ -187,6 +187,99 @@ for (const observer of ["with", "without"] as const) {
   });
 }
 
+/// Scenario: In a 1440 by 500 window, start a Go ahead batch with three distinct texts, two of them agent-written and below the fold, while the page holds back what the webview's IntersectionObserver reports. Show next text scrolls the old texts into view and the observer's report of them is held; the batch is then started again with every text changed, and the held report is delivered the moment the new texts render, with the body scrolled back to the top. Send stays disabled until Show next text has brought each new text into view, and then sends exactly the agents the confirmation listed.
+test("desktop/agent-cards/109 — a preview replaced while the observer holds a report of the old texts credits none of the new ones", async ({ page }) => {
+  /* Wrap the webview's observer so the test can hold its reports and deliver them later, to the observer that took them, as a browser may (PR #2491 observer race). */
+  await page.addInitScript(() => {
+    type Held = { callback: IntersectionObserverCallback; entries: IntersectionObserverEntry[]; observer: IntersectionObserver };
+    const race = { hold: false, held: [] as Held[], delivered: 0 };
+    (window as unknown as { __dadObserverRace: typeof race }).__dadObserverRace = race;
+    const Native = window.IntersectionObserver;
+    window.IntersectionObserver = class extends Native {
+      constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+        super((entries, observer) => {
+          if (race.hold) race.held.push({ callback, entries, observer });
+          else callback(entries, observer);
+        }, options);
+      }
+    };
+  });
+  await page.setViewportSize({ width: 1440, height: 500 });
+  await openCardsTree(page);
+  const setTexts = (version: number) => page.evaluate((at) => {
+    type Entry = Record<string, unknown> & { name: string; agent_id: string; parent?: string; actions: Record<string, unknown>[] };
+    const hook = (window as unknown as { __dadFixtureCards: { snapshot(): { revision: number; batch?: boolean; entries: Entry[] }; push(next: unknown): void } }).__dadFixtureCards;
+    const next = hook.snapshot();
+    next.batch = true;
+    const own = new Map([[next.entries.length - 2, `RACE-AGENT-A V${at}: also delete the scratch branch.`], [next.entries.length - 1, `RACE-AGENT-B V${at}: push straight to main.`]]);
+    next.entries.forEach((entry, index) => {
+      const text = own.get(index);
+      entry.actions = [{ id: "go-ahead", label: "Go ahead", kind: "prompt", prompt: text ?? `RACE-CATALOG V${at}: go ahead.`, prompt_source: text ? "agent" : "catalog", text_input: false, confirm: false, confirm_detail: null, icon: "play",
+        placement: "card", custom: text !== undefined, source: text ? "agent" : "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: `tok-race-${entry.agent_id}-v${at}` }, ...entry.actions.filter((action) => action.id !== "go-ahead")];
+    });
+    next.revision += 1;
+    hook.push(next);
+    return { roots: next.entries.filter((entry) => !entry.parent).length, cards: next.entries.length };
+  }, version);
+  const { roots, cards } = await setTexts(0);
+  const boxes = page.locator("article[data-card-key][data-depth='0']").getByTestId("agent-card-select");
+  await expect(boxes).toHaveCount(roots);
+  for (const box of await boxes.all()) await box.check();
+  await expect(page.getByTestId("agent-cards-selection-count")).toHaveText(`${cards} selected`);
+  await page.getByTestId("agent-cards-batch-action-go-ahead").click();
+  const dialog = page.getByTestId("agent-cards-batch-confirm");
+  await expect(dialog).toHaveAttribute("data-stage", "review");
+  const prompts = dialog.getByTestId("agent-cards-batch-prompt");
+  await expect(prompts).toHaveText(["RACE-CATALOG V0: go ahead.", "RACE-AGENT-A V0: also delete the scratch branch.", "RACE-AGENT-B V0: push straight to main."]);
+  const send = dialog.getByRole("button", { name: "Send", exact: true });
+  await expect(send).toBeDisabled();
+  await page.evaluate(() => new Promise((resolve) => { window.requestAnimationFrame(() => window.requestAnimationFrame(resolve)); }));
+  // From here the observer's reports are held: Show next text scrolls the old texts into view, and their report waits.
+  await page.evaluate(() => { (window as unknown as { __dadObserverRace: { hold: boolean } }).__dadObserverRace.hold = true; });
+  await pressShowNext(dialog);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __dadObserverRace: { held: { entries: IntersectionObserverEntry[] }[] } }).__dadObserverRace.held
+    .flatMap((held) => held.entries).filter((entry) => entry.isIntersecting && entry.intersectionRatio > 0.95 && (entry.target.textContent ?? "").startsWith("RACE-AGENT-")).length), { message: "the observer reported an old agent-written text in view, and the report is held" }).toBeGreaterThan(0);
+  await expect(send).toBeDisabled();
+  // Every text changes, and the batch is started again while the confirmation is open (as voice can): the held report arrives as the new texts render, with the body back at the top.
+  await setTexts(1);
+  await page.evaluate(() => {
+    const race = (window as unknown as { __dadObserverRace: { hold: boolean; held: { callback: IntersectionObserverCallback; entries: IntersectionObserverEntry[]; observer: IntersectionObserver }[]; delivered: number } }).__dadObserverRace;
+    const confirm = document.querySelector<HTMLElement>('[data-testid="agent-cards-batch-confirm"]')!;
+    const watcher = new MutationObserver(() => {
+      if (!(confirm.textContent ?? "").includes("RACE-AGENT-B V1")) return;
+      watcher.disconnect();
+      confirm.querySelector<HTMLElement>(".agent-cards-batch-body")!.scrollTop = 0;
+      race.hold = false;
+      for (const held of race.held.splice(0)) {
+        race.delivered += held.entries.length;
+        held.callback(held.entries, held.observer);
+      }
+    });
+    watcher.observe(confirm, { subtree: true, childList: true, characterData: true });
+    /* The selection bar's button sits behind the open dialog, so only a script reaches it, as voice's "go ahead" reaches the same batch. */
+    document.querySelector<HTMLButtonElement>('[data-testid="agent-cards-batch-action-go-ahead"]')!.click();
+  });
+  await expect(prompts).toHaveText(["RACE-CATALOG V1: go ahead.", "RACE-AGENT-A V1: also delete the scratch branch.", "RACE-AGENT-B V1: push straight to main."]);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __dadObserverRace: { delivered: number } }).__dadObserverRace.delivered), { message: "the held report was delivered after the replacement" }).toBeGreaterThan(0);
+  await page.evaluate(() => new Promise((resolve) => {
+    let left = 6;
+    const tick = () => (--left > 0 ? window.requestAnimationFrame(tick) : resolve(undefined));
+    window.requestAnimationFrame(tick);
+  }));
+  expect(await dialog.locator(".agent-cards-batch-body").evaluate((node) => node.scrollTop)).toBe(0);
+  await expect(prompts.nth(1)).not.toBeInViewport();
+  await expect(prompts.nth(2)).not.toBeInViewport();
+  // The new agent-written texts have not been in view: Send still waits for them.
+  await expect(send).toBeDisabled();
+  await expect(dialog.getByTestId("agent-cards-batch-unseen")).toHaveText("Scroll to see all 3 texts");
+  await showEveryText(dialog);
+  await send.click();
+  const results = page.getByTestId("agent-cards-batch-results");
+  await expect(results).toBeVisible();
+  await expect(results.getByTestId("agent-cards-batch-entry")).toHaveCount(cards);
+  await expect(results.getByRole("status")).toHaveText(`Queued for all ${cards}`);
+});
+
 /// Scenario: an agent offers a daemon-valid multiline prompt whose final instruction is a hundred lines down. In its agent's Card panel, the action's hover cannot hold the text and says so; pressing the icon sends nothing, a separate review shows the entire prompt, and only the review's Send delivers it.
 test("desktop/agent-cards/024 — a prompt the hover cannot show whole requires the review step before sending (R2-A1)", async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 900 });

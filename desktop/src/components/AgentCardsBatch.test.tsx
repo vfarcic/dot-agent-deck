@@ -1,11 +1,13 @@
 import "../styles.css";
+import { useLayoutEffect } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
 import { deckName } from "../lib/displayText";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type DeckRuntimeState } from "../types";
-import { BATCH_DAEMON_UNREACHABLE, BATCH_NOT_KNOWN } from "../hooks/useAgentCardsView";
+import { BATCH_DAEMON_UNREACHABLE, BATCH_NOT_KNOWN, type CardBatchView } from "../hooks/useAgentCardsView";
+import { AgentCardBatchDialog } from "./AgentCardBatchDialog";
 import { AgentOverview } from "./AgentOverview";
 
 const INSTANCE = "daemon-instance-batch";
@@ -833,7 +835,7 @@ describe("batch card actions (#2399)", () => {
     expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(32);
   });
 
-  /// Scenario: Start a batch whose preview gives agents three different texts, two of them below the dialog's fold, once with the webview's IntersectionObserver and once with only the measured fallback. Send stays disabled, with "Scroll to see all 3 texts" and Show next text beside it; three Show next text presses in a row only scroll and enable nothing, and a text counts as seen only once the observer reports it, or a frame after the scroll measures it, in view. With each text shown, Send is enabled and sends exactly the previewed agents. A batch whose agents all get one text has Send enabled at once.
+  /// Scenario: Start a batch whose preview gives agents three different texts, two of them below the dialog's fold, once with the webview's IntersectionObserver and once with only the measured fallback. Send stays disabled, with "Scroll to see all 3 texts" and Show next text beside it; three Show next text presses in a row only scroll and enable nothing, and a text counts as seen only once the observer reports it, or a frame after the scroll measures it, in view. With each text shown, Send is enabled and sends exactly the previewed agents. Then the preview is replaced while the observer still holds samples of the old texts: delivered after the replacement, they credit none of its texts, and Send waits for the new texts' own samples. A batch whose agents all get one text has Send enabled at once.
   it("desktop/agent-cards/109: with several distinct texts, Send waits until each has been in view", async () => {
     const TEXTS = ["TEXT-109-A: catalog go ahead.", "AGENT-109-B: also delete the scratch branch.", "AGENT-109-C: push to main directly."];
     const preview: BatchEntry[] = [
@@ -926,6 +928,69 @@ describe("batch card actions (#2399)", () => {
       cleanup();
     } finally {
       layout.restore();
+    }
+
+    /* PR #2491 observer race: a sample the observer took for the old preview,
+       delivered after its replacement has rendered into the same row nodes and
+       before the old observer is disconnected (the order Chromium was seen to
+       use), credits nothing. Only the new observer's samples count. */
+    const raced: { callback: IntersectionObserverCallback; targets: Element[]; disconnected: boolean }[] = [];
+    class HeldIntersectionObserver {
+      readonly targets: Element[] = [];
+      disconnected = false;
+      constructor(readonly callback: IntersectionObserverCallback) { raced.push(this); }
+      observe(target: Element) { this.targets.push(target); }
+      unobserve() {}
+      disconnect() { this.disconnected = true; }
+      takeRecords() { return []; }
+    }
+    const sampled = (observer: (typeof raced)[number], at: number[]) => at.map((index) => ({
+      target: observer.targets[index], time: 1, isIntersecting: true, intersectionRatio: 1, boundingClientRect: box(100, 18), intersectionRect: box(100, 18), rootBounds: box(0, 324),
+    })) as IntersectionObserverEntry[];
+    const deliver = (observer: (typeof raced)[number], entries: IntersectionObserverEntry[]) => observer.callback(entries, observer as unknown as IntersectionObserver);
+    const version = (at: number): CardBatchView => ({
+      actionId: "batch-go", label: "Go ahead", scope: "3 agents", stage: "review", results: [],
+      groups: [{ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, entries: [0, 1, 2].map((index) => ({
+        pane_id: `pane-r${index}`, agent_id: `r${index}`, name: `raced-${index}`, outcome: "included",
+        prompt: `RACE-109-${index} VERSION-${at}`, prompt_source: index ? "agent" : "catalog", action_token: `tok-r${index}-v${at}`, instance_id: INSTANCE,
+      })) }],
+    });
+    vi.stubGlobal("IntersectionObserver", HeldIntersectionObserver);
+    try {
+      const controls = { sendCardBatch: vi.fn(), closeCardBatch: vi.fn() };
+      let queued: IntersectionObserverEntry[] = [];
+      const Scene = ({ at }: { at: number }) => {
+        useLayoutEffect(() => {
+          if (at !== 1) return;
+          /* The replacement is in the DOM and the old observer is still connected: deliver what it sampled for the old texts. */
+          expect(raced[0].disconnected).toBe(false);
+          expect(queued.map((sample) => sample.target.textContent)).toEqual(["RACE-109-1 VERSION-1", "RACE-109-2 VERSION-1"]);
+          deliver(raced[0], queued);
+        }, [at]);
+        return <AgentCardBatchDialog view={version(at)} controls={controls} daemonName={() => "fixture"} />;
+      };
+      const { rerender } = render(<Scene at={0} />);
+      const send = () => screen.getByRole("button", { name: /^Send$/ });
+      act(() => deliver(raced[0], sampled(raced[0], [0])));
+      expect(send()).toBeDisabled();
+      queued = sampled(raced[0], [1, 2]);
+      rerender(<Scene at={1} />);
+      expect(raced).toHaveLength(2);
+      expect(raced[0].disconnected).toBe(true);
+      act(() => deliver(raced[1], sampled(raced[1], [0])));
+      // The new second and third texts have had no sample of their own.
+      expect(send()).toBeDisabled();
+      expect(screen.getByTestId("agent-cards-batch-unseen")).toHaveTextContent("Scroll to see all 3 texts");
+      // The old observer, disconnected, still delivering what it held: nothing either.
+      act(() => deliver(raced[0], queued));
+      expect(send()).toBeDisabled();
+      // The new observer reporting them in view enables Send.
+      act(() => deliver(raced[1], sampled(raced[1], [1, 2])));
+      expect(send()).toBeEnabled();
+      expect(controls.sendCardBatch).not.toHaveBeenCalled();
+      cleanup();
+    } finally {
+      vi.unstubAllGlobals();
     }
 
     // One text, however many agents share it: Send at once, no hint.

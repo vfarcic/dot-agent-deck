@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import { ChevronRight } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
@@ -173,6 +173,14 @@ export function quotationInView(quote: Pick<DOMRectReadOnly, "top" | "bottom" | 
  * what is measured. A quotation counts as seen only there: never in the task
  * that asked for the scroll (PR #2491 final verification P1). While `watch`
  * is false nothing is watched; a new preview starts unseen.
+ *
+ * PR #2491 observer race: a report is credited only to the preview it was
+ * taken for. Each watched node is bound, when it is watched, to the key it
+ * quoted then, never looked up again through the current keys (React reuses
+ * a row's node for the next preview's text); and a report from a watcher
+ * whose preview is no longer the one on screen counts for nothing, even when
+ * the browser delivers it after the replacement has rendered and before the
+ * old watcher is disconnected.
  */
 function useSeenTexts(body: RefObject<HTMLElement | null>, keys: readonly string[], watch: boolean, previewing: boolean) {
   // voice-registry-exempt: which quoted texts the user has had in view, an invariant of the open confirmation and not a control
@@ -190,26 +198,51 @@ function useSeenTexts(body: RefObject<HTMLElement | null>, keys: readonly string
     if (previewing) setSeen(new Set());
   }, [previewing]);
   const signature = keys.join("\u0001");
+  /* The preview on screen, as last committed: set before any task can deliver a report about the DOM that commit wrote. */
+  const shown = useRef<{ signature: string; keys: ReadonlySet<string> } | null>(null);
+  useLayoutEffect(() => {
+    shown.current = { signature, keys: new Set(keys) };
+    /* `keys` is read through the signature it spells: the same signature is the same keys. */
+  }, [signature]);
+  /* The watcher currently installed, by identity; a disconnected one's late reports are not its successor's. */
+  const watcher = useRef<object | null>(null);
   useEffect(() => {
     const root = body.current;
     if (!watch || !root) return;
     const quotes = [...root.querySelectorAll<HTMLElement>("[data-batch-text]")];
-    const keyOf = (node: Element) => current.current[Number((node as HTMLElement).dataset.batchText)];
+    /* Each node is bound now to the key it quotes for this preview, and keeps that key. */
+    const keyAt = new WeakMap<Element, string>();
+    for (const node of quotes) {
+      const key = keys[Number(node.dataset.batchText)];
+      if (key !== undefined) keyAt.set(node, key);
+    }
+    const self = {};
+    watcher.current = self;
+    /* A node's credit, only while this watcher's preview is the one shown and only to the key it was bound to. */
+    const credit = (node: Element) => {
+      if (watcher.current !== self || shown.current?.signature !== signature) return;
+      const key = keyAt.get(node);
+      if (key !== undefined && shown.current.keys.has(key)) mark(key);
+    };
+    const retire = () => {
+      if (watcher.current === self) watcher.current = null;
+    };
     if (typeof IntersectionObserver === "function") {
       const observer = new IntersectionObserver((entries) => {
         for (const entry of entries) {
-          const key = keyOf(entry.target);
-          if (key !== undefined && entry.isIntersecting && quotationInView(entry.boundingClientRect, entry.rootBounds ?? root.getBoundingClientRect())) mark(key);
+          if (entry.isIntersecting && quotationInView(entry.boundingClientRect, entry.rootBounds ?? root.getBoundingClientRect())) credit(entry.target);
         }
       }, { root, threshold: SEEN_THRESHOLDS });
       quotes.forEach((node) => observer.observe(node));
-      return () => observer.disconnect();
+      return () => {
+        retire();
+        observer.disconnect();
+      };
     }
     const measure = () => {
       const bounds = root.getBoundingClientRect();
       for (const node of quotes) {
-        const key = keyOf(node);
-        if (key !== undefined && quotationInView(node.getBoundingClientRect(), bounds)) mark(key);
+        if (quotationInView(node.getBoundingClientRect(), bounds)) credit(node);
       }
     };
     /* Two frames after the last change: the first paints it, the second
@@ -230,11 +263,13 @@ function useSeenTexts(body: RefObject<HTMLElement | null>, keys: readonly string
     root.addEventListener("scroll", later, { passive: true });
     window.addEventListener("resize", later);
     return () => {
+      retire();
       window.cancelAnimationFrame(frame);
       remeasure.current = null;
       root.removeEventListener("scroll", later);
       window.removeEventListener("resize", later);
     };
+    /* `keys` is read through the signature it spells: the same signature is the same keys. */
   }, [body, mark, signature, watch]);
   /**
    * Scroll the first text not yet seen into view, and only that: it counts as
