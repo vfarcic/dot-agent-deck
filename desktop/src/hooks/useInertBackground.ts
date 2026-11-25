@@ -476,8 +476,10 @@ function useOverlay<T extends HTMLElement>(open: boolean, layer: number, fences:
     // Focus on a voice peer is left where it is: the numbered choice's dialog
     // takes focus while it is open (PRD #1261), and this walk runs on every
     // commit, so pulling focus back here would take it from the dialog mid-answer.
+    // The approval marker (issue #2511) is a peer for the same reason, so a
+    // keyboard user who tabbed to it keeps it through the pane's next commit.
     const active = document.activeElement;
-    if (!node.contains(active) && !active?.closest(VOICE_PEER_SELECTOR)) node.focus();
+    if (!node.contains(active) && !active?.closest(VOICE_PEER_SELECTOR) && !active?.closest(APPROVAL_PEER_SELECTOR)) node.focus();
   });
 
   /**

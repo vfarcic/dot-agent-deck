@@ -22174,52 +22174,78 @@ fn render_bottom_bar_below_notice(
                         rects.insert(0, (Action::OpenUpgrade, badge_area));
                     }
                 }
-                // Issue #2511: the desktop app's "approval waiting" marker, in
-                // its words, at the right end of the bar's LAST row, which a
-                // tall dialog does not reach (left of the update badge when
-                // the two share a row). Nothing to press: the review opens on
-                // its own once the dialog holding it back closes.
-                if ui.trust_requests_held > 0 && area.height > 0 {
-                    let text = format!(
-                        " {} ",
-                        crate::trust_prompt::approvals_waiting_label(ui.trust_requests_held)
-                    );
-                    let row = area.y + area.height - 1;
-                    let used = rects
-                        .first()
-                        .filter(|(action, rect)| {
-                            matches!(action, Action::OpenUpgrade) && rect.y == row
-                        })
-                        .map_or(0, |(_, rect)| rect.width);
-                    let bw = u16::try_from(unicode_width::UnicodeWidthStr::width(text.as_str()))
-                        .unwrap_or(u16::MAX);
-                    if bw.saturating_add(used) < area.width {
-                        let badge_area = Rect {
-                            x: area.x + area.width - used - bw,
-                            y: row,
-                            width: bw,
-                            height: 1,
-                        };
-                        frame.render_widget(Clear, badge_area);
-                        frame.render_widget(
-                            Paragraph::new(Line::styled(
-                                text,
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            )),
-                            badge_area,
-                        );
-                        // Over whatever button it covers, so a click there
-                        // presses nothing hidden.
-                        rects.retain(|(_, rect)| rect.intersection(badge_area).is_empty());
-                    }
-                }
                 ui.button_rects = rects;
             }
         }
     }
+    // Issue #2511: drawn after every mode's footer (Filter, Rename and Copy
+    // mode draw their own), so a held request is said whatever the bar shows.
+    render_trust_waiting_badge(frame, ui, full_area);
+}
+
+/// Issue #2511: the desktop app's "approval waiting" marker, in its words, at
+/// the right end of the bar's LAST row, which a tall dialog does not reach:
+/// left of whatever is pressable at that end (the update badge, Rename's
+/// Save/Cancel), or, with no room beside them, over the rightmost of them,
+/// whose click targets it then drops. Nothing to press: the review opens on
+/// its own once the dialog holding it back closes.
+fn render_trust_waiting_badge(frame: &mut Frame, ui: &mut UiState, area: Rect) {
+    if ui.trust_requests_held == 0 || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text = format!(
+        " {} ",
+        crate::trust_prompt::approvals_waiting_label(ui.trust_requests_held)
+    );
+    let bw =
+        u16::try_from(unicode_width::UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX);
+    if bw > area.width {
+        return;
+    }
+    let row = area.y + area.height - 1;
+    let right = area.x + area.width;
+    // Step left past the pressable rects at the row's right end.
+    let mut end = right;
+    loop {
+        let start = end.saturating_sub(bw);
+        let blocking = ui
+            .button_rects
+            .iter()
+            .filter(|(_, rect)| rect.y <= row && row < rect.y + rect.height)
+            .filter(|(_, rect)| rect.x < end && start < rect.x + rect.width)
+            .map(|(_, rect)| rect.x)
+            .min();
+        match blocking {
+            Some(x) if x >= area.x + bw => end = x,
+            Some(_) => {
+                // No room beside them: over the rightmost, as the bar's own
+                // status message does.
+                end = right;
+                break;
+            }
+            None => break,
+        }
+    }
+    let badge_area = Rect {
+        x: end - bw,
+        y: row,
+        width: bw,
+        height: 1,
+    };
+    frame.render_widget(Clear, badge_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        badge_area,
+    );
+    // A click on it presses nothing hidden beneath it.
+    ui.button_rects
+        .retain(|(_, rect)| rect.intersection(badge_area).is_empty());
 }
 
 /// PRD #80 M5: render a left-aligned row of modal buttons into `row` and
@@ -46549,6 +46575,31 @@ mod tests {
         let config = make_orchestration("review");
         let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
         let snapshot = requesting(&pc.view, 9, 1);
+
+        // Every footer says it, the modes that draw their own bar too
+        // (Greptile, PR #2525); Rename keeps its Save/Cancel clickable.
+        for mode in [UiMode::Filter, UiMode::Rename] {
+            let mut ui = default_ui();
+            ui.mode = mode;
+            poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
+            assert!(ui.trust_prompt.is_none(), "waits behind {mode:?}");
+            let rows = draw_sized(&mut ui, 120, 40);
+            assert!(
+                rows.last()
+                    .is_some_and(|row| row.contains("1 approval waiting")),
+                "{mode:?}'s footer says a request is waiting: {rows:#?}"
+            );
+            if mode == UiMode::Rename {
+                for action in [Action::SaveRename, Action::CancelRename] {
+                    assert!(
+                        ui.button_rects.iter().any(|(a, _)| {
+                            std::mem::discriminant(a) == std::mem::discriminant(&action)
+                        }),
+                        "Rename's {action:?} is still clickable beside the badge"
+                    );
+                }
+            }
+        }
 
         let mut ui = default_ui();
         ui.mode = UiMode::Help;

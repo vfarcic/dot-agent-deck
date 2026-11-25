@@ -1472,13 +1472,13 @@ mod tests {
                 (
                     "approve_project_commands",
                     "approveProjectCommands",
-                    vec!["deck", "overview", "agent"],
+                    vec!["deck", "overview", "agent", "pull_request"],
                 ),
                 // Issue #2511: the "approval waiting" marker's click.
                 (
                     "show_approval_request",
                     "showApprovalRequest",
-                    vec!["deck", "overview", "agent"],
+                    vec!["deck", "overview", "agent", "pull_request"],
                 ),
                 // PRD #2174: the star reminder's three buttons, on every
                 // screen the app opens on.
@@ -2385,7 +2385,11 @@ mod tests {
                 "list_commands",
                 "reading_on",
                 "reading_off",
-                "hush_reading"
+                "hush_reading",
+                // Issue #2511: the "approval waiting" marker shows over every
+                // screen, and the review it opens is answered where it opens.
+                "approve_project_commands",
+                "show_approval_request"
             ]
         );
         // And every OTHER row still has both cases, which is what keeps the
@@ -2612,7 +2616,11 @@ mod tests {
                 "scroll_up",
                 "scroll_to_top",
                 "scroll_to_bottom",
-                "open_pr_in_browser"
+                "open_pr_in_browser",
+                // Issue #2511: the marker over the browser, and the review it
+                // opens over it.
+                "approve_project_commands",
+                "show_approval_request"
             ]
         );
     }

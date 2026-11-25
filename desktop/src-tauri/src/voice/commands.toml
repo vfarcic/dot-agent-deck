@@ -2399,7 +2399,7 @@ no review open the app says there is nothing to approve. Cancelling the review �
 mind, close this — is `close`, which approves and starts nothing. A start that does not say approve
 — "start it", "activate orchestration", "go ahead" — is `start_new_agent`, never this one."""
 invoke      = "approveProjectCommands"
-screens     = ["deck", "overview", "agent"]
+screens     = ["deck", "overview", "agent", "pull_request"]
 unavailable_hint = "approving project commands works while the Review project commands dialog is open"
 report      = "Approved the project commands."
 asks_to     = "approve the project commands on screen and start the orchestration"
@@ -2413,9 +2413,11 @@ must_name   = ["approve"]
 # click: it opens the review over whatever is open, and approves or declines
 # nothing — that is the review's own Approve (`approve_project_commands`) and
 # Deny (`close`). With no approval waiting the app says so and does nothing
-# (`showHeldTrustRequest`). Its screens are the ones the marker shows over that
-# voice can name; `approve_project_commands` runs on the agent screen too, so
-# the review this opens over a pane can be answered by voice there.
+# (`showHeldTrustRequest`). Its screens are every screen, since the marker
+# shows over all of them (the pull request browser included, Greptile on PR
+# #2525); `approve_project_commands` runs on the agent and pull request screens
+# too, so the review this opens over a pane or the browser can be answered by
+# voice there.
 [[commands]]
 id          = "show_approval_request"
 description = """Open the approval review a deck is waiting on — the "approval waiting" marker's
@@ -2426,7 +2428,7 @@ approval, what approval is waiting, or show me what needs approving. It opens th
 approves nothing: approving is `approve_project_commands`, said once the review is on screen. With
 no approval waiting the app says so."""
 invoke      = "showApprovalRequest"
-screens     = ["deck", "overview", "agent"]
+screens     = ["deck", "overview", "agent", "pull_request"]
 unavailable_hint = "showing an approval works while one is waiting"
 report      = "Opening the approval review."
 asks_to     = "open the approval review"

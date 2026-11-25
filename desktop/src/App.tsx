@@ -1726,7 +1726,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         <StarPromptGate due={star.due} ready={starReady && !antigravityNotice.due} onChoose={star.choose} />
         <AntigravityNoticeGate due={antigravityNotice.due} ready={starReady} onChoose={antigravityNotice.choose} />
         {/* Issue #2330: a review a deck asked for waits behind what the star reminder waits behind. */}
-        <TrustRequestGate runtime={runtime} fleet={runtime.fleet} ready={starReady} onNotice={setTrustNotice} />
+        <TrustRequestGate runtime={runtime} fleet={runtime.fleet} ready={starReady} summonable={!choiceOpen} onNotice={setTrustNotice} />
         {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}
         {prBrowser && (
           <PullRequestBrowser
