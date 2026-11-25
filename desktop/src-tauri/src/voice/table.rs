@@ -1472,7 +1472,13 @@ mod tests {
                 (
                     "approve_project_commands",
                     "approveProjectCommands",
-                    vec!["deck", "overview"],
+                    vec!["deck", "overview", "agent"],
+                ),
+                // Issue #2511: the "approval waiting" marker's click.
+                (
+                    "show_approval_request",
+                    "showApprovalRequest",
+                    vec!["deck", "overview", "agent"],
                 ),
                 // PRD #2174: the star reminder's three buttons, on every
                 // screen the app opens on.
@@ -2463,6 +2469,8 @@ mod tests {
                 // PRD #1885: the review dialog's approve, where it opens (the
                 // Runs screen); with none open the app says so.
                 "approve_project_commands",
+                // Issue #2511: the "approval waiting" marker's click.
+                "show_approval_request",
                 // PRD #2174: the star reminder's buttons; with none showing
                 // the app says so.
                 "star_repo",
@@ -2516,6 +2524,8 @@ mod tests {
                 "open_pr",
                 // PRD #1885: over the New agent dialog.
                 "approve_project_commands",
+                // Issue #2511: the "approval waiting" marker's click.
+                "show_approval_request",
                 // PRD #2174: the star reminder's buttons.
                 "star_repo",
                 "remind_star_later",
@@ -2568,6 +2578,10 @@ mod tests {
                 "scroll_to_bottom",
                 // PRD #1401: the open pane's agent's pull request, or the named agent's.
                 "open_pr",
+                // Issue #2511: a review a deck asked for, opened over the pane
+                // from the "approval waiting" marker, and the marker's click.
+                "approve_project_commands",
+                "show_approval_request",
                 // PRD #2174: the star reminder's buttons, which the reminder
                 // follows to the agent screen when the app opens on one.
                 "star_repo",

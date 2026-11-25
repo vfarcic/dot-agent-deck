@@ -2399,12 +2399,38 @@ no review open the app says there is nothing to approve. Cancelling the review �
 mind, close this — is `close`, which approves and starts nothing. A start that does not say approve
 — "start it", "activate orchestration", "go ahead" — is `start_new_agent`, never this one."""
 invoke      = "approveProjectCommands"
-screens     = ["deck", "overview"]
+screens     = ["deck", "overview", "agent"]
 unavailable_hint = "approving project commands works while the Review project commands dialog is open"
 report      = "Approved the project commands."
 asks_to     = "approve the project commands on screen and start the orchestration"
 try_saying  = "approve and start"
 must_name   = ["approve"]
+
+# Issue #2511 — the marker saying an approval is waiting. When a deck refuses
+# to start an orchestration and asks for its approval while the user is in
+# something (an agent's pane, a dialog, a sheet), the review waits behind it and
+# a marker over the screen says "1 approval waiting". This is the marker's
+# click: it opens the review over whatever is open, and approves or declines
+# nothing — that is the review's own Approve (`approve_project_commands`) and
+# Deny (`close`). With no approval waiting the app says so and does nothing
+# (`showHeldTrustRequest`). Its screens are the ones the marker shows over that
+# voice can name; `approve_project_commands` runs on the agent screen too, so
+# the review this opens over a pane can be answered by voice there.
+[[commands]]
+id          = "show_approval_request"
+description = """Open the approval review a deck is waiting on — the "approval waiting" marker's
+click. When a deck refused to start an orchestration while the user was in an agent's pane or a
+dialog, the review waits and a marker says how many approvals are waiting; this opens the review
+over whatever is open. Use for show the approval, show approvals, review the approval, open the
+approval, what approval is waiting, or show me what needs approving. It opens the review and
+approves nothing: approving is `approve_project_commands`, said once the review is on screen. With
+no approval waiting the app says so."""
+invoke      = "showApprovalRequest"
+screens     = ["deck", "overview", "agent"]
+unavailable_hint = "showing an approval works while one is waiting"
+report      = "Opening the approval review."
+asks_to     = "open the approval review"
+try_saying  = "show the approval"
 
 # PRD #2174 — the star reminder's three buttons. The app shows the reminder at
 # startup about once every ten launches, over whichever screen comes up, so the

@@ -4,6 +4,7 @@ import { overlayStackIsEmpty } from "../hooks/useInertBackground";
 import type { DeckFleet, TrustRequest } from "../types";
 import { deckName } from "./displayText";
 import {
+  NO_APPROVAL_WAITING,
   requestAnsweredElsewhereNotice,
   requestApprovedNotice,
   requestDeniedNotice,
@@ -32,6 +33,11 @@ import {
  * - A request answered anywhere else — the TUI, another app window, the CLI,
  *   or settled because the config changed — leaves its deck's list, and its
  *   review closes with a notice saying so.
+ *
+ * While something is open the review waits, and the shell says so with a
+ * marker over whatever is open (issue #2511, {@link TrustRequestGate}): the
+ * user may open the review over it from there, and otherwise it opens by
+ * itself once nothing is open.
  *
  * The app shows each request once: a request it has shown is not shown again
  * when a later snapshot still lists it. A request is known by its deck, its
@@ -93,12 +99,15 @@ type OpenRequest = { key: string; deckId: string; request: TrustRequest };
 
 /**
  * The flow, for the app shell. `free` is whether a review may open now (no
- * other dialog or overlay is up). `report` is given each sentence the flow
- * leaves behind. Answers the review on screen and its two answers, for the
- * dialog: `approve` takes the token the dialog rendered, and `deny` answers
- * the sentence saying why it cannot decline now, if it cannot.
+ * other dialog or overlay is up). `summoned` is whether the user asked for
+ * the review over whatever is open (issue #2511): it may then open with
+ * overlays up. `report` is given each sentence the flow leaves behind.
+ * Answers the review on screen and its two answers, for the dialog: `approve`
+ * takes the token the dialog rendered, and `deny` answers the sentence saying
+ * why it cannot decline now, if it cannot. `waiting` is how many requests of
+ * the observed decks have not been shown yet, for the marker.
  */
-export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet, free: boolean, report: (notice: TrustRequestNotice) => void) {
+export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet, free: boolean, report: (notice: TrustRequestNotice) => void, summoned = false) {
   const review = useProjectTrustReview(runtime);
   const { shown, check, cancel } = review;
   /* Every request this app has shown, or decided not to (the deck answered
@@ -119,13 +128,13 @@ export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet,
   useEffect(() => () => window.clearTimeout(retryTimer.current), []);
   const canDeny = runtime.denyTrustRequest !== undefined;
 
-  /* The next request opens once nothing is open and no review is on screen
-     or on its way. */
+  /* The next request opens once nothing is open, or the user asked for it
+     over what is open, and no review is on screen or on its way. */
   useEffect(() => {
     forgetRestartedDecks(fleet, incarnations.current, handled.current);
     /* `free` is as of the render; an overlay that came up in this same commit
        (the star reminder, say) is on the stack already, and holds it back. */
-    if (!canDeny || !free || opening || shown || !overlayStackIsEmpty()) return;
+    if (!canDeny || !(free || summoned) || opening || shown || (!summoned && !overlayStackIsEmpty())) return;
     const now = Date.now();
     const next = pendingTrustRequests(fleet).find((candidate) => !handled.current.has(candidate.key) && (retryAt.current.get(candidate.key) ?? 0) <= now);
     if (!next) return;
@@ -153,7 +162,7 @@ export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet,
         retryTimer.current = window.setTimeout(() => setRetryTick((tick) => tick + 1), TRUST_REQUEST_RETRY_MS);
       })
       .finally(() => setOpening(false));
-  }, [canDeny, check, fleet, free, opening, report, retryTick, shown]);
+  }, [canDeny, check, fleet, free, opening, report, retryTick, shown, summoned]);
 
   /* A request's review closes when its deck no longer lists it: another
      client answered it, it was approved from the CLI, or its text changed. A
@@ -201,7 +210,33 @@ export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet,
     );
   }, [cancel, report, runtime.denyTrustRequest, shown]);
 
-  return { review: shown, approve: review.approve, deny };
+  /* Read in render: `handled` changes only in the opener's effect, which
+     re-renders (`opening`), and on a snapshot, which re-renders too. */
+  const waiting = canDeny ? pendingTrustRequests(fleet).filter((candidate) => !handled.current.has(candidate.key)).length : 0;
+
+  return { review: shown, approve: review.approve, deny, waiting, opening };
+}
+
+/** The marker on screen, as voice reaches it (issue #2511). */
+let summonHeld: (() => void) | undefined;
+
+/**
+ * Voice's "show the approval": open the waiting review over whatever is open,
+ * as the marker's click does. Answers `undefined` when it did, or the sentence
+ * saying no approval is waiting.
+ */
+export function showHeldTrustRequest(): string | undefined {
+  if (!summonHeld) return NO_APPROVAL_WAITING;
+  summonHeld();
+  return undefined;
+}
+
+/** Publish the marker on screen; answers the unpublish, which only takes back its own. */
+export function publishHeldTrustRequest(summon: () => void): () => void {
+  summonHeld = summon;
+  return () => {
+    if (summonHeld === summon) summonHeld = undefined;
+  };
 }
 
 /** Forget what was shown of a deck whose daemon restarted, so its requests open again. */
