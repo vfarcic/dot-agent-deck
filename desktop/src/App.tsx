@@ -488,17 +488,6 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (cardPanel?.provisional && cardPanel.ofView === requestedView && paneCards.get() !== undefined) setCardPanelState(settleCardPanel(requestedView, cardPanel.before ?? false));
   });
   const cardPanelOpen = agentView !== undefined && cardPanel?.ofView === requestedView && cardPanel.open;
-  const chooseCardPanel = useCallback((open: boolean): string | undefined => {
-    const shown = agentView && agentView.from === "overview" ? paneCards.get() : undefined;
-    if (!agentView) return "No agent's pane is open.";
-    /* Closing is always the user's to do, so a panel kept open while its
-       daemon is not answering (J2) can still be put away. */
-    if (open && !shown?.shownFor(agentView.deckId)) return "This agent's daemon shows no cards.";
-    cardPanelChoice.current = open;
-    writeCardPanelChoice(open);
-    setCardPanelState((current) => (current && current.ofView === requestedView && current.open === open && current.section === undefined ? current : { ofView: requestedView, open }));
-    return undefined;
-  }, [agentView, paneCards, requestedView]);
   const [agentStopConfirm, setAgentStopConfirm] = useState<ConfirmState & { ownerView: NonNullable<typeof agentView> }>(); // voice-registry-exempt: the confirmation confirmStopAgent (or confirmGenerateConfig) opens, not an independently opened capability
   useEffect(() => {
     setAgentStopConfirm((current) => current?.ownerView === agentView ? current : undefined);
@@ -1013,6 +1002,29 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   // The agent is listed again: its view is the live pane's, no longer card-backed.
   if (paneAgent !== undefined && endedPaneView !== undefined) setEndedPaneView(undefined);
   const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined && !cardBackedPane;
+  /**
+   * The Card button's and voice's open and close of the pane's Card panel.
+   * Defined after `cardBackedPane`, because whether a panel is showing to be
+   * closed depends on it: a card-backed (ended) pane draws its card without
+   * the Card panel.
+   */
+  const chooseCardPanel = useCallback((open: boolean): string | undefined => {
+    const shown = agentView && agentView.from === "overview" ? paneCards.get() : undefined;
+    if (!agentView) return "No agent's pane is open.";
+    /* Closing is always the user's to do, so a panel kept open while its
+       daemon is not answering (J2) can still be put away — but only a panel
+       that is showing (PR #2491 review, Qodo 12): "close the card" with none
+       open, or on a pane with none, says so rather than saying it worked,
+       and does not record closed as the user's choice. The test is the one
+       `OverviewAgentPane` draws the panel by: open for this view, with the
+       dashboard's cards published. */
+    if (!open && !(cardPanelOpen && shown !== undefined && !cardBackedPane)) return "No card is showing.";
+    if (open && !shown?.shownFor(agentView.deckId)) return "This agent's daemon shows no cards.";
+    cardPanelChoice.current = open;
+    writeCardPanelChoice(open);
+    setCardPanelState((current) => (current && current.ofView === requestedView && current.open === open && current.section === undefined ? current : { ofView: requestedView, open }));
+    return undefined;
+  }, [agentView, cardBackedPane, cardPanelOpen, paneCards, requestedView]);
   useEffect(() => {
     if (!paneAgentRetired) return;
     // voice-registry-exempt: the stopped subject disappeared; retiring its view is an invariant, not another control

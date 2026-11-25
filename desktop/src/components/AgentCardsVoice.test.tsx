@@ -155,7 +155,7 @@ function settingsStore() {
 }
 
 /** The real shell on the dashboard, a daemon list with one card per fixture agent, and one utterance resolved to `outcome`. */
-function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries, batch = false, onAgent = false }: { secondDeck?: string; entries?: (agents: { id: string }[]) => AgentCardEntry[]; batch?: boolean; onAgent?: boolean } = {}) {
+function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries, batch = false, onAgent = false, noCards = false }: { secondDeck?: string; entries?: (agents: { id: string }[]) => AgentCardEntry[]; batch?: boolean; onAgent?: boolean; noCards?: boolean } = {}) {
   let started = false;
   let delivered = false;
   const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 900, maxMs: 30_000, capped: false, available: true, backend: "remote" });
@@ -189,7 +189,7 @@ function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries,
     setZoom: vi.fn(async (level: number) => level),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
-    agentCards: {
+    agentCards: noCards ? {} : {
       [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 3, entries: entries ? entries(snapshot.agents) : [card], catalogErrors: [], tree: entries !== undefined, batch },
       ...(secondDeck === undefined ? {} : { [secondDeck]: { deckId: secondDeck, instanceId: "build-instance", revision: 1, entries: [card], catalogErrors: [] } }),
     },
@@ -483,6 +483,23 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     else await waitFor(() => expect(within(pane()).getByTestId("agent-card-panel").getAttribute("data-card-key")).toBe(`pane-${agents[shows].id}/${agents[shows].id}`));
     if (stored) expect(window.localStorage.getItem("dot-agent-deck.agent-pane.card-panel")).toBe(stored);
     expect(within(pane()).getByTestId("agent-pane-card-toggle")).toHaveAttribute("aria-pressed", shows === "none" ? "false" : "true");
+    expect(invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: with an agent's pane open and no Card panel showing beside its terminal — the panel is closed, or the agent's daemon shows no cards so the pane has none — say "close the card". The deck refuses out loud that no card is showing, and the remembered Card panel choice is left as it was.
+  it.each([
+    { pane: "the panel closed", noCards: false },
+    { pane: "no panel at all", noCards: true },
+  ])("desktop/agent-cards/094: a spoken close of the Card panel with $pane is refused and remembers nothing", async ({ noCards }) => {
+    const calm = (all: { id: string }[]) => [{ ...cardFor(all[0].id, "voice-card-0"), needs_you: false, needs_you_reasons: [] }];
+    const { invokeCardAction, resolveVoice } = renderSpoken({ kind: "dispatch", transcript: "close the card", action: "close_card_panel", invoke: "closeCardPanel", params: [], sentence: "Done." } as VoiceResultDto["outcome"], { entries: calm, onAgent: true, noCards });
+    const pane = () => screen.getByTestId("agent-pane-overlay");
+    expect(within(pane()).queryByTestId("agent-card-panel")).toBeNull();
+    expect(within(pane()).queryByTestId("agent-pane-card-toggle") === null).toBe(noCards);
+    await speak(resolveVoice);
+    expect(await screen.findByText("No card is showing.")).toBeInTheDocument();
+    expect(window.localStorage.getItem("dot-agent-deck.agent-pane.card-panel")).toBeNull();
+    expect(within(pane()).queryByTestId("agent-card-panel")).toBeNull();
     expect(invokeCardAction).not.toHaveBeenCalled();
   });
 
