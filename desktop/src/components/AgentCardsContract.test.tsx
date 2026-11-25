@@ -814,4 +814,3 @@ describe("desktop/agent-cards — the card's action row, placement and long text
     expect(whole.quoted).toContain("⟦U+200B⟧");
   });
 });
-
