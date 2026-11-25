@@ -512,7 +512,7 @@ mod tests {
         assert!(input.adopt_profile(CprWaitEnd::SyncBegin, CODEX, t0 + ms(40)));
         assert!(input.backlog(), "no earlier query taken as answered");
         assert_eq!(input.hazards(t0 + ms(40)), hazards, "nothing reset");
-        assert_eq!(input.reply_class(QueryKind::Cpr), (true, false));
+        assert_eq!(input.reply_class(QueryKind::Cpr), (true, true));
         assert!(
             !input.adopt_profile(CprWaitEnd::Counted, CLAUDE, t0 + ms(45)),
             "once"

@@ -4,25 +4,22 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
-  BookMarked,
   Bot,
   Check,
   FolderCheck,
   FolderGit2,
   GripVertical,
-  Plus,
   RefreshCw,
   RotateCcw,
   Save,
   SlidersHorizontal,
-  Trash2,
   X,
 } from "lucide-react";
 import { defaultCliForProvider, permissionModeLabel, permissionModeOptions, resolveProfileCommand } from "../lib/profileCommands";
 import type { DaemonProjectsState } from "../hooks/useDaemonProjects";
 import { SelectDeckNote } from "./SelectDeckNote";
 import { ORCHESTRATION_TITLE_TAKEN, RUN_NAME_UNUSABLE, SAME_DIRECTORY_ORCHESTRATION, directoryLabel, isUsableRunName, orchestrationRunTitle, suggestOrchestrationName } from "../lib/newAgent";
-import type { AgentProfile, DaemonResolvedProject, DeckPrompt, Provider, RuntimeMode, OrchestrationLaunchConfig } from "../types";
+import type { AgentProfile, DaemonResolvedProject, Provider, RuntimeMode, OrchestrationLaunchConfig } from "../types";
 
 /**
  * PRD #819 M6: the project PICKER, and nothing else.
@@ -137,69 +134,6 @@ export function ProjectsPanel({ open, state, onClose, onConfigureOrchestration, 
           </form>
         </div>
         </>}
-      </section>
-    </div>
-  );
-}
-
-interface PromptLibraryPanelProps {
-  open: boolean;
-  prompts: DeckPrompt[];
-  selectedId: string;
-  onSelect: (id: string) => void;
-  onClose: () => void;
-  onAdd: () => void;
-  onUpdate: (id: string, updates: Partial<DeckPrompt>) => void;
-  onRemove: (id: string) => void;
-}
-
-export function PromptLibraryPanel({ open, prompts, selectedId, onSelect, onClose, onAdd, onUpdate, onRemove }: PromptLibraryPanelProps) {
-  const [removeArmed, setRemoveArmed] = useState(false);
-  const prompt = prompts.find((candidate) => candidate.id === selectedId) ?? prompts[0];
-  useEffect(() => setRemoveArmed(false), [selectedId, open]);
-  const sheet = useOverlaySheet<HTMLElement>(open, onClose);
-  if (!open) return null;
-
-  return (
-    <div className={sheet.raised ? "sheet-backdrop is-raised" : "sheet-backdrop"} role="presentation" onMouseDown={onClose}>
-      <section ref={sheet.ref} tabIndex={-1} className="config-sheet projects-sheet" role="dialog" aria-modal="true" aria-labelledby="prompts-title" data-testid="prompt-library-panel" onMouseDown={(event) => event.stopPropagation()}>
-        <header className="sheet-header">
-          <div><span className="eyebrow">PROMPT LIBRARY</span><h2 id="prompts-title">Saved prompts</h2><p>Reusable text for the orchestration task prompt and for messaging a running agent.</p></div>
-          <button className="icon-button" aria-label="Close prompt library" onClick={onClose}><X size={18} /></button>
-        </header>
-        <div className="local-only-notice project-notice"><BookMarked size={15} /><span><strong>Local library</strong> — prompts are stored on this device only. Nothing is written to the project's <code>.dot-agent-deck.toml</code>.</span></div>
-
-        <div className="projects-layout">
-          <aside className="project-library">
-            <button className="add-project" onClick={onAdd}><Plus size={14} /> Add prompt</button>
-            <nav aria-label="Saved prompts">
-              {prompts.map((item) => (
-                <button key={item.id} className={item.id === prompt?.id ? "is-selected" : ""} onClick={() => onSelect(item.id)}>
-                  <span className="project-icon"><BookMarked size={15} /></span>
-                  <span><strong>{item.name || "Untitled prompt"}</strong><small>{item.body.trim().split("\n")[0] || "Empty prompt"}</small></span>
-                </button>
-              ))}
-            </nav>
-            {!prompts.length && <div className="project-library-empty"><BookMarked size={22} /><span>No saved prompts yet.</span></div>}
-          </aside>
-
-          {prompt ? (
-            <form className="project-form" onSubmit={(event) => event.preventDefault()}>
-              <div className="form-heading">
-                <div><span>PROMPT</span><h3>{prompt.name || "Untitled prompt"}</h3></div>
-              </div>
-              <div className="project-fields">
-                <label><span>Name</span><input aria-label="Prompt name" value={prompt.name} onChange={(event) => onUpdate(prompt.id, { name: event.target.value })} placeholder="Fix the failing test" /></label>
-                <label><span>Prompt body</span><textarea aria-label="Prompt body" rows={10} value={prompt.body} onChange={(event) => onUpdate(prompt.id, { body: event.target.value })} placeholder="The task prompt to insert when activating an orchestration…" /></label>
-                <label><span>Note</span><input aria-label="Prompt note" value={prompt.note ?? ""} onChange={(event) => onUpdate(prompt.id, { note: event.target.value })} placeholder="When you reach for this one" /></label>
-              </div>
-              <footer className="sheet-footer project-footer">
-                <button type="button" className={removeArmed ? "button danger" : "button secondary"} onClick={() => { if (removeArmed) onRemove(prompt.id); else setRemoveArmed(true); }}><Trash2 size={14} /> {removeArmed ? "Confirm remove" : "Remove prompt"}</button>
-                <div><span>Auto-saved locally</span></div>
-              </footer>
-            </form>
-          ) : <div className="configuration-empty">Add a prompt to reuse it when activating an orchestration.</div>}
-        </div>
       </section>
     </div>
   );
@@ -404,7 +338,6 @@ interface OrchestrationPanelProps {
    * and degrade with a named reason.
    */
   capabilityIssue?: string;
-  prompts?: DeckPrompt[];
   /**
    * **All Decks** is selected (#1083). A workflow launches on ONE deck, so the
    * launch form is replaced by "Select a deck" and Launch stays disabled rather
@@ -429,10 +362,9 @@ interface OrchestrationPanelProps {
   deckId?: string;
 }
 
-export function OrchestrationPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, prompts = [], allDecks = false, liveTitles = [], liveDirectories = [], deckId }: OrchestrationPanelProps) {
+export function OrchestrationPanel({ open, profiles, order, mode, project, onChooseProject, onClose, onToggle, onMove, onLaunch, platformIssue, capabilityIssue, allDecks = false, liveTitles = [], liveDirectories = [], deckId }: OrchestrationPanelProps) {
   const orchestrations = project?.orchestrations ?? [];
   const [name, setName] = useState("");
-  const [taskPrompt, setTaskPrompt] = useState("");
   /*
    * Issue #1044 — the run's name, the TUI `Ctrl+n` dialog's Name field. It is
    * SUGGESTED (`<basename>-orchestrator-N`, the lowest N no live orchestration
@@ -548,9 +480,8 @@ export function OrchestrationPanel({ open, profiles, order, mode, project, onCho
   // Refused here, where it is typed, rather than by the crate after the
   // confirmation dialog (PR #1333 review). Empty is not unusable: it is "no title".
   const runNameUnusable = runName !== "" && !isUsableRunName(runName);
-  // The task prompt is NOT required (issue #1044): neither the deck nor the TUI
-  // requires one, and starting the orchestration as-is and typing the task into
-  // the orchestrator is the ordinary TUI habit.
+  // There is no task field (issue #1310): the orchestration starts as-is and the
+  // user types the task into the orchestrator's pane, the ordinary TUI habit.
   const canLaunch = mode === "live" && !allDecks && !platformIssue && !capabilityIssue && Boolean(project) && name.trim().length > 0 && cwd.startsWith("/") && !titleTaken && !runNameUnusable && allRequiredRolesEnabled && invalidCommands.length === 0;
   const customCommandCount = resolved.filter(({ resolution }) => resolution.source === "custom").length;
   const generatedFullAccessCount = resolved.filter(({ profile, resolution }) => resolution.source === "generated" && profile.permissionMode === "full-access").length;
@@ -592,28 +523,9 @@ export function OrchestrationPanel({ open, profiles, order, mode, project, onCho
             {runNameUnusable && <small role="alert" data-testid="orchestration-run-name-unusable"><AlertTriangle size={12} /> {RUN_NAME_UNUSABLE}</small>}
             {titleTaken && <small role="alert" data-testid="orchestration-title-taken"><AlertTriangle size={12} /> {ORCHESTRATION_TITLE_TAKEN}</small>}
             {!titleTaken && sameDirectory && <small data-testid="orchestration-same-directory"><AlertTriangle size={12} /> {SAME_DIRECTORY_ORCHESTRATION}</small>}
-            <label className="orchestration-task-prompt">
-              <span className="task-prompt-label">
-                Task prompt (optional)
-                {prompts.length > 0 && (
-                  <select
-                    aria-label="Insert saved prompt"
-                    value=""
-                    onChange={(event) => {
-                      const prompt = prompts.find((candidate) => candidate.id === event.target.value);
-                      if (prompt) setTaskPrompt(prompt.body);
-                    }}
-                  >
-                    <option value="">Insert saved prompt…</option>
-                    {prompts.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name || "Untitled prompt"}</option>)}
-                  </select>
-                )}
-              </span>
-              <textarea aria-label="Task prompt" value={taskPrompt} onChange={(event) => setTaskPrompt(event.target.value)} placeholder="Tell the orchestrator what to build, fix, or investigate..." rows={5} />
-            </label>
             {!project && <small data-testid="orchestration-needs-project"><AlertTriangle size={12} /> No project chosen. <button type="button" className="link-button" onClick={onChooseProject}>Choose one</button> — the daemon offers the projects it can see, and orchestrations come from the project.</small>}
             {project && !orchestrations.length && <small data-testid="orchestration-no-orchestrations"><AlertTriangle size={12} /> The daemon resolved this project but it defines no orchestration with roles.</small>}
-            {!taskPrompt.trim() && <small data-testid="orchestration-no-task">No task: the orchestrator starts, reads its role and waits — type the task into its pane.</small>}
+            <small data-testid="orchestration-no-task">The orchestrator starts, reads its role and waits: type the task into its pane.</small>
             {platformIssue && <small data-testid="orchestration-platform-issue"><AlertTriangle size={12} /> {platformIssue}</small>}
             {/* PRD #741 M8: the daemon does not advertise the verbs an activation needs. */}
             {capabilityIssue && <small data-testid="orchestration-capability-issue"><AlertTriangle size={12} /> {capabilityIssue}</small>}
@@ -638,7 +550,7 @@ export function OrchestrationPanel({ open, profiles, order, mode, project, onCho
         </div>
         <footer className="sheet-footer orchestration-footer">
           <span>{enabled.length} active roles · {ordered.length - enabled.length} skipped</span>
-          {mode === "live" ? <button className="button primary" data-testid="activate-orchestration" disabled={!canLaunch} onClick={() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), taskPrompt: taskPrompt.trim(), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Activate orchestration</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
+          {mode === "live" ? <button className="button primary" data-testid="activate-orchestration" disabled={!canLaunch} onClick={() => onLaunch({ name, cwd, displayName: orchestration?.displayName ?? name, displayPath: cwdDisplay, ...(runName !== "" ? { displayTitle: runName } : {}), roles, rows: 32, cols: 120, customCommandCount, generatedFullAccessCount, configRevision: project?.configRevision })}><Bot size={14} /> Activate orchestration</button> : <button className="button primary" onClick={onClose}><Check size={14} /> Use preview</button>}
         </footer>
       </section>
     </div>

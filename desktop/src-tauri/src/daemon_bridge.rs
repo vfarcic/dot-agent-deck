@@ -6788,7 +6788,6 @@ mod tests {
             name: "review".into(),
             display_title: None,
             cwd: cwd.to_string_lossy().into_owned(),
-            task_prompt: "list the files".into(),
             roles: vec![crate::dto::OrchestrationRoleInput {
                 role: "orchestrator".into(),
                 command: "cat".into(),

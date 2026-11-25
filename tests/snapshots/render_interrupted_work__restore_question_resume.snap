@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: question
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+     ┌ Interrupted work ────────────────────────────────────────────────────────────────────────────────┐     
+     │                                                                                                  │     
+     │  Restore restore-scratch · Agent                                                                 │     
+     │                                                                                                  │     
+     │  Restore restore-scratch with its conversation?                                                  │     
+     │                                                                                                  │     
+     │  c  Restore and continue                                                                         │     
+     │       It checks what already happened and carries on where it stopped.                           │     
+     │  o  Restore only                                                                                 │     
+     │       It comes back and waits until you tell it to continue.                                     │     
+     │                                                                                                  │     
+     │  c restore and continue · o restore only · n back                                                │     
+     └──────────────────────────────────────────────────────────────────────────────────────────────────┘     
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+1 interrupted item from before the restart                                                   [Show I] [Hide X]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r]
+[Generate g] [Schedules s]

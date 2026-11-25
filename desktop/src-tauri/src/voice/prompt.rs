@@ -746,6 +746,7 @@ pub(crate) mod tests {
                 "show_interrupted_reports".to_string(),
                 "next_interrupted_reports".to_string(),
                 "previous_interrupted_reports".to_string(),
+                "restore_interrupted".to_string(),
                 "switch_deck".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { BookMarked, Bot, FolderGit2, Keyboard, LayoutList, Network, Settings2, SquareTerminal } from "lucide-react";
+import { Bot, FolderGit2, Keyboard, LayoutList, Network, Settings2, SquareTerminal } from "lucide-react";
 import type { ConnectionView, DesktopFeatures } from "../types";
 import type { RailScreen, ShellOverlayState } from "../hooks/useShellOverlays";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
@@ -35,7 +35,7 @@ export type RailContext = Pick<VoiceActionContext, "navigate" | "openOverlay" | 
  * did.
  */
 export function NavigationRail({ screen, overlays, context, connection, features, onShowShortcuts, update }: { screen: RailScreen; overlays: ShellOverlayState; context: RailContext; connection: ConnectionView; features: DesktopFeatures; onShowShortcuts?: () => void; /** Issue #1635: the newer-release notice, which renders nothing while there is none. */ update?: ReactNode }) {
-  const overlayOpen = Boolean(overlays.projects || overlays.prompts || overlays.profiles || overlays.orchestration || overlays.settings);
+  const overlayOpen = Boolean(overlays.projects || overlays.profiles || overlays.orchestration || overlays.settings);
   /* Daemons is what the deck's rail used to call Runs: on the deck it clears the
      overlays, as Runs always did, and from the overview it goes to the deck. */
   const toDeck = () => (screen === "deck" ? VOICE_ACTIONS.showRuns.run(context) : VOICE_ACTIONS.openDeck.run(context));
@@ -48,7 +48,6 @@ export function NavigationRail({ screen, overlays, context, connection, features
         <RailButton icon={LayoutList} label="Dashboard" active={screen === "overview" && !overlayOpen} onClick={() => VOICE_ACTIONS.openOverview.run(context)} testId="open-overview" />
         {features.showDeck && <RailButton icon={SquareTerminal} label="Daemons" active={screen === "deck" && !overlayOpen} onClick={toDeck} testId="open-deck" />}
         {features.showProjects && <RailButton icon={FolderGit2} label="Projects" active={overlays.projects} onClick={() => VOICE_ACTIONS.openProjects.run(context)} testId="open-projects" />}
-        {features.showPrompts && <RailButton icon={BookMarked} label="Prompts" active={overlays.prompts} onClick={() => VOICE_ACTIONS.openPromptLibrary.run(context)} testId="open-prompts" />}
         {features.showOrchestrations && <RailButton icon={Network} label="Orchestrations" active={overlays.orchestration} onClick={() => VOICE_ACTIONS.openOrchestrationOrder.run(context)} />}
         {features.showAgentProfiles && <RailButton icon={Bot} label="Agent Profiles" active={overlays.profiles} onClick={() => VOICE_ACTIONS.openAgentProfiles.run(context)} testId="open-agent-profiles" />}
         <RailButton icon={Settings2} label="Settings" active={overlays.settings} onClick={() => VOICE_ACTIONS.openSettings.run(context)} testId="open-settings" />

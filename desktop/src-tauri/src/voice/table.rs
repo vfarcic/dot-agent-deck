@@ -1374,6 +1374,11 @@ mod tests {
                     "previousInterruptedReports",
                     vec!["overview"]
                 ),
+                (
+                    "restore_interrupted",
+                    "askRestoreInterrupted",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -1417,21 +1422,26 @@ mod tests {
                 // Scrolling the agent dashboard, which no longer pages (issue
                 // #1492) — `overview`, plus `requires = ["new_agent_dialog_closed"]`.
                 // PRD #1401: and the page of a pull request open in the app.
+                // Issue #1673: and an open agent's pane.
                 (
                     "scroll_down",
                     "scrollDown",
-                    vec!["overview", "pull_request"]
+                    vec!["overview", "agent", "pull_request"]
                 ),
-                ("scroll_up", "scrollUp", vec!["overview", "pull_request"]),
+                (
+                    "scroll_up",
+                    "scrollUp",
+                    vec!["overview", "agent", "pull_request"]
+                ),
                 (
                     "scroll_to_top",
                     "scrollToTop",
-                    vec!["overview", "pull_request"]
+                    vec!["overview", "agent", "pull_request"]
                 ),
                 (
                     "scroll_to_bottom",
                     "scrollToBottom",
-                    vec!["overview", "pull_request"]
+                    vec!["overview", "agent", "pull_request"]
                 ),
                 // PRD #1401 — an agent's pull request in the app's own browser.
                 ("open_pr", "openPullRequest", vec!["overview", "agent"]),
@@ -2487,6 +2497,7 @@ mod tests {
                 "show_interrupted_reports",
                 "next_interrupted_reports",
                 "previous_interrupted_reports",
+                "restore_interrupted",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -2550,6 +2561,11 @@ mod tests {
                 "reading_on",
                 "reading_off",
                 "hush_reading",
+                // Issue #1673: the open pane's output, as PageUp / PageDown.
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 // PRD #1401: the open pane's agent's pull request, or the named agent's.
                 "open_pr",
                 // PRD #2174: the star reminder's buttons, which the reminder
@@ -3500,9 +3516,10 @@ mod tests {
     }
 
     /// Issue #1492: scrolling the agent dashboard, which no longer splits into
-    /// pages while voice is on. Pinned by value: no params, `overview` only,
-    /// and callable only while the New agent dialog is closed, since the
-    /// dashboard is what they scroll and the dialog covers it. Each one's
+    /// pages while voice is on. Pinned by value: no params, the dashboard, an
+    /// open agent's pane (issue #1673) and a pull request open in the app, and
+    /// callable only while the New agent dialog is closed, since the dashboard
+    /// is what they scroll and the dialog covers it. Each one's
     /// description names its direction's word, which is what the meaning
     /// check reads it by.
     #[test]
@@ -3532,10 +3549,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} is in the table"));
             assert_eq!(row.invoke, invoke, "{id}");
             // PRD #1401: and over a pull request open in the app, whose page
-            // they scroll.
+            // they scroll. Issue #1673: and over an open agent's pane.
             assert_eq!(
                 row.screens,
-                vec![Screen::Overview, Screen::PullRequest],
+                vec![Screen::Overview, Screen::Agent, Screen::PullRequest],
                 "{id}"
             );
             assert_eq!(
@@ -3554,7 +3571,7 @@ mod tests {
                 "{id}: under the New agent dialog"
             );
             assert!(!row.callable(Screen::Deck, None, None), "{id}");
-            assert!(!row.callable(Screen::Agent, None, None), "{id}");
+            assert!(row.callable(Screen::Agent, None, None), "{id}");
             assert!(row.callable(Screen::PullRequest, None, None), "{id}");
         }
     }

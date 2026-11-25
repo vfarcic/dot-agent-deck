@@ -28,8 +28,8 @@ use dot_agent_deck::composer_probe::instance::{
     PAGE_BYTES, READ_MAX, ScanError, Sweep, candidate_roots, choose_root, decode_identity,
     encode_identity, generation_name_ok, identify, instance_name, liveness, liveness_from,
     may_be_alive, open_root, owned_by, parse_instance_name, removable, remove_identified,
-    same_contents, scan_processes, scan_processes_in, scan_processes_with, splittable, status_uid,
-    sweep, sweep_root, sweep_with,
+    same_contents, scan_processes, scan_processes_in, scan_processes_with, splittable, stat_tty,
+    status_uid, sweep, sweep_root, sweep_with,
 };
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, Measurement, PasteToggles,
@@ -1539,6 +1539,156 @@ fn probe_065_the_status_re_read_decides_an_empty_entry() {
     assert!(result.removed.is_empty(), "{result:?}");
     assert_eq!((result.kept, result.unknown), (1, 0), "{result:?}");
     assert!(gone.join(DAEMON_FILE).exists());
+}
+
+/// A `/proc/<pid>/stat` line for a process named `comm` whose controlling
+/// terminal is `tty` (field 7).
+fn stat_line(comm: &str, tty: i64) -> Vec<u8> {
+    format!("42 ({comm}) S 1 42 42 {tty} -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1234 0 0").into_bytes()
+}
+
+/// Scenario: Sweep a gone daemon's installed instance with scripted processes of this user whose `environ` or `maps` the kernel refuses to show (`EACCES` or `EPERM`), as `systemd --user`, `(sd-pam)`, `ssh-agent` and `sshd-session` refuse on a real host. One with no controlling terminal is skipped and the instance is removed, even next to a readable process; one on a terminal, or one whose `stat` can't be read, still keeps every instance as a scan error; one gone by the time its `stat` is read is skipped (issue #2467: before, any refused process kept every instance on the host for good).
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_a_refused_process_with_no_terminal_keeps_nothing() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let uid = unsafe { libc::getuid() };
+    let status = format!(
+        "Name:\tsystemd\nState:\tS (sleeping)\nThreads:\t1\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+    )
+    .into_bytes();
+    let readable = b"VISUAL=/usr/bin/vi\0".to_vec();
+    let refused = |errno| Err(std::io::Error::from_raw_os_error(errno));
+    // Process 7 is readable; process 8 refuses `refused_file` with `errno`,
+    // and its `stat` reads `stat`.
+    let swept = |refused_file: &'static str, errno: i32, stat: std::io::Result<Vec<u8>>| {
+        let stat = std::cell::RefCell::new(Some(stat));
+        sweep_with(
+            &root,
+            "own-0",
+            |_, _| false,
+            |visit| {
+                scan_processes_with(
+                    [7, 8],
+                    &mut |pid, file| match (pid, file) {
+                        (_, "status") => Ok(status.clone()),
+                        (7, "environ" | "maps") => Ok(readable.clone()),
+                        (8, "stat") => stat.borrow_mut().take().expect("stat read once"),
+                        (8, f) if f == refused_file => refused(errno),
+                        (8, "environ" | "maps") => Ok(readable.clone()),
+                        other => panic!("{other:?}"),
+                    },
+                    visit,
+                )
+            },
+        )
+    };
+    for (file, errno) in [
+        ("environ", libc::EACCES),
+        ("environ", libc::EPERM),
+        ("maps", libc::EACCES),
+    ] {
+        let gone = fake_instance(&root, 1, 1);
+        let result = swept(file, errno, Ok(stat_line("systemd", 0)));
+        assert_eq!(result.scan_error, None, "{file} {errno} {result:?}");
+        assert_eq!(result.removed, ["1-1"], "{file} {errno} {result:?}");
+        assert!(!gone.exists());
+    }
+    let gone = fake_instance(&root, 1, 1);
+    let result = swept("environ", libc::EACCES, refused(libc::ENOENT));
+    assert_eq!(result.removed, ["1-1"], "gone before its stat: {result:?}");
+    assert!(!gone.exists());
+    let gone = fake_instance(&root, 1, 1);
+    for (label, stat) in [
+        ("on a terminal (pts/0)", Ok(stat_line("codex", 34816))),
+        ("its stat refused", refused(libc::EACCES)),
+        ("its stat unparsable", Ok(b"42 (x) S".to_vec())),
+    ] {
+        let result = swept("environ", libc::EACCES, stat);
+        assert_eq!(
+            result.scan_error,
+            Some(ScanError::Unreadable),
+            "{label}: {result:?}"
+        );
+        assert!(result.removed.is_empty(), "{label}: {result:?}");
+        assert!(gone.join(DAEMON_FILE).exists(), "{label}");
+    }
+    // Another failure than a refusal is still the scan's error, terminal or not.
+    let result = swept("environ", libc::EIO, Ok(stat_line("x", 0)));
+    assert_eq!(result.scan_error, Some(ScanError::Unreadable), "{result:?}");
+    assert!(gone.join(DAEMON_FILE).exists());
+    assert_eq!(stat_tty(&stat_line("a ) b", 34816)), Some(34816));
+    assert_eq!(stat_tty(b"42 (x) S 1"), None);
+}
+
+/// Scenario: Sweep a root whose process scan fails, holding gone daemons' instances that were never installed (only the `daemon` record and an empty `inv/`; plus the helper; plus a partial helper copy, as a copy cut short by a full tmpfs leaves), a gone daemon's instance with a generation in it, a gone daemon's with an unknown file, and a live daemon's that was never installed. The never-installed gone ones are removed whatever the scan says; the rest are kept and the scan's error is reported (issue #2467).
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_a_gone_instance_never_installed_needs_no_scan() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let bare = |pid: u32, files: &[&str]| {
+        let path = root.join(instance_name(pid, u64::from(pid)));
+        std::fs::create_dir_all(path.join(INV_DIR)).unwrap();
+        for file in files {
+            std::fs::write(path.join(file), b"x").unwrap();
+        }
+        std::fs::write(path.join(DAEMON_FILE), daemon_record(pid, u64::from(pid))).unwrap();
+        std::fs::set_permissions(path.join(DAEMON_FILE), Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o700)).unwrap();
+        path
+    };
+    let unused = [
+        bare(1, &[]),
+        bare(2, &[HELPER_NAME]),
+        bare(3, &[".dot-agent-deck-editor.part"]),
+        bare(4, &[HELPER_NAME, ".dot-agent-deck-editor.part"]),
+    ];
+    let installed = fake_instance(&root, 5, 5);
+    let unknown = bare(6, &[HELPER_NAME, "arm-3"]);
+    let live = bare(7, &[]);
+    let result = sweep_with(
+        &root,
+        "own-0",
+        |pid, _| pid == 7,
+        |_| Err(ScanError::Unreadable),
+    );
+    assert_eq!(result.scan_error, Some(ScanError::Unreadable), "{result:?}");
+    let mut removed = result.removed.clone();
+    removed.sort();
+    assert_eq!(removed, ["1-1", "2-2", "3-3", "4-4"], "{result:?}");
+    assert_eq!((result.kept, result.failed), (3, 0), "{result:?}");
+    for path in unused {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    for path in [&installed, &unknown, &live] {
+        assert!(path.join(DAEMON_FILE).exists(), "{}", path.display());
+    }
+    // With a scan that names nothing, the installed and unknown ones go too.
+    let result = sweep_with(&root, "own-0", |pid, _| pid == 7, |_| Ok(()));
+    let mut removed = result.removed.clone();
+    removed.sort();
+    assert_eq!(removed, ["5-5", "6-6"], "{result:?}");
+    assert!(live.join(DAEMON_FILE).exists());
+}
+
+/// Scenario: Make an instance from a source that can't be read, so the attempt fails after its directory is made; the directory is gone again. A second attempt by the same daemon, from a readable source, makes the instance, where before issue #2467 it met the first attempt's directory and refused `InstanceExists`.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_a_failed_attempt_takes_its_directory_back() {
+    let dir = tempdir();
+    let base = dir.path();
+    let root = base.join("state").join("editor");
+    let unreadable = File::create(base.join("write-only")).unwrap();
+    let error = Instance::create(&root, daemon_id(4_000_000, 7), &mut { unreadable });
+    assert!(matches!(error, Err(SetupError::Io(Some(_)))), "{error:?}");
+    assert!(
+        !root.join(instance_name(4_000_000, 7)).exists(),
+        "the failed attempt's directory is taken back"
+    );
+    let made = Instance::create(&root, daemon_id(4_000_000, 7), &mut source(base)).unwrap();
+    assert!(made.helper().exists());
 }
 
 /// Scenario: Make an instance in a root already holding a directory that isn't an instance's, and read what the sweep at creation reports: it was kept, nothing was removed, and no scan was needed. Install a generation, find its arm page among this process's mappings, drop the installation, and find it no longer mapped while its file stays.

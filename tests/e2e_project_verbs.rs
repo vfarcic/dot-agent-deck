@@ -616,9 +616,8 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
     }
     // The other half of #703, and the reason the attendance is a caller
     // declaration rather than an inference from "a task was supplied": this
-    // verb's caller is the desktop's live-loop panel, which will not launch
-    // without a task prompt AND has the operator who typed it watching the
-    // panes. Inferring unattendedness from the task would tell that run nobody
+    // verb's caller can launch with a task its operator typed while watching
+    // the panes, as the desktop's Orchestrations editor did until issue #1310. Inferring unattendedness from the task would tell that run nobody
     // was there and strip the one gate its operator was present to answer.
     assert!(
         !context.contains("## Unattended run"),

@@ -195,14 +195,14 @@ pub const MAX_DISMISS_BYTES: usize = crate::close_agents::MAX_SELECTOR_BYTES;
 const GH: &str = "gh";
 
 /// One fresh read of everything the list is derived from.
-struct Snapshot {
-    list: InterruptedList,
-    read: JournalRead,
+pub(crate) struct Snapshot {
+    pub(crate) list: InterruptedList,
+    pub(crate) read: JournalRead,
     kept: Vec<KeptReport>,
 }
 
 /// The journal and the report store a request reads.
-fn sources(
+pub(crate) fn sources(
     registry: &AgentPtyRegistry,
 ) -> Result<(WorkJournal, Option<Arc<RetainedStore>>), String> {
     let journal = registry
@@ -215,7 +215,10 @@ fn sources(
 
 /// Read the journal, the launch records and the kept reports, and derive
 /// the list. Blocking.
-fn snapshot(journal: &WorkJournal, retained: Option<&RetainedStore>) -> std::io::Result<Snapshot> {
+pub(crate) fn snapshot(
+    journal: &WorkJournal,
+    retained: Option<&RetainedStore>,
+) -> std::io::Result<Snapshot> {
     let read = journal.read()?;
     let incomplete_launches = LaunchRead {
         truncated: true,
@@ -1033,7 +1036,7 @@ pub async fn dismiss(
 
 /// Write `closed how=<how>` on every work, waiting for each write; `true`
 /// when all were written. Blocking.
-fn close_all(journal: &WorkJournal, works: &[WorkId], how: CloseHow) -> bool {
+pub(crate) fn close_all(journal: &WorkJournal, works: &[WorkId], how: CloseHow) -> bool {
     let mut all = true;
     for work in works {
         if let Err(error) = journal.try_record(Event::Closed {
@@ -1112,6 +1115,26 @@ async fn git_facts(
     facts.branch_exists = exists;
     facts.pr = pr;
     facts
+}
+
+/// PRD #1790 stage 3 (§4 item 10): `item`'s Git facts, its pull request
+/// above all, read with the list's own bounded probes and deadlines, for a
+/// restore's or start-over's dry run.
+pub(crate) async fn item_git_facts(item: &InterruptedItem) -> GitFacts {
+    item_git_facts_with(item, OsStr::new(GH)).await
+}
+
+/// [`item_git_facts`], running `gh` for pull request state.
+async fn item_git_facts_with(item: &InterruptedItem, gh: &OsStr) -> GitFacts {
+    git_facts(
+        item.kind,
+        item.worktree.clone(),
+        item.branch.clone(),
+        gh,
+        Deadline::after(GIT_FACT_TIMEOUT),
+        Deadline::after(PR_STATE_TIMEOUT),
+    )
+    .await
 }
 
 /// Fill each item's Git facts, [`GIT_FACT_CONCURRENCY`] items at a time, all
