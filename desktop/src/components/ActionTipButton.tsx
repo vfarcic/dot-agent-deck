@@ -11,12 +11,12 @@ const TIP_WIDTH = 320;
 export const TIP_CUT_NOTE = "Too long to show here in full: pressing it shows all of it before anything is sent.";
 
 /**
- * The height `tip` takes drawn as the tooltip, at most `width` wide: measured
+ * The size `tip` takes drawn as the tooltip, at most `width` wide: measured
  * from a hidden copy with the tooltip's own class, so line breaks, wrapping
  * and the stylesheet's padding all count (a renderer with no layout measures
  * nothing, and every tooltip fits there).
  */
-function tipHeight(tip: string, width: number): number {
+function tipSize(tip: string, width: number): { width: number; height: number } {
   const probe = document.createElement("div");
   probe.className = "action-tip";
   probe.setAttribute("aria-hidden", "true");
@@ -26,9 +26,9 @@ function tipHeight(tip: string, width: number): number {
   probe.style.maxWidth = `${width}px`;
   probe.textContent = tip;
   document.body.appendChild(probe);
-  const height = probe.getBoundingClientRect().height;
+  const size = probe.getBoundingClientRect();
   probe.remove();
-  return height;
+  return { width: size.width, height: size.height };
 }
 
 /** Where a tooltip is drawn and whether all of it fits there. */
@@ -40,7 +40,7 @@ export interface TipLayout {
 
 /**
  * Issue #2399 re-review N2 — where the tooltip of a button at `box` is drawn,
- * from its real size: below the button when it fits there, else above when it
+ * from its real size, starting at the button's left edge (PR #2491 v9 review): below the button when it fits there, else above when it
  * fits there, else on the side with more room, never past any edge of the
  * window (its height capped to the room on that side, its width to the
  * window's). `whole` is false when the text does not fit on either side,
@@ -48,8 +48,12 @@ export interface TipLayout {
  */
 export function tipLayout(box: DOMRect, tip: string): TipLayout {
   const width = Math.min(TIP_WIDTH, window.innerWidth - 2 * EDGE);
-  const left = Math.max(EDGE, Math.min(box.left, window.innerWidth - EDGE - width));
-  const height = tipHeight(tip, width);
+  const drawn = tipSize(tip, width);
+  const height = drawn.height;
+  /* Started at the icon's left edge and moved left only as far as its own
+     drawn width needs to stay in the window (PR #2491 v9 review), so a short
+     tooltip near the window's edge stays beside its icon. */
+  const left = Math.max(EDGE, Math.min(box.left, window.innerWidth - EDGE - Math.min(width, drawn.width || width)));
   const below = window.innerHeight - box.bottom - GAP - EDGE;
   const above = box.top - GAP - EDGE;
   const whole = height <= Math.max(below, above);
@@ -114,19 +118,34 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
   // Final review F1: a tooltip that is shown is measured again when its text
   // changes, when the window is resized or anything scrolls, and when the
   // button's own size changes, so its place and its cut note stay true.
+  // PR #2491 v9 review: and whenever the button moves for any other reason —
+  // the page reflowing as its fonts settle, a card above it growing — checked
+  // once a frame while the tooltip is shown, so it stays beside its icon.
   useEffect(() => {
     const button = own.current;
     if (!shown || !button) return;
-    const again = () => draw(tipLayout(button.getBoundingClientRect(), tip));
-    again();
-    window.addEventListener("resize", again);
-    window.addEventListener("scroll", again, true);
-    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(again);
+    let last = "";
+    const again = (force: boolean) => {
+      const box = button.getBoundingClientRect();
+      const at = `${box.left},${box.top},${box.width},${box.height},${window.innerWidth},${window.innerHeight}`;
+      if (!force && at === last) return;
+      last = at;
+      draw(tipLayout(box, tip));
+    };
+    const measure = () => again(true);
+    again(true);
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(measure);
     observer?.observe(button);
+    let frame = 0;
+    const follow = () => { again(false); frame = requestAnimationFrame(follow); };
+    if (typeof requestAnimationFrame === "function") frame = requestAnimationFrame(follow);
     return () => {
-      window.removeEventListener("resize", again);
-      window.removeEventListener("scroll", again, true);
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
       observer?.disconnect();
+      if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
     };
   }, [shown, tip]);
   const show = (event: FocusEvent<HTMLButtonElement>) => {
@@ -195,10 +214,10 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
 
 /**
  * PR #2491 review — the box around a set of action icons: a card's own, the
- * selection bar's and the batch row of a card's overlay all draw their icons
+ * selection bar's and the agent pane's Card panel all draw their icons
  * inside one, so a user who learns where a card's actions are finds them in
  * the same box in all three. A card's own Close stays outside its group; the
- * batch's Close, in the bar and in the overlay's batch row, is one of the
+ * batch's Close, in the bar, is one of the
  * batch's actions and sits inside.
  */
 export function ActionIconGroup({ className = "", label, children }: { className?: string; label: string; children: ReactNode }) {
