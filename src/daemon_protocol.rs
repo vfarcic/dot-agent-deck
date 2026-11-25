@@ -1933,16 +1933,14 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // a stale one, where an older daemon kept the latest.
     // `changelog.d/1395.breaking.md` is its fragment.
     "1395-fixed-path-context-mirror-retired",
-    // Issue #2485, without moving `PROTOCOL_VERSION` -- the #2260 shape. A
-    // dispatched unit's fourth to twentieth different terminal `work-done`
-    // after its first report was refused `report_updates_exhausted` and
-    // delivered nothing; it is now accepted and delivered as a numbered
-    // update, and from the fourth on that update's post tells the dispatcher
-    // the unit may be looping. The refusal moved to the twenty-first. Nothing
-    // on the wire moved; what moved is which of the same requests a daemon
-    // delivers.
-    // `changelog.d/2485.breaking.md` is its fragment.
-    "2485-work-done-update-limit-raised",
+    // Issue #2485 (the update limit raised from 3 to 20, with a looping note
+    // from the fourth update on) is deliberately NOT listed, although it has
+    // the #2260 shape. The maintainer reclassified it on 2026-11-25, before any
+    // release carried an entry for it: neither pairing misbehaves. An older
+    // daemon keeps refusing the fourth update, as the unit it started was told,
+    // and an older client receives updates with an extra sentence. Listing it
+    // would only make the desktop refuse every mixed-version connection. Its
+    // fragment is `changelog.d/2485.feature.md`.
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
