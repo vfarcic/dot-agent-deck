@@ -79,6 +79,7 @@ import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } 
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
+import { CARD_ACTIONS_NOT_AVAILABLE } from "./hooks/useCardActionsEditor";
 import { useLocalUpgradeAtStart } from "./hooks/useLocalUpgradeAtStart";
 import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/useShellOverlays";
 import { useVoiceOn, VoiceOn } from "./hooks/useVoiceOn";
@@ -259,6 +260,20 @@ const RUN_CARD_ACTION_BATCH_INVOKE: keyof typeof VOICE_ACTIONS = "runCardActionB
 const RUN_SELECTION_BATCH_INVOKE: keyof typeof VOICE_ACTIONS = "runSelectionBatch";
 /* PRD #2374 decision 2026-11-24 — the card actions editor's rows that name an action by its label. */
 const CARD_ACTION_EDITOR_INVOKES: readonly (keyof typeof VOICE_ACTIONS)[] = ["editCardAction", "removeCardAction"];
+/*
+ * PR #2491 review T1 — every entry a Card actions editor row invokes. The rows
+ * run on the dashboard and over an agent's pane, but the editor is the
+ * dashboard's: over a pane opened from the Daemons screen, or with no daemon
+ * on screen showing cards, the dashboard publishes none of its members, and
+ * voice says why in words rather than "not wired".
+ */
+const CARD_ACTIONS_EDITOR_ROW_INVOKES: readonly (keyof typeof VOICE_ACTIONS)[] = [
+  "openCardActionsEditor", "addCardAction", "editCardAction", "removeCardAction", "refreshCardActions", "chooseCardActionIcon",
+  "askBeforeSendingCardAction", "sendCardActionWithoutAsking", "offerCardActionOnEveryCard", "offerCardActionWhenAgentsChoose",
+  "showCardActionOnCard", "showCardActionOnlyInCardPanel",
+];
+/** PR #2491 review T1 — a Card actions editor row said over a pane the Daemons screen opened. */
+const CARD_ACTIONS_NOT_ON_DECK_PANE = "The Card actions editor opens over an agent's pane opened from the agent dashboard, not from the Daemons screen.";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
 
@@ -1693,6 +1708,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     const offPage = pager && offPageTarget(outcome.params, pager.elsewhere, selectedDeckId);
     if (pager && offPage) {
       panelVoiceContext.current?.reportRefused?.(offPageSentence(offPage.label, offPage.page, pager.page));
+      return {};
+    }
+    if (CARD_ACTIONS_EDITOR_ROW_INVOKES.includes(outcome.invoke as keyof typeof VOICE_ACTIONS) && typeof context.openCardActionsEditor !== "function") {
+      panelVoiceContext.current?.reportRefused?.(agentView && base !== "overview" ? CARD_ACTIONS_NOT_ON_DECK_PANE : CARD_ACTIONS_NOT_AVAILABLE);
       return {};
     }
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;

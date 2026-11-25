@@ -90,7 +90,10 @@ export interface CardActionsEditor {
   setField: <K extends keyof CardActionFormValues>(key: K, value: CardActionFormValues[K]) => void;
 }
 
-const NOT_AVAILABLE = "The Card actions editor is not available here: no daemon on screen shows cards.";
+export const CARD_ACTIONS_NOT_AVAILABLE = "The Card actions editor is not available here: no daemon on screen shows cards.";
+const NOT_AVAILABLE = CARD_ACTIONS_NOT_AVAILABLE;
+/** PR #2491 review T1 — over an agent's pane, an opening naming no daemon means the pane's, and that daemon has no editor. */
+export const PANE_DAEMON_NO_EDITOR = "This agent's daemon shows no cards, so it has no Card actions editor.";
 const NOT_OPEN = "The Card actions editor is not open.";
 const NO_FORM = "No card action form is open.";
 const NOT_ASKING = "The editor is not asking to remove anything.";
@@ -129,12 +132,19 @@ function formPlacement(placement: string | null | undefined): CardActionPlacemen
  * several and none named, the user is asked which rather than one being
  * guessed, the way a spoken "show host" asks. PR #2491 (2026-11-25): with
  * none named, `preferred` — the one daemon the selected cards are on — is
- * meant while it is on the dashboard.
+ * meant while it is on the dashboard. PR #2491 review T1: with an agent's
+ * pane open over the dashboard, `pane` — that agent's daemon — is meant
+ * instead, and nothing else: a selection behind the pane, or the only other
+ * daemon showing cards, is not what the user is looking at.
  */
-function chooseDaemon(daemons: readonly CardActionsDaemon[], wanted: string | undefined, preferred?: string): { daemon: CardActionsDaemon } | { refused: string; which?: CardActionsWhich["which"] } {
+function chooseDaemon(daemons: readonly CardActionsDaemon[], wanted: string | undefined, preferred?: string, pane?: string): { daemon: CardActionsDaemon } | { refused: string; which?: CardActionsWhich["which"] } {
   if (wanted !== undefined) {
     const named = daemons.find((candidate) => candidate.deckId === wanted);
     return named ? { daemon: named } : { refused: NOT_SHOWN };
+  }
+  if (pane !== undefined) {
+    const own = daemons.find((candidate) => candidate.deckId === pane);
+    return own ? { daemon: own } : { refused: PANE_DAEMON_NO_EDITOR };
   }
   const selected = preferred === undefined ? undefined : daemons.find((candidate) => candidate.deckId === preferred);
   if (selected) return { daemon: selected };
@@ -205,11 +215,13 @@ export function cardIconByName(said: string): string | undefined {
  * the edit again. A daemon that did not advertise the editor is shown
  * read-only and sent nothing.
  */
-export function useCardActionsEditor({ runtime, daemons, preferredDeckId }: {
+export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDeckId }: {
   runtime: Pick<DeckRuntimeState, "readCardCatalog" | "editCardCatalog">;
   daemons: readonly CardActionsDaemon[];
   /** PR #2491 (2026-11-25) — the daemon an opening that names none means, before asking which: the one the selected cards on screen are all on. */
   preferredDeckId?: string;
+  /** PR #2491 review T1 — the daemon of the agent pane open over the dashboard, if one is: an opening that names none means it, and only it. */
+  paneDeckId?: string;
 }): CardActionsEditor {
   const read = runtime.readCardCatalog;
   const write = runtime.editCardCatalog;
@@ -403,7 +415,7 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId }: {
     if (!now.shown) return NOT_AVAILABLE;
     if (!now.open) {
       if (!voiceAsk) return NOT_OPEN;
-      const chosen = chooseDaemon(daemons, undefined, preferredDeckId);
+      const chosen = chooseDaemon(daemons, undefined, preferredDeckId, paneDeckId);
       if ("refused" in chosen) return chosen.refused;
       openEditor(chosen.daemon.deckId);
       if (!chosen.daemon.editable) return readOnly(displayText(chosen.daemon.name, DISPLAY_LIMITS.name));
@@ -433,7 +445,7 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId }: {
      stays as it is. */
   function openEditor(wanted?: string): string | CardActionsWhich | undefined {
     if (!latest.current.shown) return NOT_AVAILABLE;
-    const chosen = chooseDaemon(daemons, wanted, preferredDeckId);
+    const chosen = chooseDaemon(daemons, wanted, preferredDeckId, paneDeckId);
     if ("refused" in chosen) return chosen.which ? { refused: chosen.refused, which: chosen.which } : chosen.refused;
     const target = chosen.daemon;
     if (latest.current.open && latest.current.daemon?.deckId === target.deckId) return undefined;
@@ -483,7 +495,7 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId }: {
       if (now.busy) return SAVING_FORM;
       let target = now.daemon;
       if (!now.open) {
-        const chosen = chooseDaemon(daemons, undefined, preferredDeckId);
+        const chosen = chooseDaemon(daemons, undefined, preferredDeckId, paneDeckId);
         if ("refused" in chosen) return chosen.refused;
         target = chosen.daemon;
         openEditor(target.deckId);

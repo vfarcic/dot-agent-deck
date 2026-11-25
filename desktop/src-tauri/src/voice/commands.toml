@@ -3113,6 +3113,12 @@ try_saying  = "{action} on the selected agents"
 # are presses by hand — so a misheard word never becomes text an agent is sent
 # or takes an action off the cards.
 #
+# PR #2491 review T1 (2026-11-25): the Card panel's Edit opens the editor over
+# an agent's pane opened from the dashboard, so the editor's rows run on the
+# agent screen too. There an opening naming no daemon means the PANE's daemon,
+# never a selection behind the pane; a pane the Daemons screen opened, and one
+# whose daemon has no editor, are refused in words by the app.
+#
 # PR #2491 decision 2026-11-25: the editor belongs to one daemon (each
 # daemon's ⋯ menu on the dashboard opens it bound to that daemon, and it has no
 # Daemon picker), so this row names the daemon with an optional `deck`. With
@@ -3123,7 +3129,8 @@ try_saying  = "{action} on the selected agents"
 id          = "open_card_actions_editor"
 description = """Open one daemon's Card actions editor on the agent dashboard: the list of actions
 agents can offer on their cards (such as Go ahead and Merge it), where the user adds, changes, hides
-and removes them. It is what Card actions in a daemon's ⋯ (More) menu opens. Use for open card
+and removes them. It is what Card actions in a daemon's ⋯ (More) menu opens, and what Edit beside Actions
+in an agent pane's Card panel opens: over an agent's pane, naming no daemon means that agent's. Use for open card
 actions, open the card actions editor, edit card actions, manage card actions, show the card actions,
 and, naming the daemon (which a user may also call a deck; speech-to-text often writes daemon as
 demon), open card actions on the build box, the build box daemon's card actions, edit the local
@@ -3132,8 +3139,8 @@ as listed in `decks`; otherwise leave `deck` out. It only OPENS the editor and c
 Pressing an action on an agent's card is `run_card_action`; changing which daemon the dashboard shows
 is `switch_deck`."""
 invoke      = "openCardActionsEditor"
-screens     = ["overview"]
-unavailable_hint = "the Card actions editor opens from a daemon's ⋯ menu on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Card actions editor opens from a daemon's ⋯ menu on the agent dashboard or over an agent's pane opened from it"
 report      = "Opened the Card actions editor."
 asks_to     = "open a daemon's Card actions editor"
 try_saying  = "open card actions"
@@ -3150,8 +3157,8 @@ in and save by hand. Use for add a card action, new card action, create a card a
 editor first when it is closed. It saves nothing: the user types the fields and presses Save.
 Changing an action that is already listed is `edit_card_action`."""
 invoke      = "addCardAction"
-screens     = ["overview"]
-unavailable_hint = "card actions are added in the Card actions editor, from the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "card actions are added in the Card actions editor, from the agent dashboard or over an agent's pane opened from it"
 report      = "The form for a new card action is open: fill it in and press Save."
 asks_to     = "add a new card action"
 try_saying  = "add a card action"
@@ -3164,8 +3171,8 @@ the ship it action. Set `action` to the action's label as the user said it. It s
 changes the fields and presses Save. A new action is `add_card_action`; pressing an action on an
 agent's card is `run_card_action`."""
 invoke      = "editCardAction"
-screens     = ["overview"]
-unavailable_hint = "card actions are changed in the Card actions editor, from the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "card actions are changed in the Card actions editor, from the agent dashboard or over an agent's pane opened from it"
 report      = "The form for {action} is open: change it and press Save."
 asks_to     = "change one of the card actions"
 try_saying  = "edit the {action} action"
@@ -3181,8 +3188,8 @@ description = """Ask to remove one of the user's OWN card actions in the Card ac
 names the action; nothing is removed until the user presses Remove by hand. A deck default (Go ahead,
 Merge it) cannot be removed, only hidden, and hiding is done by hand in the editor."""
 invoke      = "removeCardAction"
-screens     = ["overview"]
-unavailable_hint = "card actions are removed in the Card actions editor, from the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "card actions are removed in the Card actions editor, from the agent dashboard or over an agent's pane opened from it"
 report      = "Confirm removing {action} in the Card actions editor: press Remove."
 asks_to     = "remove one of my card actions"
 try_saying  = "remove the {action} action"
@@ -3204,8 +3211,8 @@ description = """Read the open Card actions editor's list again from its daemon,
 form holds. Use for refresh the card actions, reload the card actions, read the card actions again,
 check the card actions list. It writes nothing."""
 invoke      = "refreshCardActions"
-screens     = ["overview"]
-unavailable_hint = "the Card actions editor's list is read again while the editor is open, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Card actions editor's list is read again while the editor is open, on the agent dashboard or over an agent's pane opened from it"
 report      = "Reading the card actions again."
 asks_to     = "read the Card actions editor's list again"
 try_saying  = "refresh the card actions"
@@ -3216,8 +3223,8 @@ description = """In the Card actions editor's form, choose the action's icon by 
 git merge, play, bug or ship. Set `icon` to the icon's name as the user said it. It only sets the
 form's icon; nothing is saved until the user presses Save."""
 invoke      = "chooseCardActionIcon"
-screens     = ["overview"]
-unavailable_hint = "a card action's icon is chosen in the Card actions editor's form, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "a card action's icon is chosen in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
 report      = "Icon: {icon}. Press Save to keep it."
 asks_to     = "choose the icon of the card action I am editing"
 try_saying  = "icon rocket"
@@ -3232,8 +3239,8 @@ description = """In the Card actions editor's form, tick Ask before sending, so 
 the user to confirm before its text is sent. Use for ask before sending, ask first, confirm before
 sending. It only sets the form's checkbox; nothing is saved until the user presses Save."""
 invoke      = "askBeforeSendingCardAction"
-screens     = ["overview"]
-unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
 report      = "Ask before sending is ticked. Press Save to keep it."
 asks_to     = "make the card action I am editing ask before sending"
 try_saying  = "ask before sending"
@@ -3244,8 +3251,8 @@ description = """In the Card actions editor's form, untick Ask before sending, s
 sends its text at once. Use for don't ask before sending, send without asking, no confirmation. It
 only sets the form's checkbox; nothing is saved until the user presses Save."""
 invoke      = "sendCardActionWithoutAsking"
-screens     = ["overview"]
-unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
 report      = "Ask before sending is unticked. Press Save to keep it."
 asks_to     = "make the card action I am editing send without asking"
 try_saying  = "send without asking"
@@ -3256,8 +3263,8 @@ description = """In the Card actions editor's form, tick Offer on every card, so
 the action whether or not the agent suggests it. Use for offer on every card, show it on every card,
 always offer it. It only sets the form's checkbox; nothing is saved until the user presses Save."""
 invoke      = "offerCardActionOnEveryCard"
-screens     = ["overview"]
-unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
 report      = "Offer on every card is ticked. Press Save to keep it."
 asks_to     = "offer the card action I am editing on every card"
 try_saying  = "offer on every card"
@@ -3268,8 +3275,8 @@ description = """In the Card actions editor's form, untick Offer on every card, 
 only when an agent suggests it. Use for don't offer on every card, only when agents suggest it, not on
 every card. It only sets the form's checkbox; nothing is saved until the user presses Save."""
 invoke      = "offerCardActionWhenAgentsChoose"
-screens     = ["overview"]
-unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
 report      = "Offer on every card is unticked. Press Save to keep it."
 asks_to     = "offer the card action I am editing only when agents suggest it"
 try_saying  = "only when agents suggest it"
@@ -3280,8 +3287,8 @@ description = """In the Card actions editor's form, set Placement to Show on the
 icon on each card that offers it. Use for show it on the card, put it on the card, as an icon on the
 card. It only sets the form's choice; nothing is saved until the user presses Save."""
 invoke      = "showCardActionOnCard"
-screens     = ["overview"]
-unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
 report      = "Placement is Show on the card. Press Save to keep it."
 asks_to     = "show the card action I am editing on the card"
 try_saying  = "show it on the card"
@@ -3293,8 +3300,8 @@ draws no icon on the card and is offered only in the Card panel of the agent's p
 the Card panel, only in the panel, not on the card, no icon on the card. It only sets the form's choice; nothing is saved until the user
 presses Save."""
 invoke      = "showCardActionOnlyInCardPanel"
-screens     = ["overview"]
-unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
 report      = "Placement is Only in the Card panel. Press Save to keep it."
 asks_to     = "offer the card action I am editing only in the Card panel"
 try_saying  = "only in the Card panel"

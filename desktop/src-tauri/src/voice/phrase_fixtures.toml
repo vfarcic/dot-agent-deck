@@ -425,6 +425,105 @@ screen = "overview"
 action = "show_card_action_only_in_the_card_panel"
 outcome = "dispatch"
 
+# PR #2491 review T1 (2026-11-25): the Card panel's Edit opens the editor over
+# an agent's pane, so its rows run on the agent screen too, where typing to
+# the agent (`dictate_to_agent`) competes for the same words. The same
+# phrases as on the dashboard, over a pane with typing mode off.
+[[fixtures]]
+name = "card-actions-editor-open-bare-over-pane"
+utterance = "open card actions"
+screen = "agent"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-open-on-named-daemon-over-pane"
+utterance = "open card actions on the build box"
+screen = "agent"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "card-actions-editor-add-over-pane"
+utterance = "add a new card action"
+screen = "agent"
+action = "add_card_action"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-edit-by-label-over-pane"
+utterance = "edit the ship it card action"
+screen = "agent"
+action = "edit_card_action"
+outcome = "dispatch"
+resolved_card_action = "ship it"
+
+[[fixtures]]
+name = "card-actions-editor-remove-by-label-over-pane"
+utterance = "remove the deploy it card action"
+screen = "agent"
+action = "remove_card_action"
+outcome = "dispatch"
+resolved_card_action = "deploy it"
+
+[[fixtures]]
+name = "card-actions-editor-refresh-over-pane"
+utterance = "refresh the card actions"
+screen = "agent"
+action = "refresh_card_actions"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-icon-by-name-over-pane"
+utterance = "set the icon to rocket"
+screen = "agent"
+action = "choose_card_action_icon"
+outcome = "dispatch"
+resolved_filter = "rocket"
+
+[[fixtures]]
+name = "card-actions-editor-ask-before-sending-over-pane"
+utterance = "ask me before sending it"
+screen = "agent"
+action = "ask_before_sending_card_action"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-send-without-asking-over-pane"
+utterance = "send it without asking"
+screen = "agent"
+action = "send_card_action_without_asking"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-on-every-card-over-pane"
+utterance = "offer it on every card"
+screen = "agent"
+action = "offer_card_action_on_every_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-when-agents-suggest-over-pane"
+utterance = "only offer it when agents suggest it"
+screen = "agent"
+action = "offer_card_action_when_agents_choose"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-placement-on-the-card-over-pane"
+utterance = "put it on the card as an icon"
+screen = "agent"
+action = "show_card_action_on_the_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-placement-only-in-the-card-panel-over-pane"
+utterance = "only show it in the card panel"
+screen = "agent"
+action = "show_card_action_only_in_the_card_panel"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-agent-zoom"
 utterance = "zoom the tester"

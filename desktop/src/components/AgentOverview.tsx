@@ -1998,7 +1998,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const deckIds = cards.mode === "cards" && cards.selection && cards.selection.selected.size > 0 ? cards.selection.deckIds : [];
     return cardActionDaemons.filter((daemon) => deckIds.includes(daemon.deckId));
   }, [cardActionDaemons, cards.mode, cards.selection]);
-  const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons, preferredDeckId: selectionDaemons.length === 1 ? selectionDaemons[0].deckId : undefined });
+  /* PR #2491 review T1 — with an agent's pane open over the dashboard, an
+     opening that names no daemon (a spoken "open card actions" there) means
+     the pane's daemon, never the selection's behind it. */
+  const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons, preferredDeckId: selectionDaemons.length === 1 ? selectionDaemons[0].deckId : undefined, paneDeckId: agentPaneOpen ? agentPane?.deckId : undefined });
   /* The editor's opening, stable across renders, for the surfaces outside the
      overview's own controls (the selection bar, the agent pane's Card panel):
      it always reaches the editor as it stands now. */

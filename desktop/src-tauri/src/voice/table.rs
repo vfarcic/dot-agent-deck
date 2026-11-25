@@ -1576,50 +1576,62 @@ mod tests {
                 (
                     "open_card_actions_editor",
                     "openCardActionsEditor",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
-                ("add_card_action", "addCardAction", vec!["overview"]),
-                ("edit_card_action", "editCardAction", vec!["overview"]),
-                ("remove_card_action", "removeCardAction", vec!["overview"]),
+                (
+                    "add_card_action",
+                    "addCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "edit_card_action",
+                    "editCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "remove_card_action",
+                    "removeCardAction",
+                    vec!["overview", "agent"]
+                ),
                 (
                     "refresh_card_actions",
                     "refreshCardActions",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
                 (
                     "choose_card_action_icon",
                     "chooseCardActionIcon",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
                 (
                     "ask_before_sending_card_action",
                     "askBeforeSendingCardAction",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
                 (
                     "send_card_action_without_asking",
                     "sendCardActionWithoutAsking",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
                 (
                     "offer_card_action_on_every_card",
                     "offerCardActionOnEveryCard",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
                 (
                     "offer_card_action_when_agents_choose",
                     "offerCardActionWhenAgentsChoose",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
                 (
                     "show_card_action_on_the_card",
                     "showCardActionOnCard",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
                 (
                     "show_card_action_only_in_the_card_panel",
                     "showCardActionOnlyInCardPanel",
-                    vec!["overview"]
+                    vec!["overview", "agent"]
                 ),
             ]
         );
@@ -2679,7 +2691,21 @@ mod tests {
                 "next_needs_you_card",
                 "open_card_panel",
                 "close_card_panel",
-                "run_card_action"
+                "run_card_action",
+                // PR #2491 review T1: the Card actions editor, which the Card
+                // panel's Edit opens over the pane, and its form's rows.
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_card_panel"
             ]
         );
         // PRD #1401 — over the pull request browser: the rows callable
