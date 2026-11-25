@@ -1,4 +1,6 @@
-import type { KeyboardEvent, ReactNode } from "react";
+import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
+import { ChevronRight } from "lucide-react";
+
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import type { CardBatchGroup, CardBatchView } from "../hooks/useAgentCardsView";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
@@ -110,11 +112,67 @@ function sameText(rows: readonly BatchRow[]): BatchRow[][] {
   return [...groups.values()];
 }
 
+/**
+ * The included groups as the confirmation lists them: every name, or, folded,
+ * only the first {@link INCLUDED_SHOWN} names across the groups in order. A
+ * group whose names are all folded is not drawn; one partly folded keeps its
+ * quotation and lists its first names.
+ */
+function foldIncluded(groups: readonly BatchRow[][], folded: boolean): { rows: BatchRow[]; shown: BatchRow[] }[] {
+  if (!folded) return groups.map((rows) => ({ rows, shown: rows }));
+  let left = INCLUDED_SHOWN;
+  return groups.flatMap((rows) => {
+    if (left <= 0) return [];
+    const shown = rows.slice(0, left);
+    left -= shown.length;
+    return [{ rows, shown }];
+  });
+}
+
 /** What an action with no text does to the agents of one group. */
 function closeWords(kind: string | undefined, label: string, several: boolean): string {
   if (kind === "close_keep_worktree") return several ? "Closes each of these agents and keeps its worktree." : "Closes this agent and keeps its worktree.";
   if (kind === "close") return several ? "Closes each of these agents." : "Closes this agent.";
   return several ? `Runs ${label} on each of these agents.` : `Runs ${label} on this agent.`;
+}
+
+/**
+ * PR #2491 decision 2026-11-25 — how many included agents' names the
+ * confirmation lists before the rest fold behind a "+N more": the list stays
+ * readable with hundreds of agents, and a press shows every one.
+ */
+export const INCLUDED_SHOWN = 8;
+/** Past this many included agents, the names past {@link INCLUDED_SHOWN} fold. */
+const INCLUDED_FOLD_AFTER = 10;
+
+/**
+ * Why a group of skipped agents is skipped, in a few words after its count
+ * ("150 don't offer Go ahead"), by the code the daemon skipped them with. A
+ * code this build does not know reads "for another reason"; each agent's row
+ * in the expanded list still carries the daemon's own words.
+ */
+function skipWords(code: string | undefined, label: string, count: number): string {
+  const one = count === 1;
+  switch (code) {
+    case "unknown_action": return one ? `doesn't offer ${label}` : `don't offer ${label}`;
+    case "agent_stopped": return one ? "isn't running" : "aren't running";
+    case "action_disabled": return one ? `can't use ${label} now` : `can't use ${label} now`;
+    case "text_required": return one ? "needs your own words" : "need your own words";
+    case "client_side_action": return one ? "is opened one card at a time" : "are opened one card at a time";
+    case "daemon_unreachable": return one ? "is on a daemon that did not answer" : "are on a daemon that did not answer";
+    case "unknown_entry": case "stale_entry": return one ? "is no longer listed" : "are no longer listed";
+    default: return "for another reason";
+  }
+}
+
+/** The skipped rows grouped by the code they were skipped with, in the order each code is first met. */
+function byReason(rows: readonly BatchRow[]): { code: string; rows: BatchRow[] }[] {
+  const groups = new Map<string, BatchRow[]>();
+  for (const row of rows) {
+    const code = row.entry.code && skipWords(row.entry.code, "", 2) !== "for another reason" ? row.entry.code : "other";
+    groups.set(code, [...(groups.get(code) ?? []), row]);
+  }
+  return [...groups.entries()].map(([code, grouped]) => ({ code, rows: grouped }));
 }
 
 /**
@@ -145,6 +203,13 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
   /* Voice's `close` reaches this through the overlay stack; while the batch is
      being sent it is refused, and the refusal is what `close` says. */
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => controls.closeCardBatch());
+  /* The two disclosures (PR #2491 decision 2026-11-25): the skipped agents' list and the included names past the first few. */
+  // voice-registry-exempt: whether the confirmation lists every skipped agent, a disclosure of what the open dialog already counts
+  const [skippedOpen, setSkippedOpen] = useState(false);
+  // voice-registry-exempt: whether the confirmation lists every included agent's name, a disclosure of what the open dialog already counts
+  const [includedOpen, setIncludedOpen] = useState(false);
+  const skippedListId = useId();
+  const includedListId = useId();
   const previewed = rowsOf(view.groups);
   const included = previewed.filter((row) => row.entry.outcome === "included");
   const skipped = previewed.filter((row) => row.entry.outcome !== "included");
@@ -195,8 +260,8 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
             <>
               <h3>{included.length === 0 ? "No agent gets this action" : `Sends to ${included.length} ${included.length === 1 ? "agent" : "agents"}`}</h3>
               {included.length > 0 && (
-                <ul className="agent-cards-batch-list">
-                  {sameText(included).map((group) => {
+                <ul className="agent-cards-batch-list" id={includedListId}>
+                  {foldIncluded(sameText(included), included.length > INCLUDED_FOLD_AFTER && !includedOpen).map(({ rows: group, shown: listed }) => {
                     const [first] = group;
                     const what = (several: boolean) => (first.entry.prompt
                       ? <><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt"><ExactText text={first.entry.prompt} /></blockquote><ExactTextNote text={first.entry.prompt} /></>
@@ -219,7 +284,7 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
                         {what(true)}
                         <p className="agent-cards-batch-gets">{first.entry.prompt ? `Each of these ${group.length} agents gets exactly this text:` : `For each of these ${group.length} agents:`}</p>
                         <ul className="agent-cards-batch-list">
-                          {group.map((row) => (
+                          {listed.map((row) => (
                             <li key={rowKey(row)} className="agent-cards-batch-entry is-included" data-testid="agent-cards-batch-entry">
                               {who(row, badge(row))}
                             </li>
@@ -230,18 +295,35 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
                   })}
                 </ul>
               )}
+              {included.length > INCLUDED_FOLD_AFTER && (
+                <button type="button" className="agent-cards-batch-more" data-testid="agent-cards-batch-more" aria-expanded={includedOpen} aria-controls={includedListId} onClick={() => setIncludedOpen((open) => !open)}>
+                  {includedOpen ? "Show fewer" : `+${included.length - INCLUDED_SHOWN} more`}
+                </button>
+              )}
               {skipped.length > 0 && (
-                <>
-                  <h3>Skipped: {skipped.length}</h3>
-                  <ul className="agent-cards-batch-list">
-                    {skipped.map((row) => (
-                      <li key={rowKey(row)} className="agent-cards-batch-entry is-skipped" data-testid="agent-cards-batch-entry">
-                        {who(row)}
-                        <p className="agent-cards-batch-reason">{displayText(row.entry.message ?? "it is not offered on this card", DISPLAY_LIMITS.message)}</p>
-                      </li>
-                    ))}
-                  </ul>
-                </>
+                <section className="agent-cards-batch-skipped" aria-label="Skipped agents">
+                  <button type="button" className="agent-cards-batch-skipped-toggle" data-testid="agent-cards-batch-skipped-toggle" aria-expanded={skippedOpen} aria-controls={skippedListId} onClick={() => setSkippedOpen((open) => !open)}>
+                    <ChevronRight className="agent-cards-batch-chevron" size={14} aria-hidden="true" />
+                    <span>{`${skipped.length} skipped: ${byReason(skipped).map((group) => `${group.rows.length} ${skipWords(group.code, label, group.rows.length)}`).join(", ")}`}</span>
+                  </button>
+                  {skippedOpen && (
+                    <div id={skippedListId} className="agent-cards-batch-skipped-list">
+                      {byReason(skipped).map((group) => (
+                        <section key={group.code} className="agent-cards-batch-skipped-group" data-testid="agent-cards-batch-skipped-group" data-reason={group.code}>
+                          <h4>{`${group.rows.length} ${skipWords(group.code, label, group.rows.length)}`}</h4>
+                          <ul className="agent-cards-batch-list">
+                            {group.rows.map((row) => (
+                              <li key={rowKey(row)} className="agent-cards-batch-entry is-skipped" data-testid="agent-cards-batch-entry">
+                                {who(row)}
+                                <p className="agent-cards-batch-reason">{displayText(row.entry.message ?? "it is not offered on this card", DISPLAY_LIMITS.message)}</p>
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      ))}
+                    </div>
+                  )}
+                </section>
               )}
             </>
           )}

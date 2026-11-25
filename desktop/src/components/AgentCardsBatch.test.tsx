@@ -89,6 +89,12 @@ function card(card: AgentCardEntry) {
 const selectionAction = (label: string) => within(screen.getByTestId("agent-cards-selection-bar")).getByRole("button", { name: label });
 const overlayBatchAction = (label: string) => within(screen.getByTestId("agent-card-batch")).getByRole("button", { name: label });
 
+/** PR #2491 decision 2026-11-25 — the skipped agents are one collapsed line: open it to read each one. */
+function showSkipped(dialog: HTMLElement) {
+  const toggle = within(dialog).queryByTestId("agent-cards-batch-skipped-toggle");
+  if (toggle && toggle.getAttribute("aria-expanded") === "false") fireEvent.click(toggle);
+}
+
 function selectRoot() {
   fireEvent.click(card(ROOT).getByRole("checkbox", { name: "Select root" }));
 }
@@ -244,6 +250,7 @@ describe("batch card actions (#2399)", () => {
   it("desktop/agent-cards/030: every batch reviews the daemon's exact text before Send", async () => {
     const calls = setup();
     const dialog = await startSelectedBatch();
+    showSkipped(dialog);
     expect(action.confirm).toBe(false);
     const rows = within(dialog).getAllByTestId("agent-cards-batch-entry");
     expect(rows).toHaveLength(3);
@@ -465,6 +472,7 @@ describe("batch card actions (#2399)", () => {
     const dialog = screen.getByTestId("agent-cards-batch-confirm");
     expect(dialog).toHaveAttribute("data-stage", "review");
     expect(within(dialog).queryByText(/Nothing was sent/)).toBeNull();
+    showSkipped(dialog);
     const rowFor = (scope: HTMLElement, name: string) => within(scope).getAllByTestId("agent-cards-batch-entry").filter((row) => within(row).queryByText(name, { exact: true }));
     const included = rowFor(dialog, "remote-coder");
     expect(included).toHaveLength(1);
@@ -533,6 +541,7 @@ describe("batch card actions (#2399)", () => {
     await act(async () => { fireEvent.click(selectionAction("Go ahead")); });
     const dialog = screen.getByTestId("agent-cards-batch-confirm");
     expect(dialog).toHaveAttribute("data-stage", "review");
+    showSkipped(dialog);
     const rowFor = (scope: HTMLElement, name: string) => within(scope).getAllByTestId("agent-cards-batch-entry").filter((row) => within(row).queryByText(name, { exact: true }));
     const skipped = rowFor(dialog, "local-coder");
     expect(skipped).toHaveLength(1);
@@ -681,6 +690,7 @@ describe("batch card actions (#2399)", () => {
     const prompts = within(dialog).getAllByTestId("agent-cards-batch-prompt");
     expect(prompts.map((node) => node.textContent)).toEqual([SAME]);
     for (const name of ["root", "child"]) expect(within(dialog).getByText(name, { exact: true })).toBeInTheDocument();
+    showSkipped(dialog);
     expect(within(dialog).getByText(SKIPPED.message!)).toBeInTheDocument();
     await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
     expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({
@@ -712,8 +722,53 @@ describe("batch card actions (#2399)", () => {
     for (const [name, text] of [["root", SAME], ["child", SAME], ["outside", OTHER]] as const) {
       expect(quotationOf(name), `${name} is shown with exactly its own text`).toEqual(new Set([text]));
     }
+    showSkipped(dialog);
     expect(within(dialog).getByText(SKIPPED.message!)).toBeInTheDocument();
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Start a batch whose preview skips 200 agents for two reasons, 150 that do not offer Go ahead and 50 that are not running. The confirmation shows one line, "200 skipped: 150 don't offer Go ahead, 50 aren't running", as a collapsed disclosure button; pressing it expands the full list grouped by reason, every name listed, and pressing it again collapses it.
+  it("desktop/agent-cards/092: hundreds of skipped agents are one collapsed line, counted by reason, that expands grouped by reason", async () => {
+    const offerless: BatchEntry[] = Array.from({ length: 150 }, (_, at) => ({ pane_id: `pane-x${at}`, agent_id: `x${at}`, name: `nogo-${at}`, outcome: "skipped", code: "unknown_action", message: `nogo-${at}'s card does not offer this action` }));
+    const stopped: BatchEntry[] = Array.from({ length: 50 }, (_, at) => ({ pane_id: `pane-s${at}`, agent_id: `s${at}`, name: `halted-${at}`, outcome: "skipped", code: "agent_stopped", message: "the agent is not running" }));
+    setup({ preview: [...INCLUDED, ...offerless, ...stopped] });
+    const dialog = await startSelectedBatch();
+    const toggle = within(dialog).getByRole("button", { name: "200 skipped: 150 don't offer Go ahead, 50 aren't running" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(within(dialog).queryByText("nogo-0", { exact: true })).toBeNull();
+    expect(within(dialog).queryByText("halted-49", { exact: true })).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const groups = within(dialog).getAllByTestId("agent-cards-batch-skipped-group");
+    expect(groups.map((group) => group.getAttribute("data-reason"))).toEqual(["unknown_action", "agent_stopped"]);
+    expect(within(groups[0]).getByRole("heading", { name: "150 don't offer Go ahead" })).toBeInTheDocument();
+    expect(within(groups[1]).getByRole("heading", { name: "50 aren't running" })).toBeInTheDocument();
+    expect(within(groups[0]).getAllByTestId("agent-cards-batch-entry")).toHaveLength(150);
+    expect(within(groups[1]).getAllByTestId("agent-cards-batch-entry")).toHaveLength(50);
+    expect(within(groups[1]).getByText("halted-49", { exact: true })).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(within(dialog).queryByTestId("agent-cards-batch-skipped-group")).toBeNull();
+  });
+
+  /// Scenario: Start a batch whose preview includes 30 agents that all get the same text. The text is quoted once, the first names are listed with a "+N more" button collapsed under them, and pressing it lists all 30 names; Send still sends to all 30.
+  it("desktop/agent-cards/093: a long included list shows the first names and a +N more that expands, and Send still reaches every agent", async () => {
+    const SAME = "SAME-MANY-2399: proceed.";
+    const many: BatchEntry[] = Array.from({ length: 30 }, (_, at) => ({ pane_id: `pane-m${at}`, agent_id: `m${at}`, name: `many-${at}`, outcome: "included", prompt: SAME, action_token: `tok-m${at}`, instance_id: INSTANCE }));
+    const calls = setup({ preview: many });
+    const dialog = await startSelectedBatch();
+    expect(within(dialog).getAllByTestId("agent-cards-batch-prompt").map((node) => node.textContent)).toEqual([SAME]);
+    const shown = within(dialog).getAllByTestId("agent-cards-batch-entry");
+    expect(shown.length).toBeLessThanOrEqual(10);
+    expect(shown.length).toBeGreaterThan(0);
+    const more = within(dialog).getByRole("button", { name: `+${30 - shown.length} more` });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    expect(within(dialog).queryByText("many-29", { exact: true })).toBeNull();
+    fireEvent.click(more);
+    expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(30);
+    expect(within(dialog).getByText("many-29", { exact: true })).toBeInTheDocument();
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", entries: many.map(({ pane_id, agent_id, action_token, instance_id }) => ({ pane_id, agent_id, action_token, instance_id })) }));
   });
 
   /// Scenario: Start a batch whose preview gives the root and the child the same exact text, the root's written by the catalog and the child's by its agent. The confirmation quotes the text once, then lists both agents, and the child's row still carries the badge saying its agent wrote the text (issue #2399 review 9).

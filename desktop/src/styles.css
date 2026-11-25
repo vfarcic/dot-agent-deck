@@ -2381,6 +2381,16 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-batch-entry.is-unknown { border-color: var(--amber-rim); }
 .agent-cards-batch-entry.is-unknown .agent-cards-batch-outcome { color: var(--amber); }
 .agent-cards-batch-reason, .agent-cards-batch-what { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
+/* PR #2491 decision 2026-11-25 — the skipped agents fold into one line counting them by reason, a disclosure that lists them grouped by reason; past ten included agents, the names after the first few fold behind "+N more". */
+.agent-cards-batch-skipped { display: grid; gap: 8px; min-width: 0; }
+.agent-cards-batch-skipped-toggle, .agent-cards-batch-more { justify-self: start; display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--ink); font: inherit; font-size: var(--text-sm); text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.agent-cards-batch-skipped-toggle:hover, .agent-cards-batch-more:hover { border-color: var(--teal); background: var(--teal-soft); }
+.agent-cards-batch-skipped-toggle:focus-visible, .agent-cards-batch-more:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 2px; }
+.agent-cards-batch-chevron { flex: none; transition: transform .12s ease; }
+.agent-cards-batch-skipped-toggle[aria-expanded="true"] .agent-cards-batch-chevron { transform: rotate(90deg); }
+.agent-cards-batch-skipped-list { display: grid; gap: 10px; min-width: 0; }
+.agent-cards-batch-skipped-group { display: grid; gap: 6px; min-width: 0; }
+.agent-cards-batch-skipped-group h4 { margin: 0; font-size: var(--text-sm); color: var(--muted); }
 .agent-cards-batch-prompt { min-width: 0; }
 .agent-cards-batch-error { margin: 0; color: var(--red); overflow-wrap: anywhere; }
 .agent-cards-batch-buttons { flex: none; padding: 10px 16px 14px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--line); }

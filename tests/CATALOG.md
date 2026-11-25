@@ -17733,6 +17733,20 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** with one card ticked on each of two daemons and the local card offering an action the remote one does not, the local daemon's next answer without batches removes that card's checkbox, the bar's count drops to 1 and its local-only action goes, and an action from the bar previews only the remote daemon; with only the local card ticked and focus on Clear, that daemon losing batches removes the bar and leaves focus on the dashboard's scroll region; batches coming back do not tick the card again (PR #2491 review).
 - **Does not assert:** the scroll position or the next `Tab`, which jsdom does not lay out (`089`).
 
+##### desktop/agent-cards/092 — Hundreds of skipped agents are one collapsed line, counted by reason, that expands grouped by reason.
+
+- **Test:** vitest `desktop/agent-cards/092: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed batch bridge.
+- **Asserts:** a preview skipping 150 agents that do not offer the action and 50 that are not running shows one disclosure button, "200 skipped: 150 don't offer Go ahead, 50 aren't running", collapsed (`aria-expanded="false"`) with no skipped name listed; pressing it lists them in two groups headed "150 don't offer Go ahead" and "50 aren't running", every agent listed under its reason; pressing it again folds the list (PR #2491 decision 2026-11-25).
+- **Does not assert:** the wording for codes other than those two, or the layout.
+
+##### desktop/agent-cards/093 — A long included list shows the first names and a +N more that expands, and Send still reaches every agent.
+
+- **Test:** vitest `desktop/agent-cards/093: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom), `AgentOverview` with a stubbed batch bridge.
+- **Asserts:** with 30 included agents sharing one text, the text is quoted once and at most 10 names are listed with a collapsed "+N more" button counting the rest; pressing it lists all 30; Send executes all 30 previewed entries (PR #2491 decision 2026-11-25).
+- **Does not assert:** how many names show before the fold beyond "at most 10".
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
