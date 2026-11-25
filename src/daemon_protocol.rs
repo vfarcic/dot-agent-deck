@@ -1286,6 +1286,27 @@ pub const CAP_KEEP_WORKTREE: &str = "keep-worktree";
 /// platform: none of the three arms is `#[cfg]`-gated.
 pub const CAP_AGENT_CARDS: &str = "agent-cards";
 
+/// Capability string for issue #2418's card tree: the optional `parent`,
+/// `rollup` and `checked_refs` of each [`crate::agent_cards::AgentCardEntry`]
+/// that [`AttachRequest::ListAgentCards`] answers, and the list's order (each
+/// card before the cards under it, in spawn order). No new verb and no
+/// [`PROTOCOL_VERSION`] bump: the fields are additive and optional, and an
+/// older daemon simply sends none. A client draws the tree only when the
+/// `Hello` on the list's connection named this
+/// ([`crate::daemon_client::DaemonClient::list_agent_cards_tree`]), and
+/// otherwise draws every card as a root. Advertised on every platform.
+pub const CAP_AGENT_CARDS_TREE: &str = "agent-cards-tree";
+
+/// Capability string for [`AttachRequest::AgentOpened`] (issue #2454): a
+/// client tells the daemon the user opened an agent's pane, which deals with
+/// the `waiting`, `done` or `failed` reason the agent's card report raised.
+/// Sent only by [`crate::daemon_client::DaemonClient::agent_opened`], after a
+/// `Hello` on the same connection named this, so no [`PROTOCOL_VERSION`]
+/// bump: an older daemon is sent nothing, and its cards keep the reason until
+/// the agent publishes again, as before. Advertised on every platform: the
+/// arm is not `#[cfg]`-gated.
+pub const CAP_AGENT_OPENED: &str = "agent-opened";
+
 /// Capability string for [`AttachRequest::ListOutcomes`] (PRD #1666 part 3,
 /// round 5, plan D10): the deck's recovery rows — reports and dispatch results
 /// set aside because their recipient was gone. Sent only by
@@ -1293,6 +1314,27 @@ pub const CAP_AGENT_CARDS: &str = "agent-cards";
 /// `Hello` on the connection that carries it, so no [`PROTOCOL_VERSION`]
 /// bump. Advertised on every platform.
 pub const CAP_DECK_OUTCOMES: &str = "deck-outcomes";
+
+/// Capability string for PRD #1790 stage 2's interrupted work verbs:
+/// [`AttachRequest::ListInterruptedWork`], [`AttachRequest::ShowInterrupted`],
+/// [`AttachRequest::ReclaimInterrupted`] and
+/// [`AttachRequest::DismissInterrupted`]. Each is withheld by
+/// [`crate::daemon_client::DaemonClient`] unless a fresh `Hello` on the
+/// connection that carries it named this, so no [`PROTOCOL_VERSION`] bump.
+/// Advertised on every platform: none of the four arms is `#[cfg]`-gated, and
+/// reclaim runs Git, which every platform has.
+pub const CAP_INTERRUPTED_WORK: &str = "interrupted-work";
+
+/// Capability string for PRD #1790 stage 3's restore verbs:
+/// [`AttachRequest::RestoreInterrupted`] and
+/// [`AttachRequest::StartOverInterrupted`]. Each is withheld by
+/// [`crate::daemon_client::DaemonClient`] unless a fresh `Hello` on the
+/// connection that carries it named this and [`CAP_INTERRUPTED_WORK`], so no
+/// [`PROTOCOL_VERSION`] bump. Advertised on Unix only: a restore resumes an
+/// agent through the launch shim, which has no Windows form. Advertised
+/// whatever the experimental flag says: restore is not behind the flag in any
+/// client (issue #2494), and nothing in the daemon reads it.
+pub const CAP_RESTORE_AGENTS: &str = "restore-agents";
 
 /// Capability string for [`AttachRequest::AddressedMessage`] (issue #1947):
 /// message an orchestration's orchestrator, or a folder's one standalone
@@ -1501,7 +1543,11 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
+    CAP_AGENT_CARDS_TREE,
+    CAP_INTERRUPTED_WORK,
+    CAP_RESTORE_AGENTS,
     CAP_REARM_ORCHESTRATOR,
+    CAP_AGENT_OPENED,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1532,7 +1578,10 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
+    CAP_AGENT_CARDS_TREE,
+    CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
+    CAP_AGENT_OPENED,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1884,6 +1933,16 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // a stale one, where an older daemon kept the latest.
     // `changelog.d/1395.breaking.md` is its fragment.
     "1395-fixed-path-context-mirror-retired",
+    // Issue #2485, without moving `PROTOCOL_VERSION` -- the #2260 shape. A
+    // dispatched unit's fourth to twentieth different terminal `work-done`
+    // after its first report was refused `report_updates_exhausted` and
+    // delivered nothing; it is now accepted and delivered as a numbered
+    // update, and from the fourth on that update's post tells the dispatcher
+    // the unit may be looping. The refusal moved to the twenty-first. Nothing
+    // on the wire moved; what moved is which of the same requests a daemon
+    // delivers.
+    // `changelog.d/2485.breaking.md` is its fragment.
+    "2485-work-done-update-limit-raised",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -2526,6 +2585,111 @@ pub enum AttachRequest {
     /// **Withheld unless the daemon advertises [`CAP_DECK_OUTCOMES`]** on the
     /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
     ListOutcomes,
+    /// PRD #1790 stage 2: the interrupted work list — work a daemon restart
+    /// (or a gone caller, decision D3) left behind, derived from the work
+    /// journal. With `git`, each item carries live Git and pull request facts
+    /// ([`crate::interrupted_work::GitFacts`]), each bounded. Answered with
+    /// [`AttachResponse::interrupted_work`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_INTERRUPTED_WORK`]** on
+    /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    ListInterruptedWork {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        git: bool,
+    },
+    /// PRD #1790 stage 2: one interrupted item (by id, or its unique name,
+    /// branch or id suffix) and the bodies of its kept reports, bounded and
+    /// framed as untrusted text: the first ones, or with `report` that one of
+    /// the item's reports (any of them, however many it has), or with
+    /// `reports_from` one page of them. Answered with
+    /// [`AttachResponse::interrupted_item`]; an id that matches no item, or a
+    /// `report` that is not one of the item's, is an error response.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_INTERRUPTED_WORK`]** on
+    /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    ShowInterrupted {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
+        /// A page of the item's kept reports: the entries from its
+        /// `reports_from`-th report on, at most
+        /// [`crate::interrupted_work::MAX_SHOWN_REPORTS`], with their bodies
+        /// unless `report` names one. The answer's `next_reports_from` says
+        /// where the next page starts. Additive and optional.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reports_from: Option<usize>,
+    },
+    /// PRD #1790 stage 2: remove an interrupted item's worktree and keep its
+    /// branch, or with `dry_run` say what that would do. Refused for an agent
+    /// caller (a request carrying `caller`, decision D4). Answered with
+    /// [`AttachResponse::interrupted_reclaim`]; every refusal is a report on
+    /// an `ok` response.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_INTERRUPTED_WORK`]** on
+    /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    ReclaimInterrupted {
+        id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+    },
+    /// PRD #1790 stage 2: stop listing the interrupted items `ids` name, or
+    /// every listed item with `all` (exactly one of the two). Refused for an
+    /// agent caller (decision D4). Answered with
+    /// [`AttachResponse::interrupted_dismiss`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_INTERRUPTED_WORK`]** on
+    /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    DismissInterrupted {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+    },
+    /// PRD #1790 stage 3: bring an interrupted item's agents back with their
+    /// conversations — `agents` names their attempts, empty for every agent
+    /// of the item a restore is offered for — each posted `mode`'s restart
+    /// note once it confirmed its conversation; with `dry_run`, every check
+    /// and nothing started. Refused for an agent caller. Answered, once each
+    /// agent confirmed or was stopped, with
+    /// [`AttachResponse::interrupted_restore`]; every refusal is a report on
+    /// an `ok` response. See [`crate::agent_restore`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RESTORE_AGENTS`]** on the
+    /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    RestoreInterrupted {
+        id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+    },
+    /// PRD #1790 stage 3: start an interrupted item's agent (`agent`, its
+    /// attempt) over, without its conversation, in the folder it ran in, a
+    /// dispatched unit's saved task posted as its first message; with
+    /// `dry_run`, every check and nothing started. Refused for an agent
+    /// caller. Answered with [`AttachResponse::interrupted_start_over`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RESTORE_AGENTS`]** on the
+    /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    StartOverInterrupted {
+        id: String,
+        agent: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+        /// The calling agent's pane claim. Absent: a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerClaim>,
+    },
     CloseAgents {
         selector: CloseSelector,
         /// The calling agent's pane claim. Absent: a person.
@@ -3497,6 +3661,20 @@ pub enum AttachRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Issue #2454: the user opened the agent in `pane_id` — its pane in the
+    /// desktop app's overlay or full window, or in the TUI. That deals with
+    /// the `waiting`, `done` or `failed` reason its card report raised, so
+    /// the card stops needing the user until the agent publishes again.
+    /// `agent_id`, when given, names the generation the client showed: the
+    /// daemon does nothing when the pane's current agent is another. The
+    /// answer is a plain `ok`, whether or not a card changed. **Withheld
+    /// unless the daemon advertises [`CAP_AGENT_OPENED`]** on the connection
+    /// that carries it, so no [`PROTOCOL_VERSION`] bump.
+    AgentOpened {
+        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+    },
     /// PRD #1666 part 3 (Q35-14b, OQ10): the `e2e` build's control of an
     /// installed generation's arm page: `operation` `publish` or `withdraw`
     /// puts up or takes back its one test liability through the records and
@@ -4307,6 +4485,18 @@ pub struct AttachResponse {
     /// cannot answer the question at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration_roles: Option<Vec<crate::state::OrchestrationRoleRecord>>,
+    /// Issue #1965: the orchestration roles whose agent exited on its own and
+    /// whose pane nobody closed yet ([`crate::agent_pty::AgentPtyRegistry::ended_roles`]),
+    /// with how each pane ended and the last lines it showed. Populated on the
+    /// [`AttachRequest::ListAgents`] reply, beside the live records that no
+    /// longer list them, so a client can show which role died and why instead
+    /// of dropping it.
+    ///
+    /// Additive and optional, so no [`PROTOCOL_VERSION`] bump: an older client
+    /// ignores the key, and a client reading an older daemon's reply gets
+    /// `None` and shows what it showed before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_roles: Option<Vec<crate::ended_role::EndedRole>>,
     /// Issue #1637: the agents whose hooks run a `dot-agent-deck` older than
     /// this daemon (or that this deck could not install hooks for, issue
     /// #1157), with what to do about each. Set on the [`AttachRequest::Hello`]
@@ -4510,6 +4700,32 @@ pub struct AttachResponse {
     /// Additive and optional, and its request is capability-gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addressed_message: Option<crate::orchestrator_address::AddressedMessageReport>,
+    /// PRD #1790 stage 2: the answer to [`AttachRequest::ListInterruptedWork`].
+    /// `None` on every other response. Additive and optional, and its request
+    /// is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_work: Option<crate::interrupted_work::InterruptedList>,
+    /// PRD #1790 stage 2: the answer to [`AttachRequest::ShowInterrupted`].
+    /// Additive and optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_item: Option<crate::interrupted_work::InterruptedShow>,
+    /// PRD #1790 stage 2: the answer to [`AttachRequest::ReclaimInterrupted`].
+    /// Additive and optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_reclaim: Option<crate::interrupted_work::ReclaimOutcome>,
+    /// PRD #1790 stage 2: the answer to [`AttachRequest::DismissInterrupted`].
+    /// Additive and optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_dismiss: Option<crate::interrupted_work::DismissOutcome>,
+    /// PRD #1790 stage 3: the answer to [`AttachRequest::RestoreInterrupted`].
+    /// Additive and optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_restore: Option<crate::interrupted_work::RestoreOutcome>,
+    /// PRD #1790 stage 3: the answer to
+    /// [`AttachRequest::StartOverInterrupted`]. Additive and optional, and its
+    /// request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_start_over: Option<crate::interrupted_work::StartOverOutcome>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -7115,6 +7331,8 @@ async fn handle_connection(
             crate::agent_pty::attach_project_config_exists(&mut records).await;
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
+            // Issue #1965: the roles the live records above no longer list.
+            resp.ended_roles = Some(registry.ended_roles());
             // Issue #887: the client's only observable of the schedule seed the
             // daemon's project list draws on. See `AttachResponse::schedule_revision`.
             resp.schedule_revision = Some(scheduler.revision());
@@ -8044,6 +8262,116 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
+        AttachRequest::ListInterruptedWork { git } => {
+            // PRD #1790 stage 2: a fresh, complete read every time, on the
+            // blocking pool — see `crate::interrupted_work_daemon`.
+            let resp = match crate::interrupted_work_daemon::list(&registry, git).await {
+                Ok(list) => AttachResponse {
+                    interrupted_work: Some(list),
+                    ..AttachResponse::ok()
+                },
+                Err(message) => AttachResponse::err(message),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::ShowInterrupted {
+            id,
+            report,
+            reports_from,
+        } => {
+            let resp = match crate::interrupted_work_daemon::show_page(
+                &registry,
+                id,
+                report,
+                reports_from,
+            )
+            .await
+            {
+                Ok(shown) => AttachResponse {
+                    interrupted_item: Some(shown),
+                    ..AttachResponse::ok()
+                },
+                Err(message) => AttachResponse::err(message),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::ReclaimInterrupted {
+            id,
+            dry_run,
+            caller,
+        } => {
+            // Every refusal, an agent caller's included, is a report on an
+            // `ok` response, as `CloseAgents`' are.
+            let outcome =
+                crate::interrupted_work_daemon::reclaim(&registry, id, dry_run, caller.as_ref())
+                    .await;
+            let resp = AttachResponse {
+                interrupted_reclaim: Some(outcome),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::DismissInterrupted { ids, all, caller } => {
+            let outcome =
+                crate::interrupted_work_daemon::dismiss(&registry, ids, all, caller.as_ref()).await;
+            let resp = AttachResponse {
+                interrupted_dismiss: Some(outcome),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::RestoreInterrupted {
+            id,
+            agents,
+            mode,
+            dry_run,
+            caller,
+        } => {
+            // PRD #1790 stage 3: every check again, then start, confirm and
+            // deliver, or stop and refuse — see `crate::agent_restore`.
+            let outcome = crate::agent_restore::restore(
+                crate::agent_restore::Daemon {
+                    registry: &registry,
+                    state: &state,
+                    event_tx: &event_tx,
+                },
+                id,
+                agents,
+                mode,
+                dry_run,
+                caller.as_ref(),
+            )
+            .await;
+            let resp = AttachResponse {
+                interrupted_restore: Some(outcome),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::StartOverInterrupted {
+            id,
+            agent,
+            dry_run,
+            caller,
+        } => {
+            let outcome = crate::agent_restore::start_over(
+                crate::agent_restore::Daemon {
+                    registry: &registry,
+                    state: &state,
+                    event_tx: &event_tx,
+                },
+                id,
+                agent,
+                dry_run,
+                caller.as_ref(),
+            )
+            .await;
+            let resp = AttachResponse {
+                interrupted_start_over: Some(outcome),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
         AttachRequest::CloseAgents {
             selector,
             caller,
@@ -8266,6 +8594,11 @@ async fn handle_connection(
                 ..AttachResponse::ok()
             };
             write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::AgentOpened { pane_id, agent_id } => {
+            crate::agent_cards::agent_opened(&registry, &state, &pane_id, agent_id.as_deref())
+                .await;
+            write_resp(&mut stream, &AttachResponse::ok()).await?
         }
         AttachRequest::AgentCardCatalog => {
             let catalog = registry.agent_cards().catalog();

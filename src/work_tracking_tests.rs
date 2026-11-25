@@ -1412,6 +1412,62 @@ fn a_scheduled_issue_dispatch_closes_with_what_it_started_or_leaves_nothing() {
     assert_eq!(tracker.book_sizes().launches, 0);
 }
 
+/// PR #2431 round 5: a launch this daemon's shutdown cut short is kept open
+/// once something of it was written — a scheduled issue dispatch's pane, or
+/// a dispatch's orchestration, whose held `opened` is written now — so the
+/// next daemon lists it as interrupted work. One that wrote nothing is
+/// forgotten, as a failed launch is, and answers that nothing was kept.
+#[test]
+fn a_launch_the_shutdown_cut_short_stays_open_once_something_of_it_was_written() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let fire = tracker.open(Launch::ScheduleFire, None, Refs::default(), None);
+
+    // A scheduled issue dispatch whose single agent came up.
+    let single = issue_launch(&tracker, fire.as_ref());
+    tracker
+        .resolve_spawn(Some(&single), Some("i-1"), None, None)
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&single, "1", Some("i-1"), None);
+    assert!(tracker.launch_interrupted(&single));
+    tracker.pane_closed("i-1");
+    assert_eq!(
+        kinds_of(&lines(&tracker, state.path()), &single),
+        ["opened", "attempt_started"],
+        "no `closed`, even when its pane goes"
+    );
+
+    // A dispatch whose orchestration's first role came up before its unit
+    // was registered: its own `opened`, still held, is written.
+    let team = tracker
+        .dispatch_minted(None, "agent/dispatch-team", Path::new("/tmp/team"))
+        .unwrap();
+    let orch = tracker
+        .resolve_spawn(
+            Some(&team),
+            Some("o-1"),
+            Some(&orchestration("orch-cut", "orchestrator")),
+            None,
+        )
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&orch, "2", Some("o-1"), Some("orchestrator"));
+    assert!(tracker.launch_interrupted(&team));
+    let read = lines(&tracker, state.path());
+    assert_eq!(kinds_of(&read, &team), ["opened"]);
+    assert_eq!(kinds_of(&read, &orch), ["opened", "attempt_started"]);
+
+    // Nothing started: nothing written, nothing kept.
+    let quiet = tracker
+        .dispatch_minted(None, "agent/dispatch-quiet", Path::new("/tmp/quiet"))
+        .unwrap();
+    assert!(!tracker.launch_interrupted(&quiet));
+    assert!(kinds_of(&lines(&tracker, state.path()), &quiet).is_empty());
+    let sizes = tracker.book_sizes();
+    assert_eq!((sizes.launches, sizes.pending_units), (0, 0));
+}
+
 /// Qodo finding 1 (second round) on PR #2248: a `dispatch` with no caller
 /// spawns without registering a unit, so no unit's end can close its work.
 /// It closes with what it spawned instead: a single agent's pane, or the
@@ -1838,6 +1894,9 @@ fn launch_records_are_kept_while_the_read_skipped_an_unknown_kind() {
         orchestration: None,
         orchestration_id: None,
         ts_ms: 0,
+        pid: None,
+        pid_start: None,
+        launch_nonce: None,
     };
     crate::launch_records::write(state.path(), &record).unwrap();
     let planted = state
@@ -1902,6 +1961,52 @@ async fn a_spawn_without_a_folder_records_the_home_it_started_in() {
     assert_eq!(
         listed.cwd, None,
         "the registry's cwd is what the caller gave"
+    );
+    registry.shutdown_all();
+}
+
+/// PRD #1790 round 7 (B1): a restore's launch nonce, handed to the spawn in
+/// its environment, is written to the agent's launch record and taken out of
+/// the environment the registry keeps for a respawn, so a later generation
+/// of the pane does not carry it. A spawn without one records none.
+#[tokio::test]
+async fn a_launch_nonce_goes_to_the_launch_record_and_not_to_a_respawn() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let nonce = "00112233445566778899aabbccddeeff";
+    let agent = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), "nonce-pane".to_string()),
+                (
+                    crate::launch_records::ENV_LAUNCH_NONCE.to_string(),
+                    nonce.to_string(),
+                ),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "plain-pane".to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+    let records = crate::launch_records::read_all(state.path()).unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let with: Vec<_> = records
+        .iter()
+        .filter_map(|r| r.launch_nonce.as_deref())
+        .collect();
+    assert_eq!(with, vec![nonce], "only the restore's start carries it");
+    let kept = registry.spawn_env_of_for_test(&agent).expect("the agent");
+    assert!(
+        kept.iter()
+            .all(|(k, _)| k != crate::launch_records::ENV_LAUNCH_NONCE),
+        "not replayed by a respawn: {kept:?}"
     );
     registry.shutdown_all();
 }
@@ -2515,6 +2620,9 @@ fn pending_cleanup_reads_real_held_free_and_missing_run_locks() {
             orchestration: None,
             orchestration_id: None,
             ts_ms: crate::launch_records::now_ms(),
+            pid: None,
+            pid_start: None,
+            launch_nonce: None,
         },
     )
     .unwrap();

@@ -148,9 +148,11 @@ pub enum Hold {
     /// MEDIUM-B): a probe would open another editor in the person's pane.
     Editor,
     /// Codex's home lies inside a folder Codex's sandbox may write to (the
-    /// cwd, other than `<cwd>/.codex` itself, `/tmp` or `$TMPDIR`), or one
-    /// of those can't be resolved ([`codex_home_checkable`]): Codex would
-    /// write the box's file somewhere the deck doesn't read.
+    /// cwd or a root the launch adds with `writable_roots` or `--add-dir`,
+    /// other than that folder's own `.codex`, `/tmp` or `$TMPDIR`), or one
+    /// of those can't be resolved or read ([`codex_home_checkable`],
+    /// [`codex_writable_roots`]): Codex would write the box's file somewhere
+    /// the deck doesn't read.
     CodexHome,
     /// Codex's status line, on the frame the check would be admitted on,
     /// doesn't show the directory its session works in in a shape the deck
@@ -510,6 +512,10 @@ pub enum ClaudeEnvSource {
     File(PathBuf),
     /// A directory of `*.json` settings files (the managed drop-ins).
     DropIns(PathBuf),
+    /// A file whose `settings` member is a settings document whose `env`
+    /// Claude applies: the server-managed settings Claude Code caches for an
+    /// organisation sign-in ([`claude_settings_member_env`]).
+    SettingsMember(PathBuf),
 }
 
 /// What one read of a [`ClaudeEnvSource`] found, as far as Claude's
@@ -530,7 +536,9 @@ pub enum EnvRead {
     /// starting with [`DECK_ENV_PREFIX`] in any case, at any depth, a line
     /// comment ended by a lone carriage return, or one
     /// holding a line or paragraph separator. These are the forms found so
-    /// far, not every way two parsers can differ.
+    /// far, not every way two parsers can differ. Also a document naming a
+    /// policy helper ([`CLAUDE_POLICY_HELPER`]), whose `env` Claude computes
+    /// as it starts rather than reading it from any file.
     Suspect,
     /// The file or directory exists but can't be read.
     Unreadable(Unreadable),
@@ -578,17 +586,39 @@ pub type ClaudeEnvRead = Vec<(PathBuf, EnvRead)>;
 ///   server-managed settings Claude caches in
 ///   `$HOME/.claude/remote-settings.json`, a plain settings document (seen
 ///   on 2.1.319, which rewrote it at each start for an account whose
-///   organisation sends settings).
+///   organisation sends settings), and, since 2.1.330, the ones it caches
+///   for an organisation sign-in in `$HOME/.claude/state/hybrid-settings.json`
+///   (and the `-custom-oauth`, `-staging-oauth` and `-local-oauth` names it
+///   gives that file under other endpoints), whose `settings` member is the
+///   settings document ([`ClaudeEnvSource::SettingsMember`]).
+///
+/// What the deck leaves out, read from the pinned 2.1.318 and the installed
+/// 2.1.330 binaries' strings and run in a sandbox (issue #2131):
+///
+/// - the settings of an `--add-dir` directory: Claude reads its
+///   `.claude/settings.json` and `settings.local.json` for plugins,
+///   marketplaces, skills, agents and further directories, never for
+///   `env`, and with `{"env": {"VISUAL": …}}` in both, Ctrl+G opened the
+///   inherited editor on 2.1.318 and 2.1.330;
+/// - settings a policy helper (`policyHelper`, `policyHelpers`) computes as
+///   Claude starts, which no file holds: a managed settings file naming one
+///   is held instead ([`CLAUDE_POLICY_HELPER`]);
+/// - `remote-settings.json` at another path: the function that would move
+///   it is a stub in the public 2.1.318 and 2.1.330 builds, and the variable
+///   an internal build reads for it, `CLAUDE_CODE_REMOTE_SETTINGS_PATH`, is
+///   held ([`CLAUDE_MOVING_ENV`]).
 ///
 /// The flag source is a launch argument ([`claude_args_move_settings`]).
 /// [`Hold::Unmeasured`] as [`claude_keybindings_path`] holds (a
-/// `CLAUDE_CONFIG_DIR`, or no absolute `HOME`), and for a relative `cwd`.
+/// `CLAUDE_CONFIG_DIR`, or no absolute `HOME`), for a
+/// `CLAUDE_CODE_REMOTE_SETTINGS_PATH`, empty included, and for a relative
+/// `cwd`.
 pub fn claude_env_sources(
     env: impl Fn(&str) -> Option<OsString>,
     cwd: &Path,
 ) -> Result<Vec<ClaudeEnvSource>, Hold> {
     let keybindings = claude_keybindings_path(&env)?;
-    if !cwd.is_absolute() {
+    if env(CLAUDE_REMOTE_SETTINGS_PATH_ENV).is_some() || !cwd.is_absolute() {
         return Err(Hold::Unmeasured);
     }
     let config = keybindings
@@ -600,7 +630,7 @@ pub fn claude_env_sources(
         ClaudeEnvSource::File(config.join("cowork_settings.json")),
         ClaudeEnvSource::File(config.join(".config.json")),
     ];
-    for suffix in ["", "-custom-oauth", "-staging-oauth", "-local-oauth"] {
+    for suffix in CLAUDE_ENDPOINT_SUFFIXES {
         sources.push(ClaudeEnvSource::File(
             home.join(format!(".claude{suffix}.json")),
         ));
@@ -620,8 +650,25 @@ pub fn claude_env_sources(
     sources.push(ClaudeEnvSource::File(managed.join("managed-settings.json")));
     sources.push(ClaudeEnvSource::DropIns(managed.join("managed-settings.d")));
     sources.push(ClaudeEnvSource::File(config.join("remote-settings.json")));
+    for suffix in CLAUDE_ENDPOINT_SUFFIXES {
+        sources.push(ClaudeEnvSource::SettingsMember(
+            config
+                .join("state")
+                .join(format!("hybrid-settings{suffix}.json")),
+        ));
+    }
     Ok(sources)
 }
+
+/// The suffixes Claude Code gives its global config and its organisation
+/// sign-in's cached settings under its endpoints: none for the production
+/// one, then the custom-OAuth, staging and local ones.
+const CLAUDE_ENDPOINT_SUFFIXES: [&str; 4] = ["", "-custom-oauth", "-staging-oauth", "-local-oauth"];
+
+/// The variable an internal Claude Code build reads for where it caches its
+/// server-managed settings instead of `remote-settings.json`; the public
+/// 2.1.318 and 2.1.330 builds ignore it (issue #2131).
+const CLAUDE_REMOTE_SETTINGS_PATH_ENV: &str = "CLAUDE_CODE_REMOTE_SETTINGS_PATH";
 
 /// Whether a Claude Code launch's arguments (after the program) name a
 /// settings source the deck doesn't read: `--settings` (a file or inline
@@ -642,6 +689,14 @@ pub fn read_claude_env(sources: &[ClaudeEnvSource]) -> ClaudeEnvRead {
     for source in sources {
         match source {
             ClaudeEnvSource::File(path) => reads.push((path.clone(), claude_env_file(path))),
+            ClaudeEnvSource::SettingsMember(path) => reads.push((
+                path.clone(),
+                match read_source_within(path, CLAUDE_ENV_BYTES) {
+                    SourceRead::Absent => EnvRead::NoEnv,
+                    SourceRead::Unreadable(why) => EnvRead::Unreadable(why),
+                    SourceRead::Present { contents, .. } => claude_settings_member_env(&contents),
+                },
+            )),
             ClaudeEnvSource::DropIns(dir) => match std::fs::read_dir(dir) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     reads.push((dir.clone(), EnvRead::NoEnv));
@@ -778,14 +833,68 @@ pub fn claude_env_member(contents: &[u8]) -> EnvRead {
     }
 }
 
+/// The `env` of the settings document in the `settings` member of a
+/// [`ClaudeEnvSource::SettingsMember`] file, as [`claude_env_member`] reads
+/// a settings document: the whole file is first read as
+/// [`claude_env_member`] reads one, so a document it holds on
+/// ([`EnvRead::Suspect`], [`EnvRead::Unparsable`]) holds here too, and a
+/// member name it holds on anywhere in the file, `settings` included, makes
+/// it [`EnvRead::Suspect`]. No `settings` member, or an empty file, has no
+/// `env`; `settings` named twice is [`EnvRead::Unparsable`], and so is a
+/// `settings` that isn't an object (2.1.330 skips one, so this over-holds).
+pub fn claude_settings_member_env(contents: &[u8]) -> EnvRead {
+    match claude_env_member(contents) {
+        EnvRead::NoEnv | EnvRead::Env(_) => {}
+        held => return held,
+    }
+    let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
+    let Some(cleaned) = without_json_comments(contents) else {
+        return EnvRead::Suspect;
+    };
+    if cleaned
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        return EnvRead::NoEnv;
+    }
+    #[derive(serde::Deserialize)]
+    struct Wrapper<'a> {
+        #[serde(borrow)]
+        settings: Option<&'a serde_json::value::RawValue>,
+    }
+    match serde_json::from_slice::<Wrapper<'_>>(&cleaned) {
+        Ok(Wrapper { settings: None }) => EnvRead::NoEnv,
+        Ok(Wrapper {
+            settings: Some(settings),
+        }) => claude_env_member(settings.get().as_bytes()),
+        Err(_) => EnvRead::Unparsable,
+    }
+}
+
+/// The member names that configure a Claude Code policy helper: an
+/// executable Claude runs as it starts, whose output it applies as managed
+/// settings, `env` included (issue #2131). Run in a sandbox, 2.1.318 and
+/// 2.1.330 ran the helper named by `/etc/claude-code/managed-settings.json`
+/// (2.1.330 also from a `managed-settings.d` drop-in) and opened the
+/// `VISUAL` its output's `env` named on Ctrl+G, over an inherited `VISUAL`;
+/// 2.1.330 ran none named by `~/.claude/settings.json`, since Claude honours
+/// one only from its administrator's sources (the managed files, the
+/// server-managed settings, and on other systems a plist or registry key).
+/// No file holds what a helper returns, so the deck holds a document naming
+/// one, in any case, at any depth, in every file it reads
+/// ([`suspect_name`]), the user's own included.
+pub const CLAUDE_POLICY_HELPER: [&str; 2] = ["policyHelper", "policyHelpers"];
+
 /// Whether a member name is one [`claude_env_member`] holds on wherever it
-/// appears: `__proto__`, `VISUAL` or `EDITOR` in any case, or a name
-/// starting with [`DECK_ENV_PREFIX`] in any case.
+/// appears: `__proto__`, `VISUAL` or `EDITOR` in any case, a name starting
+/// with [`DECK_ENV_PREFIX`] in any case, or one of [`CLAUDE_POLICY_HELPER`]
+/// in any case.
 fn suspect_name(name: &str) -> bool {
     name == "__proto__"
         || EDITOR_ENV
             .iter()
-            .any(|editor| name.eq_ignore_ascii_case(editor))
+            .chain(&CLAUDE_POLICY_HELPER)
+            .any(|held| name.eq_ignore_ascii_case(held))
         || names_deck_variable(name.as_bytes())
 }
 
@@ -1013,9 +1122,13 @@ pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
 /// can move where Claude reads its configuration (the revcxfix2 review's
 /// LOW-1): `CLAUDE_CONFIG_DIR`, which in the pinned 2.1.318 moved where
 /// `keybindings.json` was read from (a `Ctrl+E` bound to the editor in the
-/// named folder's file opened it, measured in cxfix3's sandbox), and `HOME`,
-/// which there didn't but is held as well.
-pub const CLAUDE_MOVING_ENV: [&str; 2] = ["HOME", "CLAUDE_CONFIG_DIR"];
+/// named folder's file opened it, measured in cxfix3's sandbox), `HOME`,
+/// which there didn't but is held as well, and
+/// `CLAUDE_CODE_REMOTE_SETTINGS_PATH`, which an internal build reads for
+/// where it caches server-managed settings and the public builds ignore
+/// (issue #2131).
+pub const CLAUDE_MOVING_ENV: [&str; 3] =
+    ["HOME", "CLAUDE_CONFIG_DIR", CLAUDE_REMOTE_SETTINGS_PATH_ENV];
 
 /// The variables that, set in Codex's `$CODEX_HOME/.env`, can move the home
 /// Codex reads its key bindings and keeps its editor folder in, or the
@@ -2323,36 +2436,57 @@ pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
 
 /// Whether a Codex whose home is `home` (`$CODEX_HOME`, else `~/.codex`, as
 /// the bound native's own environment names it: [`codex_home`]), started in
-/// `cwd` with `tmpdir` its `TMPDIR`, can be checked at all (the user's
-/// ruling Q227b on the revcxact review's STOP-1 follow-up). Codex 0.164.0
-/// hands its editor a file in the first of `$CODEX_HOME`, `~/.codex` and
-/// `<cwd>/.codex` its own sandbox can't write, and the deck reads only
-/// `$CODEX_HOME/editor`. Under `workspace-write` the cwd, `/tmp` and
-/// `$TMPDIR` are writable, a project's own top-level `.codex` is kept
-/// read-only, so a home under any of them (other than `<cwd>/.codex`
-/// itself) sends the file elsewhere: the helper is refused the file's
-/// shape, exits 1, and Codex draws `Failed to open editor` at each check.
-/// This holds such a generation before any check, so no key is typed and
-/// no helper runs.
+/// `cwd` with `tmpdir` its `TMPDIR` and `roots` the folders its launch adds
+/// to what its sandbox may write ([`codex_writable_roots`]), can be checked
+/// at all (the user's ruling Q227b on the revcxact review's STOP-1
+/// follow-up, issue #2127). Codex hands its editor a file in the first of
+/// `$CODEX_HOME`, `~/.codex` and `<cwd>/.codex` its own sandbox can't
+/// write, and the deck reads only `$CODEX_HOME/editor`. Under
+/// `workspace-write` the cwd, each added root, `/tmp` and `$TMPDIR` are
+/// writable, and a root's own top-level `.codex` is kept read-only (for an
+/// added root, when it exists, as a home that resolves does), so a home
+/// under any of them, other than a root's `.codex` itself, sends the file
+/// elsewhere: the helper is refused the file's shape, exits 1, and Codex
+/// draws `Failed to open editor` at each check. This holds such a
+/// generation before any check, so no key is typed and no helper runs.
+/// Measured on Codex 0.164.0 (`--add-dir`, absolute and relative,
+/// `writable_roots` in `config.toml` and in `-c`, an added root's own
+/// `.codex`): `docs/develop/doorbell-admission.md`, the Codex activation's
+/// item 8.
 ///
 /// Paths are compared resolved (`canonicalize`, symlinks followed): a home
-/// reached through a symlink is judged where it lands. Any of them that
-/// can't be resolved, `TMPDIR` set but empty or relative included, holds.
-/// It accepts no new path: a home outside all three is still read only as
-/// `$CODEX_HOME/editor` by the export rule. What it doesn't see: Codex's
-/// `writable_roots`, `--add-dir` and sandbox mode (a home it holds can be
-/// one Codex's sandbox wouldn't write, under `read-only` or
-/// `danger-full-access`), which can only hold more or leave the case as it
-/// was.
+/// reached through a symlink is judged where it lands. The home, the cwd,
+/// `/tmp` or a `TMPDIR` that can't be resolved, `TMPDIR` set but empty or
+/// relative included, holds. An added root that doesn't exist can't hold
+/// an existing home and is passed over; one that exists and can't be
+/// resolved holds. It accepts no new path: a home outside all of them is
+/// still read only as `$CODEX_HOME/editor` by the export rule. What it
+/// doesn't see: Codex's sandbox mode (a home it holds can be one Codex's
+/// sandbox wouldn't write, under `read-only` or `danger-full-access`, or
+/// under `/tmp` with `exclude_slash_tmp`), its read-only carve-outs other
+/// than `.codex`, and a permissions profile (`default_permissions`), which
+/// can only hold more or leave the case as it was.
 pub fn codex_home_checkable(
     home: &Path,
     cwd: &Path,
     tmpdir: Option<&std::ffi::OsStr>,
+    roots: &[PathBuf],
 ) -> Result<(), Hold> {
     let resolve = |path: &Path| std::fs::canonicalize(path).map_err(|_| Hold::CodexHome);
     let home = resolve(home)?;
-    let cwd = resolve(cwd)?;
-    if home.starts_with(&cwd) && home != cwd.join(".codex") {
+    let editor = home.join(super::path_rule::CODEX_EDITOR_DIR);
+    let mut writable = vec![resolve(cwd)?];
+    for root in roots {
+        match std::fs::canonicalize(root) {
+            Ok(root) => writable.push(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Hold::CodexHome),
+        }
+    }
+    // A root inside the home's `editor` makes Codex skip the home as well.
+    if writable.iter().any(|root| {
+        (home.starts_with(root) && home != root.join(".codex")) || root.starts_with(&editor)
+    }) {
         return Err(Hold::CodexHome);
     }
     let mut temporary = vec![resolve(Path::new("/tmp"))?];
@@ -2369,6 +2503,124 @@ pub fn codex_home_checkable(
     Ok(())
 }
 
+/// The folders a Codex launch adds to what its sandbox may write, for
+/// [`codex_home_checkable`] (issue #2127): every
+/// `sandbox_workspace_write.writable_roots` in the launch's sources as the
+/// spawn read them (`read`, with their paths in `sources`) and in each
+/// `-c` of `args` (the bound agent's arguments after the program, so a
+/// launcher's own `-c` counts), and each `--add-dir` of `args`.
+///
+/// A union, not Codex's merge: a root one layer sets and a later one
+/// replaces is still held, which can only hold more. A path is taken as
+/// Codex resolves it, and where the deck can't tell which base Codex uses,
+/// under each it might: `~` and `~/…` from `home` (the bound agent's
+/// `HOME`; none to resolve them with holds), a relative path both under
+/// `cwd` and under the folder of the file that names it. A source that
+/// can't be read or parsed, a `writable_roots` that isn't a list of
+/// strings, and a `--add-dir` that isn't UTF-8 or is missing its value
+/// hold. A `writable_roots` under another table (a legacy
+/// `[profiles.<name>]`) is read too.
+pub fn codex_writable_roots(
+    sources: &CodexSources,
+    read: &CodexRead,
+    args: &[OsString],
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Result<Vec<PathBuf>, Hold> {
+    let mut roots = Vec::new();
+    let mut add = |path: &str, base: Option<&Path>| -> Result<(), Hold> {
+        let path = if path == "~" {
+            home.ok_or(Hold::CodexHome)?.to_path_buf()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            home.ok_or(Hold::CodexHome)?
+                .join(rest.trim_start_matches('/'))
+        } else {
+            PathBuf::from(path)
+        };
+        if path.is_absolute() {
+            roots.push(path);
+        } else {
+            roots.push(cwd.join(&path));
+            if let Some(base) = base {
+                roots.push(base.join(&path));
+            }
+        }
+        Ok(())
+    };
+    let files = std::iter::once((&sources.config, &read.config))
+        .chain(sources.profile.iter().zip(read.profile.iter()))
+        .chain(sources.projects.iter().zip(read.projects.iter()));
+    for (path, source) in files {
+        let table = match source {
+            SourceRead::Absent => continue,
+            SourceRead::Unreadable(why) => return Err(Hold::Unreadable(*why)),
+            SourceRead::Present { contents, .. } => std::str::from_utf8(contents)
+                .map_err(|_| Hold::Unparsable)?
+                .parse::<toml::Table>()
+                .map_err(|_| Hold::Unparsable)?,
+        };
+        for root in writable_roots_in(&table)? {
+            add(root, path.parent())?;
+        }
+    }
+    // The `-c` values, read as `CodexSources` reads them for the key
+    // bindings; the home it is given names only files this doesn't read.
+    for value in CodexSources::from_launch(cwd, args, Vec::new())?.overrides {
+        for root in writable_roots_in(&override_table(&value)?)? {
+            add(root, None)?;
+        }
+    }
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        let Some(arg) = arg.to_str() else {
+            if arg.to_string_lossy().starts_with("--add-dir") {
+                return Err(Hold::Unparsable);
+            }
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--add-dir" {
+            let value = words
+                .next()
+                .and_then(|v| v.to_str())
+                .ok_or(Hold::Unparsable)?;
+            add(value, None)?;
+        } else if let Some(value) = arg.strip_prefix("--add-dir=") {
+            add(value, None)?;
+        }
+    }
+    Ok(roots)
+}
+
+/// Every `writable_roots` list under a `sandbox_workspace_write` table in
+/// `table`, at any depth; one that isn't a list of strings, or a
+/// `sandbox_workspace_write` that isn't a table, holds as
+/// [`Hold::Unparsable`].
+fn writable_roots_in(table: &toml::Table) -> Result<Vec<&str>, Hold> {
+    let mut found = Vec::new();
+    for (key, value) in table {
+        let toml::Value::Table(inner) = value else {
+            if key == "sandbox_workspace_write" {
+                return Err(Hold::Unparsable);
+            }
+            continue;
+        };
+        if key == "sandbox_workspace_write"
+            && let Some(roots) = inner.get("writable_roots")
+        {
+            let toml::Value::Array(roots) = roots else {
+                return Err(Hold::Unparsable);
+            };
+            for root in roots {
+                found.push(root.as_str().ok_or(Hold::Unparsable)?);
+            }
+        }
+        found.extend(writable_roots_in(inner)?);
+    }
+    Ok(found)
+}
 /// [`codex_editor_is_helper`] for Claude Code, with its selection
 /// (`EditorSelection::ClaudeCode`, M22, M23): a non-empty `VISUAL`, else a
 /// non-empty `EDITOR`, else the first of `code`, `vi` and `nano` on `PATH`,

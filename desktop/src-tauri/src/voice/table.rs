@@ -1334,6 +1334,51 @@ mod tests {
                     "showDashboardCounters",
                     vec!["overview"]
                 ),
+                (
+                    "show_interrupted_work",
+                    "showInterruptedWork",
+                    vec!["overview"]
+                ),
+                (
+                    "reclaim_interrupted",
+                    "reclaimInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "dismiss_interrupted",
+                    "dismissInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "dismiss_all_interrupted",
+                    "dismissAllInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "show_interrupted_details",
+                    "showInterruptedDetails",
+                    vec!["overview"]
+                ),
+                (
+                    "show_interrupted_reports",
+                    "showInterruptedReports",
+                    vec!["overview"]
+                ),
+                (
+                    "next_interrupted_reports",
+                    "nextInterruptedReports",
+                    vec!["overview"]
+                ),
+                (
+                    "previous_interrupted_reports",
+                    "previousInterruptedReports",
+                    vec!["overview"]
+                ),
+                (
+                    "restore_interrupted",
+                    "askRestoreInterrupted",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -1377,21 +1422,26 @@ mod tests {
                 // Scrolling the agent dashboard, which no longer pages (issue
                 // #1492) — `overview`, plus `requires = ["new_agent_dialog_closed"]`.
                 // PRD #1401: and the page of a pull request open in the app.
+                // Issue #1673: and an open agent's pane.
                 (
                     "scroll_down",
                     "scrollDown",
-                    vec!["overview", "pull_request"]
+                    vec!["overview", "agent", "pull_request"]
                 ),
-                ("scroll_up", "scrollUp", vec!["overview", "pull_request"]),
+                (
+                    "scroll_up",
+                    "scrollUp",
+                    vec!["overview", "agent", "pull_request"]
+                ),
                 (
                     "scroll_to_top",
                     "scrollToTop",
-                    vec!["overview", "pull_request"]
+                    vec!["overview", "agent", "pull_request"]
                 ),
                 (
                     "scroll_to_bottom",
                     "scrollToBottom",
-                    vec!["overview", "pull_request"]
+                    vec!["overview", "agent", "pull_request"]
                 ),
                 // PRD #1401 — an agent's pull request in the app's own browser.
                 ("open_pr", "openPullRequest", vec!["overview", "agent"]),
@@ -1460,6 +1510,18 @@ mod tests {
                     "close_orchestration",
                     "confirmCloseOrchestration",
                     vec!["overview"]
+                ),
+                // Issue #2148: Retry and Cancel on a deck message, on the
+                // Daemons screen. Each only opens a confirmation.
+                (
+                    "retry_inbox_message",
+                    "confirmRetryInboxMessage",
+                    vec!["deck"]
+                ),
+                (
+                    "cancel_inbox_message",
+                    "confirmCancelInboxMessage",
+                    vec!["deck"]
                 ), // PRD #2374: the agent cards, on the dashboard only.
                 ("set_overview_mode", "setOverviewMode", vec!["overview"]),
                 ("show_agent_card", "showAgentCard", vec!["overview"]),
@@ -1472,6 +1534,14 @@ mod tests {
                     vec!["overview"]
                 ),
                 ("close_agent_card", "closeAgentCard", vec!["overview"]),
+                ("open_card_tree", "openCardTree", vec!["overview"]),
+                ("close_card_tree", "closeCardTree", vec!["overview"]),
+                (
+                    "open_card_pull_request",
+                    "openCardPullRequest",
+                    vec!["overview"]
+                ),
+                ("open_card_issue", "openCardIssue", vec!["overview"]),
                 ("run_card_action", "runCardAction", vec!["overview"]),
                 ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
             ]
@@ -2399,7 +2469,11 @@ mod tests {
                 "remind_star_later",
                 "dismiss_star_prompt",
                 "open_antigravity_issues",
-                "dismiss_antigravity_notice"
+                "dismiss_antigravity_notice",
+                // Issue #2148: Retry and Cancel on a deck message, where the
+                // tiles list the messages. Each only opens a confirmation.
+                "retry_inbox_message",
+                "cancel_inbox_message"
             ]
         );
         assert_eq!(
@@ -2415,6 +2489,15 @@ mod tests {
                 "add_daemon",
                 "show_host_metrics",
                 "show_dashboard_counters",
+                "show_interrupted_work",
+                "reclaim_interrupted",
+                "dismiss_interrupted",
+                "dismiss_all_interrupted",
+                "show_interrupted_details",
+                "show_interrupted_reports",
+                "next_interrupted_reports",
+                "previous_interrupted_reports",
+                "restore_interrupted",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -2453,6 +2536,10 @@ mod tests {
                 "next_needs_you_card",
                 "filter_needs_you_cards",
                 "close_agent_card",
+                "open_card_tree",
+                "close_card_tree",
+                "open_card_pull_request",
+                "open_card_issue",
                 "run_card_action",
                 "reply_to_agent_card"
             ]
@@ -2474,6 +2561,11 @@ mod tests {
                 "reading_on",
                 "reading_off",
                 "hush_reading",
+                // Issue #1673: the open pane's output, as PageUp / PageDown.
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 // PRD #1401: the open pane's agent's pull request, or the named agent's.
                 "open_pr",
                 // PRD #2174: the star reminder's buttons, which the reminder
@@ -2925,6 +3017,8 @@ mod tests {
                 ("stop_agent", "confirmStopAgent"),
                 ("generate_config", "confirmGenerateConfig"),
                 ("close_orchestration", "confirmCloseOrchestration"),
+                ("retry_inbox_message", "confirmRetryInboxMessage"),
+                ("cancel_inbox_message", "confirmCancelInboxMessage"),
             ]
         );
         for (id, _) in &asking {
@@ -2943,6 +3037,8 @@ mod tests {
                 row.screens,
                 if matches!(*id, "stop_agent" | "generate_config") {
                     vec![Screen::Overview, Screen::Agent]
+                } else if matches!(*id, "retry_inbox_message" | "cancel_inbox_message") {
+                    vec![Screen::Deck]
                 } else {
                     vec![Screen::Overview]
                 },
@@ -3148,7 +3244,8 @@ mod tests {
     /// `close_orchestration`, the row that stops several agents at once, whose
     /// verbs are also the words a user closes a view with, and PRD #1885's
     /// `approve_project_commands`, which approves project commands only when
-    /// the user said "approve".
+    /// the user said "approve", and issue #2148's `cancel_inbox_message`,
+    /// which cancels a deck message only when the user said "message".
     #[test]
     fn voice_table_conjunctive_rows_are_the_deliberate_set() {
         let conjunctive: Vec<(&str, Vec<&str>)> = super::table()
@@ -3178,7 +3275,10 @@ mod tests {
                         "all roles",
                         "all the roles"
                     ]
-                )
+                ),
+                // Issue #2148: "cancel" alone is `close`'s, which closes what
+                // is on top; cancelling a deck message names the message.
+                ("cancel_inbox_message", vec!["message", "messages"])
             ]
         );
     }
@@ -3238,7 +3338,8 @@ mod tests {
     /// agent references (`open_agent`, `open_pr`, `stop_agent`), the daemon
     /// a required `deck` may be read from ([`super::super::outcome`]'s
     /// `names_the_daemon`: `switch_deck`, `choose_deck`) and the daemon the
-    /// Host figures are asked for (`show_host_metrics`). A list anywhere else
+    /// Host figures and the interrupted work are asked for
+    /// (`show_host_metrics`, `show_interrupted_work`). A list anywhere else
     /// would be read by nothing.
     #[test]
     fn voice_table_action_words_are_the_reference_readers_set() {
@@ -3253,6 +3354,7 @@ mod tests {
             vec![
                 "open_agent",
                 "show_host_metrics",
+                "show_interrupted_work",
                 "switch_deck",
                 "open_pr",
                 "choose_deck",
@@ -3414,9 +3516,10 @@ mod tests {
     }
 
     /// Issue #1492: scrolling the agent dashboard, which no longer splits into
-    /// pages while voice is on. Pinned by value: no params, `overview` only,
-    /// and callable only while the New agent dialog is closed, since the
-    /// dashboard is what they scroll and the dialog covers it. Each one's
+    /// pages while voice is on. Pinned by value: no params, the dashboard, an
+    /// open agent's pane (issue #1673) and a pull request open in the app, and
+    /// callable only while the New agent dialog is closed, since the dashboard
+    /// is what they scroll and the dialog covers it. Each one's
     /// description names its direction's word, which is what the meaning
     /// check reads it by.
     #[test]
@@ -3446,10 +3549,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} is in the table"));
             assert_eq!(row.invoke, invoke, "{id}");
             // PRD #1401: and over a pull request open in the app, whose page
-            // they scroll.
+            // they scroll. Issue #1673: and over an open agent's pane.
             assert_eq!(
                 row.screens,
-                vec![Screen::Overview, Screen::PullRequest],
+                vec![Screen::Overview, Screen::Agent, Screen::PullRequest],
                 "{id}"
             );
             assert_eq!(
@@ -3468,7 +3571,7 @@ mod tests {
                 "{id}: under the New agent dialog"
             );
             assert!(!row.callable(Screen::Deck, None, None), "{id}");
-            assert!(!row.callable(Screen::Agent, None, None), "{id}");
+            assert!(row.callable(Screen::Agent, None, None), "{id}");
             assert!(row.callable(Screen::PullRequest, None, None), "{id}");
         }
     }

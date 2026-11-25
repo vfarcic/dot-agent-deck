@@ -1,7 +1,9 @@
-import type { DeckView } from "../types";
+import type { DeckView, InboxActionVerb } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 import type { CardStep, OverviewMode } from "./agentCards";
+import type { CardReferenceTarget } from "./prBrowser";
+import type { InterruptedDialogControls } from "./interruptedWork";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -111,7 +113,7 @@ import type { CardStep, OverviewMode } from "./agentCards";
  * that needed it would be a change to where the state lives rather than a
  * change to the table.
  */
-export type DeckOverlay = "projects" | "prompts" | "profiles" | "orchestration" | "settings";
+export type DeckOverlay = "projects" | "profiles" | "orchestration" | "settings";
 
 /** Issue #1492 — where a spoken scroll moves the agent dashboard: a screen down or up, or to either end. */
 export type DashboardScroll = "down" | "up" | "top" | "bottom";
@@ -416,6 +418,25 @@ export type VoiceActionContext = {
    */
   closeDashboardCounters: () => void;
   /**
+   * PRD #1790 stage 2 — open a daemon's "Interrupted work" dialog: what its
+   * banner's Show does. `deckId` is the daemon a row's `deck_ref` resolved
+   * to, or the banner's own; without one, the connected daemon when there is
+   * one, and with several, the one that lists work once each has been asked
+   * again (final reviewer 2). Answers `undefined` when it opened, or the
+   * sentence saying why not — later, as a promise, when it asked again first.
+   * **Served by the OVERVIEW**, which renders the banners.
+   */
+  showInterruptedWork: (deckId?: string) => string | undefined | Promise<string | undefined>;
+  /** PRD #1790 stage 2 — hide a daemon's interrupted work banner until it is another daemon process: records nothing. */
+  hideInterruptedWork: (deckId: string) => void;
+  /**
+   * PRD #1790 stage 2 — the open "Interrupted work" dialog's calls: reclaim,
+   * dismiss and dismiss all by every route, and its own buttons. Published by
+   * the overview while the dashboard is up; while no dialog is open each
+   * action answers the sentence that says to open it first.
+   */
+  interruptedDialog: InterruptedDialogControls;
+  /**
    * PRD #1223 — the New agent dialog's directory browser, by voice: go into
    * the child a `dir_ref` resolved to (`target.directoryPath`), go up to `..`,
    * or choose the directory on screen. Each calls the function the browser's
@@ -568,6 +589,17 @@ export type VoiceActionContext = {
    */
   confirmGenerateConfig: (target: VoiceDispatchTarget) => string | undefined;
   /**
+   * Issue #2148 — Retry or Cancel the deck messages waiting on the user for
+   * the agent an `agent_ref` resolved to, as the Daemons screen's tile lists
+   * them: OPEN a confirmation listing every message the verb covers, by
+   * sender and subject. Like the stops it only asks; the confirmation's
+   * button sends each Retry or Cancel, bound to the message revisions shown.
+   * Served by the deck screen, whose tiles draw the messages. Answers
+   * `undefined` when it opened the confirmation, or the sentence saying why
+   * it did not.
+   */
+  confirmInboxAction: (verb: InboxActionVerb, target: VoiceDispatchTarget) => string | undefined;
+  /**
    * PRD #1401 — open GitHub's page for one agent's pull request in the app's
    * own browser, over the screen. Answers `undefined` when it opened, or the
    * sentence saying why not (the agent has no pull request, or none the app
@@ -577,6 +609,13 @@ export type VoiceActionContext = {
    * pane and the overview's alike.
    */
   openPullRequest: (target: { deckId: string; agentId: string }) => string | undefined;
+  /**
+   * Issue #2418 — open the in-app browser on a pull request or issue a card's
+   * agent reported, at the address the deck checked. Served by the shell,
+   * which owns the browser; the overview reaches it through
+   * `OpenCardReference`, behind `openCardReference`.
+   */
+  openCheckedReference: (target: CardReferenceTarget) => string | undefined;
   /**
    * PRD #1401 — hand the page the browser is showing to the system browser,
    * and close the in-app one once the system browser has it: the toolbar's
@@ -608,14 +647,25 @@ export type VoiceActionContext = {
    */
   /** Show the dashboard as its table or as cards (remembered per window). */
   setOverviewMode: (mode: OverviewMode) => string | undefined;
-  /** Open one agent's card in the card overlay. */
-  showAgentCard: (target: AgentCardRef) => string | undefined;
+  /**
+   * Open one agent's card in the card overlay; with `section`, at that part of
+   * it (issue #2418 review: a card's `+N` opens it at its checked references).
+   */
+  showAgentCard: (target: AgentCardRef, section?: CardOverlaySection) => string | undefined;
   /** Move the open card overlay one card on or back, or to the next card that needs the user. */
   stepAgentCard: (step: CardStep) => string | undefined;
   /** Show only the cards that need the user, or every card. */
   setNeedsYouFilter: (on: boolean) => string | undefined;
   /** Close the card overlay. Published only while it is open, so `closeTopmost` can read its presence. */
   closeAgentCard: () => string | undefined;
+  /** Issue #2418 — open or close the tree under one card: the cards the daemon hung under it. Shows the Cards view. */
+  setCardTree: (target: AgentCardRef, open: boolean) => string | undefined;
+  /**
+   * Issue #2418 — open a pull request or issue one card's agent reported, as
+   * the deck checked it, in the app's GitHub browser: the one at `url` when
+   * given (the badge pressed), else the card's first checked one of `kind`.
+   */
+  openCardReference: (target: AgentCardRef, kind: "pull_request" | "issue", url?: string) => string | undefined;
   /**
    * Press one action of one card: by id from a button, by its label from
    * voice. A prompt action is sent; one that asks for confirmation, a close,
@@ -637,6 +687,9 @@ export type VoiceActionContext = {
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
 export type AgentCardRef = { deckId: string; agentId: string; incarnation?: string };
+
+/** A part of the card overlay a control can open it at. */
+export type CardOverlaySection = "references";
 
 /**
  * One registry entry.
@@ -673,6 +726,10 @@ export type VoiceActionEntry = {
   /** Why this capability is not a spoken command. Mutually exclusive with `voice`. */
   no_voice?: string;
 };
+
+/** PRD #1790 stage 2 — what voice says while a reclaim's dry run is checking, and once it has answered with nothing to read back. */
+export const INTERRUPTED_RECLAIM_CHECKING = "Checking what reclaiming it would do…";
+export const INTERRUPTED_RECLAIM_CHECKED = "Checked.";
 
 /** PRD #1401 — what voice says while the system browser is being handed the page. */
 export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
@@ -1051,9 +1108,12 @@ export const VOICE_ACTIONS = {
 
   /* Issue #1492 — scrolling the agent dashboard, which shows everything
      whether voice is on or off rather than a page at a time. A scroll changes
-     which part of the dashboard is showing and nothing else. */
+     which part of the dashboard is showing and nothing else. The shell routes
+     `scrollDashboard` to what is in front: a pull request open in the app,
+     else an open agent's pane (issue #1673, `lib/paneScroll.ts`), else the
+     dashboard. */
   scrollDown: {
-    label: "Scroll the agent dashboard down by about a screen",
+    label: "Scroll down by about a screen: the agent dashboard, an open agent's pane, or a pull request open in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1063,7 +1123,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollUp: {
-    label: "Scroll the agent dashboard up by about a screen",
+    label: "Scroll up by about a screen: the agent dashboard, an open agent's pane, or a pull request open in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1073,7 +1133,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToTop: {
-    label: "Scroll the agent dashboard to its top",
+    label: "Scroll to the top: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1083,7 +1143,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToBottom: {
-    label: "Scroll the agent dashboard to its bottom",
+    label: "Scroll to the bottom: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1099,13 +1159,6 @@ export const VOICE_ACTIONS = {
     no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it opens a picker over project paths the daemon supplies, and no resolver kind in the table can name one of them — a row could open the panel and then leave the user inside a list voice cannot choose from, which is a worse dead end than having no command. It becomes a candidate once a `project_ref` kind exists (PRD #1195 M4)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("projects"),
-  },
-
-  openPromptLibrary: {
-    label: "Open the prompt library",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), so by default a row would be a spoken door to a panel the app does not show; and with the flag on, it is a browse-and-edit surface whose operations — choosing, adding, editing and removing a stored prompt — have no rows in the table, so the command would open a panel and stop (PRD #1195 M4)",
-    needs: ["openOverlay"],
-    run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("prompts"),
   },
 
   openAgentProfiles: {
@@ -1218,6 +1271,197 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "showDashboardCounters">) => context.showDashboardCounters(),
   },
 
+  /* PRD #1790 stage 2 — a daemon's interrupted work: the banner's Show and
+     Hide, and the "Interrupted work" dialog's controls. Every button, key and
+     the restart notice's Show dispatch through these. Reclaim and dismiss
+     name their item by what the user said (`target.filterText`: an ordinal,
+     "the second one", or the item's name), or act on the selected row. */
+  showInterruptedWork: {
+    label: "Show a daemon's interrupted work",
+    voice: true,
+    needs: ["showInterruptedWork"],
+    run: (context: Pick<VoiceActionContext, "showInterruptedWork"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { preselectDeckId?: string }) => {
+      const refused = context.showInterruptedWork(target?.preselectDeckId || undefined);
+      /* With several daemons the dashboard asks each again first (final reviewer 2), and reports once they answer. */
+      if (refused instanceof Promise) void refused.then((later) => { if (later !== undefined) context.reportRefused?.(later); });
+      else if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  hideInterruptedWork: {
+    label: "Hide a daemon's interrupted work banner",
+    no_voice: "hides a notice for as long as this daemon process runs and records nothing, so a spoken hide would only remove the words that say there is interrupted work to look at; the person can leave the banner, or dismiss the items themselves, which voice reaches (`dismiss_interrupted`, `dismiss_all_interrupted`)",
+    needs: ["hideInterruptedWork"],
+    run: (context: Pick<VoiceActionContext, "hideInterruptedWork">, deckId: string) => context.hideInterruptedWork(deckId),
+  },
+
+  reclaimInterrupted: {
+    label: "Check what reclaiming an interrupted item would do, and ask to confirm it",
+    voice: true,
+    needs: ["interruptedDialog"],
+    /* Starts the dry run only: the report reads back its verdict, and the
+       reclaim itself waits for the person's click on the confirm. */
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target?: { filterText?: string }) => {
+      const answer = context.interruptedDialog.reclaim(target?.filterText);
+      if (typeof answer === "string") {
+        context.reportRefused?.(answer);
+        return;
+      }
+      context.reportPending?.(INTERRUPTED_RECLAIM_CHECKING, answer, INTERRUPTED_RECLAIM_CHECKED);
+    },
+  },
+
+  confirmReclaimInterrupted: {
+    label: "Reclaim the interrupted item the dialog asks about",
+    no_voice: "the confirm of a reclaim, which removes a worktree; voice has no confirm-before-acting step yet (PRD #802 D5), so `reclaim_interrupted` runs the dry run, reads its verdict back and stops — the press that removes the worktree is the person's own, by hand",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.confirmReclaim(); },
+  },
+
+  /* Voice never completes a dismissal (PRD #802 D5; desktop review R6/A1):
+     this asks whether to dismiss the item the words name, bound to its id,
+     and the dismissal waits for the person's click or `y` on the question. */
+  dismissInterrupted: {
+    label: "Ask to dismiss one interrupted item",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.askDismiss(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  confirmDismissInterrupted: {
+    label: "Dismiss the interrupted item the question names",
+    no_voice: "the answer to a spoken dismissal's question; voice has no confirm-before-acting step yet (PRD #802 D5), so `dismiss_interrupted` asks the question on screen, naming the item, and stops — the click or `y` that dismisses it is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.confirmDismiss(); },
+  },
+
+  dismissSelectedInterrupted: {
+    label: "Dismiss the selected interrupted item",
+    no_voice: "the Dismiss button and the `d` key, which dismiss the selected row at once, as the TUI's `d` does; a spoken dismissal must not complete without the person's confirm, so voice reaches it through `dismiss_interrupted`, which asks first",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { void context.interruptedDialog.dismiss(); },
+  },
+
+  dismissAllInterrupted: {
+    label: "Ask to dismiss every listed interrupted item",
+    voice: true,
+    needs: ["interruptedDialog"],
+    /* Asks the question only; dismissing waits for the person's click. */
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.interruptedDialog.dismissAll();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  confirmDismissAllInterrupted: {
+    label: "Dismiss every interrupted item the question named",
+    no_voice: "the answer to Dismiss all's question; voice has no confirm-before-acting step yet (PRD #802 D5), so `dismiss_all_interrupted` asks the question on screen and stops — the press that dismisses them is the person's own, by hand",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.confirmDismissAll(); },
+  },
+
+  selectInterruptedItem: {
+    label: "Select an interrupted item in the list",
+    no_voice: "picks the row the buttons act on, a pointer and keyboard affordance; the spoken rows name their item themselves — \"reclaim the second one\", \"dismiss fix-login\" — so voice never needs a selection first",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">, id: string) => context.interruptedDialog.select(id),
+  },
+
+  /* Reviewer 11 (CLAUDE.md rule 23): an item's details, its reports and their
+     pages by voice. They are shown to read on screen; nothing is read aloud. */
+  showInterruptedDetails: {
+    label: "Show an interrupted item's details",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string; itemId?: string }) => {
+      const refused = context.interruptedDialog.openDetails({ ...(target?.filterText !== undefined ? { item: target.filterText } : {}), ...(target?.itemId !== undefined ? { id: target.itemId } : {}) });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  showInterruptedReports: {
+    label: "Show the first page of an interrupted item's kept reports",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.showReports(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  nextInterruptedReports: {
+    label: "Show the next page of an interrupted item's kept reports",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.interruptedDialog.nextReports();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  previousInterruptedReports: {
+    label: "Show the previous page of an interrupted item's kept reports",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.interruptedDialog.previousReports();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* PRD #1790 stage 3 — Restore. Voice never starts an agent (PRD #802 D5):
+     this asks the restore question about the item the words name, and the
+     agent starts on the person's own click or key on it. The Restore button
+     and `s` open the same question through this entry; for an item that
+     lists no agent the dialog asks nothing and says so. */
+  askRestoreInterrupted: {
+    label: "Ask to restore an interrupted agent",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.askRestore(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  restoreAndContinueInterrupted: {
+    label: "Restore the agent the question names, and let it continue",
+    no_voice: "Restore and continue starts an agent that spends credits and may push or send; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `c` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreAndContinue(); },
+  },
+
+  restoreOnlyInterrupted: {
+    label: "Restore the agent the question names, waiting",
+    no_voice: "Restore only starts an agent that spends credits and may push or send once told to continue; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `o` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreOnly(); },
+  },
+
+  startOverInterrupted: {
+    label: "Start the agent the question names over in its worktree",
+    no_voice: "Start over starts an agent that spends credits and may push or send, with its saved task; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `w` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.startOver(); },
+  },
+
+  backInterruptedWork: {
+    label: "Back to the interrupted work list",
+    no_voice: "backs out of an item's details or a confirmation to the list; voice's `close` does the same while the dialog is the topmost overlay, which is what the dialog's Escape does",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => context.interruptedDialog.back(),
+  },
+
+  closeInterruptedWork: {
+    label: "Close the Interrupted work dialog",
+    no_voice: "the dialog's X and a press outside it; voice's `close` reaches the dialog while it is the topmost overlay, through the fence it registers, so a row naming it directly would close it out from under anything opened over it",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => context.interruptedDialog.close(),
+  },
+
   /* PRD #2374 — the dashboard's agent cards. Every control of the cards view
      dispatches through one of these; none sends anything unasked: a prompt
      action sends exactly the prompt the card shows, one that asks for
@@ -1238,8 +1482,11 @@ export const VOICE_ACTIONS = {
     label: "Open one agent's card",
     voice: true,
     needs: ["showAgentCard"],
-    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
-      const refused = context.showAgentCard(cardRefOf(target));
+    /* A spoken "show <agent>'s card" opens the overlay at its top, and its
+       checked references are a section of it; the card's `+N` control names
+       that section so it opens there. */
+    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { cardSection?: CardOverlaySection }) => {
+      const refused = target.cardSection !== undefined ? context.showAgentCard(cardRefOf(target), target.cardSection) : context.showAgentCard(cardRefOf(target));
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1290,6 +1537,48 @@ export const VOICE_ACTIONS = {
     needs: ["closeAgentCard"],
     run: (context: Pick<VoiceActionContext, "closeAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
       const refused = context.closeAgentCard();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* Issue #2418 — the Cards tree: a card's toggle, and its checked pull
+     request and issue badges. */
+  openCardTree: {
+    label: "Open the tree of cards under one card",
+    voice: true,
+    needs: ["setCardTree"],
+    run: (context: Pick<VoiceActionContext, "setCardTree"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.setCardTree(cardRefOf(target), true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  closeCardTree: {
+    label: "Close the tree of cards under one card",
+    voice: true,
+    needs: ["setCardTree"],
+    run: (context: Pick<VoiceActionContext, "setCardTree"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.setCardTree(cardRefOf(target), false);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  openCardPullRequest: {
+    label: "Open the pull request a card's agent reported, as the deck checked it",
+    voice: true,
+    needs: ["openCardReference"],
+    run: (context: Pick<VoiceActionContext, "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { referenceUrl?: string }) => {
+      const refused = context.openCardReference(cardRefOf(target), "pull_request", target.referenceUrl);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  openCardIssue: {
+    label: "Open the issue a card's agent reported, as the deck checked it",
+    voice: true,
+    needs: ["openCardReference"],
+    run: (context: Pick<VoiceActionContext, "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { referenceUrl?: string }) => {
+      const refused = context.openCardReference(cardRefOf(target), "issue", target.referenceUrl);
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1595,6 +1884,29 @@ export const VOICE_ACTIONS = {
     needs: ["confirmGenerateConfig", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">, target: VoiceDispatchTarget) => {
       const refused = context.confirmGenerateConfig(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* Issue #2148 — Retry and Cancel on an agent's deck messages that wait on
+     the user, by voice. Each only OPENS the confirmation listing them; a
+     row's own Retry or Cancel button acts on its one message directly. */
+  confirmRetryInboxMessage: {
+    label: "Ask to retry the deck messages waiting on one agent",
+    voice: true,
+    needs: ["confirmInboxAction", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmInboxAction" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmInboxAction("retry", target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  confirmCancelInboxMessage: {
+    label: "Ask to cancel the deck messages waiting on one agent",
+    voice: true,
+    needs: ["confirmInboxAction", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmInboxAction" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmInboxAction("cancel", target);
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
@@ -1959,7 +2271,7 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "clos
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the
  * browser opens over the deck's pane and the overview's alike.
  */
-export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "openPullRequestInBrowser" | "closePullRequest" | "pullRequestBack">;
+export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "openPullRequestInBrowser" | "closePullRequest" | "pullRequestBack" | "openCheckedReference">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent
@@ -1969,10 +2281,10 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | AgentCardMember>;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | "showInterruptedWork" | "hideInterruptedWork" | "interruptedDialog" | AgentCardMember>;
 
 /** PRD #2374 — the agent cards' members, served by the overview. */
-export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu";
+export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";
@@ -2077,7 +2389,8 @@ export type VoiceContextChannel = { current: VoiceScreenContext | undefined };
 export function dispatchVoiceAction(invoke: string, context: VoiceDispatchContext, target: VoiceDispatchTarget): boolean {
   const entry: VoiceActionEntry | undefined = (VOICE_ACTIONS as Record<string, VoiceActionEntry>)[invoke];
   if (!entry) return false;
-  if (entry.needs.some((member) => typeof context[member] !== "function")) return false;
+  /* A member is a call, or — `interruptedDialog` (PRD #1790 stage 2) — an object of calls. */
+  if (entry.needs.some((member) => typeof context[member] !== "function" && (typeof context[member] !== "object" || context[member] === null))) return false;
   (entry.run as (...args: unknown[]) => void)(context, target);
   return true;
 }

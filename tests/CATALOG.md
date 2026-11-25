@@ -540,7 +540,7 @@ The deck asks for the approval itself when it refuses to start an unapproved orc
 
 ### Work journal (PRD #1889)
 
-The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. All entries are lane 1 with token-free stand-ins; they read the journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
+The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. Lane-1 lifecycle tests use token-free stand-ins and read journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The interrupted-work and restore sub-areas also include L1 unit and render tests; each entry names its layer and agent. The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
 
 #### journal/launch
 
@@ -607,6 +607,621 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** synthetic routing stand-in registered as a Claude Code orchestration role; no real agent or credentials.
 - **Asserts:** after posting session-start hooks for an initial session, a new session after clear and an unchanged repeat, then stopping the first daemon and starting a fresh one, the shared journal reader returns the old attempt and exactly the two session ids in order, tied to its work and agent type; one JSON launch record for that attempt preserves its command, cwd, display name, role, orchestration name and instance, schema version, timestamp and shell field; launch-record directory and JSON files have modes 0700 and 0600 respectively.
 - **Does not assert:** resuming an agent, listing interrupted work, retention expiry, Pi synthetic session exclusion or OpenCode session aliases; SIGKILL recovery is `journal/restart/002`.
+- **Platform coverage:** mac+linux.
+
+#### journal/interrupted
+
+##### journal/interrupted/001 — After a restart, `interrupted list` shows the dispatched units and the plain pane the restart interrupted, and nothing before it.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** a `--single` unit and an orchestration-shaped unit (`--orchestration=interrupted-team`) dispatched from one pane; before the restart `list --json --no-git` has no items; after it the list is complete and has three items: each unit with `kind=unit`, `branch=agent/dispatch-<unit>`, its worktree, `launcher` = the dispatcher pane's name, a `last_entry` with a kind and a timestamp and a `progress` counting at least one attempt, and the pane with `kind=agent`, its name and no branch; the human list prints the title `Interrupted work`, both unit ids under it and before `Other agents`, the pane's id after `Other agents`, a `Progress:` line for each of the three items, and the footer `3 interrupted items from before the restart`.
+- **Does not assert:** Git and pull request facts (`--no-git`); scheduled issue dispatches and orchestrations started from a client; roles and delegation counts in the progress (`interrupted_work` unit tests); the TUI and desktop surfaces.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/002 — `interrupted dismiss` hides an item for good, and `dismiss --all` needs confirmation.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** `dismiss <id>` exits 0 and says `Dismissed.`; the unit leaves the list and its dispatcher pane stays; after a second restart the unit is still not listed; `dismiss --all` with no terminal and no `--yes` exits 1 and dismisses nothing; `dismiss --all --yes` exits 0 and empties the list.
+- **Does not assert:** the interactive confirmation prompt on a terminal; an older daemon re-listing a dismissed item after a downgrade.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/003 — `interrupted reclaim` removes a clean, deck-created worktree and keeps its branch; `--dry-run` changes nothing.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** premises: the worktree carries the deck's ownership marker, the marker names the listed item's id as the launch that created it, and `git status` in it is empty; `reclaim <id> --dry-run` exits 0, says `Reclaim would remove its worktree and keep its branch.`, and leaves the worktree on disk and the item listed; `reclaim <id>` exits 0, says `Reclaimed: its worktree was removed and its branch kept.`, the worktree directory is gone, `git branch --list agent/dispatch-<unit>` still shows the branch, and the item is no longer listed.
+- **Does not assert:** the unpushed-commit count; a worktree without the ownership marker, with one naming another launch or none, or on another branch (daemon unit tests, `interrupted_work_daemon_tests`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/004 — `interrupted reclaim` keeps a dirty worktree and one that holds another worktree, and says why.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** with an untracked file in one unit's worktree, `reclaim` exits 1, says `Kept: its worktree has uncommitted changes. …`, keeps the file and leaves the item listed; with another worktree of the repository under the other unit's ignored `.worktrees/` (so `git status` there is empty), `reclaim` exits 1, says `Kept: other worktrees lie inside its worktree. …`, names the nested worktree's path, and keeps both trees, the nested one's file and the listing.
+- **Does not assert:** a check that cannot run (`KeptCouldNotCheck`) or a removal that fails.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/005 — A report a unit sent to a dispatcher that never fetched it is listed with its unit after a restart, and `show` prints it framed as untrusted.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** the unit's `work-done --done` writes `reported destination=inbox` and the dispatcher never fetches it; after the restart the unit's item carries that `report_id` with a `kept_until_ms`; the human list prints `kept until`; `interrupted show <id>` exits 0 and prints the report's text between `[UNTRUSTED-WORKER-REPORT:` and `:END-UNTRUSTED-WORKER-REPORT]`; `interrupted show <id> --report <report_id>` exits 0 and prints that report's text after the frame's opening marker; `--report` with an id that is not one of the item's reports exits 1 and says `That report is not one of this item's kept reports.`
+- **Does not assert:** the date's format; report expiry; a report longer than the show bound; an item with more than 16 reports (`interrupted_work_daemon` unit tests `show_reads_any_one_of_the_items_reports_by_its_id` and `show_pages_reach_every_kept_report_beyond_the_metadata_cap`; the TUI's paging, `journal/interrupted/016`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/006 — With no restart, a report sent to a dispatcher that is gone is listed as an item of the unit's work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** while the pane and its unit run the list is empty; after the pane is closed (`StopAgent`) and the unit's `work-done --done` is recorded, the list shows the unit's item, its agent still running, with that report's `report_id` (decision D3).
+- **Does not assert:** the deck notice the report also produces; the TUI and desktop surfaces.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/007 — An agent in a deck pane may list interrupted work but not reclaim or dismiss it.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** with the pane identity of a live agent of the new daemon (`DOT_AGENT_DECK_PANE_ID`, `DOT_AGENT_DECK_AGENT_ID`, `DOT_AGENT_DECK_PANE_CAPABILITY`), `list --json --no-git` exits 0 and shows the unit; `reclaim <id>` and `dismiss <id>` each exit 1 and say `Refused: this request came from an agent in a deck pane, and reclaiming or dismissing interrupted work is left to the person. …`; the worktree is still on disk and the item still listed.
+- **Does not assert:** a partial pane identity (refused before any request, as `close` does).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/008 — The TUI's footer counts the interrupted items and offers `[Show I]` and `[Hide X]`.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** one item reads `1 interrupted item from before the restart`, three read `3 interrupted items from before the restart` (snapshots); the row carries `[Show I]` and `[Hide X]`; an empty list draws no row; `X` hides it.
+- **Does not assert:** the attach and reconnect fetch itself (`journal/interrupted/014`); the desktop surface.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/009 — The TUI's "Interrupted work" list puts units and orchestrations before "Other agents", and shows the selected row's progress.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `I` opens the list titled `Interrupted work`; the unit and the orchestration come before the heading `Other agents` and the plain agent after it, although the daemon listed the agent first; rows show the kind label, branch, worktree, launcher and last entry; only the selected row shows its `Progress:` line, and `j` moves it; with the plain agent selected the hints offer no reclaim and `r` changes nothing (D1); `Esc` closes.
+- **Does not assert:** scrolling a list longer than the popup; the incomplete or omitted notes.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/010 — The TUI's item details show every field and the kept reports with "kept until", and a report's text only on demand, framed as untrusted.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `Enter` on the unit shows `Branch:`, `Worktree:`, `Started by:`, `Last entry:`, `Progress:` and `Report: <id>, kept until 2026-11-26 10:00 UTC` (snapshot) but not the report's text; `Enter` again and the daemon's show answer display the text between `[UNTRUSTED-WORKER-REPORT:` and `:END-UNTRUSTED-WORKER-REPORT]`; `Esc` goes back to the list; a plain agent's directory is labelled `Folder:`.
+- **Does not assert:** Git facts (shown only when a list carried them); a report that cannot be read.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/011 — The TUI's reclaim shows the dry-run verdict and the unpushed commits before asking y/n, then the reclaim's sentence.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `r` on the unit and the dry-run answer show `Reclaim would remove its worktree and keep its branch.`, `remove its worktree, keep its branch`, `2 commits on its branch are on no remote; the branch keeps them.`, the branch and `y/n` (snapshot); `y` and the real answer show `Reclaimed: its worktree was removed and its branch kept.`; the refreshed, empty list removes the footer.
+- **Does not assert:** a kept or refused verdict's confirmation (no `y` offered); the daemon side (`journal/interrupted/003`, `015`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/012 — The TUI's `D` asks before dismissing all, and `d` dismisses the selected item.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `D` shows `Dismiss all: 3 interrupted items from before the restart? [y/N]` (snapshot) and `n` returns to the list; `d` and the daemon's answer show `Dismissed.`, and the refreshed list drops the unit and counts two.
+- **Does not assert:** `y` on dismiss all (`journal/interrupted/024`, `025`); refusals.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/013 — The TUI's restart notice list leads to the interrupted work list with the same key.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** the restart notice's list keeps `The deck restarted; these agents were stopped:` and gains a line with `3 interrupted items from before the restart` and the key `I` (snapshot); `I` there opens `Interrupted work`.
+- **Does not assert:** the notice's footer row (`lifecycle/handshake/013`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/014 — A fresh TUI after a restart shows the footer, lists the unit, dismisses it, and stays clear after another restart.
+- **Layer:** L2 PTY/vt100 (`tests/e2e_interrupted_work.rs`): the real binary as a fresh TUI attached to the second `daemon serve` on the same state directory, after a restart that is SIGTERM to the first daemon's own pid.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the `--single` unit it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** the footer reads `2 interrupted items from before the restart`; `I` shows `Interrupted work` and the unit's branch; `d` shows `Dismissed.`, the branch leaves the list and the footer reads `1 interrupted item…`; `d` on the pane shows `No interrupted work.` and no footer; the CLI's list is empty; after another restart a fresh TUI shows no footer and its list says `No interrupted work.`
+- **Does not assert:** a TUI that stayed open through the restart (the reconnect fetch); dismiss all.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/015 — Reclaim from the TUI removes a clean, deck-created worktree after a dry-run confirmation and keeps the branch.
+- **Layer:** L2 PTY/vt100 (`tests/e2e_interrupted_work.rs`): the real binary as a fresh TUI attached to the second `daemon serve` on the same state directory, after a restart that is SIGTERM to the first daemon's own pid.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the `--single` unit it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** premises: the worktree carries the deck's ownership marker and is clean; `r` shows `Reclaim would remove its worktree and keep its branch.`, `remove its worktree, keep its branch` and `y/n` with the worktree still on disk; `y` shows `Reclaimed: its worktree was removed and its branch kept.` and the footer counts one; the worktree directory is gone, `git branch --list agent/dispatch-<unit>` still shows the branch and the CLI no longer lists the unit.
+- **Does not assert:** a kept verdict from the TUI (`journal/interrupted/004` covers the daemon's).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/016 — The TUI's item details page through every kept report, past the ones the list carries.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** an item listed with three report entries and five more counted says `5 more reports are kept`; `Enter` and the first page show `Reports 1 to 3 of 8.` and the hint `n next reports` but no `p previous reports`; `n` and the next page show `Reports 4 to 6 of 8.`, its first entry and a report's text, and offer `p previous reports`; a page handed in that the TUI did not ask for is not shown; `n` again reaches `Reports 7 to 8 of 8.` with no `n next reports`; `p` returns to `Reports 1 to 3 of 8.`
+- **Does not assert:** the daemon's paging (`interrupted_work_daemon` unit test `show_pages_reach_every_kept_report_beyond_the_metadata_cap`); the CLI's `--reports-from` (`interrupted_cli` unit test `an_item_with_more_reports_points_at_the_next_page`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/017 — The TUI draws no Unicode bidi control read from the journal or a report.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** with right-to-left overrides and isolates in an item's name, branch, worktree and launcher and in a line of its report's text, no frame of the list, the details or the shown report draws a bidi control, the text around them is still shown, and the details show the branch's override escaped (`Branch: agent/\u{202e}txt.exe`), as the CLI shows it.
+- **Does not assert:** the CLI (`interrupted_cli` unit test `bidi_controls_from_the_journal_cannot_reorder_the_text`); other invisible format characters.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/018 — The TUI escapes every control and bidi character a journal value, a report or a daemon message carries, wherever it shows one.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with every C0 and C1 control, DEL and every bidi formatting character in an item's name, branch, worktree (a long Chinese path), launcher, last entry, roles, repository and report id, in a report's text, in a reclaim dry run's paths and an unknown verdict's sentence, and in a failed request's message, no cell of any frame of the list, details, shown report, reclaim confirmation or list message holds one, at 110×32, 80×24 and 40×24, and the overlay's borders stay whole; the failed request's message is shown escaped (`\u{0}\u{1}`); and a shown report body short enough to be on screen draws each of `U+202E`, `U+2066`, ESC, BEL and `U+0085` beside a sentinel as its escaped spelling.
+- **Does not assert:** the CLI (`interrupted_cli` unit test `bidi_controls_from_the_journal_cannot_reorder_the_text`); invisible format characters other than the bidi ones.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/019 — A dry run the person backed out of leaves reclaim and dismiss free, and its late answer is not taken for a newer one's.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** after `r` and `Esc`, `q` or `n`, whether the dry run then answers, fails or never answers, `d` sends a dismissal of the selected item; a second `r` sends a second dry run, the first one's late answer shows no `y/n`, the second's does, and `y` sends the real reclaim.
+- **Does not assert:** a real reclaim or dismissal in flight (it cannot be cancelled, and its answer frees the actions).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/020 — Answers from a daemon process the TUI has since left are dropped, and the list is fetched once per process.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** after the TUI attaches to a second process, a late list answer from the first, numbered as the second's newest list request, does not replace the second's list; late dry-run, reclaim and dismissal answers from the first send nothing and change no frame, and `d` then dismisses the second's item; a report asked of the first is not shown in the second's details of an item with the same id; attaching to the same process again fetches nothing, and each new process is fetched once.
+- **Does not assert:** the real event stream's reconnect (`journal/interrupted/014` covers a fresh TUI).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/021 — A refresh of the TUI's interrupted work list keeps the selected item, not the selected row.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with the orchestration selected, a refresh that drops an earlier item, adds a newer one or reorders the list keeps `▶ release-team` and `d` dismisses the orchestration's id; a selected plain agent stays selected when another agent is listed before it; when the selected item is gone, its neighbour is selected and `d` dismisses that one.
+- **Does not assert:** the list's scroll position.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/022 — The interrupted work footer's hide key acts while the overlay is open, remapped or not.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with the list, an item's details or the dismiss-all question open, the footer offers `[Hide X]` and `X` hides it, leaves the overlay open and sends no dismissal; with `hide_interrupted_work = "Z"` the footer offers `[Hide Z]` and `Z` hides it.
+- **Does not assert:** the footer coming back on another daemon process (`journal/interrupted/014`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/023 — A failed or unsupported report request says why in the item's details and can be asked again.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** a failed show answer shows its message in the details, an unsupported one the shared unsupported sentence, `Enter` sends the show request again and the next answer shows the report's text; a failed next page shows its message and keeps `Reports 1 to 3 of 8.`, and `n` asks for that page again.
+- **Does not assert:** the daemon's own failures (`interrupted_work_daemon` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/024 — A confirmation too big for its popup can still be read whole and answered.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** at 40 columns the dismiss-all question is wrapped and drawn whole, and `y` dismisses the three listed ids; at 80×24 a dry run naming long Chinese paths pushes `Reclaim? y/n` below the popup, `y` then sends no reclaim, PageDown scrolls the question into view and `y` sends exactly one; `Esc` and `q` go back from both.
+- **Does not assert:** mouse scrolling.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/025 — A confirmation's `y` sends only what the confirmation showed.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** `y` typed in the same burst as `D`, or as the dry run's answer, sends nothing; in a terminal too short to show the question, `y` sends nothing; kept (`KeptDirty`) and refused dry runs show no `y/n` and `y` sends no reclaim; the two cases that send nothing are checked for no dismissal of any shape; `D`, a refresh listing a fourth item, then `y` sends a dismissal of exactly the three ids the question named, with `all` false.
+- **Does not assert:** the daemon's handling of a dismissal (`journal/interrupted/002`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/026 — A report page the daemon clamped after reports expired is applied, not dropped as stale.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** after `Reports 1 to 3 of 8.`, `n` asks for the page from 3; its answer, clamped to an empty page from 2, replaces the shown page (no `Reports 1 to 3 of 8.`, no `n next reports`, `p previous reports` offered); a late answer to the first page's request is not shown; `p` asks for the page from 0 and shows the two kept reports; the show requests sent are exactly from 0, 3 and 0.
+- **Does not assert:** the daemon's clamping (`interrupted_work` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/027 — A confirmation question seen whole can be confirmed, however many rows it wraps to.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** at 14×24 the dismiss-all question wraps to more than eight rows, all drawn, and `y` sends exactly one dismissal of the three listed ids with `all` false; at 14×10, where no frame shows the whole question, `y` sends nothing until `j` has scrolled every row into some drawn frame, then sends the dismissal, and still does after scrolling back up; `j` presses and `y` in one burst, before a frame drew the lower rows, send nothing.
+- **Does not assert:** a resize between frames (the rows are re-wrapped and must be seen again).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/028 — A real agent's dispatched unit, stopped by a daemon restart, is listed by the CLI and the TUI and reclaimed from the TUI, keeping its branch.
+- **Layer:** L2 headless `daemon serve` plus a PTY/vt100 TUI, lane 2 (`tests/e2e_interrupted_work_live.rs`): the real `dot-agent-deck dispatch` CLI run from a routing stand-in dispatcher pane, a restart that is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory, the real `interrupted list` CLI run as a person, and the real binary as a fresh TUI attached to the second daemon. Both daemons bind inbox components normally (`inbox::daemon`, not the test switch `daemon_unbound`) and log to `deck-first.log` / `deck-next.log` in the test root, which a failure message quotes.
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--add-dir` naming the hold's directory, `--allowedTools Bash Read Write`, no `-p`, no first prompt on its command line) as the `--single` unit, started with `dispatch --command`; the deck delivers its task. Its credentials, onboarding and the trust of the worktree and of the hold's directory (Claude Code asks to trust an `--add-dir` directory too) are seeded into the daemon's HOME before the dispatch (`seed_claude_worker_home`), with the deck's Claude Code hooks (`hooks install --agent claude-code`). One Bash command, given on a line of its own in the task: it writes the sentinel and then runs `cat` on a FIFO (`interrupted-live-hold-7c41.fifo`) that the test creates before the dispatch at an absolute path in this run's own test root and holds open without writing (`tests/support/fifo_hold.rs`), so the command blocks until the test drops the hold, which closes the FIFO's last writer and so ends the `cat` with end-of-file; nothing in the test signals the held command. The `cat` carries a 1200 s bound: `perl -e` (`BOUND_SCRIPT`) resets SIGALRM to its default, sets an alarm and execs the `cat`, which keeps the alarm across the exec and ends by SIGALRM (status 142) when it fires, with no supervisor process (`perl` ships with a stock macOS and with Linux, GNU `timeout` only with Linux). The test checks that the dispatched task carries that bounded command and that each held `cat` runs under the agent's own shell among the daemon's descendants; a pending alarm is not visible from outside the process, so it does not read the alarm itself or prove the agent kept the `perl` prefix (a bare `cat` under the agent's shell passes the same check), and `tests/support/fifo_hold.rs` pins that the command's `cat` ends by it. Claude Code's Bash tool timeout is raised to ten minutes (`BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`) so its own two-minute default does not end the hold before the restart. Runtime-skipped (Decision 26) without the `claude` CLI or a credential; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` makes that skip a failure.
+- **Asserts:** the agent writes a uniquely named sentinel under the worktree's git-ignored `.dot-agent-deck/`; the unit's inbox holds its dispatched task, naming the sentinel, as acknowledged; a bounded wait until a `cat` of exactly this run's absolute FIFO path is running among the first daemon's descendant processes (`ps`), and the same check again immediately before the SIGTERM, so the restart stops the command while it runs; after the restart the journal's `attempt_ended` for the unit's attempt says `how=interrupted` and the unit's work has no `reported` line; `interrupted list --json --no-git` lists the unit with `kind=unit`, `branch=agent/dispatch-interrupted-live`, its worktree and no kept reports, so it is listed for its interruption; the worktree's ownership marker names the listed item's id as the launch that created it; the worktree is clean; a TUI attached to the second daemon after the restart shows the footer `2 interrupted items from before the restart`; `I` shows `Interrupted work` and the unit's branch; `r` shows `Reclaim would remove its worktree and keep its branch.`, `remove its worktree, keep its branch` and `y/n` with the worktree still on disk; `y` shows `Reclaimed: its worktree was removed and its branch kept.` and the footer counts one; the worktree is gone, the branch is still listed by `git branch --list`, and the CLI no longer lists the unit.
+- **Does not assert:** a TUI showing the live agent before the restart (the TUI attaches only after it); what happens to the held `cat` after the restart (the test only logs whether a `cat` of its FIFO is still running; dropping the hold ends it); Git and pull request facts (`--no-git`); the agent's exact output; a report from the unit; the desktop surface; a dirty worktree kept by reclaim (lane 1, `journal/interrupted` reclaim refusals and `interrupted_work_daemon::tests::reclaim_keeps_a_dirty_worktree_and_leaves_the_item_listed`).
+- **Platform coverage:** Linux verified; macOS intended (the bound is POSIX `alarm` kept across `exec`, and `ps`, `perl` and Claude Code ship there) and not yet run.
+
+##### journal/interrupted/029 — Dismiss all over more items than one dismissal may name sends bounded batches of exactly the confirmed ids.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with 257 listed items, `I` `D` `y` sends one dismissal of 256 ids and, only once it answered, a second of the last id; both with `all` false, together naming exactly the 257 ids in the order listed; no list request between the batches, one after the last answer; the overlay then says `Dismissed.`, and an item listed after the question stays listed.
+- **Does not assert:** the byte limit (`interrupted_work::tests`, `dismiss_batches`); the daemon's own admission (`interrupted_work_daemon::tests`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/030 — A later batch of Dismiss all that fails or is refused stops the rest and says so.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** over 257 items, with the first batch dismissed and the second failing (a timeout) or refused whole (`Unreadable`), no third dismissal is sent, the list is asked for again, and the overlay says `Dismissed.` and `dismiss_stopped_sentence`'s words for one item not dismissed and why. When the first batch also refused one of its ids (`NotListed`) and the second failed, the overlay shows both that refusal's sentence and the stopped-batch words.
+- **Does not assert:** a failed FIRST batch, which reads as a single dismissal does (`journal/interrupted/012`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/031 — A daemon replaced between Dismiss all's batches is sent no further batch.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** over 257 items, after the first batch answered, a second batch withheld from a replaced process (unsupported), or the event stream attaching to another process before it answers, ends the dismissal: exactly two dismissals were sent, both pinned to the first daemon process, and the overlay says one item was not dismissed because the deck daemon was replaced.
+- **Does not assert:** the shared client's instance pin itself (`daemon_client` tests).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/032 — A dismissal the daemon refuses because its journal read was incomplete says so, for one item and for Dismiss all.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** `d` answered by a whole refusal `IncompleteRead` shows its sentence; `D` `y` over 257 items whose first batch is refused that way shows it and sends no second batch; when only the second batch is refused, the overlay says `Dismissed.` and `dismiss_stopped_sentence`'s words for one item not dismissed with that refusal.
+- **Does not assert:** the daemon's refusal itself (`interrupted_work_daemon::tests::dismiss_refuses_a_truncated_journal_read_and_writes_no_close`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/033 — A list that came back empty but incomplete still gets the footer row, which opens the list and can be hidden.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answer is handed in where the background request would deliver it, keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** with an empty list marked incomplete, the dashboard's footer shows `INTERRUPTED_UNREAD` (the desktop banner's sentence) with `[Show I]` and `[Hide X]` (snapshot `footer_incomplete_empty_list`); `X` hides the row; `I` opens `Interrupted work`, asks for the list again with Git facts, and the overlay says `LIST_INCOMPLETE`, also when `X` hid the row first; a complete empty list shows no row.
+- **Does not assert:** the desktop banner (`InterruptedWork.test.tsx`, "several daemons whose lists are incomplete each offer a way in"); the restart notice's line for an incomplete empty list (`journal/interrupted/035`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/034 — Opening an item's kept reports keeps the Git facts its list entry had.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answers are handed in where the background request would deliver them, keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** a unit listed with Git facts shows `LABEL_GIT` and `git_facts_line`'s words in its details; after `Enter` asks for its reports and the show answer carries the item with `git: None`, the details show the report's text and still the same Git line (PR #2431 review, Greptile P2).
+- **Does not assert:** the desktop dialog (`desktop/src/components/InterruptedWork.test.tsx`, "keeps the list's Git facts when the report page arrives"); the daemon's show answer itself, which carries no Git facts by design.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/035 — With an empty list the daemon could not read whole, the restart notice still leads to the list.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answer is handed in where the background request would deliver it, keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** in `UiMode::RestartNotice` over an empty list marked incomplete, the notice's line shows `INTERRUPTED_UNREAD` wrapped inside the popup; `I` opens `Interrupted work`, which says `LIST_INCOMPLETE` (PR #2431 review, Qodo 2, the TUI half for CLAUDE.md rule 22).
+- **Does not assert:** the desktop restart toast (`desktop/src/components/InterruptedWork.test.tsx`, "offers Show for an incomplete empty list").
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/036 — `interrupted reclaim` keeps the directory a `dispatch --dir` unit was started in.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin); a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the `--single` unit it dispatches with the real `dot-agent-deck dispatch --dir` CLI into a linked worktree the test made with `git worktree add`.
+- **Asserts:** premises: the directory carries no deck ownership marker after the dispatch and reads clean; the item listed for the unit names the directory and its checked-out branch; `reclaim <id>` exits 1, says `Refused: the deck did not create this worktree.`, keeps the directory, its file and its branch, and leaves the item listed (PRD #468 merged into PR #2431).
+- **Does not assert:** a `--dir` into a worktree an earlier dispatch created, whose marker names that earlier launch (reclaim refuses it as another launch's, `interrupted_work_daemon_tests`); an orchestration-shaped `--dir` unit.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/037 — A refresh that fails while a list is shown says the list may be out of date, until a list answers.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answers are handed in where the background request would deliver them, keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** with three items listed, `I` shows them without `LIST_REFRESH_FAILED`; the list request failing (`timed out`) keeps the three items and shows `LIST_REFRESH_FAILED` followed by the reason; `Esc` and `I` again still show it while the new request is outstanding; that request answering with a list removes it (PR #2431 round 4, Qodo).
+- **Does not assert:** the desktop dialog (`desktop/src/components/InterruptedWork.test.tsx`, "says a failed refresh may leave the list out of date"); a failed first fetch, which shows only the failure.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/038 — A daemon stop while a dispatch is still starting keeps its unit as interrupted work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck dispatch` CLI from a routing stand-in dispatcher; the spawn's `dispatch-seed` pause armed through `DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR`; the stop is SIGTERM to the daemon's own pid, then a second `daemon serve` on the same state directory.
+- **Agent:** synthetic: a `--single --command <script> --agent opencode` unit whose script ignores SIGTERM, writes a ready file once its trap is set and records that it got the signal, so the stopping daemon waits out its grace while the dispatch goes on.
+- **Asserts:** the CLI is answered and the unit's agent runs, with its attempt in the journal and its TERM trap set, while the seam holds its first prompt; the seam never wrote `dispatch-seed.timed-out`, read before the stop and again once the stopped daemon exited, so the test fails rather than passes when a delay let the seam give up and the unit finish starting (PR #2431 round 6); the stop drains the agent (the script got SIGTERM) before the seam is released, so posting the prompt fails; after the restart the unit's worktree and branch `agent/dispatch-interrupted-cut` are on disk, and `interrupted list --json` lists a `unit` item naming that worktree; `interrupted reclaim <id>` exits 0 with `RECLAIM_REMOVED`, removes the worktree and keeps the branch, since its ownership marker names this launch (PR #2431 round 5).
+- **Does not assert:** the window before the unit's agent is published (`dispatch::tests::a_shutdown_before_the_unit_is_published_keeps_it_as_interrupted_work`); an agent closed by a person before the stop, which rolls back as an ordinary failed start (`dispatch::tests::a_close_before_a_shutdown_at_publication_rolls_the_unit_back`, `…_at_the_first_prompt_rolls_the_unit_back`, `spawn::tests::a_role_closed_before_a_shutdown_leaves_the_ordinary_failed_spawn`); an orchestration-shaped unit or a scheduled issue dispatch cut short the same way (`work_tracking::tests::a_launch_the_shutdown_cut_short_stays_open_once_something_of_it_was_written` holds their journal half).
+- **Platform coverage:** mac+linux.
+
+#### journal/restore
+
+##### journal/restore/001 — A single interrupted agent offers conversation restore.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
+- **Agent:** none; in-memory Claude journal records (Codex is a documented gap since #2492 and is listed in 002).
+- **Asserts:** single pane, dispatch and issue-dispatch items list their attempt, name, type and folder with a `resume` verdict; the latest session by sequence wins even when the reader order differs; older replies without the additive fields still read; a team with twenty attempts lists sixteen distinct agents and reports four omitted.
+- **Does not assert:** filesystem checks, process liveness, or starting an agent.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/002 — Unsupported single agents offer Start over and team roles wait for a later version.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
+- **Agent:** none; synthetic records for the supported agent types.
+- **Asserts:** Codex, Pi, OpenCode, Devin and Antigravity yield `start_over` with `agent-cannot-resume`; a default shell yields `default-shell`; orchestration roles, multi-attempt dispatches and a single-attempt unit with a delegation yield `none` with `orchestration-later`, listing each distinct attempt once.
+- **Does not assert:** start-over execution or saved-task delivery.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/003 — Bad or incomplete evidence refuses restore with a specific reason.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
+- **Agent:** none.
+- **Asserts:** duplicate or wrongly joined records and an attempt shared between plain works yield `ambiguous-record`; moved folders and missing records yield `folder-moved` and `no-launch-record`; absent and invalid session ids offer Start over with `no-session-id` and `session-id-invalid`; a record an older deck wrote without `pid`/`pid_start` (or without `pid_start` alone) offers Start over with `old-process-unknown` (review R#2); journal truncation, launch truncation and skipped launch records yield `incomplete-read` and mark the list incomplete.
+- **Does not assert:** restore-time safety checks or filesystem ownership.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/004 — The launch shim injects resume arguments once and acknowledges them privately.
+
+- **Layer:** L1 unit (`src/telemetry/shim.rs`), real temporary files, no child launched; registry inputs also pinned by `journal_restore_resume_specs_define_literal_arguments_and_safe_inputs` in `src/agent_registry.rs`.
+- **Agent:** synthetic executable files and shell-script launchers named Claude or Codex.
+- **Asserts:** Claude gets `--resume <uuid>` and Codex gets `resume <uuid>` before user and embedded args (the shim reads each agent's `session_args`, which Codex keeps although the daemon does not resume it yet, #2492); matching requests remove their one-shot variables from the child plan; private acknowledgement creation is exclusive; unmatched and absent requests pass through, and ordinary Claude gets no telemetry args. The existing installation tests also require Claude, Codex and Devin shims with telemetry on or off, while ordinary spawn PATH remains conditional on telemetry.
+- **Does not assert:** `exec` applying the child plan, agent session confirmation, or a real conversation.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/005 — Invalid sessions and conflicting launch arguments produce refusal acknowledgements.
+
+- **Layer:** L1 unit (`src/telemetry/shim.rs` and registry inputs in `src/agent_registry.rs`).
+- **Agent:** synthetic executable files; no agent launched.
+- **Asserts:** Claude conversation-selecting and print arguments and Codex subcommands or prompts leave argv unchanged and write a private `resume-args-conflict` refusal; invalid ids write `session-id-invalid`; each refusal removes the one-shot environment. Registry inputs require canonical lowercase UUIDs, reject leading dashes and shell text, preserve supported option/value pairs, and expose no resume specification for GAP agents.
+- **Does not assert:** daemon handling of refused acknowledgements.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/006 — Launch process identities survive storage and guard against two transcript writers.
+
+- **Layer:** L1 unit (`src/launch_records.rs`), temporary files and the test's own process identity.
+- **Agent:** none.
+- **Asserts:** additive `pid` and `pid_start` fields round-trip in v1; legacy records still read with absent fields and serialize without them; live matching identity gives `still-running`, missing or partial identity gives `old-process-unknown`, and an impossible OS pid is gone.
+- **Does not assert:** orphaned descendants in an old process session or the spawn write site.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/007 — The TUI asks with the offered restore choices.
+
+- **Layer:** L1 `TestBackend` and insta through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); list and details entry points.
+- **Agent:** none; injected Claude resume, Pi Start-over and older-deck Claude (`start_over`, `old-process-unknown`) verdicts.
+- **Asserts:** `s` opens the question for the selected name without acting; a resumable agent shows exactly `Restore and continue` and `Restore only`; a gap agent offers `Start over in this worktree` instead; a Claude an older deck started shows the `old-process-unknown` sentence and Start over only, `c`/`o` send nothing and `w` sends one StartOverInterrupted for its attempt (review R#2); wording equals the shared Rust constants. All of it runs with the experimental flag off: restore is not behind it (issue #2494).
+- **Does not assert:** daemon execution or genuine conversation recall; the resulting snapshots need review at promotion.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/008 — TUI confirmation sends the shown attempt once and honours daemon capability.
+
+- **Layer:** L1 production-key/render seam and recorded human-client requests (`tests/render_interrupted_work.rs`).
+- **Agent:** none; two listed agents with distinct work and attempt ids, injected capability state.
+- **Asserts:** selecting the second row and pressing `s` only asks; `c` sends exactly one RestoreInterrupted with mode `continue`, `o` with `only`, and `w` sends StartOverInterrupted for the Start-over attempt. Every action targets the shown second item, uses `dry_run=false`, and repeats while pending send nothing extra. `Esc`, `q` and `n` go back and permit reopening without acting; unoffered choices send nothing; without `restore-agents`, neither action reaches the daemon and an on-screen explanation names the daemon's lack of restore support.
+- **Does not assert:** live daemon replies, reconnect/stale-answer behavior, desktop or voice (009/010).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/011 — Restore and continue confirms the conversation before sending the first message.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI outside a pane, no terminal on stdin; restart by SIGTERM to the owned daemon pid and a new daemon on the same state directory.
+- **Agent:** synthetic executable named `claude` on PATH, recording argv and reporting a real hook-protocol `SessionStart` through the deck's hook CLI. No agent credential.
+- **Asserts:** show names the agent and attempt and says `Can be restored with its conversation.`; without `--yes` a nonterminal restore and a nonterminal start-over each refuse and name `--yes`; every CLI call runs with `DOT_AGENT_DECK_EXPERIMENTAL=0`, since restore is not behind the flag (issue #2494); dry-run starts nothing and keeps the item. Restore and continue launches the original command once in its folder with separate `--resume`, UUID arguments, removes all three one-shot resume variables from the child, shows the same name on an independent dashboard pane, sends exactly the continue note as its first inbox message with deck reason `restart note`, and removes the interrupted item.
+- **Does not assert:** genuine agent conversation recall (lane 2, 016/017); TUI or desktop confirmation controls (007–010/015); Restore-only delivery (015); unsupported launch shapes.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/012 — A different conversation is stopped before any mail and offers Start over.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); public attach request and inbox history, with the real CLI for the resulting show.
+- **Agent:** synthetic `claude` acknowledges the resume arguments but reports a different canonical session UUID.
+- **Asserts:** final `interrupted_restore` has an empty `restored` array and one refused attempt with reason `not-resumed` and a message explaining the conversation; the new card is gone and the process no longer exists; no inbox message was posted, including recent history; the original item stays listed with verdict `start_over`, and show offers `Start over in this worktree`.
+- **Does not assert:** timeout, missing shim acknowledgement, or early-exit failure variants; real-agent behavior.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/013 — An old session descendant blocks a second writer.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session-descendant process guard.
+- **Agent:** synthetic `claude` leaves a child in the original session but a different process group, ignoring TERM/HUP. The child independently enforces a 180-second SIGALRM lifetime cap; fixture cleanup signals only its exact pid while its recorded start identity still matches.
+- **Asserts:** the child survives shutdown; restore returns `still-running`, launches nothing, posts nothing and keeps the interrupted item.
+- **Does not assert:** macOS descendant scanning (not implemented); the direct pid guard and missing identity fields (006).
+- **Platform coverage:** linux.
+
+##### journal/restore/014 — Start over replays a safe saved task without a restart note.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); real `dispatch --single --command … --agent claude --task …`, restart, and real `interrupted start-over` CLI; public attach refusal and inbox history.
+- **Agent:** synthetic routing dispatcher and synthetic `claude` single unit.
+- **Asserts:** the actual dispatch saved the multiline sentinel task verbatim; replacing that task by a symlink refuses `task-unsafe`, starts nothing, posts nothing and keeps the item; restoring its original safe file then starting over with `--agent <attempt> --yes` runs the recorded command in the worktree without resume arguments, with `--session-id <new uuid>` in front (round 3, audit B3) and that new conversation reported, delivers exactly the saved task as the first inbox message under deck reason `saved task`, delivers neither restart note, and removes the item.
+- **Does not assert:** other unsafe task file kinds or modes; plain-agent start-over without a saved task; orchestrations; a real agent spending a turn on the task.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/015 — Restore only through the attached TUI creates a named pane with its first restart note.
+
+- **Layer:** L2 PTY-attached `TuiDeck` and vt100 grid, lane 1 (`tests/e2e_agent_restore.rs`, extending the 011 fixture).
+- **Agent:** private synthetic executable named `claude`, no real agent or credential; same capped fixture as 011.
+- **Asserts:** the original agent is visible on an attached TUI before daemon restart; a new TUI attached to the replacement daemon opens `I`, sees the stopped agent, presses `s` and sees the question and both exact restore choices. No agent starts merely from asking; `o` starts exactly one resumed pane whose box title has the original name, whose recorded argv has the separate resume UUID, and whose first and sole inbox message is exactly the Restore-only note with deck reason `restart note`; the item leaves the interrupted list.
+- **Does not assert:** agent recall or compliance with the note (lane 2, 016/017), staying in the same TUI process across changing fixture socket paths, saved-workspace dedupe (018), or desktop controls.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/016 — Real Claude recalls its conversation after Restore and continue from the attached TUI.
+
+- **Layer:** L2 PTY-attached `TuiDeck` and vt100 grid, lane 2 (`tests/e2e_agent_restore_live.rs`); developer machine only, never CI or RWX.
+- **Agent:** real interactive Claude Code on `claude-haiku-4-5-20251001`; isolated credentials, onboarding and folder trust seeded with `seed_claude_worker_home`, real deck hooks installed, `--allowedTools Bash Read Write`; no print mode or positional seed prompt. `check_claude_available` and `skip_unless!` skip missing CLI/auth, or fail under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`.
+- **Asserts:** the attached person tells the agent a unique random codename and asks for an acknowledgement file holding only `OK`; after the real daemon is stopped by its own pid, a new daemon shares the journal state and isolated HOME. A fresh attached TUI shows the interrupted item; `I`, `s`, `c` restores its conversation. The restored generation receives exactly the agreed Continue restart note as its first and sole inbox message before recall, acknowledges its receipt and finishes its turn. The new attempt's highest-sequence native session equals the original; before the recall turn no regular file anywhere under the agent's work folder holds the codename (every directory scanned, `.claude` and `.codex` included, links not followed, and a directory, entry or file that cannot be read counted as holding it; the agent's native session storage is in the fixture's separate home), and a human recall prompt, which never repeats it, makes the agent write it into a new uniquely named file with no recall-turn tool call visibly naming its session storage. The original acknowledgement's exact bytes, inode, mtime and ctime remain unchanged after note delivery and recall, and the original named card shows live Idle status. Exactly one resumed agent is present.
+- **Does not assert:** restoring an unfinished tool call, automated continuation of a cut-off turn, staying in one TUI process across changed fixture endpoints, desktop controls, or the bogus-id picker path. Recall is an observable memory test, not a sandbox proof: a copy of the codename outside the work folder, or a lookup whose tool event carries no detail, is not ruled out. Acknowledged inbox history proves note receipt/order, not a quoted transcript of the model's reasoning.
+- **Platform coverage:** mac+linux intended; lane 2 is run locally. Both daemon lifetimes use a 900-second cap and owned-pid cleanup.
+
+##### journal/restore/017 — Real Codex recalls its conversation after the human CLI restores and continues it.
+
+- **Layer:** L2 real interactive Codex under an attached TUI, lane 2 (`tests/e2e_agent_restore_live.rs`); the restore choice uses the real CLI `interrupted restore <item> --agent <old-attempt> --continue --yes` without a pane identity. Developer machine only, never CI or RWX.
+- **Agent:** real Codex on `common::codex_test_model()`, the harness's auth-appropriate cheap mini model, with workspace-write sandbox, low reasoning effort and approvals set to never. Existing `check_codex_available` verifies the installed CLI, persisted auth and a bounded live model request; `skip_unless!` produces a clean skip when unauthenticated and a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`. A refused configured model remains the harness's deliberate hard failure.
+- **Asserts:** the same unique conversation-memory (with the same work-folder and visible-lookup checks), unchanged acknowledgement, first acknowledged restart-note, new-attempt/same-native-session, exactly-one-agent and attached live-card checks as 016, exercising Codex's `resume <session>` launch through the saved command. Native SessionStart, UserPromptSubmit and Stop hooks must be trusted before startup, and both lifetimes share the scratch CODEX_HOME and HOME.
+- **Does not assert:** Claude resume syntax (016), Codex picker navigation, remote state, orchestration/report-route recovery, or a start-over fallback. A passing 017 is required before Codex graduates from conditional support; the test's existence alone is no graduation evidence.
+- **Quarantined** (`#[ignore = "quarantined: vfarcic, #2492"]`): every run timed out because Codex sends its first hook only with its first prompt, so the restore never confirmed before the restart note. Stage 3 ships Codex as a documented gap (registry `resume: None`); #2492 is the design change that lifts this, with the body unchanged.
+- **Platform coverage:** mac+linux intended; lane 2 is run locally. The real CLI must preserve its native thread id and reach the composer after resume; no unmeasured `tui.resume_cwd` setting is added.
+
+##### journal/restore/018 — Saved-workspace startup leaves a matching resumable agent for the question.
+
+- **Layer:** L1 unit of the TUI's saved-pane startup predicate, extending `tests/session_restore_precedence.rs` around the real SavedSession::load call in `src/ui.rs`.
+- **Agent:** none; in-memory saved pane, interrupted list and launch records.
+- **Asserts:** on a daemon-empty startup with the experimental flag pinned off, a saved pane is deferred exactly when its directory and verbatim command match a launch record joined by both item work id and resumable attempt id; name changes do not defeat the match. Start-over verdict, different directory or command, missing item/record, or wrong-work/wrong-attempt record preserves ordinary saved-pane startup. The existing daemon-hydration-wins gate remains structural.
+- **Does not assert:** an actual PTY launch on this predicate (the production call site must use it); remote transport of the daemon's matching launch data; process liveness or the agent's actual resume (006/011/015).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/019 — A repeated or oversized selection is refused whole before anything is read.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI and raw attach requests. Unit companion: `a_repeated_or_oversized_selection_is_refused_before_anything_is_read` (`src/agent_restore.rs`).
+- **Agent:** synthetic `claude` of the 011 fixture.
+- **Asserts:** `interrupted restore … --agent A --agent A --yes` exits 1 naming the repeated agent; raw requests with a repeated attempt, 17 agents, a 129-byte id and 5,000 agents each answer one whole-request `bad-selection` refusal (no attempt) in under 4 KiB; nothing starts, nothing is sent and the item stays listed (audit F5, review/audit F1).
+- **Does not assert:** the concurrent-request permit (`too-many-pending`), which needs sixteen held requests.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/020 — A request prepared before a restore reads everything again before it starts.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests and the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_BARRIER` pause between a start over's preparation and its start.
+- **Agent:** synthetic `claude` of the 011 fixture.
+- **Asserts:** a Start over held at the barrier after reading the item lets Restore and continue bring the agent back; released, it answers `not-listed` and starts nothing, so there are two launches in all (the original and the restored) and the restored agent's first and only inbox message is the Continue note (audit F1).
+- **Does not assert:** the cross-daemon claim (021).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/021 — Two daemons on one state directory start one writer.
+
+- **Layer:** L2 two headless `daemon serve` processes with separate sockets and one state directory, lane 1 (`tests/e2e_agent_restore.rs`); concurrent raw attach requests, one per daemon. Unit companions: `a_claim_holds_its_attempt_and_conversation_against_a_second_claimer`, `a_claim_file_released_after_it_was_opened_claims_nothing`.
+- **Agent:** synthetic `claude` that delays its SessionStart report three seconds (`slow-start`), so a restore holds its claims while it confirms.
+- **Asserts:** restoring one attempt from both daemons at once restores it once, the other refused (`already-restoring`, `session-in-use`, `directory-in-use` or `not-listed`), two launches in all; restoring two attempts that were in one conversation, in different folders, one from each daemon at once, restores one and refuses the other `session-in-use`, three launches in all (audit F2).
+- **Does not assert:** a daemon that dies while holding a claim (the lock goes with its descriptor).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/022 — Start over refuses a launch that reopens the old conversation.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI and raw attach requests. Unit companion: `reopening_arguments_and_commands_are_told_from_a_fresh_start` (`src/agent_registry.rs`).
+- **Agent:** synthetic `claude`; one recorded command runs `claude --continue`, one `claude --resume <uuid>`, one a wrapper script that adds `--continue`.
+- **Asserts:** the two direct commands are refused `command-reopens` by the CLI (naming it) and by the raw request, starting nothing; the wrapper's Start over starts at most once, the shim sees its real `--continue` and the answer is `command-reopens` (round 3, audit B3; it was `not-fresh` before): no agent stays live, nothing is posted and the item stays listed (audit F3).
+- **Does not assert:** the other agents' classifiers and the no-recorded-session wrapper (028).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/023 — A failed restore stops every process it started.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan.
+- **Agent:** synthetic `claude` restored with `wrong-session`, `survive-stop` (a child in its session but another process group, ignoring TERM/HUP) and `ignore-term-child` (a child in its own group ignoring TERM); each child caps itself at 180 seconds and fixture cleanup signals only its exact pid while its start identity matches.
+- **Asserts:** the restore answers `not-resumed` only after both children are gone (exited, or waiting only to be reaped); nothing is sent; with the sentinels removed, a Start over then starts the agent again, so the failed restore's own launch no longer blocks it (audit F4).
+- **Does not assert:** a child that left the session (`setsid`), which no session scan finds; the `not-stopped` answer when the stop cannot be proven (027); pid and session-id reuse, covered by the injected-view unit test `the_sweep_signals_only_the_launchs_own_processes`; a retained zombie, covered by `a_retained_zombie_is_gone_for_every_session_check` (`src/platform/proc/mod.rs`).
+- **Platform coverage:** linux.
+
+##### journal/restore/024 — A restart note that cannot be delivered restores nothing.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); `DOT_AGENT_DECK_INBOX_MAX_BODY_BYTES` and the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NOTE` on the restarted daemon.
+- **Agent:** synthetic `claude` of the 011 fixture.
+- **Asserts:** an inbox that takes no body as long as the restart note refuses the restore `note-refused` before anything starts; a note post that fails after the agent confirmed its conversation answers `note-not-delivered`, stops the confirmed agent again, posts nothing, and keeps the item listed with its `resume` verdict (review R#4).
+- **Does not assert:** a full inbox reached by real traffic between admission and post.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/025 — Newer work in the folder refuses Start over and restore.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests. Unit companion: `newer_live_work_in_the_same_folder_makes_it_in_use`.
+- **Agent:** synthetic `claude`; a newer one started in the same folder on the restarted daemon, by its own path, through a symlink to it, and through a path with `..` in it (round 3, audit S1/F7), each in a fixture of its own.
+- **Asserts:** for each spelling, Start over and Restore of the stopped agent are both refused `directory-in-use`, nothing more starts and the item stays listed (review R#3).
+- **Does not assert:** the act-time Git and GitHub refusals (`folder-missing` for a gone worktree, covered by `act_time_git_facts_refuse_a_gone_worktree_and_an_open_pr_start_over`; `pr-open` under the claims, 029); a live launch whose folder cannot be read, covered by the unit companion.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/026 — A finished restore keeps its conversation from a second writer.
+
+- **Layer:** L2 two headless `daemon serve` processes with separate sockets and one state directory, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests; the e2e-only `DOT_AGENT_DECK_TEST_WITHHOLD_SESSIONS` (the journal admits no session event) and `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_EDGE` (the successor link's write fails). Unit companion: `a_confirmed_successor_owns_its_conversation_before_its_own_report`.
+- **Agent:** synthetic `claude`; two agents in one conversation (`fixed-session`), in folders of their own.
+- **Asserts:** with session reports withheld, restoring the first succeeds and records its successor link with the confirmed conversation while no `attempt_session` of the successor exists; after that request finished, restoring the second from the same daemon and from the second daemon is refused `session-in-use`, three launches in all (audit B1). With the link's write failing, a restore whose agent came back answers `not-recorded`, the agent is stopped and the item stays listed.
+- **Does not assert:** a journal that fails for a real reason (full disk), or the `not-stopped` + unrecorded case that keeps the claims for the daemon's life.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/027 — An unproven stop fences its conversation from every item.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP` (the stop leaves what the close did not stop and answers unproven). Unit companion: `an_unproven_stop_fences_its_conversation_until_its_launch_is_gone`.
+- **Agent:** synthetic `claude`; two agents in one conversation in folders of their own; the first restored with `wrong-session` and `survive-stop` (a child in its session, another process group, ignoring TERM/HUP, capped at 180 seconds; cleanup signals only its exact pid while its start identity matches).
+- **Asserts:** the first restore answers `not-stopped`; while its child runs, restoring the second from either daemon is refused `session-in-use` though the first's successor attempt ended in the journal; nothing more starts and nothing is sent; once the child is gone, the second restores (audit B2).
+- **Does not assert:** the fence's per-attempt half (023's Start over after a proven stop), a real kernel refusing a SIGKILL.
+- **Platform coverage:** linux.
+
+##### journal/restore/028 — Start over checks the arguments the agent really gets.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests. Unit companions: `reopening_arguments_and_commands_are_told_from_a_fresh_start` (`src/agent_registry.rs`), `a_fresh_start_request_is_checked_at_the_real_arguments` (`src/telemetry/shim.rs`).
+- **Agent:** the synthetic fixture executable, also as `opencode` and `codex`; OpenCode panes (`agent_type: open_code`) running `opencode --continue`, `opencode --session ses_1` and a wrapper running `opencode --session ses_028`; Claude Code panes running `(codex resume --last)`, `true;codex resume --last` and `c=codex; $c resume --last`; two Claude Code panes started with no conversation reported (`no-hook`), one through a wrapper adding `--continue`, one through a wrapper calling the fixture by its full path.
+- **Asserts:** the four commands the deck can read are refused `command-reopens` with nothing started; the OpenCode wrapper, the variable-named Codex and the Claude `--continue` wrapper (whose item is `no-session-id`) are refused `command-reopens` once the shim sees their real arguments; the full-path wrapper, which the shim never sees, is refused `not-fresh`; every started agent is stopped, nothing is sent and every item stays listed (audit B3).
+- **Does not assert:** real OpenCode, Pi, Devin or Codex CLIs (their classifiers are unit-tested against each CLI's `--help`); a Codex-typed pane, whose start runs the deck's hooks trust probe; Antigravity and plain shells, which are started over unchecked.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/029 — Start over reads GitHub again under its claims.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); real `dispatch --single`, a fake `gh` on the daemon's `PATH` that answers an open pull request for the branch once a sentinel exists, an `origin` remote naming a GitHub repository, and the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_BARRIER`.
+- **Agent:** synthetic routing dispatcher and synthetic `claude` single unit.
+- **Asserts:** a Start over held at the barrier after reading the item, while the branch had no pull request, answers `pr-open` once a pull request appears and it is released: Git and GitHub are read again with its claims held; nothing more starts and nothing is sent (audit S5).
+- **Does not assert:** a pull request opened between that read and the spawn, which no read can rule out; the dry run's facts in the question.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/030 — An unrecorded unproven stop fences the conversation it reported.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP` (the stop answers unproven) and `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE` (the `restore_failed` write fails). Unit companions: `a_fence_marker_is_written_while_another_request_holds_its_conversation`, `a_fence_marker_refuses_like_a_recorded_failure`.
+- **Agent:** synthetic `claude`; two agents in conversations of their own (the second started with `--resume` into the fixture's other conversation), in folders of their own; the first restored with `wrong-session` (it reports the second's conversation) and `survive-stop` (a capped child in its session; cleanup signals only its exact pid while its start identity matches).
+- **Asserts:** the first restore answers `not-stopped` and no `restore_failed` is written; restoring the second, whose conversation the first reported, from the same daemon and from the second daemon is refused `session-in-use`; nothing more starts and nothing is sent (round-4 B2).
+- **Does not assert:** another request holding the claim on that conversation while the fence is written (unit-level: the fence is a marker file, not a claim); the fence outliving its daemon and lifting (`journal/restore/034`).
+- **Platform coverage:** linux.
+
+##### journal/restore/031 — A survivor in an unknown conversation fences its kind.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP`. Unit companions: `a_survivor_in_an_unknown_conversation_fences_its_whole_kind`, `a_fence_covers_its_kind_only_when_its_conversation_is_unknown`.
+- **Agent:** synthetic `claude`; the first started with `--continue` in its own command (the launch shim refuses the resume beside it), the second in a conversation of its own in another folder; the first restored with `no-hook` (it reports no conversation) and `survive-stop`.
+- **Asserts:** the first restore answers `not-stopped` and writes `restore_failed` with `failure: refused` and `unknown_session: true`; while its child runs, restoring the second, a conversation the first never named, from either daemon is refused `session-in-use`; nothing more starts and nothing is sent; once the child is gone, the second restores (round-4 B2).
+- **Does not assert:** another agent kind's restores going on meanwhile (unit-level); the refused acknowledgement keeping a reported conversation, which `confirm_fresh` reads before it answers (unit-level).
+- **Platform coverage:** linux.
+
+##### journal/restore/032 — A same-name Claude wrapper is checked by its conversation.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests; a user's script named `claude` ahead of the fixture on the daemon's `PATH`.
+- **Agent:** synthetic `claude`, started through that script, which runs the fixture by its full path with `--resume <earlier conversation>` in front of the arguments it is given.
+- **Asserts:** Start over reaches the script through the launch shim (the agent's arguments hold both the deck's `--session-id` and the script's `--resume`), the agent reports the earlier conversation, and Start over is refused `not-fresh`; the agent is stopped, nothing is sent and the item stays listed (round-4 F3/B1).
+- **Does not assert:** the same shape for Codex, OpenCode, Pi or Devin, which report no conversation the deck can check a Start over against: a script of the user's named after one of them that picks a conversation itself is not checked (`docs/interrupted-work.md`); a later program the user's launcher starts after the first Claude reported the new conversation, which is not checked for any agent.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/033 — One restore acts at a time across daemons.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, lane 1 (`tests/e2e_agent_restore.rs`); raw attach requests; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_LOCK_BARRIER` (a restore or start over that acts waits just after it took the restore lock). Unit companion: `one_restore_acts_at_a_time_per_state_directory`.
+- **Agent:** synthetic `claude`; two agents in conversations and folders of their own.
+- **Asserts:** while the first daemon's restore holds the restore lock at the barrier, the second daemon refuses a restore and a Start over of the other agent as a whole (`restore-busy`, with its sentence) and starts nothing, and its dry run still answers `would_restore`; released, the held restore brings its agent back, and the second daemon's restore of the other agent then succeeds (round 5, R1/R2).
+- **Does not assert:** two requests in one daemon (the lock is an `flock` per open file, so they exclude each other the same way; unit-level); a request refused while a daemon keeps the lock for its life after a fence it could not write.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/034 — An unrecorded fence survives its daemon.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, one of them restarted, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP` and `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE`. Unit companion: `a_fence_marker_lifts_only_once_its_agent_is_gone_and_an_unreadable_one_fences`.
+- **Agent:** synthetic `claude`; the `journal/restore/030` shape: the first restored with `wrong-session` and `survive-stop`, so it reports the second's conversation and leaves a capped child in its session.
+- **Asserts:** the first restore answers `not-stopped` with no `restore_failed` written; after the daemon that answered it restarts, with the child still running, restoring the second from the new daemon and from the second daemon is refused `session-in-use`; nothing more starts and nothing is sent; once the child is gone, the second restores (round 5, R1).
+- **Does not assert:** a marker that cannot be written before the spawn (nothing is started: unit-level, `a_fence_that_cannot_be_written_before_the_spawn_starts_nothing`); a marker whose agent's leader was never written (`journal/restore/035`).
+- **Platform coverage:** linux.
+
+##### journal/restore/035 — A fence written before the spawn survives every later write failing.
+
+- **Layer:** L2 two headless `daemon serve` processes on one state directory, one of them restarted, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP`, `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE` and `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NARROW`. Unit companions: `a_fence_that_cannot_be_written_before_the_spawn_starts_nothing`, `a_pre_spawn_marker_narrows_in_place_and_lifts_by_its_launch_nonce`, `an_older_launch_in_the_same_pane_does_not_lift_a_new_marker`.
+- **Agent:** synthetic `claude`; the `journal/restore/034` shape: the first restored with `wrong-session` and `survive-stop`, so it reports the second's conversation and leaves a capped child in its session.
+- **Asserts:** the first restore answers `not-stopped`, no `restore_failed` is written, and the claims folder holds exactly one fence marker, the one placed before the spawn: no `pid`, no `to`, a `pane` and a `launch_nonce`, `unknown: true`, `sessions` the requested conversation (every narrowing failed); after the daemon that answered it restarts, with the child still running, restoring the second (another folder, a Claude conversation the marker covers by kind) from the new daemon and from the second daemon is refused `session-in-use`; nothing more starts and nothing is sent; once the child is gone, the second restores from the second daemon and no marker is left (the first lifted through the agent's launch record found by its launch nonce, the second's own lifted on success) (round 6, B1; round 7, B1).
+- **Does not assert:** a daemon that stopped between placing the marker and the spawn (no launch record carries the nonce, so the marker stays until removed by hand); a marker that cannot be placed (unit-level); an older launch record in the same pane, which does not lift the marker (unit-level, `an_older_launch_in_the_same_pane_does_not_lift_a_new_marker`).
+- **Platform coverage:** linux.
+
+##### journal/restore/036 — A spawn refused after its fork keeps its fence.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan; the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK` (a file it names arms the refusal, after its fork, of the next restore spawn, once the path the file names exists). Unit companions: `a_spawn_refused_after_its_fork_reports_the_child_it_started`, `a_failed_spawn_lifts_its_marker_only_once_nothing_was_left_running`.
+- **Agent:** synthetic `claude` restored with `survive-stop`, so it leaves a capped child in its session, out of its process group, that ignores the hangup.
+- **Asserts:** the restore is refused `not-stopped` (the spawn returned an error, and the session of the child it forked is not seen empty); the claims folder keeps one fence marker, narrowed to that child as leader (`pid` is the survivor's session, a `pid_start`, no `to`, a `launch_nonce`); a second restore of the conversation is refused `session-in-use` and starts nothing; once the survivor is gone, the restore succeeds and no marker is left (round 7, B2).
+- **Does not assert:** a spawn that fails before its fork (the marker lifts and the restore answers `spawn-failed`: unit-level); a child whose pid or start time could not be read (the marker stays as placed).
+- **Platform coverage:** linux.
+
+##### journal/restore/037 — An agent left out of the bounded list still makes a shared conversation ambiguous.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`), an in-memory journal and launch records.
+- **Agent:** none: seventeen recorded Claude Code attempts of one plain pane.
+- **Asserts:** the item lists sixteen agents and one omitted; the first, whose conversation only the omitted seventeenth shares, is `none` / `ambiguous-record` rather than `resume`; the others are `resume` (PR #2497 review: the duplicate-session check runs over every attempt before the list is bounded).
+- **Does not assert:** an act-time refusal of such a restore (the verdict is what offers it).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/038 — A restored agent's left-behind child keeps its conversation.
+
+- **Layer:** L2 headless `daemon serve`, restarted twice, plus a second daemon on the same state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan. Unit companion: `a_confirmed_successor_owns_its_conversation_before_its_own_report`.
+- **Agent:** synthetic `claude`, two panes in one conversation in folders of their own; the first restored with `survive-stop`, so it leaves a capped child in its session, out of its process group.
+- **Asserts:** the first restores; once its daemon stopped it, with the child still running, a restore of the second item, in another folder, from the next daemon and from a second one, is refused `session-in-use` and starts nothing; once the child is gone it restores (PR #2497 review, Greptile P1: a successful successor holds its confirmed conversation until its launch is proven gone, not until its attempt ends or its daemon goes).
+- **Does not assert:** a successor that reported another conversation while it ran (unit-level); a child that left the session (`setsid`, a documented residual).
+- **Platform coverage:** linux.
+
+##### journal/restore/039 — Restoring both agents of one item restores both.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); the second pane's attempt is moved onto the first pane's work in the dead run's journal and in its launch record: the shape a plain pane whose agent was replaced in place leaves when the deck goes away before the replaced attempt's end is written, which no public request makes in one test.
+- **Agent:** synthetic `claude`, two attempts in folders and conversations of their own.
+- **Asserts:** the item lists both agents with `resume`; one restore request selecting both answers two restored agents, each `recorded` and with its first message posted, and no refusal; each came back once; the item leaves the list (PR #2497 review, Qodo: the item closes once, after every selected agent was handled).
+- **Does not assert:** two agents of one item in the same folder (the second is refused `directory-in-use` beside the first's successor); a partial success (`journal/restore/042`).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/040 — A start over whose saved task cannot be posted starts nothing.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_TASK=1` refuses the saved task's post after the spawn.
+- **Agent:** synthetic `claude` as a dispatched single-agent unit with a saved task.
+- **Asserts:** Start over is refused `task-not-delivered` with the sentence naming the saved task; the agent it started is stopped; nothing is sent; the item stays listed with its verdict unchanged (PR #2497 review, Qodo).
+- **Does not assert:** an inbox that refuses the task before the spawn (`task-unsafe`, `journal/restore/014`).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/041 — A start over that reports the old conversation is not fresh.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`), through the launch shim's `opencode`.
+- **Agent:** two synthetic agents typed OpenCode (the `claude` stand-in under the name `opencode`), each in a known conversation of its own item: the first's every fresh start reports the old conversation, then one in a new conversation; the second's start over sends no hook (`no-hook`).
+- **Asserts:** Start over of the first is refused `not-fresh`, the agent it started is stopped, nothing is sent and the item stays listed; started over again in a new conversation, it is started and the item's close is recorded (PR #2497 review, Qodo: for an agent started without a new id that reports before its prompt, the first report is compared with the old conversation). Start over of the second, which reports nothing within the confirmation bound, is started on the shim's acknowledgement: recorded, still running, nothing sent, and the item leaves the list (whether those agents report before their prompt is not verified, so silence is not refused).
+- **Does not assert:** the real OpenCode, Pi or Devin (no lane-2 test covers their Start over); Codex, whose first report comes with its first prompt and is not waited for.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/042 — A partly refused restore keeps the refused agent listed.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan. The second pane's attempt is moved onto the first pane's work, as in `journal/restore/039`.
+- **Agent:** synthetic `claude`, two attempts in folders and conversations of their own; the second's old launch leaves a capped `survive-stop` child in its session, out of the process group the restart stops.
+- **Asserts:** one restore selecting both brings the first back (`recorded`, first message posted) and refuses the second `still-running`; the item stays listed with the first `none` / `restored` and the second `resume`; a restore naming the first is refused `not-restorable` and starts nothing; once the child is gone, a restore of the item naming no agent brings back the second alone, `recorded`, and the item leaves the list (PR #2497 review, Qodo: the item closes only once every interrupted agent of it is back).
+- **Does not assert:** a start over leaving another agent interrupted (it goes through the same `settle_item` check); an interrupted agent that can never come back (the item stays listed for the person to dismiss).
+- **Platform coverage:** linux.
+
+##### journal/restore/043 — A partly restored item offers only the agent still interrupted.
+
+- **Layer:** L1 `TestBackend` through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); details and question.
+- **Agent:** none; an injected item with one agent `none` / `restored` and one `resume`.
+- **Asserts:** the details list each agent with its own verdict sentence, the first `The deck already brought this agent back.`; `s` asks about the agent still interrupted only; `c` sends one RestoreInterrupted naming that attempt alone.
+- **Does not assert:** daemon execution (`journal/restore/042`); the desktop app's rendering, which reads the same verdict and sentence (`interruptedWork.test.ts`, `journal/restore/009`).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/044 — An item that lists no agent offers no restore.
+
+- **Layer:** L1 `TestBackend` through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); list and details. The desktop app's half is in `desktop/src/components/InterruptedWork.test.tsx` and `desktop/e2e/interrupted-work.spec.ts`.
+- **Agent:** none; an injected item with no agents, as a daemon that lists none returns (PR #2497 review, Qodo).
+- **Asserts:** with the daemon restoring agents or not, neither the list's nor the details' hints offer `s`, pressing `s` leaves the frame as it was and sends nothing; in the desktop app the Restore button is absent in both views, `s` opens no question, and a spoken restore opens none and answers `This item lists no agent to restore.`; a spoken restore of such an item while the details' report page is loading, or a reclaim question waits on its dry run, leaves that view, its pending answer and the selection as they were, and so does one on a daemon that answered it does not restore agents (PR #2497 review, Qodo).
+- **Does not assert:** an item whose agents are all brought back (`journal/restore/043`).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/045 — An interrupted list the deck cannot read at startup defers no saved pane.
+
+- **Layer:** L1 unit of `saved_restore_deferral_from` (`tests/session_restore_precedence.rs`), the decision the daemon-empty saved-workspace restore in `src/ui.rs` takes from the daemon's answer.
+- **Agent:** none; in-memory answers and launch records.
+- **Asserts:** no answer within the bound, a failed request, or launch records that cannot be read each defer nothing and name a reason (the caller logs it with `warn!` and starts every saved pane fresh, PR #2497 review); a daemon that does not list interrupted work or offers no resume defers nothing without a reason; a readable answer offering a resume defers by it.
+- **Does not assert:** the match between a saved pane and a launch record (`journal/restore/018`); the `warn!` line itself or a real slow daemon.
 - **Platform coverage:** mac+linux.
 
 #### journal/compat
@@ -2595,6 +3210,13 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Agent:** none (a deck-owned, clean worktree in a checkout whose `origin` is the upstream repository and which has a second GitHub remote, `fork`; the stub `gh` reply lists one `MERGED` pull request carrying `isCrossRepository: true` and a `headRepository` / `headRepositoryOwner`, the shape `gh pr list --head <branch>` returns for a contributor's pull request opened from their fork).
 - **Asserts:** a **fixture precondition** that the entry reads `owned: true` and `clean: true`; that with no push remote configured the entry reads `no_pr` / `keep`; that with `branch.<name>.pushRemote` set to `fork` but the pull request's head owned by someone else it still reads `no_pr` / `keep` and the directory survives `worktree reclaim --yes`; then that with the pull request's head being the fork the branch is pushed to the entry reads `merged` / `remove` and a bare `worktree reclaim` removes the directory. Pins issue #1779: the fork filter from #1687 also ignored a contributor's own pull request when they pushed to their fork while `origin` was the upstream, so a merged worktree was kept forever.
 - **Does not assert:** a push remote resolved through `remote.pushDefault` or the branch's upstream remote rather than `branch.<name>.pushRemote` (git resolves all three into the one `%(push:remotename)` the lookup reads); case-insensitive owner matching, a deleted fork (`headRepository: null`) and the ambiguous own-plus-fork case (unit-tested as `parse_pr_state_matches_a_fork_pull_request_only_from_the_push_repository` in `src/worktree_reclaim.rs`); the PR badge's side of the same match (`pull_request::tests::a_pull_request_from_the_fork_the_branch_is_pushed_to_is_the_branchs`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/014 — A worktree holding a linked worktree of another repository is kept, and the nested one is named.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, clean worktree whose stub `gh` reply is `MERGED`, so it would be removed; under its git-ignored `.worktrees/` lies a linked worktree of a second, independent repository holding an unsaved file).
+- **Asserts:** `worktree list --json` reads the holder `keep`; after `worktree reclaim --yes` the holder is still on disk, the nested worktree's unsaved file is unchanged, and the output says it `holds other worktrees`, naming the nested one. Pins PRD #1790 stage 2's final review, auditor 1: the holder's own repository's `git worktree list` does not know a worktree of another repository, and `git status` does not see it under an ignored directory.
+- **Does not assert:** the bound on the walk that finds it, or an unreadable directory (`nested_git_trees` unit tests); a plain clone rather than a linked worktree (same walk, unit-tested).
 - **Platform coverage:** mac+linux.
 
 ### Prompts
@@ -5983,6 +6605,16 @@ without depending on the config struct API.
 - **Does not assert:** the locked behaviour itself (`orchestration/lock/008`); that the focus steering is gated too (no automatic focus movement is asserted here).
 - **Platform coverage:** mac+linux.
 
+#### orchestration/ended-role
+
+##### orchestration/ended-role/001 — A role whose command dies at spawn says which role exited and why on its card, and selecting the card keeps it (issue #1965).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_ended_role.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon). Synthetic stand-ins.
+- **Agent:** none. The `ended-role-at-spawn` fixture's orchestrator is `cat`; its `reviewer` is `sh -c 'echo ended-role-sentinel-1965; exit 7'`, which prints a uniquely named sentinel line and exits at once, as a launcher that fails to load the agent does.
+- **Asserts:** after opening the orchestration through the `Ctrl+n` form, the reviewer's card names the role, reads `Exited`, says `its command exited (code 7)` and shows the sentinel under `Last output:`, and is not titled `pane-__dead`; pressing its number in command mode puts `reviewer exited: its command exited (code 7)` on the status line and keeps the card (no `Removed stale agent`). On a failure it prints the daemon's `ListAgents` `ended_roles`, which separates a daemon that never recorded the exit from a TUI that never showed it.
+- **Why it exists:** a role that died at spawn left a `No agent` card (`pane-__dead` when it was rebuilt as a dead slot) that selecting deleted as stale, with no word of which role died or why. Red before the fix: the card read `No agent · reviewer` for the whole wait while the daemon already listed the exit, because the role's pane keeps its attach open and nothing told the TUI the agent was gone; the daemon's `role_ended` broadcast is what closes it.
+- **Does not assert:** the dead-slot shape a reconnect or a daemon-started (dispatched) orchestration produces, which the L1 tests `the_card_grid_draws_a_reported_dead_slot_as_its_exited_role` and `enter_on_an_exited_role_keeps_its_card_and_says_why` in `src/ui.rs` cover; the desktop's row for the same role (`desktop/src/components/AgentOverview.test.tsx`); a real agent.
+- **Platform coverage:** mac+linux (unix-only PTY/UDS, `sh` stand-in role).
+
 #### orchestration/focus
 
 ##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.
@@ -6133,7 +6765,7 @@ without depending on the config struct API.
 - **Fixture:** `tests/fixtures/remit-compaction-live`; the orchestration is opened with the TUI's `Ctrl+n`, so the TUI's re-arm is the one under test. Credentials are imported and trust is pre-seeded in the isolated HOME.
 - **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`) as the orchestrator, Bash/Read/Write allowed; the worker is a `cat` stub. Runtime-skipped without CLI/credentials unless strict real-e2e enforcement is enabled.
 - **Asserts:** the orchestrator reads its role file once at startup (one line in `remit_reads_82_5c1e.txt`) and its startup turn ends; `/compact` typed into its pane reaches the deck as `Compacting`; exactly one new per-publish role file is published; the orchestrator then records a second read; and in its transcript the new file's name appears in no user or assistant turn before the `compact_boundary` entry, reaches the conversation after it as a user turn, and is then read with a tool call. (Measured on Claude Code 2.1.329: the re-assert is handed over while compaction runs and Claude Code queues it, a `queue-operation` record, until the summary is in place.)
-- **Does not assert:** the orchestrator's behaviour after the re-assert (delegating, carve-outs, gates — the PRD's Validation milestone); an orchestration the daemon re-arms (`013`); OpenCode or Codex.
+- **Does not assert:** the orchestrator's behaviour after the re-assert (delegating, carve-outs, gates — the PRD's Validation milestone); an orchestration the daemon re-arms (`013`); OpenCode (`014`) or Codex (`015`).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`).
 
 ##### orchestration/remit/013 — The daemon re-arms the coordinator of an orchestration no client is watching, once per compaction or `/clear`, and an attached TUI does not add a second re-arm (PRD #82).
@@ -6150,6 +6782,14 @@ without depending on the config struct API.
 - **Asserts:** the orchestrator reads its role file once at startup and its turn ends; `/compact` typed into its pane reaches the deck as `Compacting` (the plugin's report of the compaction starting); exactly one new per-publish role file is published; the orchestrator records a second read; the re-assert posted to its inbox names the new file; and a read of a role file follows the `Compacting` report (the event's shortened tool detail can cut an absolute path before the file name, as OpenCode 1.x's does, so the read is matched by its `.dot-agent-deck/orches…` prefix). The new file exists only from the compaction's start and the model takes no turn while writing the summary, so that read is a turn after the summary. Passed against OpenCode 2.2.7 (the queued re-assert runs in the same execution right after the compaction, with no idle between) and 1.19.5 (the session reports busy within milliseconds of the compaction part, which is why the TUI's re-arm reads the `Compacting` event and not only the status).
 - **Does not assert:** OpenCode's stored transcript order; an automatic (overflow) compaction; the orchestrator's behaviour after the re-assert (the Validation milestone).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
+##### orchestration/remit/015 — A real Codex orchestrator compacted with `/compact` gets its role back after the summary, not before it (issue #2435).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_orchestration_remit_codex_live.rs`, `orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summary`).
+- **Fixture:** `minimal`; the test writes the orchestration into `project/` (`support/codex_installed.rs`'s `project_dir`, a folder that does not hold the test HOME, so the deck can check Codex's input box), approves it, trusts the deck's Codex hooks in the test `CODEX_HOME` (`support/codex_inbox_live.rs`'s `prepare`) and opens it with the TUI's `Ctrl+n`, so the TUI's re-arm is the one under test.
+- **Agent:** REAL interactive Codex on the test model (`common::codex_test_model`) as the orchestrator, a plain `codex …` argv (`Direct(Codex)`); the worker is a `cat` stub. Runtime-skipped (`codex_installed::checkable`) without Codex, credentials or a build that checks a direct Codex's box, unless strict real-e2e enforcement is enabled.
+- **Asserts:** the orchestrator reads its role file once at startup (one line in `remit_reads_2435_c0d3.txt`) and its turn ends (`Idle`); `/compact` typed into its pane reaches the deck as `Compacting` (Codex's `PreCompact` hook); exactly one new per-publish role file is published; the orchestrator then records a second read; and in Codex's rollout (`$CODEX_HOME/sessions/**/rollout-*.jsonl`) the new file's name appears in no line up to and including the `compacted` record, and after it reaches the conversation as a message (`response_item/message`; on 0.164.0 a `developer` one, the inbox message the deck's hook hands Codex) that a tool call naming the file follows. (Measured on Codex 0.164.0: `/compact` fires `PreCompact` and `PostCompact`, both `"trigger":"manual"`, and no `Stop`. Until issue #2435 the deck read that `PostCompact` as `Thinking`, so the card never reached Idle, the doorbell never rang the re-assert, and this test failed on the second read. A manual Codex `PostCompact` now reads as `Idle`; unit test `a_manual_codex_post_compact_ends_the_turn` in `src/hook.rs`.)
+- **Does not assert:** `/clear`, after which the deck does not re-send a Codex orchestrator its role (`docs/orchestration.md`); an automatic compaction; an orchestration the daemon re-arms (`013`); the orchestrator's behaviour after the re-assert.
+- **Platform coverage:** linux (`target_os = "linux"`, as the other tests on `support/codex_installed.rs`).
 
 #### orchestration/layout
 
@@ -6536,8 +7176,8 @@ without depending on the config struct API.
 ##### dispatch/return/029 — A unit's updates to its report are bounded.
 - **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
 - **Agent:** none.
-- **Asserts:** after its first report a unit's next `MAX_REPORT_UPDATES` different reports are accepted as updates 1 to 3; one more different report is refused `report_updates_exhausted` with an exit-1 CLI line saying it was not delivered, and posts and saves nothing; an identical repeat of an earlier update still answers `already_accepted` with that update's id.
-- **Why it exists:** issue #2260: a unit that loops on `work-done` must not flood the conversation that dispatched it.
+- **Asserts:** after its first report a unit's next `MAX_REPORT_UPDATES` (20) different reports are accepted as updates 1 to 20, each delivered once; updates 1 to `USUAL_REPORT_UPDATES` (3) are delivered without the loop note and updates 4 to 20 each carry it; one more different report is refused `report_updates_exhausted` with an exit-1 CLI line naming 20 updates and saying it was not delivered, and posts and saves nothing; identical repeats of an update within the usual count and of one past it still answer `already_accepted` with that update's id and number, and deliver nothing.
+- **Why it exists:** issue #2260: a unit that loops on `work-done` must not flood the conversation that dispatched it; issue #2485: a healthy unit whose work keeps moving is not silenced at its fourth correction, and the dispatcher is told of a likely loop instead.
 - **Does not assert:** a real agent; the desktop app.
 - **Platform coverage:** mac+linux.
 
@@ -6564,6 +7204,14 @@ without depending on the config struct API.
 - **Why it exists:** issue #2260 (PR #2275 review): a repeat of an update used to answer with the first report's destination and no number.
 - **Does not assert:** a real agent; the desktop app.
 - **Platform coverage:** mac+linux.
+
+##### dispatch/return/034 — A unit's fourth update reaches the dispatcher flagged as a possible loop.
+- **Layer:** L2 synthetic, lane 1, real CLI/daemon with an attached `TuiDeck` (`tests/e2e_dispatch_report_updates.rs`); the dispatcher is opened from the TUI's New Agent dialog with dispatcher mode chosen, its dispatcher seed is in its inbox, and it runs a real `dispatch --single`.
+- **Agent:** none — identity-recording probes that emit a synthetic `SessionStart` and exec `cat`, using their own minted pane capabilities.
+- **Asserts:** after the unit's first report, its next `USUAL_REPORT_UPDATES + 1` (4) different `work-done --done` reports each exit 0 saying which update they sent, and each reaches the dispatcher's inbox once, opening with the update wording and naming its number of at most `MAX_REPORT_UPDATES`; updates 1 to 3 carry no loop note and update 4 carries `LOOPING_NOTE`; an identical repeat of update 4 exits 0 and delivers nothing new.
+- **Why it exists:** issue #2485: the dispatcher-visible note on an update past the usual count, through the spawned binary.
+- **Does not assert:** the hard limit's refusal (`dispatch/return/029`); a real agent; the desktop app.
+- **Platform coverage:** mac+linux (Unix PTY/socket harness).
 
 ##### dispatch/return/030 — A real dispatched single unit, told its report is out of date, sends an update, and the dispatcher receives it as a separate turn beside the first report.
 - **Layer:** L2 PTY-attached, lane 2 (`TuiDeck` on `minimal`, `tests/e2e_dispatcher_mode.rs`) driving the real new-pane dispatcher flow and two real interactive Claude Code panes through the branch binary; the dispatcher runs `dot-agent-deck dispatch --single` itself, and no test process runs `dispatch` or `work-done`.
@@ -6699,6 +7347,13 @@ without depending on the config struct API.
 - **Agent:** none — identity-recording `cat` probes.
 - **Asserts:** for two completed single units, each with another worktree of the fixture repository under its ignored `.worktrees/` holding an untracked file and `git status` empty, `close <name>` exits 0, removes the agent, reports `<path>: kept: holds other worktrees` and `holds worktree <nested path>`, and `close <name> --json` reports one `kept-holds-worktrees` verdict whose `nested_worktrees` names the nested path; both unit worktrees and both nested files are still on disk. Without the fix both closes report `removed` and the nested files are gone.
 - **Does not assert:** the orchestration scope, the `Force` policy, or `worktree reclaim` (its own unit test, `worktree_reclaim::tests::a_candidate_holding_other_worktrees_is_kept_and_names_them`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/015 — After a daemon restart, `close <unit>` answers `unknown-unit` and points at `dot-agent-deck interrupted list` (PRD #1790 stage 2).
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); a SIGTERM to the first daemon's own pid and a second `daemon serve` on the same state directory, then the real `close` CLI run as a person.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and a `--single` unit.
+- **Asserts:** `close <unit>` exits 1 and its output names `dot-agent-deck interrupted list`; `close <unit> --json` exits 1 with a report carrying `unknown-unit` and the same hint.
+- **Does not assert:** `close --unit-id` with a pre-restart id (its own message, `dispatched_units` unit tests).
 - **Platform coverage:** mac+linux.
 
 #### dispatch/single
@@ -6877,8 +7532,8 @@ without depending on the config struct API.
 ##### session/restore/001 — No-flag startup auto-restores dashboard panes from the saved session (PRD #89 Phase 2).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
 - **Agent:** none (a saved `session.toml` with two panes running `sleep 600`; daemon is freshly spawned and empty).
-- **Asserts:** launching with NO `--continue` flag against an empty daemon restores both saved panes as dashboard cards, with their saved display names. (Restore is unconditional now — the old `--continue` gate is gone.)
-- **Does not assert:** the agents' inner state (not preserved per docs); the daemon-vs-snapshot precedence (deferred to Phase 2 M2.2).
+- **Asserts:** launching with NO `--continue` flag against an empty daemon restores both saved panes as dashboard cards, with their saved display names. (Restore is unconditional now — the old `--continue` gate is gone.) Two slow-start cases (issue #2421), each with one saved pane and the daemon's every fresh spawn held by the e2e-only `DOT_AGENT_DECK_TEST_SPAWN_DELAY_MS` (a stand-in for a daemon's first installed Claude Code spawn, which copies the deck's binary as its editor helper before replying, measured at 9 s on a loaded box): at 7 s, past the TUI's former 5 s bound and inside the 15 s it now shares with the desktop app, the pane comes back named and focused (`[Command Mode Ctrl+D]` in the footer); at 17 s, past the bound, the deck gives up but the agent the daemon still starts reaches the dashboard under its saved name rather than its command, because the restore passes the name on the start itself. Red before the fix with the issue's signature: an unnamed `sleep 600` card in command mode and an `attach protocol connection error: Broken pipe` in the deck log.
+- **Does not assert:** the agents' inner state (not preserved per docs); the daemon-vs-snapshot precedence (deferred to Phase 2 M2.2); that the 17 s case's late card is attached or focused (it is not: it surfaces from the daemon's record like any card this TUI did not start); the warning a timed-out restore leaves in `session_warnings`; the real helper copy's duration, which the delay only stands in for (`inbox/doorbell/010`'s installed-Claude fixture meets the real one in lane 2).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/004 — A saved pane whose `dir` no longer exists is skipped with a stderr warning; other saved panes still restore.
@@ -7488,7 +8143,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 ##### upgrade/upgrade-dialog/007 — A command too long for the dialog is reached by scrolling, never cut off.
 - **Layer:** L1 (dialog state machine + `TestBackend` at 80×24), a staged outcome whose staging path is long but under `plan::MAX_SHOWN_PATH_CHARS`.
 - **Agent:** none.
-- **Asserts:** the dialog shows `↑ more` / `↓ more` markers and names `PgUp/PgDn` in its hint; paging with PageUp/PageDown reaches every row of the core's install command, its `sha256sum -c -` check included, and every short line of the plan and the outcome.
+- **Asserts:** Enter reaches Upgrade once the plan has been paged through (the collector's line, issue #2064, made it longer than the dialog); the dialog shows `↑ more` / `↓ more` markers and names `PgUp/PgDn` in its hint; paging with PageUp/PageDown reaches every row of the core's install command, its `sha256sum -c -` check included, and every short line of the plan and the outcome.
 - **Does not assert:** the mouse wheel, which calls the same `scroll_by` from the run loop.
 - **Platform coverage:** mac+linux+windows.
 
@@ -7548,6 +8203,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** running the refresh (`self_upgrade::agent_hooks` unit tests, `inbox/claude/048`), or the desktop dialog (`local_upgrade_008`–`010`).
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-dialog/016 — A terminal focus-in re-checks only when the last check is an hour old.
+- **Layer:** L1 (pure `upgrade_dialog::focus_check_due`, `FOCUS_RECHECK_FLOOR`, `focus_recheck_floor`).
+- **Agent:** none.
+- **Asserts:** the floor is one hour and `focus_recheck_floor()` is it; a focus-in is due with no check started yet, not due within the hour, due at the hour and after five hours, and due when the wall clock moved backwards (issue #2450).
+- **Does not assert:** the checker loop reacting to a real focus-in (`upgrade/tui-upgrade/005`), the desktop app's focus re-check (`desktop/src/hooks/useSelfUpgradeCheck.test.ts`, `self_upgrade_check_006`–`007`).
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
@@ -7556,6 +8218,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Asserts:** the footer shows `dot-agent-deck CLI: update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Upgrading does not restart the daemon on this machine` (issue #1753), `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, the installed file is last run as `hooks refresh --json`, and the dialog shows `Upgraded …`, the provenance result, the refresh's report (PRD #1666 part 3, R-3) and the restart line; Escape closes it.
 - **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
 - **Platform coverage:** mac+linux.
+
+##### upgrade/tui-upgrade/004 — Confirming the dialog also upgrades the release collector beside the CLI and restarts its service.
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server serving the CLI's and the collector's release scripts under one manifest, an old collector script beside the running copy, and a stand-in `systemctl` in the sandbox `PATH` reporting `dot-agent-deck-collector.service` running that file and recording its invocations).
+- **Agent:** none.
+- **Asserts:** the dialog's plan names `A resource collector (dot-agent-deck-collector)` before confirming; after Down + Enter the collector file becomes the served collector, the dialog shows `Upgraded the resource collector` and `Restarted the dot-agent-deck-collector.service`, and the stand-in was run with `--user try-restart dot-agent-deck-collector.service` (issue #2064).
+- **Does not assert:** a real systemd user manager, the collector-absent and collector-elsewhere cases (`upgrade/cli-upgrade/010`, `011`, and `self_upgrade::collector` unit tests), the desktop app (`self_upgrade_042`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS, where the collector does not ship).
 
 ##### upgrade/tui-upgrade/002 — A copy installed with Nix is told what to do and offered no confirmation.
 - **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server, a faked `/nix/store` path).
@@ -7569,6 +8238,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** no badge while the server's newest release is the running version; after the server publishes a newer one, the badge appears within 30 s without a restart.
 - **Does not assert:** the production 6-hour interval (`upgrade/upgrade-dialog/006` pins the constant).
+- **Platform coverage:** mac+linux.
+
+##### upgrade/tui-upgrade/005 — A terminal focus-in re-checks for a release published while the TUI runs.
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server whose newest release changes mid-test, the production re-check interval, the `e2e`-only focus re-check floor seam at 0 s, a focus-in report `ESC [ I` written to the PTY).
+- **Agent:** none.
+- **Asserts:** no badge while the server's newest release is the running version; after the server publishes a newer one and the terminal reports focus-in, the badge appears within 30 s, long before the 6-hour interval (issue #2450).
+- **Does not assert:** the one-hour floor itself (`upgrade/upgrade-dialog/016`), a real suspend and resume.
 - **Platform coverage:** mac+linux.
 
 #### upgrade/cli-upgrade
@@ -7628,6 +8304,34 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Asserts:** the installed file is unchanged byte for byte and no temporary file is left beside it; the release script ran once (`--version`) and never again; no `Upgraded`; a `` `…--version` failed: `` line saying it was cancelled; non-zero exit; `Cancelled.` as the last line.
 - **Does not assert:** the refusal to start a command once interrupted and the teardown-window signal (`self_upgrade::cli` unit tests `cli_007`–`cli_009`), the detach of a cancelled app swap (`execute_034`).
 - **Platform coverage:** mac+linux.
+
+##### upgrade/cli-upgrade/009 — `upgrade --yes` upgrades a release collector beside the CLI and restarts the user service that runs it.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving the CLI's and the collector's release scripts under one `checksums.txt`, an old collector script beside the CLI, and a stand-in `systemctl` in the sandbox `PATH` reporting `dot-agent-deck-collector.service` active with that file as `ExecStart`).
+- **Agent:** none.
+- **Asserts:** exit 0; the plan says the collector in the same folder is upgraded too; the collector is the served collector byte for byte; `Upgraded the resource collector at <path> from v0.0.1 to v<release>, checked the same way.` and `Restarted the dot-agent-deck-collector.service user service, so it now runs v<release>.`; the stand-in's last invocation is `--user try-restart dot-agent-deck-collector.service` (issue #2064).
+- **Does not assert:** a real systemd user manager, a service running another file or none, a failed restart, a collector download that fails its checksum (`self_upgrade::collector` unit tests `collector_008`, `collector_009`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
+
+##### upgrade/cli-upgrade/010 — With no collector beside the CLI, `upgrade --yes` installs none and says so.
+- **Layer:** L2 (lane 1, real subprocess, fake release server that also serves a collector asset).
+- **Agent:** none.
+- **Asserts:** exit 0; the CLI is upgraded; `No resource collector (dot-agent-deck-collector) is in <folder>, so none was upgraded.`; no collector file is created (issue #2064).
+- **Does not assert:** the TUI and desktop clients, which run the same core step (`self_upgrade::collector` unit test `collector_003`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
+
+##### upgrade/cli-upgrade/011 — A collector elsewhere on PATH is named and left alone.
+- **Layer:** L2 (lane 1, real subprocess, fake release server, an old collector script in the sandbox `PATH` folder and none beside the CLI).
+- **Agent:** none.
+- **Asserts:** exit 0; `The resource collector first on your PATH, <path>, v0.0.1, is not in the upgraded CLI's folder, so it was left as it is.`; that collector is unchanged byte for byte and none is created beside the CLI (issue #2064).
+- **Does not assert:** a collector the CLI's folder links to elsewhere, or one a system package owns (`self_upgrade::collector` unit test `collector_004`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
+
+##### upgrade/cli-upgrade/012 — A collector in a folder the user cannot write is downloaded, checked and staged with its install command.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving both release scripts; the install's folder, holding the CLI and an old collector, made read-only).
+- **Agent:** none.
+- **Asserts:** exit 0; the collector is unchanged; `Downloaded and checked v<release> of the resource collector at <path>, which you cannot write to.`; a `sudo install -m 0755 … <path>` line with its `sha256sum -c -` check; and that a running collector keeps its old version until restarted once installed (issue #2064).
+- **Does not assert:** the desktop app's password prompt, which installs the CLI and leaves the same command for the collector. Prints `SKIP:` when run as root, which can write the folder.
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
 
 ### Remote diagnostics (PRD #345)
 
@@ -9315,6 +10019,41 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the 1 MiB eviction route or the mouse-mode half of the preamble (both covered by the `AgentBus` replay unit tests in `src/agent_pty.rs`); that the wheel reaches the agent in typing mode; the notice's render tiers or TTL (covered by `mode/scroll/005`); or real-agent behavior.
 - **Platform coverage:** mac+linux.
 
+##### mode/scroll/009 — A REAL full-screen Claude Code scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--settings` naming a file in its working directory that sets `"tui": "fullscreen"`, with `CLAUDE_CODE_NO_FLICKER=1`, `--allowedTools Bash Read`, no `-p`), started with `StartAgent`, credentials imported and the work directory's trust seeded.
+- **Asserts:** after the agent types the integers 1 to 150 and the screen settles, a written `ESC[5~` takes 150 off the screen while earlier numbers show; repeated `ESC[6~` brings 150 back; the agent is still registered and not `crashed`. This is the route the desktop's voice "scroll up" / "scroll down" take over a pane on the alternate screen.
+- **Does not assert:** the desktop app itself (its routing is `desktop/src/lib/paneScroll.test.ts` and `PullRequestBrowser.test.tsx`'s issue #1673 block); how many lines one PageUp moves; the wheel; mid-turn scrolling (measured by hand for the issue, not pinned).
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/010 — A REAL Claude Code on its default renderer leaves its output in the history the deck scrolls (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the prompt is written on an attach stream, PageUp is pressed in the TUI's command mode; asserted on the rendered vt100 grid).
+- **Agent:** REAL interactive Claude Code on Haiku with `--settings` naming a file that sets `"tui": "default"` (inline renderer; the harness copies the host's `settings.json`, so the renderer is pinned), `--allowedTools Bash Read`, started with `StartAgent`.
+- **Asserts:** after the agent types 1 to 150 and the screen settles, Ctrl+D then PageUp in command mode (pressed until the view moves, because the first press after Ctrl+D can be lost, #2477) takes 150 off the screen while earlier numbers show, with no `Nothing to scroll` notice, and the agent is still running. This is the TUI's half of the route the desktop takes for a pane on the main screen with history (it scrolls its own terminal history).
+- **Does not assert:** that the desktop's xterm.js keeps the same history (it is fed the same bytes; not driven here); that PageUp written to the agent does nothing (measured for the issue, not pinned).
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/011 — A REAL OpenCode scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive OpenCode on its cheap test model (`common::opencode_interactive_command`), started from the New agent dialog, credentials imported.
+- **Asserts:** as `mode/scroll/009`: after 1 to 150 is typed and the screen settles, a written `ESC[5~` takes 150 off the screen while earlier numbers show, repeated `ESC[6~` brings it back, and the agent is still running.
+- **Does not assert:** as `mode/scroll/009`.
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/012 — A REAL Codex scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive Codex on `common::codex_test_model()`, `--sandbox workspace-write --ask-for-approval never`, low reasoning effort, started from the New agent dialog with the `codex-live` fixture, credentials imported.
+- **Asserts:** as `mode/scroll/009`. Codex 0.147.0 kept no transcript of its own and ignored PageUp (PRD #611); this pins that the version under test does scroll by it.
+- **Does not assert:** as `mode/scroll/009`; which Codex versions changed this.
+- **Platform coverage:** mac+linux.
+
+##### mode/scroll/013 — A REAL Pi scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
+- **Agent:** REAL interactive Pi on `common::pi_test_model()` with `--approve --no-builtin-tools --thinking off` (so the list is typed rather than collapsed behind a `seq` call), restored from a saved session with the bundled extension, credentials imported.
+- **Asserts:** as `mode/scroll/009`.
+- **Does not assert:** as `mode/scroll/009`.
+- **Platform coverage:** mac+linux.
+
 #### mode/live
 
 ##### mode/live/001 — A real PTY-attached deck keeps the persistent mode chip after the command banner collapses.
@@ -9547,10 +10286,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### scheduler/dispatch/013 — A fired `issue_dispatch` task against an ORCHESTRATION repo drives the GENUINE `gh` → clone → per-issue worktree → real-agent path against LIVE GitHub, and the dispatched orchestration must surface LIVE as an orchestration TAB (with its orchestrator + worker role panes) on the already-attached TUI — the real-scenario multi-agent showcase (CLAUDE.md rule 4) a `cat`/stub stand-in can never prove (PRD #120).
 - **Layer:** L2 PTY (the real `dot-agent-deck` binary in an isolated PTY via the `TuiDeck` harness, asserted on the rendered vt100 grid — same harness as `scheduler/dispatch/011`). REAL seams, no stand-ins: REAL `gh` on the normal PATH (no `gh` stub) really enumerates/PR-checks/clones against live GitHub, with `GITHUB_TOKEN` threaded through the scrubbed deck env so the daemon's `gh` inherits auth; the clone's `[[orchestrations]]` resolves to two FULLY INTERACTIVE `claude` role panes pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash`, no `-p`); the freshly-built `dot-agent-deck` binary's dir is prepended to the deck→daemon→agents PATH (`with_env("PATH", …)` wins over the harness scrub) so the orchestrator's `dot-agent-deck delegate --to worker` resolves. The dispatch behavior is ungated, so the env carries no `DOT_AGENT_DECK_EXPERIMENTAL`; the fire is driven by `RunNow` over the attach socket.
-- **Fixture:** the permanent public repo `vfarcic/dot-agent-deck-tests` — a committed `DISPATCH_E2E_SENTINEL.md`, a `.dot-agent-deck.toml` with `[[orchestrations]] name = "issue-work"` (roles `orchestrator` (start) + `worker`, both Haiku `claude`; the orchestrator's `prompt_template` delegates the task to the worker), and a PERMANENT open issue #1 labelled `agent-dispatch-test`. The schedule filters on that label with `max_per_run = 1`, so ONLY issue #1 is enumerated (deterministic). Both role panes share the per-issue worktree cwd (pre-trusted in the per-test HOME so claude's first-run gates clear with no keystroke). Clone + worktree live under a `common::harness_tempdir()` removed on drop.
+- **Fixture:** the permanent public repo `vfarcic/dot-agent-deck-tests` — a committed `DISPATCH_E2E_SENTINEL.md`, a `.dot-agent-deck.toml` with `[[orchestrations]] name = "issue-work"` (roles `orchestrator` (start) + `worker`, both Haiku `claude`), and a PERMANENT open issue #1 labelled `agent-dispatch-test`. The schedule filters on that label with `max_per_run = 1`, so ONLY issue #1 is enumerated (deterministic). An issue dispatch hands the schedule's `prompt` to the orchestrator verbatim, with no orchestrator context, so that prompt tells the orchestrator not to do the work itself and gives it the exact `dot-agent-deck delegate --to worker --task '…'` command. Both role panes share the per-issue worktree cwd (pre-trusted in the per-test HOME so claude's first-run gates clear with no keystroke). Clone + worktree live under a `common::harness_tempdir()` removed on drop.
 - **Agent:** REAL Claude Code (Haiku) ×2 role panes, cheap interactive turns (<$0.05/run). Flaky-tolerant lane-2 tier (real LLM + real network) — run once, not looped (rule 4). Runtime-skipped (Decision 26) when the `claude` CLI/credentials or `GITHUB_TOKEN` are absent.
-- **Asserts:** after the fire the daemon registers both dispatched orchestration role agents under their role names, `orchestrator` and `worker` (precondition proving the live clone, worktree and spawn happened). Since `orchestration/dispatch/002`, role panes carry their role names, matching the interactive `Ctrl+n` path, rather than the shared schedule name `github-issues`. The dispatched orchestration then surfaces live as an `issue-work` tab (the fixture's orchestration name) in the attached TUI without reconnecting. Without the live orchestration surface, role panes would appear as flat dashboard cards until hydration. Best-effort, logged without gating: switch to the tab and observe the worker listing files including `DISPATCH_E2E_SENTINEL.md`. Agents are instructed not to push or open PRs, and the test best-effort probes for a pushed `agent/issue-1` branch. The deck itself makes best-effort claim writes, provisioning/adding `agent-deck/claimed` and creating/editing a claim comment when permitted. With a read-only token those writes were denied, the claim-failure notice appeared and dispatch succeeded (PRD #421 M2.4, verified 2026-10-27).
-- **Does not assert:** the delegation chain / sentinel as a hard gate (logged best-effort — too LLM/timing-dependent); exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
+- **Asserts:** after the fire the daemon registers both dispatched orchestration role agents under their role names, `orchestrator` and `worker` (precondition proving the live clone, worktree and spawn happened). Since `orchestration/dispatch/002`, role panes carry their role names, matching the interactive `Ctrl+n` path, rather than the shared schedule name `github-issues`. The dispatched orchestration then surfaces live as an `issue-work` tab (the fixture's orchestration name) in the attached TUI without reconnecting. Without the live orchestration surface, role panes would appear as flat dashboard cards until hydration. After switching to the tab, within 150 s the worker's inbox holds an Acknowledged message sent from the orchestrator's pane (matched by pane: on this start path the sender carries no role name), and `DISPATCH_E2E_SENTINEL.md` is on the worker pane's own screen (its pane snapshot, not the tab's combined stream, which the orchestrator listing the files itself would also satisfy). Agents are instructed not to push or open PRs, and the test best-effort probes for a pushed `agent/issue-1` branch. The deck itself makes best-effort claim writes, provisioning/adding `agent-deck/claimed` and creating/editing a claim comment when permitted. With a read-only token those writes were denied, the claim-failure notice appeared and dispatch succeeded (PRD #421 M2.4, verified 2026-10-27).
+- **Does not assert:** a report from the worker back to the orchestrator; exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/014 — Concurrent bootstrap delays retain each seed until its recipient consumes it.
@@ -11502,6 +12241,7 @@ The live history case (`doorbell_010_live_history_enter_recovers_the_doorbell`) 
 - **Agent:** the e2e stand-in profile's Python editor and the tester's explicitly profiled synthetic composer (`tests/support/empty_composer.py`) in lane 1; real Claude Haiku in lane 2.
 - **Asserts:** The real TUI holds a draft for a 1500 ms observation with the task Queued and no ring; Ctrl+U permits the token-led line without submitting the draft. A companion deterministic case receives and fetches a control task (its capture settling at the line and one Enter, with no cleanup CR), presses Left, waits for captured navigation bytes and a processed empty-composer redraw, and requires another doorbell and nonce-bearing fetch. Its composer consumes navigation separately from text and supplies a redraw marker, width witness, dim placeholder and transcript echo; the e2e-only profile requires both the explicit selector and its executable path. Three controls require zero typed bytes, the task queued with no delivery and `cannot_type` past the stall threshold: no selector, the selector with no executable path, and the selector naming another executable copy that the pane does not run. The real-agent empty-editor cases first complete a fallback-delivered control task, then press Right in the empty editor or erase an exact visible draft completely with Backspace. Right has a recipient-processing barrier: a harmless marker is drawn after the initial key, Left and Right visibly move across it, and Backspace redraws the exact empty composer, without a submit or clear key. Another task must create its sentinel within 30 seconds without another keypress; exact sentinel contents, acknowledged state and single delivery are checked afterward with the helper's separate 120-second waits. Left opens Claude Code 2.1.310's background-session overview: a companion case observes it for 5 seconds with the input row exactly unchanged and showing its empty placeholder, an unchanged util-linux `script --log-in` input ledger, the task Queued, zero deliveries, no logged pane write, doorbell attempt or ring, and no sentinel. Capturing the human Left first validates the ledger; subsequent bytes would be automatic because the test sends no further input. The overview is not a recognised composer, so it holds delivery. A retained-draft case covers typed, history-recalled and partly deleted text, including navigation within text: over 5 seconds, longer than the configured 2-second stall threshold, the composer stays exact, the task stays Queued with zero deliveries, no doorbell is appended, and `wake_stalled` plus the matching log line are required; clearing then delivers the original sentinel once, and the hold must report `possible_draft`. Native waiters are killed by captured scratch-process pid to isolate fallback. On empty-editor failure, Ctrl+U recovery is recorded before the automatic-delivery assertion fails. The live overview case (`doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there`) asserts that the deck types nothing into Claude Code's overview after Left; since issue #2342 the task may leave the queue there only when the background session the conversation moved to took the receiver over, through that session's own waiter.
 - **Does not assert:** delivery through an armed native waiter; an age-based permission rule at arbitrary durations, which `inbox/doorbell/040` takes on with a controlled clock (the live observation is 5 seconds); Codex, OpenCode, Pi or the desktop client; bytes consumed internally by Claude after the input-recording relay, whose nested PTY's own mode the deck's termios read does not describe. Return from the overview is outside this guard: Claude Code 2.1.310 does not reliably return to a ready composer on Esc. Right and Backspace retain recovery coverage.
+- **Quarantined:** the live history case (`doorbell_010_live_history_enter_recovers_the_doorbell`) and the live kept-draft case (`doorbell_010_live_kept_draft_stays_held`), `#[ignore = "quarantined: vfarcic, #2461"]` (CLAUDE.md rule 6). Each fails in rotation with others in a full parallel run of `e2e_inbox_claude_live` and passes alone; #2461 has the evidence, the run command (`--run-ignored only`) and what lifts it. The other live `doorbell_010` cases still run.
 - **Platform coverage:** Linux for the native F2 draft and navigation cases; linux for the synthetic composer-profile cases (their mode reporter uses SO_PEERCRED and /proc, and the stand-in profile reads the process's command line from /proc) and lane 2's captured-waiter fixture. The composer-profile cases are compiled out elsewhere, rather than reporting a successful runtime skip. Python 3 on PATH is an explicit failing preflight, with no pip dependencies. The live overview ledger additionally requires util-linux `script`.
 
 S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tests/e2e_probe_delivery.rs`: an observed non-empty draft stays held during the 1500 ms observation, and Ctrl+U requires another real check before the notice and CLI fetch. This function is Linux-only; the unmodified profile-selection controls and lane-2 cases retain their own platforms and obligations.
@@ -11900,7 +12640,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/probe/002 — The box is empty again only through a probe whose own byte is the last input, which read it empty with nothing foreign since; a prompt hook never empties it.
 - **Layer:** Fast. Pure in `tests/input_epoch.rs` (`GenerationInput`, `src/composer_probe/epoch.rs`, and the real `OutputHook` for the report modes), and in-module in `src/composer_probe/epoch.rs` (the epoch at its last value) `src/agent_pty_input_epoch_tests.rs` (on Unix, the registry's turn paths on a real `/bin/cat` pane) and `src/daemon.rs`'s `hook_ingestion_tests` (on Unix, the daemon's own ingest of hook events for a live pane).
 - **Agent:** none.
-- **Asserts:** one human byte, one probe admitted with its own byte next, and an empty read with nothing else applies the observation and the box is not touched, until the next byte. Between admission and settlement, a voice answer, a human byte, a deck write with no job named, another deck job's byte, an external edit, a focus report with focus reporting off, an unsolicited DA1 reply, and a CPR reply to an outstanding query each refuse it and the box stays touched; so do a non-empty read, a retired generation (in the observation or through the generation's input), a stale admission epoch and another job's observation. Whole focus reports with 1004 on, whole SGR mouse reports with a tracking mode and 1006 on, and whole DA1 and OSC 11 replies to outstanding queries are exempt and leave the observation applicable; the same report split, prefixed, written by the deck or as a voice answer, inside a bracketed paste, with focus reporting off, with the encoding switched to 1005, with tracking reset or after RIS moves the epoch, and a reset naming a tracking mode not in force leaves the one in force on. Through the real output hook, `?1004;1003;1006h` in one sequence makes both reports exempt, RIS ends that, and resetting 1004, the 1006 encoding or the tracking mode in force each ends its report's exemption. The epoch at its last value stays there, touched, and applies nothing. Through the registry, turn edges delivered after a person typed, or before, leave the epoch exactly as the typing left it. Through the daemon's hook ingestion, after a person typed into a live Claude Code pane, the agent's thinking report, a tool starting, its prompt hook's report of a prompt it took, the deck's own line it recognised, the turn ending, a prompt report from the pane's previous generation and a subagent's prompt report each leave the epoch unchanged and the box touched.
+- **Asserts:** one human byte, one probe admitted with its own byte next, and an empty read with nothing else applies the observation and the box is not touched, until the next byte. Between admission and settlement, a voice answer, a human byte, a deck write with no job named, another deck job's byte, an external edit, a focus report with focus reporting off, an unsolicited DA1 reply, and a CPR reply to an outstanding query in a modified F3 key's shape (`CSI 1;2R`) each refuse it and the box stays touched; so do a non-empty read, a retired generation (in the observation or through the generation's input), a stale admission epoch and another job's observation. Whole focus reports with 1004 on, whole SGR mouse reports with a tracking mode and 1006 on, and whole DA1 and OSC 11 replies to outstanding queries are exempt and leave the observation applicable; the same report split, prefixed, written by the deck or as a voice answer, inside a bracketed paste, with focus reporting off, with the encoding switched to 1005, with tracking reset or after RIS moves the epoch, and a reset naming a tracking mode not in force leaves the one in force on. Through the real output hook, `?1004;1003;1006h` in one sequence makes both reports exempt, RIS ends that, and resetting 1004, the 1006 encoding or the tracking mode in force each ends its report's exemption. The epoch at its last value stays there, touched, and applies nothing. Through the registry, turn edges delivered after a person typed, or before, leave the epoch exactly as the typing left it. Through the daemon's hook ingestion, after a person typed into a live Claude Code pane, the agent's thinking report, a tool starting, its prompt hook's report of a prompt it took, the deck's own line it recognised, the turn ending, a prompt report from the pane's previous generation and a subagent's prompt report each leave the epoch unchanged and the box touched.
 - **Does not assert:** the probe's real admission, claim or read (Q35-19, Q35-20); the ring's reconcile (R3 §3.5, Q35-21); the release's `replies_inert` record for D3′'s forms, which no record carries yet (M35); how a real agent or terminal treats the reports.
 - **Platform coverage:** all; the registry's hook paths on Unix.
 
@@ -12244,20 +12984,20 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a real zsh or fish (neither is installed on the recording box; bash's `BASH_ENV` stands in for the start-up file); a value the agent sets in its own process after it started, which no environment read sees (Claude Code's settings `env` and Codex's `.env` are `inbox/probe/099` and `100`); a real Codex or Claude Code.
 - **Platform coverage:** Linux.
 
-##### inbox/probe/098 — The deck checks no Codex whose home lies inside a folder Codex's sandbox may write to: the working directory (other than its own `.codex`), `/tmp` or `$TMPDIR`.
+##### inbox/probe/098 — The deck checks no Codex whose home lies inside a folder Codex's sandbox may write to: the working directory or a folder its launch adds with `writable_roots` or `--add-dir` (other than that folder's own `.codex`), `/tmp` or `$TMPDIR`.
 
-- **Layer:** L1 (`tests/editor_keymap.rs`, Linux): `codex_home_checkable` over directories, symlinks and temporary directories laid out on disk in a temporary directory under `/var/tmp` (it fails, rather than skipping, when that resolves under `/tmp`). L2 lane 1 (`tests/e2e_probe_delivery.rs`, Linux): the live-segments Codex stand-in with `CODEX_HOME` at `<cwd>/codex`, an attached TUI.
+- **Layer:** L1 (`tests/editor_keymap.rs`, Linux): `codex_home_checkable` over directories, symlinks and temporary directories laid out on disk in a temporary directory under `/var/tmp` (it fails, rather than skipping, when that resolves under `/tmp`). L1 also `codex_writable_roots` over Codex sources laid out on disk. L2 lane 1 (`tests/e2e_probe_delivery.rs`, Linux): the live-segments Codex stand-in with `CODEX_HOME` at `<cwd>/codex`, or at its own `~/.codex` with a `config.toml` adding a folder to `writable_roots`, an attached TUI.
 - **Agent:** none (a native Codex stand-in).
-- **Asserts:** L1 (`probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held`): a home outside the working directory, the working directory's own `.codex`, a symlinked home landing outside it, and a home outside with `TMPDIR` elsewhere are checkable; a `.codex` below the working directory, the working directory itself, a symlinked home landing inside it, a home inside it reached through a symlinked cwd, a home under `TMPDIR` or `/tmp`, a missing home, and an empty, relative or missing `TMPDIR` hold `CodexHome`. Lane 1 (`probe_098_a_codex_home_inside_the_working_directory_is_held_without_a_check`): a touched-and-cleared box and a queued task give `cannot_check` on the card and in the TUI, a `Keymap(CodexHome)` refusal in the log, no byte typed, no helper run and no notice; red before the pre-check (the check's Ctrl+G and a notice were typed). Every other live-segments Codex test, whose `CODEX_HOME` is the working directory's own `.codex`, is the control.
-- **Does not assert:** a real Codex's choice of export directory (`docs/develop/doorbell-admission.md`, the Codex activation's item 8); `writable_roots`, `--add-dir` or the sandbox mode, which the pre-check doesn't read.
+- **Asserts:** L1 (`probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held`): a home outside the working directory, the working directory's own `.codex`, a symlinked home landing outside it, and a home outside with `TMPDIR` elsewhere are checkable; a `.codex` below the working directory, the working directory itself, a symlinked home landing inside it, a home inside it reached through a symlinked cwd, a home under `TMPDIR` or `/tmp`, a missing home, and an empty, relative or missing `TMPDIR` hold `CodexHome`; with added folders (issue #2127), a home outside them, an added folder's own `.codex` and an added folder that doesn't exist are checkable, and a home inside one (or the folder itself, through a symlinked folder or a symlinked home) or one with an added folder inside its `editor` hold `CodexHome`. L1 (`probe_098_the_roots_a_codex_launch_adds_are_read_from_every_source`): `writable_roots` is read from `config.toml`, a profile file, a project file and `-c` (dotted and as a table), with `--add-dir` in both forms, relative roots under the cwd and the naming file's folder, `~` from `HOME`, nothing after `--`, and a root a later layer replaces still counted; a non-list or non-string `writable_roots`, a non-table `sandbox_workspace_write`, a `--add-dir` with no value, a `~` with no `HOME` and an unparsable `config.toml` hold. Lane 1 (`probe_098_a_codex_home_inside_the_working_directory_is_held_without_a_check`, and `probe_098_a_codex_home_inside_a_root_its_config_adds_is_held_without_a_check` with `writable_roots = ["~/.codex"]`, red without the roots): a touched-and-cleared box and a queued task give `cannot_check` on the card and in the TUI, a `Keymap(CodexHome)` refusal in the log, no byte typed, no helper run and no notice; red before the pre-check (the check's Ctrl+G and a notice were typed). Every other live-segments Codex test, whose `CODEX_HOME` is the working directory's own `.codex`, is the control, and `probe_098_a_codex_whose_config_adds_another_root_is_checked_then_rung` (a `writable_roots` folder that doesn't hold the home: checked and rung once) the roots' control.
+- **Does not assert:** a real Codex's choice of export directory (measured by hand with the recorder's `sandbox-home` mode, not committed: `docs/develop/doorbell-admission.md`, the Codex activation's item 8); the sandbox mode or a permissions profile, which the pre-check doesn't read.
 - **Platform coverage:** Linux.
 
-##### inbox/probe/099 — The deck checks no Claude Code whose settings files name an editor or a deck variable in their `env`, or that it can't judge.
+##### inbox/probe/099 — The deck checks no Claude Code whose settings files name an editor or a deck variable in their `env`, or a policy helper, or that it can't judge.
 
 - **Layer:** L1 (`tests/editor_keymap.rs`, Linux): `claude_env_member` and `claude_env_guard` over documents; `claude_env_sources` and `read_claude_env` over a HOME and a working directory inside a git repository laid out on disk under the private test base; `ClaudeEnvBaseline` and `ClaudeEnv` over rewrites. L2 lane 1 (`tests/e2e_probe_delivery.rs`, Linux): the live-segments Claude Code stand-in with a `~/.claude/settings.json` written into its HOME before the spawn, and no attached TUI (an attached TUI's resize makes the stand-in's frame read `Surface`, which shows `cannot_check` without the hold).
-- **Agent:** none (a native Claude Code stand-in). What Claude Code 2.1.318 does with those files was confirmed by running it in a sandbox HOME (`docs/develop/doorbell-admission.md`), not in a test.
-- **Asserts:** L1: an `env` naming `VISUAL` or `EDITOR` in any case (also after a byte-order mark), a document that isn't JSON or an object, `env` named twice and an `env` that isn't an object hold `Editor`; no `env`, other names only, a `VISUAL` in a comment or another member's value, comment markers inside strings, and an empty, whitespace-only or comment-only file pass (`probe_099_claude_settings_env_naming_the_editor_holds`). A member named `__proto__` at any depth (also spelled with an escape), `VISUAL` or `EDITOR` as a member name anywhere (`VISUAL` also spelled with an escape), a deck variable spelled with an escape in `env`, a line comment ended by a lone carriage return (and its variant where a `/*` follows the CR), and a line comment holding a line or paragraph separator (U+2028, U+2029), hold `Editor`; an escaped name that is none of those, CRLF line endings with comments, those names only inside string values, and the two separators inside a string and a block comment, pass (`probe_099_claude_settings_a_parser_could_read_differently_hold`). `VISUAL` in each of the user's `settings.json`, `cowork_settings.json` and `remote-settings.json`, `~/.claude.json` and its three other-endpoint names, `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the git root's `.claude/settings.local.json` holds, and the same file with an unrelated `env` passes; an unreadable file, a directory, a file past `CLAUDE_ENV_BYTES`, and a symlink to a file naming `VISUAL` hold; a dangling symlink, and server-managed settings with no `env` in the form Claude Code 2.1.319 caches them, pass (`probe_099_each_file_claude_takes_an_env_from_is_read`). A `.json` drop-in naming `EDITOR` holds, a non-`.json` one is not read, an unlistable directory and more than `CLAUDE_DROP_INS` files hold (`probe_099_claude_managed_drop_ins_are_read`). An `env` naming `CLAUDE_CONFIG_DIR` or `HOME` in any case holds `Unmeasured`, names containing them and a home folder as a value pass (`probe_099_claude_settings_env_moving_its_config_holds`). An `env` naming `DOT_AGENT_DECK_EDITOR_GEN`, the helper's saved editor or another `DOT_AGENT_DECK_` variable, in any case, holds `Editor`, also beside `HOME`, and so does such a name outside `env`, at any depth (at the top, nested, under `ENV`, in an array's object); such a name only in a value (a hook's command included), and names with the prefix inside them or without its underscore, pass (`probe_099_claude_settings_env_naming_a_deck_variable_holds`). `CLAUDE_CONFIG_DIR`, no `HOME` and a relative cwd are `Unmeasured`; `--settings` and `--project-config-root` are found (`probe_099_claude_env_sources_it_cannot_follow`). Another cwd at settlement is `Changed`, `--settings` `Editor`, unread arguments `Unmeasured`, an `env` changed before the settlement `Changed`; after it, a rewrite keeping every `env` passes, and a changed `env`, or a file still unparsable after the check's retries (left half written, or with trailing commas), latches `Changed`, also once reverted (`probe_099_claude_env_is_compared_with_its_spawn_read`). Lane 1: `env.VISUAL` in `~/.claude/settings.json` (`probe_099_a_claude_whose_settings_env_sets_visual_is_held_without_a_check`) gives `cannot_check` on the card, a `Keymap(Editor)` refusal in the log, no byte typed (no check's Ctrl+G) and no notice, red before the hold (the check's Ctrl+G and a notice were typed); a `settings.json` with comments and no `env` (`probe_099_a_claude_whose_settings_name_no_editor_is_checked_then_rung`, the control) is checked and rung once. `env.DOT_AGENT_DECK_EDITOR_GEN` in `~/.claude/settings.json` (`probe_099_a_claude_whose_settings_env_sets_a_deck_variable_is_held_without_a_check`) is held the same way, red before the hold (the card never read `cannot_check`).
-- **Does not assert:** a real Claude Code; `/etc/claude-code` itself (the drop-in reader is driven with a directory of the test's own); `remote-settings.json` at a path `dA()` moves it to, or in another stored form; a `policyHelper`; whether Claude Code re-applies `env` when a file changes while it runs (2.1.318 did not within 25 s, measured in a sandbox, not in a test); a change undone before the next check.
+- **Agent:** none (a native Claude Code stand-in). What Claude Code 2.1.318 does with those files, and what 2.1.318 and 2.1.330 do with a policy helper and with an `--add-dir` directory's settings (issue #2131), was confirmed by running it in a sandbox HOME (`docs/develop/doorbell-admission.md`), not in a test.
+- **Asserts:** L1: an `env` naming `VISUAL` or `EDITOR` in any case (also after a byte-order mark), a document that isn't JSON or an object, `env` named twice and an `env` that isn't an object hold `Editor`; no `env`, other names only, a `VISUAL` in a comment or another member's value, comment markers inside strings, and an empty, whitespace-only or comment-only file pass (`probe_099_claude_settings_env_naming_the_editor_holds`). A member named `__proto__` at any depth (also spelled with an escape), `VISUAL` or `EDITOR` as a member name anywhere (`VISUAL` also spelled with an escape), a deck variable spelled with an escape in `env`, a line comment ended by a lone carriage return (and its variant where a `/*` follows the CR), and a line comment holding a line or paragraph separator (U+2028, U+2029), hold `Editor`; an escaped name that is none of those, CRLF line endings with comments, those names only inside string values, and the two separators inside a string and a block comment, pass (`probe_099_claude_settings_a_parser_could_read_differently_hold`). `VISUAL` in each of the user's `settings.json`, `cowork_settings.json` and `remote-settings.json`, `~/.claude.json` and its three other-endpoint names, `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the git root's `.claude/settings.local.json` holds, and the same file with an unrelated `env` passes; an unreadable file, a directory, a file past `CLAUDE_ENV_BYTES`, and a symlink to a file naming `VISUAL` hold; a dangling symlink, and server-managed settings with no `env` in the form Claude Code 2.1.319 caches them, pass (`probe_099_each_file_claude_takes_an_env_from_is_read`). A `.json` drop-in naming `EDITOR` holds, a non-`.json` one is not read, an unlistable directory and more than `CLAUDE_DROP_INS` files hold (`probe_099_claude_managed_drop_ins_are_read`). An `env` naming `CLAUDE_CONFIG_DIR`, `HOME` or `CLAUDE_CODE_REMOTE_SETTINGS_PATH` in any case holds `Unmeasured`, names containing them and a home folder as a value pass (`probe_099_claude_settings_env_moving_its_config_holds`). `policyHelper` or `policyHelpers` as a member name, in any case, at the top or nested, a static-payload-only map and one beside an unrelated `env` included, holds `Editor`; `apiKeyHelper` and the names only in values pass (`probe_099_claude_settings_naming_a_policy_helper_hold`). The organisation sign-in's cached settings are read from their `settings` member: `VISUAL` or a policy helper there holds `Editor`, `HOME` there `Unmeasured`, a `settings` that isn't an object or is named twice holds, and no `settings`, one with no editor, an empty file and an `env` beside `settings` pass (`probe_099_claude_organisation_cached_settings_are_read`); `HOME` in `state/hybrid-settings.json` under each endpoint's name holds and an unrelated `env` passes, and a policy helper in `remote-settings.json` holds (`probe_099_each_file_claude_takes_an_env_from_is_read`). An `env` naming `DOT_AGENT_DECK_EDITOR_GEN`, the helper's saved editor or another `DOT_AGENT_DECK_` variable, in any case, holds `Editor`, also beside `HOME`, and so does such a name outside `env`, at any depth (at the top, nested, under `ENV`, in an array's object); such a name only in a value (a hook's command included), and names with the prefix inside them or without its underscore, pass (`probe_099_claude_settings_env_naming_a_deck_variable_holds`). `CLAUDE_CONFIG_DIR`, no `HOME`, a `CLAUDE_CODE_REMOTE_SETTINGS_PATH` (empty included) and a relative cwd are `Unmeasured`; `--settings` and `--project-config-root` are found (`probe_099_claude_env_sources_it_cannot_follow`). Another cwd at settlement is `Changed`, `--settings` `Editor`, unread arguments `Unmeasured`, an `env` changed before the settlement `Changed`; after it, a rewrite keeping every `env` passes, and a changed `env`, or a file still unparsable after the check's retries (left half written, or with trailing commas), latches `Changed`, also once reverted (`probe_099_claude_env_is_compared_with_its_spawn_read`). Lane 1: `env.VISUAL` in `~/.claude/settings.json` (`probe_099_a_claude_whose_settings_env_sets_visual_is_held_without_a_check`) gives `cannot_check` on the card, a `Keymap(Editor)` refusal in the log, no byte typed (no check's Ctrl+G) and no notice, red before the hold (the check's Ctrl+G and a notice were typed); a `settings.json` with comments and no `env` (`probe_099_a_claude_whose_settings_name_no_editor_is_checked_then_rung`, the control) is checked and rung once. `env.DOT_AGENT_DECK_EDITOR_GEN` in `~/.claude/settings.json` (`probe_099_a_claude_whose_settings_env_sets_a_deck_variable_is_held_without_a_check`) is held the same way, red before the hold (the card never read `cannot_check`).
+- **Does not assert:** a real Claude Code; `/etc/claude-code` itself (the drop-in reader is driven with a directory of the test's own); server-managed settings Claude Code keeps through its storage backend rather than in `remote-settings.json` (issue #2470); what a policy helper returns, which no file read sees (the deck holds the document naming one instead); that an `--add-dir` directory's settings are not read, which is a measurement of Claude Code (it applies no `env` from them), not a property of the deck's reader; whether Claude Code re-applies `env` when a file changes while it runs (2.1.318 did not within 25 s, measured in a sandbox, not in a test); a change undone before the next check.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/100 — The deck checks no Codex whose home's `.env` file names an editor or a deck variable, or that it can't read.
@@ -12299,6 +13039,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Asserts:** `probe_104_a_resize_burst_delays_a_codex_check_by_seconds_not_a_backoff_step` (CX-5h's sequence, #2129): a touched Codex box, three size changes 200 ms apart, a task 200 ms later and Codex's three cursor queries 2 s apart; the tick's first check waits once for the estimate, a query moves it on, and the check is refused `Estimate`. Counted as a failure (`probe_failed`, the old path) the next check comes `BACKOFF[0]` or more after the post; through `scheduling_refused` it is admitted within 7 s, two checks asked, no failure counted. `probe_104_an_estimate_that_never_runs_out_still_backs_off` (the safety half): a query every 2 s for 20 simulated minutes admits nothing, asks no check before the estimate it was last refused for, at most four between long waits, walks the long waits through `BACKOFF` in order and reaches `BROKEN_AFTER` failures. `probe_104_estimate_refusals_wait_for_the_estimate_and_count_every_fourth`: `ESTIMATE_PER_FAILURE` is 4; the first three refusals in a row count nothing, keep the card on `CannotCheck` and make the next attempt due exactly at the estimate (or at the refusal, for an estimate already behind it), the fourth counts one failure with the first backoff step, or with the estimate when that is further off (a 120.5 s one), and a failure or a read starts the run again, a read also clearing the card. `probe_104_live_a_touched_box_after_a_resize_burst_is_checked_within_seconds`: a touched-and-emptied box in a 40 × 140 pane with nothing answering cursor queries, its screen unchanged for 2 s, three one-column resizes 200 ms apart and a task 200 ms later; on up to five fresh decks, each check is written within 15 s of the post (measured 5.9–6.2 s, against 36 s before the fix) and each task acted on once and acknowledged after one hand-over, until a trial's check was refused `Estimate` before the written one. When none was (Codex chains its cursor-query waits over a burst only some of the time: 9 of 9 bursts one hour, 2 of 31 the next, on one build), the test ends through `skip_unless!`, so it reads as skipped, and fails under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`.
 - **Does not assert:** admission itself in the fast tier (O5 alone, the other conjuncts taken as passing, as on the measured box); the writer's own estimate refusal (routed to the same `Schedule::estimate` in `probe_ended`, not driven by a test); a client that answers cursor queries (`inbox/probe/043`); Claude Code against a real resize; Codex 0.160.0.
 - **Platform coverage:** Linux (the tick's decision and lane 2); the `Schedule` test on every platform.
+
+##### inbox/probe/105 — A client's reply to the agent's cursor position query leaves the input box untouched, so a fresh Codex shown in the desktop app is still rung.
+
+- **Layer:** fast (`src/agent_pty_input_epoch_tests.rs`): the generation input's epoch and ledger; L2 lane 1 (`tests/e2e_inbox_redraw_wait.rs`): the real daemon, doorbell tick and PTY against the CPR stand-in (`tests/support/cpr_composer.py`), a pane the deck installs no helper into, with a test-owned client (`tests/support/cpr_answerer.rs`) attached that answers cursor queries; L2 real agent, lane 2 (`tests/e2e_composer_check_codex_live.rs`, Linux): real interactive Codex in an installed `Direct(Codex)` pane with the same client attached. The client stands in for the desktop app's terminal (xterm.js answers `CSI 6 n` and `onData` forwards the reply); it is not the desktop's own answer path.
+- **Agent:** none in the fast tier and lane 1 (the stand-in reported as Claude Code and as Codex); real interactive Codex on `common::codex_test_model()` in lane 2, one cheap turn for the sentinel task.
+- **Asserts:** a whole person-written CPR reply to an outstanding query (`CSI 1;1R`, `CSI 24;1R`, `CSI 38;153R`, `CSI 2;5R`) is exempt, settles the query and leaves the box untouched; a reply in row 1 at column 2 or later (a modified F3's shape), a reply to no query, a second reply to one query and a reply split over two ops each touch it; a reply to a query noted after a fence's trigger passes ahead and one noted before it doesn't (`probe_105_a_clients_cursor_reply_leaves_the_box_untouched`). Lane 1: after a resize the stand-in asks, the client answers, the reply reaches the stand-in, and a queued task is rung, for a pane reported as Claude Code and one reported as Codex (`probe_105_a_clients_cursor_reply_does_not_hold_the_doorbell`; before the fix both stayed queued, held `cannot_type`). Lane 2: after a resize Codex asks and the client answers, and a queued sentinel task is rung with no check written (`doorbell tick probe … outcome=Written` absent), acted on and acknowledged once (`probe_105_live_a_clients_cursor_reply_leaves_a_fresh_codex_untouched`).
+- **Does not assert:** the desktop app's own reply path (xterm.js and `onData`); Codex's start-up query (the client attaches after Codex has drawn its composer, so the queries it answers are the ones Codex asks on a resize); a real Codex whose cursor sits in row 1 at column 2 or later when it asks, whose reply still touches the box; a deck whose editor helper could not be made (the sweep and retry are `inbox/probe/065`).
+- **Platform coverage:** Linux (lane 2); the fast tier and lane 1 wherever the e2e tier runs.
 
 ##### inbox/probe/040 — A person's Ctrl+G during the deck's check of a real Claude Code input box loses none of their typing.
 
@@ -12347,7 +13095,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Agent:** none (`cat` for the attach and registry rows).
 - **The gate's lock rank (A-20d-9):** `probe_011_a_debug_build_checks_the_gates_place_in_the_lock_order` (`tests/fence_gate.rs`, debug builds only): the gate's mutex is `crate::lock_rank::GATE`, between `R5` and `R6`; taken under `R4` with `R6` taken in its acceptance it runs, and taken with `R6` held it panics naming the held rank. It checks the ranked edges only: the pane writer's async lock, the seam's lock and the ingress ledger are unranked, and their order around the gate is still the lock-order diagram's word.
 - **Q16-2 (Q35-20d, coder):** `probe_011_typing_through_the_registry_waits_behind_a_closed_fence` (`src/agent_pty.rs`, `spawn_tests`, a `cat` pane under the model editor): with the generation's fence closed, `AgentPtyRegistry::write_user_bytes` hands the keys to the gate, which holds them with their ticket outstanding and nothing typed; a release writes them once. The blocking `std::io::Write` for `PaneWriter`, which wrote past the gate, is now test-only; `tests/pane_restart.rs`'s draft goes through `write_user_bytes`.
-- **Asserts:** with no fence, a frame, an empty frame and another are written and awaited, settle with what the PTY took and move the epoch once each; a short write answers the error after its prefix and settles partial, a failed one settles failed, and at the attach boundary each ends the connection at that write with the next frame neither admitted nor written, while the control writes every frame in order (`inbox/probe/015`'s forced rows, which its lane-1 harness can't force). Fenced frames are held, write nothing, move the epoch at acceptance and not again, are in flight with their tickets outstanding and no job queued, and a release writes them once in acceptance order. Empty frames settle at acceptance with no held op; the 1,025th held op is full; exactly 1 MiB is held and a byte more is full; one larger frame is held alone. Full waiters are served in arrival order, open or fenced, a fresh frame queues behind them, and a cancelled waiter's frame is never written and its place passes on; at the attach boundary, a connection closed while its frame waits for room gives up its place, its ticket settles cancelled once, its viewer is released, and after the release neither that frame nor one queued behind it in the socket is written; a connection shut for writing while still reading counts as closed the same way and its reader sees the stream end; on a connection that stays, a frame that waited for room and one queued behind it in the socket are both written after the release, in order. Retirement refuses each held frame `exited` once, tells its connection, empties the in-flight count, wakes the full waiter and refuses its frame; a release reached on the writer thread after retirement, or after its target exited with the generation not retired, writes nothing, is refused `exited` once and tells its connection, and a release to an exited target submits nothing; a released write the PTY fails while its target is live and its generation not retired (a broken pipe, partial or whole, or a zero-length write) settles partial or failed once and tells its connection `write-failed` once, not `exited`; a release whose captured target fails refuses every held frame with that reason; a release to a gone writer settles broken pipe once and tells its connection once, `write-failed` while its target is live and `exited` once it exited. A whole DA1 reply to a query asked after the trigger is written past the closed fence while the key waits, is in flight, moves no epoch and takes no held op or byte, and a deck job that never came through acceptance is written and not held (I-5). With DA1 queries on both sides of the trigger, both replies are exempt but only the later query's passes ahead; a CPR reply, two replies in one frame, a reply to no query and a split reply are held. A reply decided to pass ahead stays exempt when the output saturates the query ledger before its job reaches the writer, moving no epoch, and one offered after the saturation is held and moves it, with the held key never overtaken. A held frame, an empty one included, moves the pane's human-input clock at acceptance, before any release. A parked acceptance shows the epoch moved before the writer is handed the job. A job taken back before its ledger closes reports cancelled once; one taken back after the close reports cancelled once after its retirement row; a job its writer's queue disposes of before the queueing hold armed it reports failed once, and so does one whose drop looked at it before the hold armed it and moves its state after; and a job inside the PTY at retirement leaves the outstanding set but stays unreported until the writer reports it written, once. Each way a generation retires (close, restart, a spawn over an exited agent) refuses a frame its fence held, and exiting alone retires nothing. The peer-close watch, set up only after failing at first, is tried again and sees the close; one that never sets up is tried a bounded number of times and then stays pending, not reporting a close it didn't see. The bounds are 1,024 ops and 1 MiB; the classifier is asked only while fenced, with the fence's own trigger. Q35-20 (`tests/live_gate.rs`, O-20.2): a person's op accepted before a probe's arm section takes the job back and the section never runs or closes a fence; one accepted after a successful section is held behind the fence it closed and takes nothing back; a refused section closes nothing; retirement and a superseded job refuse without running the section; a withdrawal after a successful section undoes it, the composed fence opening again. A closed fence refuses the deck's own line at the writer (`src/agent_pty_fence_tests.rs`).
+- **Asserts:** with no fence, a frame, an empty frame and another are written and awaited, settle with what the PTY took and move the epoch once each; a short write answers the error after its prefix and settles partial, a failed one settles failed, and at the attach boundary each ends the connection at that write with the next frame neither admitted nor written, while the control writes every frame in order (`inbox/probe/015`'s forced rows, which its lane-1 harness can't force). Fenced frames are held, write nothing, move the epoch at acceptance and not again, are in flight with their tickets outstanding and no job queued, and a release writes them once in acceptance order. Empty frames settle at acceptance with no held op; the 1,025th held op is full; exactly 1 MiB is held and a byte more is full; one larger frame is held alone. Full waiters are served in arrival order, open or fenced, a fresh frame queues behind them, and a cancelled waiter's frame is never written and its place passes on; at the attach boundary, a connection closed while its frame waits for room gives up its place, its ticket settles cancelled once, its viewer is released, and after the release neither that frame nor one queued behind it in the socket is written; a connection shut for writing while still reading counts as closed the same way and its reader sees the stream end; on a connection that stays, a frame that waited for room and one queued behind it in the socket are both written after the release, in order. Retirement refuses each held frame `exited` once, tells its connection, empties the in-flight count, wakes the full waiter and refuses its frame; a release reached on the writer thread after retirement, or after its target exited with the generation not retired, writes nothing, is refused `exited` once and tells its connection, and a release to an exited target submits nothing; a released write the PTY fails while its target is live and its generation not retired (a broken pipe, partial or whole, or a zero-length write) settles partial or failed once and tells its connection `write-failed` once, not `exited`; a release whose captured target fails refuses every held frame with that reason; a release to a gone writer settles broken pipe once and tells its connection once, `write-failed` while its target is live and `exited` once it exited. A whole DA1 reply to a query asked after the trigger is written past the closed fence while the key waits, is in flight, moves no epoch and takes no held op or byte, and a deck job that never came through acceptance is written and not held (I-5). With DA1 queries on both sides of the trigger, both replies are exempt but only the later query's passes ahead; a CPR reply to a query noted before the trigger, two replies in one frame, a reply to no query and a split reply are held. A reply decided to pass ahead stays exempt when the output saturates the query ledger before its job reaches the writer, moving no epoch, and one offered after the saturation is held and moves it, with the held key never overtaken. A held frame, an empty one included, moves the pane's human-input clock at acceptance, before any release. A parked acceptance shows the epoch moved before the writer is handed the job. A job taken back before its ledger closes reports cancelled once; one taken back after the close reports cancelled once after its retirement row; a job its writer's queue disposes of before the queueing hold armed it reports failed once, and so does one whose drop looked at it before the hold armed it and moves its state after; and a job inside the PTY at retirement leaves the outstanding set but stays unreported until the writer reports it written, once. Each way a generation retires (close, restart, a spawn over an exited agent) refuses a frame its fence held, and exiting alone retires nothing. The peer-close watch, set up only after failing at first, is tried again and sees the close; one that never sets up is tried a bounded number of times and then stays pending, not reporting a close it didn't see. The bounds are 1,024 ops and 1 MiB; the classifier is asked only while fenced, with the fence's own trigger. Q35-20 (`tests/live_gate.rs`, O-20.2): a person's op accepted before a probe's arm section takes the job back and the section never runs or closes a fence; one accepted after a successful section is held behind the fence it closed and takes nothing back; a refused section closes nothing; retirement and a superseded job refuse without running the section; a withdrawal after a successful section undoes it, the composed fence opening again. A closed fence refuses the deck's own line at the writer (`src/agent_pty_fence_tests.rs`).
 - **Does not assert:** a real agent or terminal, which `inbox/probe/023` and `015` cover through real attach sockets; a voice answer or a deck line through a fence (Q35-17, Q35-16/20); the accounting oracle as a property test (`inbox/probe/010`); segment-driven release (Q35-20); at the attach boundary, a wait for room that only the output task's end can stop because the peer-close watch can't be set up, except as Q15-1's private test runs it (the watch's own half is the `peer_closed_tests` rows); in that test, a real write error ending the output task (the control ends it, which the loop sees as the same task completion) and a platform with no half-close (the degraded watch is a switch over the real platform's watch).
 - **Platform coverage:** all; the attach rows on Unix.
 
@@ -12624,10 +13372,10 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the Rust DTO projection (`map_agent`), capability negotiation, token transmission by the real answer sender (`question/answer/025` covers the sender), daemon retention/eviction, input delivery, real microphone/LLM behavior or browser layout. The tests exercise camelCase DTOs and snake_case streamed notices; fixture parity is coder-owned.
 - **Platform coverage:** desktop vitest.
 
-##### inbox/probe/045 — The D3′ query ledger keeps eight outstanding queries, saturates for good at the ninth without refusing anything, and exempts only whole solicited non-CPR replies before it saturates.
+##### inbox/probe/045 — The D3′ query ledger keeps eight outstanding queries, saturates for good at the ninth without refusing anything, and exempts only whole solicited replies, a CPR reply only outside a modified F3 key's shape, before it saturates.
 - **Layer:** Fast. Pure in `tests/query_ledger.rs` (`QueryLedger`, and `GenerationInput` with the real `OutputHook`, `src/composer_probe/{query_ledger,epoch,paste_mode}.rs`); in-module in `src/agent_pty_input_epoch_tests.rs` (on Unix, a real `/bin/cat` generation spawned through the registry).
 - **Agent:** none.
-- **Asserts:** eight CPR queries, or eight of DA1, OSC 11 and CPR mixed, are kept with history `Exact`; the ninth saturates the ledger: history `Unknown`, the query dropped and counted, no reply exempt or eligible to pass ahead, a freed slot not unsaturating it, while a reply to a kept query is still solicited and still settles it, and touches. A whole solicited DA1 or OSC 11 reply, ended by BEL or ST, is exempt once; a duplicate, a reply to nothing and a reply inside a paste move the epoch, the pasted one answering nothing; a reply split over two writes moves the epoch and still answers its query; a query whose reply never comes stays outstanding until a later reply. A CPR reply settles its query and always touches. A native Ctrl+G accepted behind an unanswered CPR is latched, stays non-clear over three quiet periods, and the reply doesn't pop it. The output hook notes DA1 (`CSI c`, `CSI 0 c`), OSC 10/11 `?` and CPR (`CSI 6 n`, `CSI ? 6 n`) queries split at every offset, and not a DA1 with another parameter, DA2, another DSR, a CPR with another parameter or an intermediate, an OSC 12 query, an OSC 10 set, or query text in an OSC or DCS payload. On a spawned `cat` generation, a DA1 query pushed through the bus makes the pane writer's whole reply exempt, and a duplicate touches.
+- **Asserts:** eight CPR queries, or eight of DA1, OSC 11 and CPR mixed, are kept with history `Exact`; the ninth saturates the ledger: history `Unknown`, the query dropped and counted, no reply exempt or eligible to pass ahead, a freed slot not unsaturating it, while a reply to a kept query is still solicited and still settles it, and touches. A whole solicited DA1 or OSC 11 reply, ended by BEL or ST, is exempt once; a duplicate, a reply to nothing and a reply inside a paste move the epoch, the pasted one answering nothing; a reply split over two writes moves the epoch and still answers its query; a query whose reply never comes stays outstanding until a later reply. A CPR reply settles its query; a whole one is exempt, and one in a modified F3 key's shape (`CSI 1;2R`) touches (issue #2467 narrowed OQ3 to that shape; `inbox/probe/105`). A native Ctrl+G accepted behind an unanswered CPR is latched, stays non-clear over three quiet periods, and the reply doesn't pop it. The output hook notes DA1 (`CSI c`, `CSI 0 c`), OSC 10/11 `?` and CPR (`CSI 6 n`, `CSI ? 6 n`) queries split at every offset, and not a DA1 with another parameter, DA2, another DSR, a CPR with another parameter or an intermediate, an OSC 12 query, an OSC 10 set, or query text in an OSC or DCS payload. On a spawned `cat` generation, a DA1 query pushed through the bus makes the pane writer's whole reply exempt, and a duplicate touches.
 - **Does not assert:** which queries a real agent emits or a real client answers (M35); a reply's classification at physical acceptance rather than enqueue (Q35-15/16); admission reading any of it (Q35-19); C1's settlement interface (`settle_query(… Dropped)`).
 - **Platform coverage:** all; the spawned generation on Unix.
 
@@ -13704,6 +14452,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Agent:** Claude Code (Haiku).
 - **Asserts:** the doorbell rings and the project hook blocks its prompt (the marker). The card then reads Idle (issue #2347), and the doorbell's hold is `AwaitingPrompt` (its `doorbell hold` log line), since Claude Code put the blocked line back in its input box. Once the test presses Enter in the pane, sending that line, the deck's hook hands the task over again; Haiku writes the sentinel exactly once and the task is acknowledged with two deliveries.
 - **Does not assert:** a blocked prompt the user typed; the deck clearing the restored line itself, which it does not do; a box the user clears by hand, after which the doorbell holds as `NeedsFetch`.
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #2461"]` (CLAUDE.md rule 6). It fails in rotation with others in a full parallel run of `e2e_inbox_claude_live` and passes alone; #2461 has the evidence, the run command (`--run-ignored only`) and what lifts it.
 - **Platform coverage:** linux.
 - **Cost:** one or two cheap model turns.
 
@@ -13895,6 +14644,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Asserts:** A preflight reads the installed Claude Code release (`claude --version`) and runs the test whenever Claude Code's facts are Go, which they are for every release; otherwise it prints `SKIP:` naming the installed release, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure (UNVERIFIED, never green). Then killing the captured scratch waiter leaves none armed; the token-led doorbell wakes the agent (`doorbell rang` in the deck's log) and its submit hook fetches, injects and acknowledges the sentinel task without recording it as human history. Issue #2390: the session transcript real Claude Code wrote, read with the transcript witness's own parser (`inbox_witness::witnessed_in_line`), holds delivery 1.1 of the task, and no other attempt, as a `hook_additional_context` attachment.
 - **Test:** `claude_014_live_killed_waiter_falls_back_to_injection` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** macOS process discovery, or a turned-off doorbell, which is held (`inbox/claude/050`).
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #2461"]` (CLAUDE.md rule 6). It fails in rotation with others in a full parallel run of `e2e_inbox_claude_live` (a doorbell `EchoMismatch`, the message left queued) and passes alone; #2461 has the evidence, the run command (`--run-ignored only`) and what lifts it.
 - **Platform coverage:** linux.
 
 ##### inbox/route/008 — A refused inbox post releases its delegation commission and permits a fresh task.
@@ -14820,7 +15570,7 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 ##### agent-report/cli/001 — An agent's published card is listed with what the deck computed.
 - **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
 - **Agent:** two synthetic routing stand-ins; no real agent.
-- **Asserts:** `card publish --file` from a pane (waiting status, a catalog and a custom field, a question, a custom action) exits 0 printing `Card published (revision N).`; `card list` shows the card with `report.source == "agent"`, reasons `["question","waiting"]`, the catalog field's resolved label/type/placement and the custom field's `custom`/`detail` defaults, the question's option actions with the deck-composed prompt, each action's `prompt_source` (`agent` for the deck-composed answer, which quotes the agent's question and label, and for an option's own prompt and the custom action, `catalog` for `explain`, null for `reply`), the always-offered `explain`, the custom action and the deck actions in the contract's order, `close-keep-worktree` omitted without a worktree, and `primary_action_id` on the first option; the second pane's card has `report: null`; `--json` prints the key and a higher revision.
+- **Asserts:** with a user catalog adding an always-offered `explain` action, `card publish --file` from a pane (waiting status, a catalog and a custom field, a question, a custom action) exits 0 printing `Card published (revision N).`; `card list` shows the card with `report.source == "agent"`, reasons `["question","waiting"]`, the catalog field's resolved label/type/placement and the custom field's `custom`/`detail` defaults, the question's option actions with the deck-composed prompt, each action's `prompt_source` (`agent` for the deck-composed answer, which quotes the agent's question and label, and for an option's own prompt and the custom action, `catalog` for `explain`, null for `reply`), that user-configured `explain`, the custom action and the deck actions in the contract's order, `close-keep-worktree` omitted without a worktree, and `primary_action_id` on the first option; the second pane's card has `report: null`; `--json` prints the key and a higher revision.
 - **Does not assert:** the desktop's rendering (`desktop/agent-cards/*`), or bounds beyond the ones `agent-report/cli/003` refuses.
 - **Platform coverage:** mac+linux.
 
@@ -14854,6 +15604,20 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Does not assert:** a custom action that collides with a later catalog name (the catalog's definition wins).
 - **Platform coverage:** mac+linux.
 
+##### agent-report/state/003 — Opening an agent in the TUI deals with its report's needs-you (issue #2454).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in under the TUI's daemon; no real agent.
+- **Asserts:** a `done` report makes `card list` read `needs_you_reasons: ["done"]`; pressing `1` on the TUI's dashboard opens the agent's pane and the card then reads `needs_you: false` with the `done` report and its summary kept; a newer `waiting` report reads `["waiting"]` again.
+- **Does not assert:** the desktop's open (`desktop_agent_opened`, covered by the daemon unit test `agent_cards::tests::opening_the_agent_clears_its_report_reason` and the desktop's vitest), Enter on a selected card (the same `note_card_opened` call), or a daemon without the `agent-opened` capability (the client sends nothing; `cross-version` runs that pairing).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/state/004 — The agent's next turn deals with its report's needs-you (issue #2454).
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in whose hook events are posted by the test; no real agent.
+- **Asserts:** a `waiting` report published inside a turn that then ends reads `["waiting"]`; a `thinking` event starting the next turn makes it read `needs_you: false` with the report kept; a `done` published inside that running turn still reads `["done"]` after a `tool_start` in the same turn, with status `working`.
+- **Does not assert:** a daemon-synthesized `ShellBusy` (unit test `state::tests::the_agent_starting_its_next_turn_deals_with_its_card_report`), or the live reasons, which no report clears (`agent_cards::tests::dealing_with_a_report_leaves_the_live_reasons`).
+- **Platform coverage:** mac+linux.
+
 #### agent-report/catalog
 
 ##### agent-report/catalog/001 — The catalog merges the user's entries over the defaults and validates reports.
@@ -14866,7 +15630,7 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 ##### agent-report/catalog/002 — The resolved catalog prints and travels with both dispatch shapes.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
 - **Agent:** synthetic routing stand-ins as dispatcher, single unit and one-role team; no real agent.
-- **Asserts:** with a user config adding field `risk` and action `ship` and removing `merge`, `card catalog` prints the agent-card block with `risk`/`ship`, the defaults, no `merge` and no always-offered `explain`; `--json` lists the same names in order with `ship` from the user and the config path read; the single unit's seeded task and the team's published orchestrator context file both contain the block `card catalog` printed, verbatim.
+- **Asserts:** with a user config adding field `risk`, action `ship` and an always-offered `explain` action and removing `merge`, `card catalog` prints the agent-card block with `risk`/`ship` and the remaining defaults, omitting `merge` and the user-configured always-offered `explain` from the actions the agent can suggest; `--json` includes `risk` after the default fields and actions `[go-ahead, ship, explain]` in that order, with `ship` from the user and the config path read; the single unit's seeded task and the team's published orchestrator context file both contain the block `card catalog` printed, verbatim.
 - **Does not assert:** a project-level `[catalog]` (ignored in this slice).
 - **Platform coverage:** mac+linux.
 
@@ -14907,6 +15671,45 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Does not assert:** `confirm_detail`'s pending-work wording.
 - **Platform coverage:** mac+linux.
 
+#### agent-report/tree
+
+##### agent-report/tree/001 — Cards hang under the agent that started them.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** synthetic routing stand-ins as dispatcher, dispatched single unit and standalone agent, and a dispatched two-role team of capability-exporting `cat` seats; no real agent.
+- **Asserts:** `card list` holds exactly five entries in tree order — the dispatcher (`kind: dispatcher`, no `parent`), the unit (`agent`) and the team's orchestrator (`orchestrator`) with the dispatcher as `parent`, the worker (`role`) with the orchestrator as `parent`, then the standalone agent (`agent`, no `parent`) started last; the dispatcher's `rollup.total` is 3 and the orchestrator's 1, the leaves carry no `rollup`, and the unit and orchestrator still name the dispatcher in `relations`.
+- **Does not assert:** a dispatcher dispatched by a dispatcher, a child whose parent's card is gone, or cycles (the `agent_cards` unit tests); the desktop's drawing of the tree (`desktop/agent-cards/*`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/tree/002 — A grandchild's status rolls up to the root.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** the tree of `agent-report/tree/001`, whose statuses the test reports through the hook socket with each pane's own capability; no real agent.
+- **Asserts:** with the unit idle and the orchestrator and worker thinking, the dispatcher's `rollup` is `{total: 3, worst: thinking, counts: {idle: 1, thinking: 2}, needs_you: 0}`; after the worker (the dispatcher's grandchild) reports `quota_blocked`, it becomes `{total: 3, worst: blocked, counts: {blocked: 1, idle: 1, thinking: 1}, needs_you: 1}` and the orchestrator's `{total: 1, worst: blocked, counts: {blocked: 1}, needs_you: 1}`, while both cards' own `status` stays `thinking`, the dispatcher's own `needs_you` stays false, the worker reads `blocked` with reason `blocked`, and the list's order is unchanged.
+- **Does not assert:** every status word's place in the severity order (the `agent_cards` unit tests); a roll-up's doorbell timing.
+- **Platform coverage:** mac+linux.
+
+#### agent-report/refs
+
+##### agent-report/refs/001 — A reported pull request and issue show the deck's own check.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** one capability-exporting `cat` pane in a fixture clone whose `origin` is `github.com/test-org/test-repo`, under a daemon whose `PATH` has a stand-in `gh` answering from files; no real agent, no GitHub.
+- **Asserts:** after a report with `pull-request` = `#41` and `issue` = `other-org/other-repo#7`, `checked_refs` shows the pull request with its claim as written, `repo` resolved from the folder's origin, the canonical `https://github.com/test-org/test-repo/pull/41`, and the deck's check `merged`, CI `failing` (1 passing, 1 failing), review `approved`, its title, `stale: false` and an RFC 3339 `checked_at`; the issue as `closed` with its canonical `/issues/7` link and no CI or review; the issue's labels retain the repo colour when valid, omit an invalid colour while keeping its name, cap names at 50 Unicode characters and keep the first 20 labels in order; PR labels are omitted. The report's own field values are unchanged; the daemon ran exactly `gh pr view 41 --repo test-org/test-repo --json …` and `gh issue view 7 --repo other-org/other-repo --json number,state,title,url,labels`, and with a one-second refresh does not look either up again.
+- **Does not assert:** a full URL claim (`agent-report/live/002` reports one) or answers whose link names another repository or number (the `reference_check` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/refs/002 — A reference the deck cannot check says why.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** capability-exporting `cat` panes under two daemons, one with the stand-in `gh` and a one-second refresh, one whose `PATH` holds only `git` and `cat`; no real agent, no GitHub.
+- **Asserts:** while the stand-in holds a lookup (released as soon as the test has seen it; a fresh pull request is named instead if the daemon's own `gh` timeout ends the held lookup first), the reference reads `{status: pending}` with its repository and link already known, then `checked` `open` once released; `gh` answering `Could not resolve to` reads `not_found`, exit 4 reads `no_github_access`, and a GitLab link reads `unrecognised` with no link and no `gh` call, each with the deck's fixed sentence as `detail`; once the open pull request's lookups fail, it keeps `state: open` and the `checked_at` of a successful lookup, reads `stale: true`, and keeps that `checked_at` through a later failed lookup; a rate-limited lookup reads `rate_limited`, and a reference named after it stays `pending` with no `gh` call for it; with no `gh` on the daemon's `PATH` a reference reads `no_github_access`, and a bare `#5` from a folder with no GitHub origin reads `unrecognised` (`no GitHub origin for this agent's folder`).
+- **Does not assert:** the end of the five-minute rate-limit pause, the failure backoff's length or the lookup budget (the `reference_check` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/refs/003 — The check a client shows is the one made on the daemon's host.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** one capability-exporting `cat` pane under a daemon with the stand-in `gh`; no real agent, no GitHub.
+- **Asserts:** `card list` run with a `PATH` whose own `gh` records every call and answers nothing shows `test-org/test-repo#88` as `merged` with the deck's title and canonical link; the daemon's `gh` made the one lookup and the client's `gh` was never run.
+- **Does not assert:** a client on another machine: the client reaches the daemon over its local attach socket, not over a remote deck's SSH tunnel (`fleet/observe/002` covers that transport; this test does not list cards through it), so the daemon's host and the client's are one machine told apart only by their `PATH`s.
+- **Platform coverage:** mac+linux.
+
 #### agent-report/live
 
 ##### agent-report/live/001 — A real agent publishes its card and acts on a card action.
@@ -14914,6 +15717,13 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`).
 - **Asserts:** told to publish a waiting card with a question that suggests the user catalog's `touch-sentinel` action, and a custom action of its own, the agent's card appears in `card list` with that report; pressing its own custom action delivers the agent's text framed as untrusted and the agent still creates the file that text names; `card act --action touch-sentinel` sends the prompt, the agent creates the uniquely named sentinel file, the action's `last_delivery` reaches `delivered`, the card's report turns `done`, and the attached TUI shows the sentinel's name in the agent's pane.
 - **Does not assert:** the desktop app's cards with a real agent (no native-driver test in this slice).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/live/002 — A real agent's reported pull request is checked by the deck.
+- **Layer:** L2 PTY-attached, lane 2 (real agent) (`tests/e2e_agent_cards_live.rs`).
+- **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`); the daemon's `gh` is the host's, logged in with the token `gh auth token` prints on the host, which the pane's own environment does not carry.
+- **Asserts:** told to create a uniquely named sentinel file and publish its card with `pull-request` = `https://github.com/vfarcic/dot-agent-deck/pull/2378`, the agent creates the sentinel, its card shows that claim as written, and `checked_refs` shows the deck's check: `vfarcic/dot-agent-deck` #2378, the canonical link, `checked`, `merged`, not stale. Skips (a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`) when the host's `gh` is not logged in or the deck's lookup reads `no_github_access`.
+- **Does not assert:** the desktop's badge for the reference (`desktop/agent-cards/*`); the TUI draws no cards.
 - **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
@@ -14953,7 +15763,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/route/003 — An exited worker's task stays inspectable and its orchestrator is told; a report whose orchestrator was replaced is kept for recovery, not handed to the successor.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, the orchestrator exits and a successor takes its pane before the worker runs the real `work-done --task-id`: the CLI prints that the report was saved to a file under the `report_id` of the `worker_report` row `list-outcomes` lists for that task, points to the troubleshooting section "Saved results and reports", and says the clients cannot show or list saved reports yet, and the successor's inbox stays empty and its fetch gets nothing.
+- **Asserts:** Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, the orchestrator exits and a successor takes its pane before the worker runs the real `work-done --task-id`: the CLI prints that the report was saved to a file under the `report_id` of the `worker_report` row `list-outcomes` lists for that task, points to `dot-agent-deck interrupted list` and `interrupted show` and to the troubleshooting section "Saved results and reports", and says the TUI's and the desktop app's Interrupted work shows it too, and the successor's inbox stays empty and its fetch gets nothing.
 - **Test:** `route_003_exited_bound_agent_is_undeliverable_and_notifies_sender` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds; how a client shows the recovery row (round 6).
 - **Platform coverage:** mac+linux.
@@ -15868,7 +16678,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 #### inbox/load
 
-Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when scheduled on the shared box. Use `cargo test-e2e-live --config-file tests/fixtures/inbox-load-nextest.toml --test e2e_inbox_load load_ --no-capture`; this dedicated configuration selects the four load cases, runs one at a time, and allows 12 minutes for fixture setup plus each case's absolute agent deadline. The ordinary nextest configuration stays unchanged. Without opt-in each case emits `SKIP:` before the agent preflight calls, fixture setup or CPU loops; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure.
+Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when scheduled on the shared box. Use `cargo test-e2e-live --config-file tests/fixtures/inbox-load-nextest.toml --test e2e_inbox_load load_ --no-capture`; this dedicated configuration selects the four load cases, runs one at a time, and allows 12 minutes for fixture setup plus each case's absolute agent deadline. The ordinary nextest configuration stays unchanged. Without opt-in each case emits `SKIP:` before the agent preflight calls, fixture setup or CPU loops; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure. Dated runs, and how to read the `STARVED` verdict every valid run reports, are in [`docs/develop/agent-messaging.md`](../docs/develop/agent-messaging.md#the-load-test).
 
 ##### inbox/load/001 — Claude Haiku inbox delivery under deliberate CPU pressure.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_001_claude_acknowledges_seed_idle_busy_and_clear_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
@@ -16200,8 +17010,8 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 
 - **Layer:** Fast (`tests/editor_installer.rs`, Linux): `src/composer_probe/instance.rs` on real files in a temporary directory, real `sleep` children for retention.
 - **Agent:** none.
-- **Asserts:** an instance for a daemon is a 0700 directory named for its pid and start holding `daemon` (0400, read back as written), `inv/` (0700) and the helper (0500, the source's bytes, its `(dev, ino)` as recorded), and no temporary copy; this process's identity carries its pid and a fresh 32-hex nonce. An instance directory that exists is never reused; a root whose path an agent can't split or that is relative, a root or the directory above it that is a symlink or writable by group or others, a root under a directory another user owns, and an unreadable source each refuse with their cause; the root is the state directory's, else the runtime directory's, else none. The copy check compares every byte across buffer boundaries. An identity is written whole (a non-UTF-8 basename included) at 0400 and read back, once; one whose install root is missing, a file, another directory or relative, or whose basename is empty, writes nothing; malformed or symlinked identity, `daemon` and `kind-G` files read as absent, and an absent `kind-G` reads as learned; a FIFO with no writer at `arm-G`, `kind-G` or `daemon` is refused without blocking in its open, and a symlinked `arm-G` is refused as a link while a missing one reads as absent; a file exactly as long as the reader's 16 KiB bound reads whole and one byte longer reads as absent, and an identity whose install root is several kilobytes long reads back. An instance reports what its creation's sweep kept; a generation's arm page is mapped while its installation lives and unmapped when it is dropped, its file staying. Retention removes a gone daemon's directory that no process's environment or maps names, keeps a live daemon's, a named one, a name that isn't an instance's and the caller's own, removes nothing when the scan fails or names a path conservatively by prefix, counts a removal that fails without removing anything, and follows no symlink; through this host's processes, a directory a running child's environment names is kept, and when a process of this user can't be read nothing is removed. Through a scripted `/proc`, a live process of this user whose `environ` or `maps` reads empty (as `environ` does while its exec is under way) keeps every gone daemon's directory and is counted as unknown with no scan error, and so does a zombie leader whose other thread still runs (`Threads:` above 1), while a single-threaded zombie whose entries read empty, and a live process whose environment is there and names another path, keep nothing. The `status` re-read after the entries decides: gone (`ENOENT`/`ESRCH`), or a zombie or dead (`X`) task whose `Threads:` is exactly 1 by then, removes; still live, a multi-threaded zombie, a zombie or dead task whose `Threads:` reads 0, a missing or unparseable state or thread count keeps and counts each empty entry (two when both are); a failed re-read, or a later process that can't be read, is a scan error that keeps everything and counts no empty entry.
-- **Does not assert:** a retention sweep removing anything through this host's own scan where a non-dumpable process of the user (a user `systemd`, `sshd-session`) makes the scan fail, or a live process of the user shows an empty entry, which keeps everything there by design (the case prints `SKIP-REMOVAL`; the removal itself is covered with the scan given); a process caught mid-exec on the real `/proc` (the non-UTF-8 case keeps its instance either way); concurrent daemons racing to create instances.
+- **Asserts:** an instance for a daemon is a 0700 directory named for its pid and start holding `daemon` (0400, read back as written), `inv/` (0700) and the helper (0500, the source's bytes, its `(dev, ino)` as recorded), and no temporary copy; this process's identity carries its pid and a fresh 32-hex nonce. An instance directory that exists is never reused; a root whose path an agent can't split or that is relative, a root or the directory above it that is a symlink or writable by group or others, a root under a directory another user owns, and an unreadable source each refuse with their cause; the root is the state directory's, else the runtime directory's, else none. The copy check compares every byte across buffer boundaries. An identity is written whole (a non-UTF-8 basename included) at 0400 and read back, once; one whose install root is missing, a file, another directory or relative, or whose basename is empty, writes nothing; malformed or symlinked identity, `daemon` and `kind-G` files read as absent, and an absent `kind-G` reads as learned; a FIFO with no writer at `arm-G`, `kind-G` or `daemon` is refused without blocking in its open, and a symlinked `arm-G` is refused as a link while a missing one reads as absent; a file exactly as long as the reader's 16 KiB bound reads whole and one byte longer reads as absent, and an identity whose install root is several kilobytes long reads back. An instance reports what its creation's sweep kept; a generation's arm page is mapped while its installation lives and unmapped when it is dropped, its file staying. Retention removes a gone daemon's directory that no process's environment or maps names, keeps a live daemon's, a named one, a name that isn't an instance's and the caller's own, removes nothing when the scan fails or names a path conservatively by prefix, counts a removal that fails without removing anything, and follows no symlink; through this host's processes, a directory a running child's environment names is kept, and when a process of this user can't be read nothing is removed. Through a scripted `/proc`, a live process of this user whose `environ` or `maps` reads empty (as `environ` does while its exec is under way) keeps every gone daemon's directory and is counted as unknown with no scan error, and so does a zombie leader whose other thread still runs (`Threads:` above 1), while a single-threaded zombie whose entries read empty, and a live process whose environment is there and names another path, keep nothing. The `status` re-read after the entries decides: gone (`ENOENT`/`ESRCH`), or a zombie or dead (`X`) task whose `Threads:` is exactly 1 by then, removes; still live, a multi-threaded zombie, a zombie or dead task whose `Threads:` reads 0, a missing or unparseable state or thread count keeps and counts each empty entry (two when both are); a failed re-read, or a later process that can't be read, is a scan error that keeps everything and counts no empty entry. Issue #2467: a process of this user whose `environ` or `maps` read is refused (`EACCES`, `EPERM`) and whose `stat` shows no controlling terminal, as `systemd --user`, `(sd-pam)`, `ssh-agent` and `sshd-session` are on a real host, is skipped and the gone instance removed; refused on a terminal, with a `stat` it can't read or parse, or failing otherwise, it still keeps every instance as a scan error (`probe_065_a_refused_process_with_no_terminal_keeps_nothing`). A gone daemon's instance that was never installed (only `daemon`, an empty `inv/`, and the helper or its partial copy) is removed even when the scan fails, while an installed one, one holding another file and a live daemon's are kept (`probe_065_a_gone_instance_never_installed_needs_no_scan`). An attempt that fails after making its directory takes it back, so the same daemon's next attempt makes the instance instead of refusing `InstanceExists` (`probe_065_a_failed_attempt_takes_its_directory_back`), and the daemon's instance is tried again 60 s after a failed attempt and kept once made (`probe_065_a_failed_instance_is_tried_again_after_its_wait`, `src/composer_probe/install.rs`).
+- **Does not assert:** a retention sweep removing anything through this host's own scan where a process of the user that the kernel won't let it read is on a terminal, or a live process of the user shows an empty entry, which keeps everything there by design (the case prints `SKIP-REMOVAL`; the removal itself is covered with the scan given); a process caught mid-exec on the real `/proc` (the non-UTF-8 case keeps its instance either way); concurrent daemons racing to create instances.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/066 — The e2e editor-probe assumption is read through its real reader and captured once at daemon start, and a list with an unknown entry is refused there.
@@ -16230,37 +17040,37 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 
 ## Desktop agent cards (webview)
 
-The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library tests in the webview (`cd desktop && pnpm test`), outside the Rust `#[spec]` scanner, so they are named here by test title (`desktop/agent-cards/00N: …`), as in `question/desktop`. 001–007 are in `desktop/src/components/AgentCardsContract.test.tsx` and render the real `AgentOverview`; 008 is in `desktop/src/components/AgentCardsVoice.test.tsx` and renders the real `DeckShell` with only the microphone and the resolved voice answer synthetic. The fixtures contradict what a client would compute (a `working` agent the daemon marks needs-you with reason `done`, a `waiting_for_input` one it does not mark, a prompt action disabled `agent_stopped` on a running agent, a primary that is not the first action, entries in neither alphabetical nor needs-you-first order, one group appearing twice), so a view that recomputed status, needs-you, enablement or order fails. **Agent:** none. **Platform coverage:** jsdom on Node; CI runs them in `desktop-web`'s vitest (or the RWX counterpart).
+The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. These are Vitest + Testing Library tests in the webview (`cd desktop && pnpm test`), outside the Rust `#[spec]` scanner, so they are named here by test title (`desktop/agent-cards/0NN: …`), as in `question/desktop`. 001–007 are in `desktop/src/components/AgentCardsContract.test.tsx` and render the real `AgentOverview`; 008 and 018 are in `desktop/src/components/AgentCardsVoice.test.tsx` and render the real `DeckShell` with only the microphone and the resolved voice answer synthetic; 009–017 and 020–023 are in `desktop/src/components/AgentCardsTree.test.tsx` and render the real `AgentOverview` (023 calls the issue-address check directly); 019 is the Playwright spec `desktop/e2e/agent-cards-tree.spec.ts` (`cd desktop && pnpm test:browser agent-cards-tree`). The fixtures contradict what a client would compute (a `working` agent the daemon marks needs-you with reason `done`, a `waiting_for_input` one it does not mark, a prompt action disabled `agent_stopped` on a running agent, a primary that is not the first action, entries in neither alphabetical nor needs-you-first order, a roll-up that changes while the entries under it do not, a checked state that differs from the agent's claim), so a view that recomputed status, needs-you, enablement, order, the tree, a roll-up or a reference fails. **Agent:** none. **Platform coverage:** jsdom on Node; CI runs them in `desktop-web`'s vitest (or the RWX counterpart); 019 runs in Chromium and WebKit in the desktop browser job.
 
-##### desktop/agent-cards/001 — The Cards grid groups consecutive entries by `group.id`, with the daemon's counts.
+##### desktop/agent-cards/001 — A daemon list without the tree draws every card as a root, in the daemon's order, with the daemon's counts.
 - **Test:** vitest `desktop/agent-cards/001: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), real `AgentOverview` against a daemon card list.
-- **Asserts:** one group section per run of consecutive entries sharing a `group.id`, so the dispatcher's group appears twice when the daemon orders a member last; each section's label, kind and `N agents · M need you` (singular forms included); each group's card names in the daemon's order; the toolbar's total `5 agents · 3 need you`.
-- **Does not assert:** the daemon's grouping or ordering (`agent-report/cli/002` covers the dispatcher group); several decks' grids.
+- **Asserts:** no grouping by `group.id` is rebuilt (issue #2418 replaced the grouped grid with the tree); every card of a list that does not advertise the tree is a root, in the order received; the toolbar's total `5 agents · 3 need you`.
+- **Does not assert:** the tree itself (009); the daemon's ordering (`agent-report/cli/002`).
 
-##### desktop/agent-cards/002 — Cards keep the daemon's order, status and needs-you; the Needs you filter hides the rest.
+##### desktop/agent-cards/002 — Cards keep the daemon's order, status words and needs-you; Needs you only fades the rest in place.
 - **Test:** vitest `desktop/agent-cards/002: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status words (`Working`, `Waiting for input`, `Thinking`, `Stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and `card`-placed fields show, a `detail` field does not; an unreported agent reads "No report from this agent yet."; the Needs you filter (`aria-pressed`) keeps only the daemon-marked cards, in order, while the group count stays the whole group's.
-- **Does not assert:** the hover text of the needs-you reasons; the CSS grid's responsive layout.
+- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status in the daemon's words as the table shows them (`working`, `needs input`, `thinking`, `stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and fields are not on the compact card; Needs you only (`aria-pressed`) keeps every card in place and fades exactly the cards the daemon did not mark, and turning it off unfades them.
+- **Does not assert:** the hover text of the needs-you reasons; the tree's layout (019).
 
-##### desktop/agent-cards/003 — The primary action sends the daemon's action, shows its prompt, and asks first when it must.
+##### desktop/agent-cards/003 — The compact card keeps only Close, using the overlay's confirmation and action definition.
 - **Test:** vitest `desktop/agent-cards/003: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), `invokeCardAction` stubbed.
-- **Asserts:** the primary button is the daemon's `primary_action_id` (not the first action) and shows its label, with the prompt beneath cut to 60 characters and whole in its `title`; pressing it calls `invokeCardAction` once with `{deckId, instanceId, paneId, agentId}`, that action id, a request id and no `confirm`, and the answer shows under the card; a primary the daemon disabled on a running agent is a disabled button naming "the agent is not running" and sends nothing; a `confirm` primary opens the overlay's confirm step with the exact prompt and `confirm_detail`, and only that step's Send invokes it, with `confirm: true`.
+- **Asserts:** the compact card omits its primary action and prompt; its icon-only Close has an accessible name and tooltip and opens the same confirmation with the same pending detail as the overlay's Close; confirming sends `close` to that card's `{deckId, instanceId, paneId, agentId}`, with `confirm: true` and the offered token. Close on a running agent that the daemon disabled remains disabled, names the reason in its tooltip, sends nothing and opens no overlay.
 - **Does not assert:** what the daemon does with the request (`agent-report/actions/001`); delivery-state words.
 
 ##### desktop/agent-cards/004 — The overlay navigates in display order, updates live, and survives its agent closing.
 - **Test:** vitest `desktop/agent-cards/004: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** opened from a card at `2 of 5`; `]` / `[` and the Next card / Previous card buttons walk the daemon's order with wrap-around; `n` and Next card that needs you land only on daemon-marked cards; the overlay lists every action's full prompt, `detail` fields, the needs-you reasons and the `agent says` / `deck checked` labels; a new list with the same key re-renders the open card (new summary and status); a list without its key shows "This agent was closed." under the old name and navigation still moves on; Escape closes it.
+- **Asserts:** opened from a card at `2 of 5`; `]` / `[` and the Next card / Previous card buttons walk the daemon's order with wrap-around; `n` and Next card that needs you land only on daemon-marked cards; the overlay lists every action's full prompt, `detail` fields, the needs-you reasons and the `agent says` / `deck checked` labels; a new list with the same key re-renders the open card (new summary and status); a list without its key shows "This agent was closed." under the old name and navigation still moves on; Escape closes it. With an open question, summary, question/options and the directly visible reply field precede fields, other actions and deliveries; Send reply sends the user's text through the offered reply action.
 - **Does not assert:** the full-screen layout under 640 px (CSS); focus handling.
 
 ##### desktop/agent-cards/005 — Table rows carry the daemon's needs-you marker and a menu that shows the card.
 - **Test:** vitest `desktop/agent-cards/005: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), Table view.
-- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status; the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent.
-- **Does not assert:** the menu's keyboard dismissal beyond Escape; the row primary's send (covered by 003's path).
+- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status (since issue #2454 it is a badge in the name cell, which `OverviewCards.test.tsx` places after the PR badge and outside the row's controls); the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent. In Cards, the name is a focusable native button that invokes the same open-agent action and navigation target as that row, without opening the overlay; clicking the body opens the overlay without agent navigation, and controls are not nested inside other controls.
+- **Does not assert:** the menu's keyboard dismissal beyond Escape; the row primary's send (covered by 003's path); a real native webview's tab order.
 
 ##### desktop/agent-cards/006 — The view is remembered per client, and a broken storage falls back to the table.
 - **Test:** vitest `desktop/agent-cards/006: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
@@ -16275,10 +17085,126 @@ The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library 
 - **Does not assert:** that a consumed runtime asks the backend once before it listens and reads (`useDeckRuntime agent cards` in `desktop/src/hooks/useDeckRuntime.test.ts`).
 
 ##### desktop/agent-cards/008 — Every new card control is reachable by voice, and a spoken confirm action, or one whose text the agent wrote, only opens its step.
-- **Test:** vitest `desktop/agent-cards/008: …` (nine tests) in `desktop/src/components/AgentCardsVoice.test.tsx`.
+- **Test:** vitest `desktop/agent-cards/008: …` in `desktop/src/components/AgentCardsVoice.test.tsx`.
 - **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it (`card_action` and `reply_text` param kinds).
 - **Asserts:** each of `setOverviewMode`, `showAgentCard`, `nextAgentCard`, `previousAgentCard`, `nextNeedsYouCard`, `toggleNeedsYouFilter`, `closeAgentCard`, `runCardAction` and `replyToAgentCard` is `voice: true` with no `no_voice`, and exactly one `commands.toml` row invokes it, with the contract's row id, `screens = ["overview"]` and its param names and kinds; `confirmCardAction` and `toggleOverviewRowMenu` carry a `no_voice` reason and no row. A spoken `run_card_action` naming a `confirm` action, or Close, opens that card's overlay at its confirm step (exact prompt and pending detail) and sends nothing; one naming an action or a question's answer whose text is, or quotes, what the agent wrote (`prompt_source: "agent"`, the deck-composed answer included) opens that card's review step showing the exact text, says why on the voice row, and sends nothing until Send, which sends it once — including an answer to a question whose quotes and line breaks smuggle an instruction into the composed text (audit A1); only one naming a catalog prompt action sends exactly that action of that card once, unconfirmed; a spoken `reply_to_agent_card` sends `reply` with the user's words.
+- **Asserts (compact controls):** name-open and spoken `open_agent` dispatch `VOICE_ACTIONS.openAgent` and show the agent terminal without a card overlay; the existing `open_agent` command row is voice-enabled on overview. The Close icon and spoken Close use `runCardAction` and show the same confirmation without sending or opening a terminal.
 - **Does not assert:** the model's choice of row or the crate's param resolution (the desktop crate's voice tests); real speech.
+
+##### desktop/agent-cards/009 — Only roots show at first, and opening a card shows exactly its children, to any depth.
+- **Test:** vitest `desktop/agent-cards/009: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom), real `AgentOverview` against a list whose entries carry `parent` from a daemon that advertises the tree.
+- **Asserts:** only the three roots render (`data-depth="0"`), in the daemon's order; a card with nothing under it has no toggle; the toggle reads `Open <name>'s tree` with `aria-expanded`; opening the dispatcher shows one band for it holding exactly its two children in order at depth 1, the roots unchanged; opening the orchestrator under it adds its two roles at depth 2; closing the dispatcher removes its whole tree and the band.
+- **Does not assert:** the parent links themselves (`agent-report/tree/001`); geometry (019).
+
+##### desktop/agent-cards/010 — A closed card with children shows its roll-up's colour, counts bar and totals.
+- **Test:** vitest `desktop/agent-cards/010: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a closed card's `data-tone` is the worst of its own status and its roll-up's `worst` (an idle dispatcher over a `waiting_for_input` card reads `needs_input`; one over `blocked` reads `blocked`); the bar's segments follow the roll-up's counts, most severe first, with the accessible name `1 needs input, 1 working, 2 idle`; the totals read `4 under it · 1 needs you` (singular forms included); a card with no children shows its own status and no roll-up; opened, the card takes its own status's colour again.
+- **Does not assert:** the roll-up's computation (`agent-report/tree/002`, module tests in `src/agent_cards.rs`); the palette's colours (CSS).
+
+##### desktop/agent-cards/011 — Roll-ups and statuses update live, and open trees stay open.
+- **Test:** vitest `desktop/agent-cards/011: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** after a new list in which only a closed root's `rollup` changed, its colour, totals and bar follow the new roll-up with no client recount; another root's open tree stays open, and a card in it shows its new status. The status button's accessible name includes the kind and current status words before and after the update.
+- **Does not assert:** the daemon's doorbell or the runtime's re-read (`useDeckRuntime agent cards`).
+
+##### desktop/agent-cards/012 — A compact card shows who and what in the daemon's words, and the overlay keeps what the agent said.
+- **Test:** vitest `desktop/agent-cards/012: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** each card shows its kind (`dispatcher` for a card the daemon names as another's dispatcher, `orchestrator` and `role` from its orchestration relation, else `agent`), its status in the daemon's words (`working`, `needs input` for `waiting_for_input`, `idle` for `unknown`, `error`) and the needs-you marker where the daemon set it; agent type, summary, progress and next step are not on the compact card; opening the overlay shows the summary, progress, next step and agent type there.
+- **Does not assert:** the overlay's own behaviour (004).
+
+##### desktop/agent-cards/013 — Checked pull request and issue badges show the deck's check and open their GitHub pages.
+- **Test:** vitest `desktop/agent-cards/013: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom), the shell's `OpenCardReference` replaced by a spy.
+- **Asserts:** a pull request the agent claimed as `#24180` shows the deck's check (`data-pr-state="merged"`, checks `failing`, review `approved`) through the shared pull request badge; clicking it calls the opener once with the card (its deck, the daemon instance that listed it and its key), `pull_request`, the number and the checked github.com address, and opens no overlay; an issue claimed as `o/r#3` shows `closed` and opens its checked issue address the same way.
+- **Asserts (issue labels):** display-only label chips show repo colours, invalid and missing colours share a neutral decoration, and a measured line that fits two of five chips shows those two plus `+3`; the overlay lists all five labels. For malformed daemon data, `issueLabels()` and the rendered compact card and overlay keep at most 20 labels and 50 characters per name, with no extra hidden chip nodes; a usable label after 1,000 invalid entries is ignored by the bounded scan. Clicking the issue badge opens no overlay.
+- **Does not assert:** the lookup (`agent-report/refs/001`); the in-app browser itself (018 opens it through the shell); real browser label geometry.
+
+##### desktop/agent-cards/014 — Pending, unavailable and stale references say so.
+- **Test:** vitest `desktop/agent-cards/014: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a pending reference reads `#7 · checking…` with a tooltip saying the deck has not looked it up yet; a `not_found` one reads `not found or private` with the daemon's detail in its tooltip and no button; an `unrecognised` one reads `not a GitHub reference` with the agent's claim in its tooltip; a stale one keeps its badge with its last checked state, is marked `stale`, and its tooltip says when it was last checked. A pending and a `not_found` reference that already carry an address are drawn as text with no button, and a click on that text opens no page and opens the card's overlay.
+- **Does not assert:** the daemon's failure classification (`agent-report/refs/002`).
+
+##### desktop/agent-cards/015 — Needs you only opens the path to every card that needs you and fades the rest.
+- **Test:** vitest `desktop/agent-cards/015: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** with every tree closed, turning it on opens every card that has a daemon-marked card under it, at any depth; the marked cards and the cards on their paths stay bright and exactly the others fade (`data-faded`); turning it off unfades every card. While it stays on, a live list that adds a marked card under a card with no tree before and a marked card one level under an open card's child opens the way to each, and both are bright; a tree the user closed stays closed when nothing under it newly needs them; and a card that comes to need the user under a tree the user closed reopens that tree.
+- **Does not assert:** the fade's opacity (CSS).
+
+##### desktop/agent-cards/016 — Open trees are remembered per client, pruned, and a broken storage falls back to closed.
+- **Test:** vitest `desktop/agent-cards/016: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** opening a tree stores its key under `dot-agent-deck.cards.open` as deck, daemon instance and card key; a fresh render comes back with it open; a remembered key of a card the on-screen daemon no longer lists is pruned while a deck not on screen keeps its keys; with that storage throwing on read and write, every tree renders closed without an error and opening one still works for the session. What is read back is bounded and checked: of 501 stored keys the oldest is not read and the newest is; stored text longer than the app ever writes is ignored whole; malformed JSON reads as nothing open; non-strings, an overlong key and keys not shaped `deck\0instance\0key` are dropped while a valid key beside them is kept; a key of a replaced daemon instance is forgotten; and a deck whose daemon answers with no cards forgets its keys while another deck's stay.
+- **Does not assert:** storage shared across windows or app restarts (jsdom only).
+
+##### desktop/agent-cards/017 — An older daemon's cards are all roots, with no roll-ups, and a note says why.
+- **Test:** vitest `desktop/agent-cards/017: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** for a list whose daemon does not advertise the tree, every entry is a root in its order even if it carries `parent`, no card has a toggle, a roll-up or a checked reference, and one line says the daemon is older than the app.
+- **Does not assert:** that the shared client drops the tree fields (`src/daemon_client.rs`'s tree gate tests).
+
+##### desktop/agent-cards/018 — The tree's controls are reachable by voice.
+- **Test:** vitest `desktop/agent-cards/018: …` (seven tests) in `desktop/src/components/AgentCardsVoice.test.tsx`.
+- **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it.
+- **Asserts:** `openCardTree`, `closeCardTree`, `openCardPullRequest` and `openCardIssue` are each `voice: true` with no `no_voice`, invoked by exactly one `commands.toml` row (`open_card_tree`, `close_card_tree`, `open_card_pull_request`, `open_card_issue`) on `screens = ["overview"]` taking an `agent_ref`; a spoken `open_card_tree` shows the card under the named card, and `close_card_tree` hides it; a spoken `open_card_pull_request` opens the app's GitHub browser on the checked pull request (`Pull request #24180`), and `open_card_issue` on the checked issue (`Issue #3`); the same two commands on a card whose agent has stopped and is absent from the fleet's agents (`status: "stopped"`, an agent id no deck lists) open the browser named for that card (`Issue #3 for child-card`) and it stays open; a spoken `open_card_tree` for a card one level under a closed root opens the root too, so the card and its child show; and with the dashboard filter hiding the named card, the voice answer says the tree is open but the filter hides it, instead of reporting success.
+- **Does not assert:** the model's choice of row (the desktop crate's voice tests); real speech.
+
+##### desktop/agent-cards/019 — The Cards tree's layout keeps the roots in place at every width.
+- **Test:** Playwright `desktop/agent-cards/019 — the Cards tree at <width>px` (five tests per width) in `desktop/e2e/agent-cards-tree.spec.ts`, against the fixture scene `/?fixture=1&state=docs&cards=tree` (eight roots, a dispatcher with an orchestration under it, one with seven units, orchestrators with roles) and `cards=tree-nested` (a root whose only child has nine cards under it). Live updates are pushed through the tree scenes' `window.__dadFixtureCards` hook.
+- **Layer:** desktop browser (production build, `vite preview`), widths 375, 768, 1024, 1440 and 1920 px.
+- **Asserts:** the page never scrolls sideways with every tree closed or every root open, and every tree and line stays inside the frame; opening any root leaves every root's x, width and height unchanged, the roots in its row and above do not move, the rows below move down together by one amount, and closing it puts every root back; two roots opened in one row each get their own level under it in the roots' order, and the later root's line passes through no part of the earlier tree and stays inside the frame. At 375 px each row holds one root, so the two-roots case asserts that instead. With the nested scene's child level wider than the frame, the root's line ends on the child's top edge, within its width, both as opened and after the tree's block is scrolled, and stays inside the frame. With a tree open, a live list in which a root and a child start needing the user with other status words, and then one in which more checked references than fit on a line appear on a root and on a child, leaves every root's x, y, width and height unchanged.
+- **Does not assert:** the colours; a real daemon's tree (the fixture plays the daemon); the line while the child is scrolled wholly out of view (it then ends at the block's nearer edge).
+
+##### desktop/agent-cards/020 — The grid measures its frame whenever cards appear, including after a filter emptied it.
+- **Test:** vitest `desktop/agent-cards/020: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom) with a recording `ResizeObserver` and a set frame width.
+- **Asserts:** a deck that starts with no cards lays its grid out for the frame's width as soon as cards arrive, and again on a resize; after the dashboard filter hides every card and is cleared, the restored frame is measured afresh and its resizes are followed.
+- **Does not assert:** real layout (019 does that in a browser).
+
+##### desktop/agent-cards/021 — A card's kind is the daemon's, whatever the dashboard filter shows.
+- **Test:** vitest `desktop/agent-cards/021: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a card the daemon sends with `kind: "dispatcher"` reads "dispatcher" whether its unit is on screen or hidden by the dashboard filter, and so does one with no unit listed at all; for a daemon without the tree, the kind is read off the relations of the cards on screen.
+- **Does not assert:** how the daemon works the kind out (`agent_cards::tests::each_card_carries_its_kind_from_the_dispatch_records`).
+
+##### desktop/agent-cards/022 — A cyclic list is drawn once, with persisted open cards and Needs you only.
+- **Test:** vitest `desktop/agent-cards/022: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** two entries naming each other as `parent`, both remembered open and one needing the user, render without recursing: the first is the only root, each card is drawn once, and Needs you only and toggling the root leave it that way.
+- **Does not assert:** the daemon's own cycle cutting (`agent_cards::tests::self_links_and_cycles_still_give_a_forest`).
+
+##### desktop/agent-cards/023 — An issue badge opens only an issue's own numbered page.
+- **Test:** vitest `desktop/agent-cards/023: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** pure webview helper (`isIssueUrl`, `referenceUrl`).
+- **Asserts:** `https://github.com/<owner>/<repo>/issues/<n>` with n ≥ 1, an optional trailing `/` and an explicit `:443` is accepted; a segment after the number, a query (even an empty one), a fragment, number 0 or a leading zero, a pull request page, another host, plain http, a login and another port are refused. The native browser's matcher has the same cases in `pr_browser::tests::a_github_issue_opens_the_browser_too`.
+- **Does not assert:** the in-app browser's navigation policy after it opens.
+
+##### desktop/agent-cards/024 — An agent-written prompt is read whole before it is sent.
+- **Test:** vitest `primaryNeedsReview (issue #2418 audit A4)` in `desktop/src/lib/agentCards.test.ts`, review regressions in `desktop/src/components/AgentCardsReview.test.tsx` and `desktop/src/components/OverviewCards.test.tsx`; Playwright `desktop/agent-cards/024` in `desktop/e2e/agent-cards-tree.spec.ts`, against the fixture scene `cards=tree` with pushed agent-written actions.
+- **Layer:** pure webview helper; desktop component (jsdom); desktop browser (production build, `vite preview`) at 1024 px.
+- **Asserts:** the pure `primaryNeedsReview` helper returns false for catalog prompts and actions without a prompt, and true for prompts with agent, deck or unspecified source, including short prompts. General actions and question options send catalog prompts directly, while non-catalog prompts first open a token-bound review with no delivery, and only its Send delivers the shown definition. Existing exact-character markers and changed-token review checks remain covered. In the browser, the compact card omits the agent-written action and offers Close. A separate regression supplies a multiline prompt shorter than 2,000 characters, proves its suffix lies below the overlay viewport, then verifies that pressing the visible action sends nothing and opens the full-text review; only the review's Send produces `m-fixture-card`.
+- **Does not assert:** what the daemon does with the request (`agent-report/actions/001`); a real agent.
+
+##### desktop/agent-cards/025 — Every checked reference is reachable from a compact card.
+- **Test:** vitest `desktop/agent-cards/025: …` (three tests) in `desktop/src/components/AgentCardsTree.test.tsx`; Playwright `desktop/agent-cards/025 — every checked reference is reachable from a compact card at <width>px` in `desktop/e2e/agent-cards-tree.spec.ts`, against `cards=tree` with pushed references.
+- **Layer:** desktop component (jsdom; the second test stubs the reference line's and badges' layout widths); desktop browser at 375 and 1440 px.
+- **Asserts:** the card overlay's "Pull requests and issues" section lists every `checked_refs` entry in the daemon's order with the deck's check (a pull request's state, review and CI, an issue's state, the title), when it was checked or that it is stale, that it is still to be checked, or why it cannot be (with the daemon's detail), and the agent's claim marked **agent says**; its checked badges open their pages through the same opener as the card's, named by the card; an open the opener accepts closes the overlay, and one it refuses leaves the overlay open with the opener's sentence in it, and on the card the same refusal shows in a dashboard banner that Dismiss clears; an unchecked one has no link. On the card, badges that do not fit the line whole are hidden whole (`data-overflow`, `aria-hidden`, not drawn) and counted by a `+N` button; pressing it, from the keyboard in the browser, opens that card's overlay with the focus on the section, scrolled into view. In the browser with two pull requests, a stale issue and a not-found issue, every drawn badge is wholly inside the line and clear of the count, the roots do not move, the overlay lists all four with their states, and a real click on the stale issue past the card's line opens the in-app browser on it although bench's card is `stopped` and its agent is absent from the fleet's agents. The browser is then in front: the card overlay is gone, the browser is not `inert`, none of its toolbar buttons is, it is not marked covered, a hit-test at its centre lands inside it and the focus is inside it; its Back works, a later card list that still holds bench keeps it open, Close puts the focus back on the `+N`, and a list without bench's card closes it.
+- **Does not assert:** the lookup (`agent-report/refs/001`, `002`); voice beyond the existing show-card command, which opens the same overlay.
+
+##### desktop/agent-cards/026 — A reference opened again follows what asked for it last.
+- **Test:** vitest `desktop/agent-cards/026: …` (four tests) in `desktop/src/CardReferenceSubject.test.tsx`.
+- **Layer:** desktop shell (jsdom): the real `DeckShell` with its `OpenCardReference` and `OpenPullRequest` providers, opened from the dashboard's own card badges and table pull request badge; the native page host and the daemons' pushes are synthetic.
+- **Asserts:** with the in-app browser already on an address, a second accepted open of that address does not reload the page (the host's `open` is called once) but the browser takes the new request's subject: two cards on one deck, or on two decks, reporting the same issue leave it named for the second card, and it stays open when the first card's list drops it and closes when the second's does; a card's pull request reopened from the agent's table badge is named for the agent, stays open when the card goes and closes when the agent goes; the badge's pull request reopened from the card is named for the card, stays open when the agent stops while the card is listed, and closes when the card goes.
+- **Does not assert:** a switch to a different address (`PullRequestBrowser.test.tsx`); voice beyond the shared providers.
+
+##### desktop/agent-cards/027 — A compact card's name, Close and labels stay readable.
+- **Test:** Playwright `desktop/agent-cards/027` in `desktop/e2e/agent-cards-tree.spec.ts`, against `cards=tree` with a pushed long name and an issue with eight labels, plus a separate single over-wide label regression.
+- **Layer:** desktop browser (production build, `vite preview`) at 375 and 1440 px.
+- **Asserts:** the long name's first character starts inside its button's content box, its text is cut with `overflow: hidden` and `text-overflow: ellipsis`, and its box ends before Close; Close has a positive width and lies wholly inside the card. The labels line stays 18 px high, shows at least one but fewer than eight labels in their original order, draws each visible chip whole inside the line and clear of `+N`, counts the hidden labels with `+N`, and shows the first label's repository colour. A single valid 50-character label wider than the line is hidden whole and counted by `+1`; any drawn chip has `scrollWidth <= clientWidth`. No root moves or resizes, and the page does not scroll sideways.
+- **Does not assert:** the pixels of the ellipsis glyph; the `agent-cards` screenshot scenario's image.
 
 ## Desktop native driver scenarios
 

@@ -19,7 +19,8 @@
 //!
 //! `041` needs no model turn (nothing is submitted); `043` delivers tasks,
 //! one of them in a pane under 32 rows, where Codex draws no witness before
-//! its first prompt (issue #2262).
+//! its first prompt (issue #2262). `105` delivers one to a box nobody typed
+//! into while a client answers Codex's cursor queries (issue #2467).
 #[path = "support/codex_installed.rs"]
 mod codex_installed;
 dot_agent_deck_test_harness::link!();
@@ -34,6 +35,7 @@ mod live;
 
 use codex_installed::{BUDGET, CprAnswerer, Installed};
 use helper_pause::{Pauser, helpers};
+use inbox::attach;
 use serde_json::json;
 use spec::spec;
 use std::io::Write;
@@ -565,6 +567,74 @@ fn probe_043_live_a_touched_box_in_a_short_pane_is_checked_before_any_prompt() {
         "043 short pane: checked, one delivery: {}; cpr answers {}",
         codex.message(&id),
         answerer.answered()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// inbox/probe/105
+// ---------------------------------------------------------------------------
+
+/// Scenario: In real interactive Codex in an installed pane nobody has typed into, with a test-owned client attached that answers Codex's cursor position queries as the desktop app's terminal does (a stand-in, not the desktop), resize the pane so Codex asks for the cursor position and the client answers, then queue a sentinel task. The doorbell rings the untouched box with no check of it, and the task is acted on and acknowledged after exactly one hand-over (issue #2467: the client's reply counted as the person touching the box, so every delivery needed a check, and with the deck's editor helper unavailable none ever came).
+#[spec("inbox/probe/105")]
+#[test]
+fn probe_105_live_a_clients_cursor_reply_leaves_a_fresh_codex_untouched() {
+    skip_unless!(codex_installed::checkable());
+    let codex = Installed::new(&[]);
+    codex.assert_installed();
+    codex.wait_armable();
+    let record = codex.record();
+    let (rows, cols) = (
+        record["rows"].as_u64().unwrap() as u16,
+        record["cols"].as_u64().unwrap() as u16,
+    );
+    let answerer = CprAnswerer::attach(
+        codex.deck.attach_socket_path(),
+        &codex.pane.agent,
+        rows,
+        cols,
+    );
+    let since = codex.log().len();
+    answerer.resize(rows, cols - 1);
+    let reply = attach(
+        &codex.deck,
+        json!({"op": "resize", "id": codex.pane.agent, "rows": rows, "cols": cols - 1}),
+    );
+    assert_eq!(reply["ok"], true, "resize: {reply}");
+    assert!(
+        common::wait_until(BUDGET, || answerer.answered() >= 1),
+        "Codex asks for the cursor position after the resize and the client answers; {}",
+        codex.evidence()
+    );
+    let name = "p105-cpr-reply-1051.txt";
+    let id = codex.post(name);
+    let delivered = common::wait_until(BUDGET, || {
+        codex_installed::project_dir(&codex.deck)
+            .join(name)
+            .exists()
+    });
+    assert!(
+        delivered,
+        "the untouched box must be rung and the task delivered; cpr answers {}; {}",
+        answerer.answered(),
+        codex.evidence()
+    );
+    codex.done(&id, name);
+    let log = codex.log()[since..].to_string();
+    assert!(
+        log.lines().any(|l| l.contains("doorbell rang")),
+        "the doorbell rang; {}",
+        codex.evidence()
+    );
+    assert!(
+        !log.lines()
+            .any(|l| l.contains("doorbell tick probe") && l.contains("outcome=Written")),
+        "no check was needed: the client's replies left the box untouched; {}",
+        codex.evidence()
+    );
+    eprintln!(
+        "105: rung with no check after {} client cursor replies: {}",
+        answerer.answered(),
+        codex.message(&id)
     );
 }
 

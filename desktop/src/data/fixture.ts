@@ -895,7 +895,9 @@ export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
 /*
  * PRD #2374 — the `agent-cards` docs scene: the cards the daemon would send
  * for the `docs` state's four agents, as one orchestration and one standalone
- * agent, in the daemon's display order (needs-you first within a group).
+ * agent. Issue #2418: as a daemon that builds the card tree sends them — the
+ * orchestrator a root with its two roles under it and their roll-up, in the
+ * tree's order, and the reviewer's pull request as the deck checked it.
  * Served by the fixture bridge only for `/?fixture=1&state=docs&cards=1`,
  * so no other fixture scene grows a needs-you bell or a row menu.
  */
@@ -911,7 +913,6 @@ function docsCardAction(id: string, overrides: Partial<AgentCardAction>): AgentC
 
 function docsDeckActions(): AgentCardAction[] {
   return [
-    docsCardAction("explain", { label: "Explain", prompt: "Explain in a few sentences what you did and what you need from me, then update your card.", prompt_source: "catalog", icon: "help-circle" }),
     docsCardAction("reply", { label: "Reply", text_input: true, source: "deck", placement: "detail", icon: "message-square" }),
     docsCardAction("open", { label: "Open", kind: "open", source: "deck", placement: "detail", icon: "terminal" }),
     docsCardAction("close", { label: "Close", kind: "close", confirm: true, source: "deck", placement: "detail", icon: "x" }),
@@ -934,6 +935,7 @@ export function docsAgentCards(): AgentCardsSnapshot {
   const entries: AgentCardEntry[] = [
     docsCard("1", "Plan / architecture", {
       status: "idle", needs_you: true, needs_you_reasons: ["done"], group: DOCS_CARDS_TEAM,
+      rollup: { total: 2, worst: "working", counts: { working: 2 }, needs_you: 1 },
       relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "planner", is_orchestrator: true } },
       report: { source: "agent", status: "done", summary: "Retry design is written up and ready for the builder.", published_at: DOCS_REPORTED_AT, revision: 3 },
       fields: [{ name: "next-step", label: "Next step", description: "What you will do next, or what you are waiting for.", type: "text", icon: "arrow-right", placement: "card", custom: false, source: "agent", value: "Waiting for your go-ahead" }],
@@ -941,7 +943,11 @@ export function docsAgentCards(): AgentCardsSnapshot {
       primary_action_id: "go-ahead",
     }),
     docsCard("3", "Contract review", {
-      status: "working", needs_you: true, needs_you_reasons: ["question"], group: DOCS_CARDS_TEAM,
+      status: "working", needs_you: true, needs_you_reasons: ["question"], group: DOCS_CARDS_TEAM, parent: "docs-pane-1/1",
+      checked_refs: [{
+        field: "pull-request", kind: "pull_request", claim: "#18421", repo: "acme/checkout", number: 18421, url: "https://github.com/acme/checkout/pull/18421",
+        result: { status: "checked", state: "open", ci: { state: "passing", passing: 14, failing: 0, pending: 0, skipped: 1 }, review: "review_required", title: "Retry failed payments", checked_at: DOCS_REPORTED_AT, stale: false },
+      }],
       relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "reviewer", is_orchestrator: false } },
       report: { source: "agent", status: "waiting", summary: "One breaking change in the payment API response.", published_at: DOCS_REPORTED_AT, revision: 2 },
       fields: [
@@ -963,7 +969,13 @@ export function docsAgentCards(): AgentCardsSnapshot {
       primary_action_id: "question/flag/yes",
     }),
     docsCard("2", "Desktop implementation", {
-      agent_type: "codex", status: "working", group: DOCS_CARDS_TEAM,
+      agent_type: "codex", status: "working", group: DOCS_CARDS_TEAM, parent: "docs-pane-1/1",
+      checked_refs: [{
+        field: "issue", kind: "issue", claim: "#18436", repo: "acme/checkout", number: 18436, url: "https://github.com/acme/checkout/issues/18436",
+        result: { status: "checked", state: "open", title: "Let customers retry a failed payment", checked_at: DOCS_REPORTED_AT, stale: false, labels: [
+          { name: "enhancement", color: "a2eeef" }, { name: "payments", color: "0e8a16" }, { name: "needs design", color: "d876e3" }, { name: "frontend", color: "1d76db" },
+        ] },
+      }],
       relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "builder", is_orchestrator: false } },
       report: { source: "agent", status: "working", summary: "Adding the retry button to the checkout view.", published_at: DOCS_REPORTED_AT, revision: 5 },
       fields: [
@@ -975,7 +987,93 @@ export function docsAgentCards(): AgentCardsSnapshot {
       agent_type: "opencode", status: "waiting_for_input", needs_you: true, needs_you_reasons: ["native_question"],
     }),
   ];
-  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 12, entries, catalogErrors: [] };
+  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 12, entries, catalogErrors: [], tree: true };
+}
+
+/** Issue #2418 — one card of the `cards=tree` scene: its name, status and kind, and the cards it started. */
+interface TreeSceneCard {
+  name: string;
+  status: string;
+  needsYou?: boolean;
+  kind: "dispatcher" | "orchestrator" | "role" | "agent";
+  children?: TreeSceneCard[];
+}
+
+const TREE_SCENE: readonly TreeSceneCard[] = [
+  { name: "issue-queue", status: "idle", kind: "dispatcher", children: [
+    { name: "issue-2301", status: "working", kind: "agent" },
+    { name: "prd-2374", status: "idle", kind: "orchestrator", children: [
+      { name: "coder", status: "working", kind: "role" },
+      { name: "tester", status: "waiting_for_input", needsYou: true, kind: "role" },
+      { name: "reviewer", status: "thinking", kind: "role" },
+    ] },
+    { name: "issue-2310", status: "error", needsYou: true, kind: "agent" },
+  ] },
+  { name: "prd-queue", status: "waiting", kind: "dispatcher", children: ["prd-1", "prd-2", "prd-3", "prd-4", "prd-5", "prd-6", "prd-7"].map((name, at) => ({ name, status: at % 3 === 0 ? "working" : "idle", kind: "agent" as const })) },
+  { name: "scratch", status: "idle", kind: "agent" },
+  { name: "docs-site", status: "working", kind: "orchestrator", children: [
+    { name: "writer", status: "working", kind: "role" },
+    { name: "editor", status: "blocked", needsYou: true, kind: "role" },
+  ] },
+  { name: "spike", status: "compacting", kind: "agent" },
+  { name: "triage", status: "idle", kind: "dispatcher", children: [
+    { name: "issue-2320", status: "idle", kind: "agent" },
+    { name: "issue-2321", status: "working", kind: "agent" },
+  ] },
+  { name: "bench", status: "idle", kind: "agent" },
+  { name: "release", status: "idle", kind: "orchestrator", children: [
+    { name: "packager", status: "working", kind: "role" },
+    { name: "notes", status: "idle", kind: "role" },
+  ] },
+];
+
+/**
+ * Issue #2418 review — the `cards=tree-nested` scene: a root whose only child
+ * has nine cards under it, so that child's level is wider than the frame at
+ * every width the browser tier uses, and
+ * one plain root beside it.
+ */
+const TREE_NESTED_SCENE: readonly TreeSceneCard[] = [
+  { name: "deep-queue", status: "idle", kind: "dispatcher", children: [
+    { name: "prd-2400", status: "working", kind: "orchestrator", children: ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"].map((name) => ({ name, status: "working", kind: "role" as const })) },
+  ] },
+  { name: "scratch", status: "idle", kind: "agent" },
+];
+
+/** The card statuses from the most severe down, as the daemon orders a roll-up's worst. */
+const TREE_SCENE_SEVERITY = ["waiting_for_input", "blocked", "error", "waiting", "working", "thinking", "compacting", "idle", "stopped", "unknown"];
+
+/**
+ * Issue #2418 — the `cards=tree` scene (`/?fixture=1&state=docs&cards=tree`):
+ * eight root agents, some with a tree under them — a dispatcher with an
+ * orchestration in it, one with seven units side by side, orchestrators with
+ * roles — linked and summed up as a daemon that builds the tree sends them.
+ * The browser tier lays it out at every width.
+ */
+export function treeAgentCards(scene: "tree" | "tree-nested" = "tree"): AgentCardsSnapshot {
+  const entries: AgentCardEntry[] = [];
+  let next = 100;
+  const add = (card: TreeSceneCard, parent: string | undefined, dispatcher: { key: string; name: string } | undefined, orchestration: string | undefined): AgentCardEntry[] => {
+    next += 1;
+    const id = String(next);
+    const key = `docs-pane-${id}/${id}`;
+    const relations: AgentCardEntry["relations"] = {
+      ...(dispatcher && card.kind !== "role" ? { dispatcher } : {}),
+      ...(card.kind === "orchestrator" || card.kind === "role" ? { orchestration: { id: `o-${orchestration ?? card.name}`, label: orchestration ?? card.name, role: card.kind === "orchestrator" ? "lead" : card.name, is_orchestrator: card.kind === "orchestrator" } } : {}),
+    };
+    const entry = docsCard(id, card.name, { status: card.status, needs_you: card.needsYou === true, needs_you_reasons: card.needsYou ? ["waiting"] : [], relations, kind: card.kind, ...(parent ? { parent } : {}) });
+    entries.push(entry);
+    const below = (card.children ?? []).flatMap((child) => add(child, key, card.kind === "dispatcher" ? { key, name: card.name } : undefined, card.kind === "orchestrator" ? card.name : orchestration));
+    if (below.length) {
+      const counts: Record<string, number> = {};
+      for (const under of below) counts[under.status] = (counts[under.status] ?? 0) + 1;
+      const worst = TREE_SCENE_SEVERITY.find((status) => counts[status]) ?? "unknown";
+      entry.rollup = { total: below.length, worst, counts, needs_you: below.filter((under) => under.needs_you).length };
+    }
+    return [entry, ...below];
+  };
+  for (const root of scene === "tree-nested" ? TREE_NESTED_SCENE : TREE_SCENE) add(root, undefined, undefined, undefined);
+  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 1, entries, catalogErrors: [], tree: true };
 }
 
 const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
@@ -1883,40 +1981,41 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   },
   {
     // Issue #1492 — scrolling the agent dashboard, which no longer pages. Like
-    // the live rows, only while the New agent dialog is closed.
+    // the live rows, only while the New agent dialog is closed. Issue #1673:
+    // and over an open agent's pane.
     phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
     action: "scroll_down",
     invoke: "scrollDown",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolling down.",
   },
   {
     phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
     action: "scroll_up",
     invoke: "scrollUp",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolling up.",
   },
   {
     phrases: ["scroll to the top", "go to the top", "back to the top"],
     action: "scroll_to_top",
     invoke: "scrollToTop",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolled to the top.",
   },
   {
     phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
     action: "scroll_to_bottom",
     invoke: "scrollToBottom",
-    screens: ["overview", "pull_request"],
+    screens: ["overview", "agent", "pull_request"],
     requires: "new_agent_dialog_closed",
-    unavailableHint: "scrolling works on the agent dashboard once the agent's pane and the New agent dialog are closed, and on a pull request open in the app",
+    unavailableHint: "scrolling works on the agent dashboard, in an agent's pane and on a pull request open in the app, once the New agent dialog is closed",
     report: "Scrolled to the bottom.",
   },
   {

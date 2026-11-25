@@ -209,6 +209,17 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // file, names no FORBIDDEN_SYMBOL or project-state literal, and contains no
     // `std::env::current_dir` — all zero for it.
     "deck_list",
+    // Issue #1965, argued rather than added quietly. The desktop names
+    // `EndedRole`, the wire record of an orchestration role whose agent exited
+    // (`ListAgents`' `ended_roles` and the `role_ended` broadcast), and its
+    // `reason` / `headline`, the words both clients show for it (CLAUDE.md rule
+    // 22). A desktop-side copy would be a second definition of the record and
+    // a second list of its words, the drift `tests/fixtures/ended-role.json`
+    // exists to catch. Checked against this rule's lines: the module is a serde
+    // type, its words and a sanitiser; it reads no file, resolves no project,
+    // names no FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "ended_role",
     "event",
     // Issue #1198, argued rather than added quietly. The desktop names two
     // things here: the six `show_desktop_*` wrappers, one per surface the
@@ -246,6 +257,19 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // same argument made here for that item, since nothing in this rule
     // would stop it.
     "inbox_display",
+    // PRD #1790 stage 2, argued rather than added quietly. The desktop names
+    // the interrupted work WIRE types here — `InterruptedList`,
+    // `InterruptedShow`, `ReclaimOutcome` and `DismissOutcome` — which the
+    // shared `DaemonClient` returns and the desktop passes to the webview as
+    // the daemon sent them (CLAUDE.md rule 18: the daemon derives the list,
+    // the desktop computes nothing about it). A desktop-side copy of those
+    // shapes would be a second definition to keep in step with the daemon's.
+    // The module also holds the daemon's pure derivation from its own work
+    // journal (the daemon's state directory, never a project's), which the
+    // desktop does not call. Checked against this rule's lines: it resolves no
+    // project, opens no file, names no FORBIDDEN_SYMBOL or project-state
+    // literal, and contains no `std::env::current_dir` — all zero for it.
+    "interrupted_work",
     // Issue #1635, argued rather than added quietly, with `self_upgrade`
     // below. The desktop names ONE item here, `capture_login_shell_path`: a
     // GUI app's own `PATH` usually lacks the user's shell setup, so finding the

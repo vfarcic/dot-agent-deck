@@ -784,6 +784,31 @@ screen = "overview"
 action = "close"
 outcome = "dispatch"
 
+# PRD #1790 stage 2 — interrupted work (`show_interrupted_work`,
+# `reclaim_interrupted`, `dismiss_all_interrupted`): the banner's words, an
+# ordinal reclaim, and the dismiss-all question. Not yet measured against a
+# live backend.
+[[fixtures]]
+name = "show-interrupted-work"
+utterance = "show the interrupted work"
+screen = "overview"
+action = "show_interrupted_work"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reclaim-interrupted-second"
+utterance = "reclaim the second one"
+screen = "overview"
+action = "reclaim_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dismiss-all-interrupted"
+utterance = "dismiss all the interrupted items"
+screen = "overview"
+action = "dismiss_all_interrupted"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "close-counters-hide-stats"
 utterance = "hide the stats"
@@ -2255,6 +2280,40 @@ screen = "deck"
 action = "generate_config"
 outcome = "unavailable"
 
+# Issue #2148: Retry and Cancel on a deck message waiting on the user, by the
+# agent it was sent to, on the Daemons screen where the tiles list them. Each
+# opens a confirmation; the dashboard draws no deck message.
+[[fixtures]]
+name = "retry-inbox-message-to-the-tester"
+utterance = "retry the message to the tester"
+screen = "deck"
+action = "retry_inbox_message"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "retry-inbox-message-resend"
+utterance = "resend the tester's deck message"
+screen = "deck"
+action = "retry_inbox_message"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "cancel-inbox-message-to-the-tester"
+utterance = "cancel the message to the tester"
+screen = "deck"
+action = "cancel_inbox_message"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "cancel-inbox-message-unavailable"
+utterance = "cancel the message to the tester"
+screen = "overview"
+action = "cancel_inbox_message"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "close-orchestration"
 utterance = "close the build orchestration"
@@ -2699,12 +2758,44 @@ screen = "overview"
 action = "scroll_to_bottom"
 outcome = "dispatch"
 
+# Issue #1673 — over an open agent's pane the four rows are callable and the
+# app scrolls the pane (PageUp / PageDown to an agent on the alternate screen),
+# or says why it did not. "scroll to the top" there is still `scroll_to_top`,
+# which the app answers, rather than a `scroll_up` that would move one screen.
 [[fixtures]]
-name = "scroll-negative-over-an-agent-pane"
+name = "scroll-down-over-an-agent-pane"
 utterance = "scroll down"
 screen = "agent"
 action = "scroll_down"
-outcome = "unavailable"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-over-an-agent-pane"
+utterance = "scroll up"
+screen = "agent"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-back-up-through-the-agents-output"
+utterance = "scroll back up through what it wrote"
+screen = "agent"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top-over-an-agent-pane"
+utterance = "scroll to the top"
+screen = "agent"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom-over-an-agent-pane"
+utterance = "scroll to the bottom"
+screen = "agent"
+action = "scroll_to_bottom"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "scroll-negative-under-the-new-agent-dialog"
@@ -3067,3 +3158,31 @@ screen = "agent"
 action = "dictate_to_agent"
 outcome = "dispatch"
 dictate_prefix = "type"
+
+[[fixtures]]
+name = "restore-interrupted-selected"
+utterance = "restore the agent"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-bring-back"
+utterance = "bring back fix-login"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-conversation"
+utterance = "resume fix-login's conversation"
+screen = "overview"
+action = "restore_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "restore-interrupted-unavailable-in-pane"
+utterance = "restore the agent"
+screen = "agent"
+action = "restore_interrupted"
+outcome = "unavailable"

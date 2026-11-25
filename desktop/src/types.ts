@@ -687,7 +687,6 @@ export type NewAgentOptions =
 export interface DesktopFeatures {
   showDeck: boolean;
   showProjects: boolean;
-  showPrompts: boolean;
   showOrchestrations: boolean;
   showAgentProfiles: boolean;
   /**
@@ -701,7 +700,6 @@ export interface DesktopFeatures {
 export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showDeck: false,
   showProjects: false,
-  showPrompts: false,
   showOrchestrations: false,
   showAgentProfiles: false,
   showAgentDetails: false,
@@ -833,10 +831,91 @@ export interface AgentCardEntry {
   actions: AgentCardAction[];
   primary_action_id: string;
   facts: { source: "deck"; pull_request: unknown | null };
+  /**
+   * Issue #2418 — the key of the card that started this one (a dispatcher, or
+   * an orchestration's orchestrator), as the daemon linked them; absent for a
+   * root. Read only from a daemon that advertises the tree
+   * (`AgentCardsSnapshot.tree`).
+   */
+  parent?: string | null;
+  /**
+   * Issue #2418 — what the card is, as the daemon worked it out from its own
+   * records: `dispatcher`, `orchestrator`, `role` or `agent`. Sent with the
+   * tree only; absent from an older daemon.
+   */
+  kind?: string | null;
+  /** Issue #2418 — what is under this card, as the daemon summed it up; absent when nothing is. */
+  rollup?: AgentCardRollup | null;
+  /** Issue #2418 — the pull requests and issues the agent reported, each beside the deck's own check of it. */
+  checked_refs?: AgentCardCheckedRef[];
   /** The actions invoked on this card, newest first (bounded by the daemon). */
   recent_deliveries?: AgentCardDeliveryRecord[];
   revision: number;
   updated_at: string;
+}
+
+/**
+ * Issue #2418 — every card under one card, at any depth (not the card itself),
+ * as the daemon counted them. Status keys are the card's status words.
+ */
+export interface AgentCardRollup {
+  total: number;
+  /** The most severe status among them. */
+  worst: string;
+  /** How many hold each status; a status none holds is absent. */
+  counts: Record<string, number>;
+  /** How many of them the daemon marks as needing the user. */
+  needs_you: number;
+}
+
+/**
+ * Issue #2418 (D13) — one label of a checked issue: repository text, so
+ * untrusted. `color` is GitHub's six hex digits without `#` when the daemon
+ * kept one; the app checks it again before drawing with it.
+ */
+interface AgentCardIssueLabel {
+  name: string;
+  color?: string;
+}
+
+/** Issue #2418 — what the deck's own lookup of a reported reference found, on the daemon's host. */
+type AgentCardCheckResult =
+  | { status: "pending" }
+  | {
+    status: "checked";
+    /** `open`, `draft`, `merged` or `closed`. */
+    state: string;
+    ci?: AgentPullRequestChecks;
+    review?: string;
+    title?: string;
+    checked_at: string;
+    /** A later lookup failed: this is the last answer that succeeded, not a fresh one. */
+    stale: boolean;
+    /** An issue's labels, as the daemon bounded them (issue #2418, D13); absent when it has none and for a pull request. */
+    labels?: AgentCardIssueLabel[];
+  }
+  | {
+    status: "unavailable";
+    /** `no_github_access`, `not_found`, `rate_limited`, `unrecognised` or `error`. */
+    reason: string;
+    detail?: string;
+  }
+  /** A result a newer daemon names that this build does not know. */
+  | { status: string; [field: string]: unknown };
+
+/** Issue #2418 — a pull request or issue the agent reported in a field, and the deck's check of it. */
+export interface AgentCardCheckedRef {
+  /** The report field it came from. */
+  field: string;
+  /** `pull_request` or `issue`. */
+  kind: string;
+  /** The value as the agent reported it. */
+  claim: string;
+  repo?: string;
+  number?: number;
+  /** Its page on github.com, once its repository is known. */
+  url?: string;
+  result: AgentCardCheckResult;
 }
 
 /** One deck's cards (`desktop://agent-cards`, `agent_cards_list`), in the daemon's display order. */
@@ -846,6 +925,12 @@ export interface AgentCardsSnapshot {
   revision: number;
   entries: AgentCardEntry[];
   catalogErrors: string[];
+  /**
+   * Issue #2418 — the daemon advertised the card tree: each entry's `parent`,
+   * `rollup` and `checked_refs` are its own. `false` (or absent) for an older
+   * daemon, whose cards are drawn as roots with no roll-up.
+   */
+  tree?: boolean;
 }
 
 /**
@@ -899,13 +984,6 @@ export type NewAgentOrchestrations =
   | ({ kind: "project" } & DaemonResolvedProject)
   | { kind: "not_project" }
   | { kind: "unsupported"; reason: string };
-
-export interface DeckPrompt {
-  id: string;
-  name: string;
-  body: string;
-  note?: string;
-}
 
 export interface WorkflowStage {
   id: string;
@@ -1425,6 +1503,26 @@ export interface HostMetrics {
  */
 export type HostMetricsReport = { status: "available"; metrics: HostMetrics } | { status: "not-available" };
 
+/**
+ * Issue #1965 — an orchestration role whose agent exited, as its daemon reported
+ * it. `reason` and `headline` are the daemon crate's words, the ones the TUI's
+ * card shows; `lastOutput` is the last lines its pane showed, sanitised by the
+ * crate and treated as display text here.
+ */
+export interface EndedRole {
+  paneId: string;
+  agentId: string;
+  roleIndex: number;
+  roleName: string;
+  orchestrationId?: string;
+  /** The orchestration's name and display title, to head its group when no live role of it is left. */
+  orchestrationName: string;
+  displayTitle?: string;
+  reason: string;
+  headline: string;
+  lastOutput: string[];
+}
+
 export interface DeckSnapshot {
   runId: string;
   repo: string;
@@ -1468,6 +1566,12 @@ export interface DeckSnapshot {
   hostMetrics?: HostMetricsReport;
   stages: WorkflowStage[];
   agents: AgentSession[];
+  /**
+   * Issue #1965 — the orchestration roles whose agent exited and whose pane
+   * nobody closed yet, which `agents` no longer lists. Absent from a daemon
+   * that does not report them, and in fixture mode.
+   */
+  endedRoles?: EndedRole[];
   evidence: EvidenceItem[];
   /** Live delegation edges (handoff-visibility PRD D2), newest first. */
   handoffs: HandoffEdge[];
@@ -1557,13 +1661,13 @@ export type DeckAction =
    */
   | { type: "allow_build_mismatch"; deckId?: string }
   /**
-   * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
-   * then composes a coordinator context with no task section and the
-   * coordinator waits for instructions, as under the TUI's `Ctrl+n`.
+   * The Runs screen's launch. It sends no task: the deck composes a
+   * coordinator context with no task section and the coordinator waits for
+   * the user to type one into its pane, as under the TUI's `Ctrl+n`.
    * `displayTitle` is the run's name — absent when the form's Name is empty, so
    * the run takes the orchestration's name, as `start_orchestration`'s does.
    */
-  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks
@@ -1686,8 +1790,6 @@ export interface OrchestrationLaunchConfig {
    * daemon, and is kept off the text nodes the same way any title is.
    */
   displayTitle?: string;
-  /** May be empty: the coordinator then waits for instructions (issue #1044). */
-  taskPrompt: string;
   roles: OrchestrationLaunchRole[];
   rows: number;
   cols: number;
@@ -1882,6 +1984,13 @@ export interface DeckRuntimeState {
    */
   generateConfig?: (deckId: string, agentId: string, paneId: string, incarnation?: string) => Promise<GenerateConfigResult>;
   /**
+   * Issue #2454 — tell the daemon the user opened agent `agentId` in pane
+   * `paneId` on deck `deckId` (as the daemon process `incarnation` listed it),
+   * which clears the "Needs you" its card report raised. Absent where no
+   * daemon can answer.
+   */
+  agentOpened?: (deckId: string, agentId: string, paneId: string, incarnation?: string) => Promise<void>;
+  /**
    * PRD #2374 — each deck's agent cards, by deck id, as its daemon last sent
    * them. A deck whose daemon has no cards has no key here. Absent where the
    * bridge offers no cards (a render-only test runtime).
@@ -1896,6 +2005,12 @@ export interface DeckRuntimeState {
   consumeAgentCards?: () => void;
   /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
   invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
+  /**
+   * PRD #1790 stage 2 — each deck's interrupted work (what a restart of its
+   * daemon left behind), the dialog that lists it, and the calls that act on
+   * it. Absent where the bridge offers none (a render-only test runtime).
+   */
+  interruptedWork?: import("./hooks/useInterruptedWork").InterruptedWorkRuntime;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

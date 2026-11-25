@@ -148,8 +148,20 @@ function renderDashboardVoice(said: string, initial: "deck" | "overview" = "over
     voiceCancel: vi.fn(async () => status("idle")),
     ...overrides,
   });
-  render(createElement(DeckShell, { runtime: deck, initialView: { kind: initial } }));
-  return { deck, resolveVoice };
+  const view = render(createElement(DeckShell, { runtime: deck, initialView: { kind: initial } }));
+  return { deck, resolveVoice, view };
+}
+
+/**
+ * Issue #2454 removed the dashboard row's Generate config icon, so the
+ * dashboard asks by voice: "generate config" naming its first agent.
+ */
+function spokenGenerateConfig(): VoiceResultDto["outcome"] {
+  return {
+    kind: "dispatch", transcript: "generate config", action: "generate_config", invoke: "confirmGenerateConfig",
+    params: [{ name: "agent", kind: "agent_ref", spoken: "first agent", value: "planner", label: "planner" }],
+    sentence: "Confirm generating config — nothing has been sent yet.",
+  };
 }
 
 async function speakDashboardCommand(resolveVoice: ReturnType<typeof vi.fn>) {
@@ -291,12 +303,15 @@ describe("VOICE_ACTIONS", () => {
     }
   });
 
-  /// Scenario: Click Generate config on an agent. It crosses the same voice registry entry once and opens a confirmation without sending work.
-  it("desktop/config-gen/003: the agent control uses the voice registry", () => {
+  /// Scenario: Look for Generate config on the dashboard's rows, then open an agent and click Generate config in its pane. The rows have none (issue #2454); the pane's control crosses the same voice registry entry once and opens a confirmation without sending work.
+  it("desktop/config-gen/003: the agent control uses the voice registry", async () => {
     const deck = runtime({ snapshot: generationSnapshot() });
     render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
+    expect(within(screen.getByTestId("overview-table-region")).queryAllByRole("button", { name: /config with/i })).toHaveLength(0);
+    fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[0]);
+    const pane = await screen.findByTestId("agent-pane-overlay");
     registryDispatch.mockClear();
-    fireEvent.click(screen.getAllByRole("button", { name: /Generate config/i })[0]);
+    fireEvent.click(within(pane).getByRole("button", { name: /Generate config/i }));
     expectOneRegistryDispatch("confirmGenerateConfig");
     expect(screen.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" })).toBeVisible();
     expect(deck.runAction).not.toHaveBeenCalled();
@@ -310,7 +325,7 @@ describe("VOICE_ACTIONS", () => {
     const deck = runtime({ snapshot });
     const verb = exists ? "Update" : "Generate";
     render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
-    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[0]);
     const pane = await screen.findByTestId("agent-pane-overlay");
     registryDispatch.mockClear();
     fireEvent.click(within(pane).getByRole("button", { name: `${verb} config` }));
@@ -338,7 +353,7 @@ describe("VOICE_ACTIONS", () => {
     const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { pending.push(resolve); }));
     const deck = runtime({ snapshot: generationSnapshot(), generateConfig });
     render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
-    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[0]);
     const open = () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: /Generate config/i }));
     open();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
@@ -363,11 +378,13 @@ describe("VOICE_ACTIONS", () => {
     let settle!: (result: GenerationResult) => void;
     const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { settle = resolve; }));
     const snapshot = generationSnapshot();
-    const deck = runtime({ snapshot, generateConfig });
-    const view = render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
-    if (entry === "pane") fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
-    const surface = entry === "pane" ? within(screen.getByTestId("agent-pane-overlay")) : screen;
-    fireEvent.click(surface.getAllByRole("button", { name: /Generate config/i })[0]);
+    const { deck, resolveVoice, view } = renderDashboardVoice("generate config", "overview", spokenGenerateConfig(), { snapshot, generateConfig });
+    if (entry === "pane") {
+      fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[0]);
+      fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getAllByRole("button", { name: /Generate config/i })[0]);
+    } else {
+      await speakDashboardCommand(resolveVoice);
+    }
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "No" }));
     if (entry === "pane") {
@@ -377,7 +394,7 @@ describe("VOICE_ACTIONS", () => {
     const successor = { ...snapshot, agents: snapshot.agents.map((agent) => ({ ...agent, incarnation: "successor-process" })) };
     const successorRuntime = { ...deck, snapshot: successor, fleet: [successor] };
     view.rerender(createElement(DeckShell, { runtime: successorRuntime, initialView: { kind: "overview" } }));
-    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[0]);
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(generateConfig).toHaveBeenCalledExactlyOnceWith(snapshot.connection.deckId, snapshot.agents[0].id, snapshot.agents[0].paneId, "config-fixture-process");
     const sent = "Config request sent to the agent's inbox.";
@@ -395,7 +412,7 @@ describe("VOICE_ACTIONS", () => {
       params: [{ name: "agent", kind: "agent_ref", spoken: "filter-voice-agent-2", value: snapshot.agents[1].id, label: "filter-voice-agent-2" }],
       sentence: "Confirm generating config — nothing has been sent yet.",
     });
-    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[0]);
     await speakDashboardCommand(resolveVoice);
 
     expect(screen.queryByRole("alertdialog")).toBeNull();
@@ -422,13 +439,13 @@ describe("VOICE_ACTIONS", () => {
       getSettings: vi.fn(async () => ({ settings: privateSettings })),
       resolveVoice: vi.fn(() => pending),
     });
-    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[0]);
     await speakDashboardCommand(deck.resolveVoice as ReturnType<typeof vi.fn>);
     expect(screen.queryByRole("alertdialog")).toBeNull();
     if (change === "other-agent") {
       fireEvent.keyDown(document.body, { key: "Escape" });
       await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).toBeNull());
-      fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[1]);
+      fireEvent.click(screen.getAllByRole("row", { name: /Open .* agent$/ })[1]);
       expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading")).toHaveTextContent("filter-voice-agent-2");
     }
     await act(async () => release({ outcome, resolveMs: 21, backend: "stub" }));
@@ -462,19 +479,18 @@ describe("VOICE_ACTIONS", () => {
     expect(deck.generateConfig).not.toHaveBeenCalled();
   });
 
-  /// Scenario: Confirm a config request from the dashboard, dismiss its busy question with No, and open another agent. A late successful send must keep that second pane visible.
+  /// Scenario: Ask the dashboard by voice to generate config, confirm, dismiss its busy question with No, and open another agent. A late successful send must keep that second pane visible.
   it("desktop/config-gen/002: later navigation survives a dismissed overview send", async () => {
     let settle!: (result: { outcome: "sent"; messageId: string; message: string }) => void;
     const generateConfig = vi.fn(() => new Promise<{ outcome: "sent"; messageId: string; message: string }>((resolve) => { settle = resolve; }));
-    const deck = runtime({ snapshot: generationSnapshot(), generateConfig });
-    render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
-    const agents = screen.getAllByRole("button", { name: /^Open .* agent$/ });
-    const secondLabel = agents[1].getAttribute("aria-label")!;
-    fireEvent.click(screen.getAllByRole("button", { name: /Generate config/i })[0]);
+    const { resolveVoice } = renderDashboardVoice("generate config", "overview", spokenGenerateConfig(), { snapshot: generationSnapshot(), generateConfig });
+    const agents = screen.getAllByRole("row", { name: /Open .* agent$/ });
+    const secondRow = agents[1].getAttribute("data-testid")!;
+    await speakDashboardCommand(resolveVoice);
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "No" }));
     expect(screen.queryByRole("alertdialog")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: secondLabel }));
+    fireEvent.click(screen.getByTestId(secondRow));
     const second = await screen.findByTestId("agent-pane-overlay");
     const heading = within(second).getByRole("heading").textContent;
 
@@ -484,18 +500,43 @@ describe("VOICE_ACTIONS", () => {
     expect(generateConfig).toHaveBeenCalledTimes(1);
   });
 
-  /// Scenario: Confirm a config request from the dashboard, then say open daemons while the request is pending. The dashboard and its question disappear, and a late successful send leaves the Daemons screen visible without reopening the agent.
+  /// Scenario: Ask the dashboard by voice to generate config and confirm, then say open daemons while the request is pending. The dashboard and its question disappear, and a late successful send leaves the Daemons screen visible without reopening the agent.
   it("desktop/config-gen/002: voice navigation survives an unmounted overview send", async () => {
     let settle!: (result: { outcome: "sent"; messageId: string; message: string }) => void;
     const generateConfig = vi.fn(() => new Promise<{ outcome: "sent"; messageId: string; message: string }>((resolve) => { settle = resolve; }));
-    const { resolveVoice } = renderDashboardVoice("open daemons", "overview", {
+    /* Two utterances: the microphone stub hands the panel one only when the
+       test queues it, so "open daemons" is heard after Yes, not before. */
+    const said = ["generate config", "open daemons"];
+    const outcomes: VoiceResultDto["outcome"][] = [spokenGenerateConfig(), {
       kind: "dispatch", transcript: "open daemons", action: "open_deck", invoke: "openDeck", params: [], sentence: "Opening daemons.",
-    }, { snapshot: generationSnapshot(), generateConfig });
-    fireEvent.click(screen.getAllByRole("button", { name: /Generate config/i })[0]);
-    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
+    }];
+    let heard = 0;
+    let resolved = 0;
+    let queued = 1;
+    let recording = false;
+    const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 1240, maxMs: 30_000, capped: false, available: true, backend: "remote" });
+    const resolveVoice = vi.fn(async (): Promise<VoiceResultDto> => ({ outcome: outcomes[resolved++], resolveMs: null, backend: "stub" }));
+    renderDashboardVoice(said[0], "overview", outcomes[0], {
+      snapshot: generationSnapshot(),
+      generateConfig,
+      resolveVoice,
+      voiceStart: vi.fn(async () => { recording = true; return status("recording"); }),
+      voiceStatus: vi.fn(async () => {
+        if (recording && queued > 0) { queued -= 1; return status("done"); }
+        return status(recording ? "recording" : "idle");
+      }),
+      voiceStop: vi.fn(async () => {
+        recording = false;
+        const transcript = said[heard++];
+        return { outcome: { kind: "heard" as const, transcript, sentence: `Heard: ${transcript}.` }, transcribeMs: null, backend: "remote" as const, audioMs: 1240 };
+      }),
+    });
+    await speakDashboardCommand(resolveVoice);
+    fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Yes" }));
     expect(generateConfig).toHaveBeenCalledTimes(1);
 
-    await speakDashboardCommand(resolveVoice);
+    queued = 1;
+    await waitFor(() => expect(resolveVoice).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByTestId("agent-tile-planner")).toBeVisible());
     expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
@@ -514,8 +555,8 @@ describe("VOICE_ACTIONS", () => {
     const generateConfig = vi.fn(() => new Promise<{ outcome: "sent"; messageId: string; message: string }>((resolve) => { settle = resolve; }));
     const deck = runtime({ snapshot: generationSnapshot(), generateConfig });
     render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
-    const agents = screen.getAllByRole("button", { name: /^Open .* agent$/ });
-    const secondLabel = agents[1].getAttribute("aria-label")!;
+    const agents = screen.getAllByRole("row", { name: /Open .* agent$/ });
+    const secondRow = agents[1].getAttribute("data-testid")!;
     fireEvent.click(agents[0]);
     const first = await screen.findByTestId("agent-pane-overlay");
     fireEvent.click(within(first).getByRole("button", { name: /Generate config/i }));
@@ -523,7 +564,7 @@ describe("VOICE_ACTIONS", () => {
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "No" }));
     fireEvent.keyDown(document.body, { key: "Escape" });
     await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).toBeNull());
-    fireEvent.click(screen.getByRole("button", { name: secondLabel }));
+    fireEvent.click(screen.getByTestId(secondRow));
     const second = await screen.findByTestId("agent-pane-overlay");
     const heading = within(second).getByRole("heading").textContent;
 
@@ -685,7 +726,6 @@ describe("VOICE_ACTIONS", () => {
    */
   it.each([
     ["Projects", "projects-panel"],
-    ["Prompts", "prompt-library-panel"],
     ["Orchestrations", "orchestration-editor"],
     ["Agent Profiles", "agent-profiles-panel"],
     ["Settings", "settings-panel"],
@@ -753,7 +793,6 @@ describe("VOICE_ACTIONS", () => {
    */
   it.each([
     [/Manage projects/, "projects-panel"],
-    [/Open prompt library/, "prompt-library-panel"],
     [/Open agent profiles/, "agent-profiles-panel"],
     [/Edit orchestration order/, "orchestration-editor"],
     [/Open settings/, "settings-panel"],
@@ -1068,7 +1107,6 @@ describe("VOICE_ACTIONS", () => {
     fireEvent.click(screen.getByRole("button", { name: /deck/ }));
     await waitFor(() => expect(screen.getByTestId("selected-project")).toBeVisible());
     fireEvent.click(screen.getByRole("button", { name: "Configure orchestration" }));
-    fireEvent.change(screen.getByLabelText("Task prompt"), { target: { value: "Build it." } });
     fireEvent.click(screen.getByTestId("activate-orchestration"));
     registryDispatch.mockClear();
 

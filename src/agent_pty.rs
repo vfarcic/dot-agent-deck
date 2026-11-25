@@ -1429,6 +1429,64 @@ fn force_kill_and_wait(pty: &mut AgentPty) {
     crate::platform::proc::force_kill_child_and_wait(&mut pty.child, &pty.process_group);
 }
 
+/// PRD #1790 round 7: what a spawn on this thread forked, as
+/// [`spawn_with_dir`] saw it right after `spawn_command` returned: the
+/// child's pid and its start time, read before anything could reap it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Forked {
+    /// No child was started: the spawn failed before `spawn_command`, or
+    /// `spawn_command` failed, which leaves no child (a child whose `exec`
+    /// failed has exited and been reaped by the time it returns).
+    Nothing,
+    /// A child was started, named by pid and start time when both were read.
+    Child(Option<crate::platform::proc::SessionMember>),
+}
+
+thread_local! {
+    static FORK_WATCH: std::cell::Cell<Option<Forked>> = const { std::cell::Cell::new(None) };
+}
+
+/// PRD #1790 round 7: watches the spawns this thread runs while it is held,
+/// so a caller whose spawn returned an error can tell whether a child was
+/// started all the same. A spawn that fails after its fork kills and reaps
+/// the child it started, but not what that child already moved out of its
+/// process group.
+pub(crate) struct ForkWatch(());
+
+impl ForkWatch {
+    /// Start watching. Dropping the watch stops it.
+    pub(crate) fn arm() -> Self {
+        FORK_WATCH.with(|watch| watch.set(Some(Forked::Nothing)));
+        ForkWatch(())
+    }
+
+    /// What the spawns since [`Self::arm`] forked; the last one wins.
+    pub(crate) fn forked(self) -> Forked {
+        FORK_WATCH
+            .with(|watch| watch.get())
+            .unwrap_or(Forked::Nothing)
+    }
+
+    /// Record a fork, when a watch is armed on this thread.
+    fn note(pid: Option<u32>) {
+        FORK_WATCH.with(|watch| {
+            if watch.get().is_some() {
+                let member = pid.and_then(|pid| {
+                    crate::platform::proc::process_start_of(pid)
+                        .map(|start| crate::platform::proc::SessionMember { pid, start })
+                });
+                watch.set(Some(Forked::Child(member)));
+            }
+        });
+    }
+}
+
+impl Drop for ForkWatch {
+    fn drop(&mut self) {
+        FORK_WATCH.with(|watch| watch.set(None));
+    }
+}
+
 /// RAII guard that owns a freshly-spawned child between the `spawn_command`
 /// call and the point at which ownership is handed off to an [`AgentPty`].
 /// If the guard is dropped while still holding the child (e.g. because a
@@ -2091,6 +2149,22 @@ fn spawn_with_dir(
     for knob in crate::inbox_watcher::TEST_KNOBS {
         cmd.env_remove(knob);
     }
+    // PRD #1790 stage 3 (audit S4): a one-shot resume request, on the same
+    // rule. A daemon started from a launcher that still carried one (a
+    // restore's wrapper, say) would otherwise hand it to every agent it
+    // spawns, and with the shim on their `PATH` the first of them to start
+    // the named agent would be resumed into a conversation meant for another
+    // pane. The restore spawn is the one caller that supplies a request, in
+    // `opts.env` below. A Start over's fresh-start request likewise (audit
+    // S2, round 4): an inherited one could spend another launch's token, put
+    // its chosen conversation id on an unrelated Claude Code, or ride along
+    // with a restore's own resume request.
+    for key in crate::telemetry::shim::RESUME_ENV_KEYS
+        .into_iter()
+        .chain(crate::telemetry::shim::FRESH_ENV_KEYS)
+    {
+        cmd.env_remove(key);
+    }
 
     for (k, v) in &opts.env {
         // PRD #127 C2: `SHELL` in `opts.env` is a wrapper-choice override only
@@ -2196,6 +2270,7 @@ fn spawn_with_dir(
         .slave
         .spawn_command(cmd)
         .map_err(|e| AgentPtyError::Spawn(e.to_string()))?;
+    ForkWatch::note(child.process_id());
     let (launch_dir, launch_dir_moved_from) = if pathname_start {
         confirm_launch_dir(launch_dir, launch_identity, child.process_id())
     } else {
@@ -2212,6 +2287,11 @@ fn spawn_with_dir(
     // single-process kill (logged) instead of failing an otherwise-healthy spawn.
     let child_pid = child.process_id();
     let process_group = crate::platform::proc::AgentProcessGroup::adopt(child_pid);
+    // Issue #1897: and into its own cgroup, where the daemon has a delegated
+    // subtree, as early as the spawn allows. Infallible and a no-op elsewhere.
+    if let Some(pid) = child_pid {
+        crate::run_cgroup::place(pid, run_id_of(&opts.env));
+    }
 
     // Wrap the freshly-spawned child in an RAII guard *before* any fallible
     // step below: a failure in `take_writer` / `try_clone_reader` (or a
@@ -2265,6 +2345,17 @@ fn spawn_with_dir(
         launch_dir,
         launch_dir_moved_from,
     })
+}
+
+/// The run id the spawn's environment gives the agent, if any: the last
+/// non-blank [`crate::telemetry::shim::RUN_ID_ENV`], as the agent would read
+/// it.
+fn run_id_of(env: &[(String, String)]) -> Option<&str> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == crate::telemetry::shim::RUN_ID_ENV)
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
 }
 
 /// Cap on the per-agent scrollback buffer (bytes). Keeps reattach affordable
@@ -3827,6 +3918,15 @@ fn pump_reader(
         );
         termination
     });
+    // Issue #1965: an orchestration role that exited on its own keeps how its
+    // pane ended and what it last showed, so both clients can say which role
+    // died and why instead of losing it with the live records.
+    if registered_at_eof
+        && let (Some(registry), Some(termination)) = (registry.upgrade(), termination.as_ref())
+    {
+        registry.record_pane_ending(&agent_id, Some(termination.wire()));
+        registry.announce_ended_role(&agent_id);
+    }
     // PRD #1889: the attempt this generation was ends, as the deck observed
     // it. Best effort at a shutdown: this thread is detached, and the next
     // run's startup recovery ends whatever it did not reach.
@@ -4100,6 +4200,12 @@ pub struct RunningAgent {
     /// accepted from the generation's own child, under the same-user trust
     /// boundary (`crate::hook_provenance`), not one only the wrapper can make.
     pub wrapper_child_exit: Option<String>,
+    /// Issue #1965: how this generation's pane ended and the last lines it
+    /// showed, settled once by its reader after EOF for an orchestration role
+    /// ([`AgentPtyRegistry::record_pane_ending`]). Read by
+    /// [`AgentPtyRegistry::ended_roles`] while the exited entry stays
+    /// registered.
+    pub ending: Option<crate::ended_role::PaneEnding>,
     /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what removed this
     /// generation, shared with its reader, which reads it once the stream
     /// ends.
@@ -9117,6 +9223,17 @@ pub struct AgentPtyRegistry {
     /// publishes the agent, so no agent can join the registry after the
     /// snapshot the client confirmed. See [`Self::freeze_admission`].
     admission_frozen: AtomicBool,
+    /// Issue #2110: spaces the `clear = true` restarts of the delegate path,
+    /// so workers handed tasks together do not all start in one second. One
+    /// per daemon, since the provider limit it spreads is the account's. See
+    /// [`crate::role_start_pacing`].
+    role_start_pacer: crate::role_start_pacing::RoleStartPacer,
+    /// PRD #1790 stage 3: the panes a restore is waiting on, each with the
+    /// first attested session its agent reported: `(agent id, session)`.
+    /// Keyed by the pane id the restore mints before it spawns, so a hook
+    /// that lands before the spawn returns is not missed. See
+    /// [`Self::watch_restore_session`].
+    restore_watches: Mutex<HashMap<String, Option<(String, String)>>>,
     /// Issue #424 F1 + PRD #1631: what each pane's input box is holding — the
     /// human-input sequence [`Self::user_typed_since_question`] reads, and each
     /// pane's input stream, whose paste framing and turn clock
@@ -9183,6 +9300,10 @@ pub struct AgentPtyRegistry {
     /// registry with no owning daemon (in-process unit tests), in which case
     /// no injection happens and children resolve the endpoint the old way.
     hook_socket: Mutex<Option<PathBuf>>,
+    /// Issue #1965: where an orchestration role's exit is announced
+    /// ([`crate::event::BroadcastMsg::RoleEnded`]). `None` for a registry with
+    /// no owning daemon (in-process unit tests), where nothing is announced.
+    ended_role_broadcast: Mutex<Option<tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>>>,
     /// PRD #1589 D8: the attach endpoint this registry's daemon serves, pinned
     /// into every child as `DOT_AGENT_DECK_ATTACH_SOCKET` so an agent's
     /// attach-socket call (`close`, `daemon stop`, `list-agents`) reaches the
@@ -9490,6 +9611,60 @@ pub(crate) const FAULT_SPAWN_BEFORE_PUBLISH: &str = "spawn-before-publish";
 /// PRD #1666 part 3, round 5: a spawn's fault point before its reservation:
 /// `Fail` makes it fail ((f1)'s seam).
 pub(crate) const FAULT_SPAWN_FAILS: &str = "spawn-fails";
+
+/// TEST knob, read only by a build with the `e2e` feature: every fresh spawn
+/// waits this many milliseconds before it starts, as the first installed
+/// spawn of a daemon does while it copies its editor helper (issue #2421), so
+/// a test can make a client's start outlast the client's bound on its reply.
+/// A respawn does not wait.
+pub const ENV_TEST_SPAWN_DELAY_MS: &str = "DOT_AGENT_DECK_TEST_SPAWN_DELAY_MS";
+
+#[cfg(feature = "e2e")]
+fn test_spawn_delay() -> Option<Duration> {
+    std::env::var(ENV_TEST_SPAWN_DELAY_MS)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(feature = "e2e"))]
+fn test_spawn_delay() -> Option<Duration> {
+    None
+}
+
+/// TEST knob, read only by a build with the `e2e` feature (PRD #1790 round
+/// 7): the path of a file that arms the refusal, after its fork, of the next
+/// spawn a restore starts. That spawn removes the file, waits up to 30
+/// seconds for the path the file names (when it names one) to exist, and is
+/// refused, its child killed as a refused spawn's is.
+pub const ENV_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK: &str =
+    "DOT_AGENT_DECK_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK";
+
+#[cfg(feature = "e2e")]
+fn restore_spawn_refused_after_fork_for_test() -> bool {
+    let Some(armed) = std::env::var_os(ENV_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK) else {
+        return false;
+    };
+    let Ok(wait_for) = std::fs::read_to_string(&armed) else {
+        return false;
+    };
+    if std::fs::remove_file(&armed).is_err() {
+        return false;
+    }
+    let wait_for = wait_for.trim();
+    if !wait_for.is_empty() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !std::path::Path::new(wait_for).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    true
+}
+
+#[cfg(not(feature = "e2e"))]
+fn restore_spawn_refused_after_fork_for_test() -> bool {
+    false
+}
 
 /// PRD #1666 part 3, round 5: the replacement's abort fault point: `Fail`
 /// drops its ticket with no transition ((f5a)'s seam).
@@ -10986,6 +11161,16 @@ struct RegistryInner {
     /// each one's [`PaneDiscard::retired_seq`]. Bumped under the registry
     /// lock, so it orders retirements as they happened.
     discard_seq: u64,
+    /// PR #2431 round 6: the generations this registry's shutdown drain
+    /// stopped while they were still running, written in the lock hold that
+    /// drains them. A generation whose stream had already ended on its own
+    /// (`crashed`), or that a close removed before the drain, is not here.
+    /// Read by [`AgentPtyRegistry::stopped_by_shutdown`]. Only filled once the
+    /// registry is shutting down, so it never outgrows one drain.
+    stopped_by_shutdown: HashSet<String>,
+    /// PR #2431 round 6: the shutdown drain has run, so
+    /// [`Self::stopped_by_shutdown`] is final.
+    shutdown_drained: bool,
 }
 
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
@@ -11177,6 +11362,176 @@ pub enum DispatchDirRefusal {
     BeingRemoved(PathBuf),
 }
 
+/// PRD #1790 round 6 (B2): the authority over every numeric signal the
+/// registry sends one restored agent's child, held by that child
+/// ([`UnderAuthority`]) wherever it is: in the registry, or checked out of it
+/// by a close, a retried close or a shutdown. Each of those signals is sent
+/// with the authority held, its pid read in the same hold. A restore's stop
+/// holds it across its identity-checked sweep and then retires it
+/// ([`Self::retire_after`]), so a concurrent teardown either signalled
+/// before the sweep began or finds the signals retired and sends nothing.
+/// That is an order, not an identity check: a signal sent before the sweep
+/// goes to the pid the child holds, unchecked, as an ordinary teardown's
+/// does.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct SignalAuthority {
+    retired: std::sync::Mutex<bool>,
+    /// The same, for an ordinary pid read, which never waits for a sweep.
+    retired_seen: AtomicBool,
+}
+
+#[cfg(unix)]
+impl SignalAuthority {
+    fn hold(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.retired.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `sweep` with the authority held, then retire every numeric
+    /// signal of the child before letting it go. Answers the sweep's answer.
+    pub(crate) fn retire_after<T>(&self, sweep: impl FnOnce() -> T) -> T {
+        let mut held = self.hold();
+        let out = sweep();
+        *held = true;
+        self.retired_seen.store(true, Ordering::SeqCst);
+        out
+    }
+
+    /// Whether the signals are retired, without waiting for the authority.
+    fn retired(&self) -> bool {
+        self.retired_seen.load(Ordering::SeqCst)
+    }
+}
+
+/// PRD #1790 round 6 (B2): a child whose numeric signals go through a
+/// [`SignalAuthority`]. Every registry teardown signal reaches it through
+/// `signal_child_pgroup_or_fallback`, which asks for the signal while it
+/// reads the pid; this child sends it itself, holding the authority
+/// (nothing once retired), and answers no pid. Its own `kill` is held the
+/// same way. An ordinary pid read answers the pid until the signals are
+/// retired, and none after. Waiting for and reaping go to the child it
+/// wraps.
+#[cfg(unix)]
+#[derive(Debug)]
+struct UnderAuthority {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    authority: Arc<SignalAuthority>,
+}
+
+#[cfg(unix)]
+impl UnderAuthority {
+    fn signal(&self, signal: libc::c_int) -> bool {
+        let retired = self.authority.hold();
+        if *retired {
+            tracing::debug!(signal, "the child's signals are retired; nothing was sent");
+            return true;
+        }
+        match self.child.process_id() {
+            Some(pid) => {
+                crate::platform::proc::signal_group(pid, signal, "under-restore-authority")
+            }
+            None => true,
+        }
+    }
+}
+
+/// The stand-in [`AgentPtyRegistry::put_signals_under_authority`] holds for
+/// the moment it wraps a child, under the registry lock: nothing reads it.
+#[cfg(unix)]
+#[derive(Debug)]
+struct NoChild;
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for NoChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(NoChild)
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::Child for NoChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        Ok(None)
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        Err(std::io::Error::other("no child"))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+}
+
+/// [`UnderAuthority`]'s killer, held by the same authority.
+#[cfg(unix)]
+#[derive(Debug)]
+struct KillerUnderAuthority {
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    authority: Arc<SignalAuthority>,
+}
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for KillerUnderAuthority {
+    fn kill(&mut self) -> std::io::Result<()> {
+        let retired = self.authority.hold();
+        if *retired {
+            return Ok(());
+        }
+        self.killer.kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(KillerUnderAuthority {
+            killer: self.killer.clone_killer(),
+            authority: Arc::clone(&self.authority),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for UnderAuthority {
+    fn kill(&mut self) -> std::io::Result<()> {
+        let retired = self.authority.hold();
+        if *retired {
+            return Ok(());
+        }
+        self.child.kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(KillerUnderAuthority {
+            killer: self.child.clone_killer(),
+            authority: Arc::clone(&self.authority),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::Child for UnderAuthority {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        self.child.wait()
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        if crate::platform::proc::answer_signal_request(|signal| self.signal(signal)) {
+            return None;
+        }
+        if self.authority.retired() {
+            return None;
+        }
+        self.child.process_id()
+    }
+}
+
 /// PRD #1589 test seam: a child that has already exited and needs nothing to
 /// reap it — the process behind [`AgentPtyRegistry::insert_idle_member_for_test`].
 #[cfg(test)]
@@ -11334,6 +11689,11 @@ fn path_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
 /// is not a directory. The only directories held for removal are abandoned
 /// issue-dispatch worktrees inside the daemon's clones, which are none of those
 /// unless the daemon or its environment was pointed into one.
+///
+/// PRD #1790 stage 2: each directory that resolves through a symlink or a
+/// `..` to another spelling is recorded in that canonical spelling too, so a
+/// hold on a worktree's canonical path refuses a start through an alias of it
+/// (a symlink to the worktree), and a removal sees an agent started that way.
 fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<PathBuf> {
     let orchestration_cwd = match tab_membership {
         Some(TabMembership::Orchestration {
@@ -11342,19 +11702,26 @@ fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<
         _ => None,
     };
     let mut base = None;
-    cwd.into_iter()
-        .chain(orchestration_cwd)
-        .map(|dir| {
-            let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                return dir;
-            }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in cwd.into_iter().chain(orchestration_cwd) {
+        let dir = PathBuf::from(dir);
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
             match base.get_or_insert_with(|| std::env::current_dir().ok()) {
                 Some(base) => base.join(dir),
                 None => dir,
             }
-        })
-        .collect()
+        };
+        let canonical = std::fs::canonicalize(&dir).ok();
+        out.push(dir);
+        if let Some(canonical) = canonical
+            && !out.contains(&canonical)
+        {
+            out.push(canonical);
+        }
+    }
+    out
 }
 
 /// Issue #454 round-3 review (blocker 1): RAII holder for a
@@ -11554,6 +11921,8 @@ impl AgentPtyRegistry {
                 exit_waiters: HashMap::new(),
                 input_discarded: HashMap::new(),
                 discard_seq: 0,
+                stopped_by_shutdown: HashSet::new(),
+                shutdown_drained: false,
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
@@ -11563,6 +11932,8 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
+            role_start_pacer: crate::role_start_pacing::RoleStartPacer::default(),
+            restore_watches: Mutex::new(HashMap::new()),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             held_display: Arc::new(Notify::new()),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
@@ -11588,6 +11959,7 @@ impl AgentPtyRegistry {
                     .unwrap_or(REPAINT_NUDGE_GAP.as_millis() as u64),
             ),
             hook_socket: Mutex::new(None),
+            ended_role_broadcast: Mutex::new(None),
             attach_endpoint: Mutex::new(AttachEndpoint::NotConfigured),
             dispatched_units: crate::lock_rank::RankedMutex::new(
                 crate::dispatched_units::DispatchedUnits::default(),
@@ -11909,12 +12281,57 @@ impl AgentPtyRegistry {
         session: &str,
         agent: &crate::event::AgentType,
     ) {
+        if let Some(pane) = pane {
+            self.note_restore_session(pane, agent_id, session);
+        }
         let inner = self.inner.lock();
         let reserved =
             !inner.agents.contains_key(agent_id) && inner.pending_spawns.contains_key(agent_id);
         self.work
             .session_seen(agent_id, pane, session, agent, reserved);
         drop(inner);
+    }
+
+    /// PRD #1790 stage 3: start recording the first attested session the
+    /// agent in `pane` reports ([`Self::session_seen`]), for a restore that
+    /// is about to spawn into it. Ended by [`Self::unwatch_restore_session`].
+    pub fn watch_restore_session(&self, pane: &str) {
+        self.restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pane.to_string(), None);
+    }
+
+    /// PRD #1790 stage 3: the first attested session the agent in the watched
+    /// `pane` reported, as `(agent id, session)`; `None` until one did, or
+    /// for a pane no restore watches.
+    pub fn restore_session_seen(&self, pane: &str) -> Option<(String, String)> {
+        self.restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pane)
+            .cloned()
+            .flatten()
+    }
+
+    /// PRD #1790 stage 3: stop watching `pane`.
+    pub fn unwatch_restore_session(&self, pane: &str) {
+        self.restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(pane);
+    }
+
+    /// Keep the first session reported in a watched pane; later ones and
+    /// unwatched panes change nothing.
+    fn note_restore_session(&self, pane: &str, agent_id: &str, session: &str) {
+        let mut watches = self
+            .restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(slot @ None) = watches.get_mut(pane) {
+            *slot = Some((agent_id.to_string(), session.to_string()));
+        }
     }
 
     /// TEST: the agent ids of the spawns the registry holds a reservation
@@ -15257,6 +15674,12 @@ impl AgentPtyRegistry {
         self.detach_count.load(Ordering::Relaxed)
     }
 
+    /// Issue #2110: the daemon's pacer for worker starts. See
+    /// [`crate::role_start_pacing`].
+    pub fn role_start_pacer(&self) -> &crate::role_start_pacing::RoleStartPacer {
+        &self.role_start_pacer
+    }
+
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(self: &Arc<Self>, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
         self.spawn_agent_with_dir(opts, None, Admission::Fresh)
@@ -15359,6 +15782,13 @@ impl AgentPtyRegistry {
         // reservation ((f1)'s seam).
         if self.fault_point(FAULT_SPAWN_FAILS) {
             return Err(AgentPtyError::Spawn("injected spawn failure (test)".into()));
+        }
+        // Issue #2421's test seam: a fresh spawn as slow as a first installed
+        // one on a loaded machine.
+        if matches!(admission, Admission::Fresh)
+            && let Some(delay) = test_spawn_delay()
+        {
+            std::thread::sleep(delay);
         }
 
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
@@ -15720,6 +16150,14 @@ impl AgentPtyRegistry {
                 spool.to_string_lossy().into_owned(),
             ));
         }
+        // PRD #1790 round 7: a restore's launch nonce goes to this
+        // generation's launch record and nowhere else: taken out of the
+        // environment before the fork, so the agent does not see it and a
+        // respawn replaying `spawn_env` does not carry it.
+        let launch_nonce =
+            overlay_value(&opts.env, crate::launch_records::ENV_LAUNCH_NONCE).map(str::to_string);
+        opts.env
+            .retain(|(k, _)| k != crate::launch_records::ENV_LAUNCH_NONCE);
         // PRD #211: an agent that reports its status through OSC 7501 is asked
         // to on every pane the deck starts, whatever the pane's command, so
         // one started from a shell there reports it too. The daemon reads it
@@ -16012,8 +16450,12 @@ impl AgentPtyRegistry {
         // the lock is released.
         let _abandoned_turns = ReleaseAbandonedTurns(self);
         // PRD #1666 part 3, round 5 test seam: a panic after the fork and
-        // before the record is published, with the reservation armed.
-        let _ = self.fault_point(FAULT_SPAWN_BEFORE_PUBLISH);
+        // before the record is published, with the reservation armed. PRD
+        // #1790 round 7: `Fail` there, or in an e2e build a restore's spawn
+        // armed by `ENV_TEST_RESTORE_SPAWN_FAILS_AFTER_FORK`, refuses the
+        // spawn after its fork the way a shutdown below does.
+        let refused_after_fork = self.fault_point(FAULT_SPAWN_BEFORE_PUBLISH)
+            || (launch_nonce.is_some() && restore_spawn_refused_after_fork_for_test());
         let mut inner = self.inner.lock();
         // Issue #454: hand ownership over from the reservation to `agents`
         // WITHOUT releasing the lock in between — each early return below gives
@@ -16037,6 +16479,12 @@ impl AgentPtyRegistry {
         if self.shutting_down.load(Ordering::SeqCst) {
             reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+        if refused_after_fork {
+            reservation.abandon_locked(&mut inner);
+            return Err(AgentPtyError::Spawn(
+                "refused after the fork for a test".into(),
+            ));
         }
         // PRD #1487 audit A2: the same re-check for a restart's reservation,
         // and atomic with the insert for the same reason. A spawn that was
@@ -16355,6 +16803,10 @@ impl AgentPtyRegistry {
                 launch_dir_moved_from,
                 display_name.clone(),
                 tab_membership.clone(),
+                // PRD #1790 stage 3: the child's identity, so a restore can
+                // tell whether this agent is gone.
+                child.process_id().map(|pid| (pid, child_started)),
+                launch_nonce.clone(),
             )
         });
         let agent = RunningAgent {
@@ -16371,6 +16823,7 @@ impl AgentPtyRegistry {
             child_role,
             child_started,
             wrapper_child_exit: None,
+            ending: None,
             removal,
             input_mode: Arc::default(),
             ingress: crate::ingress_ledger::IngressLedger::new(),
@@ -16480,7 +16933,17 @@ impl AgentPtyRegistry {
         // (file I/O, so after the registry lock is released).
         if let (
             Some(work),
-            Some((command, shell, agent_type, cwd, cwd_moved_from, name, membership)),
+            Some((
+                command,
+                shell,
+                agent_type,
+                cwd,
+                cwd_moved_from,
+                name,
+                membership,
+                identity,
+                launch_nonce,
+            )),
         ) = (&work, &launch_record)
         {
             self.work.launch_recorded(
@@ -16494,6 +16957,9 @@ impl AgentPtyRegistry {
                     cwd_moved_from: cwd_moved_from.as_deref(),
                     name: name.as_deref(),
                     membership: membership.as_ref(),
+                    pid: identity.map(|(pid, _)| pid),
+                    pid_start: identity.and_then(|(_, started)| started),
+                    launch_nonce: launch_nonce.as_deref(),
                 },
             );
         }
@@ -17540,6 +18006,8 @@ impl AgentPtyRegistry {
             child_started: _,
             // The replacement's wrapper reports its own child's exit.
             wrapper_child_exit: _,
+            // The replacement's reader settles its own pane's ending.
+            ending: _,
             // Held by the ticket above, which settles it.
             removal: _,
             // The replacement's evidence starts empty.
@@ -19495,6 +19963,29 @@ impl AgentPtyRegistry {
             })
     }
 
+    /// PRD #1790 round 6 (B2): put every numeric signal this registry sends
+    /// `id`'s child under a new [`SignalAuthority`], and answer that child's
+    /// pid and start time as it was spawned ([`RunningAgent::child_started`])
+    /// with the authority, read in the same hold of the registry. The
+    /// authority goes with the child wherever a teardown takes it. `None`
+    /// when `id` is not a running agent now.
+    #[cfg(unix)]
+    pub(crate) fn put_signals_under_authority(
+        &self,
+        id: &str,
+    ) -> Option<(u32, Option<u64>, Arc<SignalAuthority>)> {
+        let mut inner = self.inner.lock();
+        let agent = inner.agents.get_mut(id)?;
+        let pid = agent.child.process_id()?;
+        let authority = Arc::new(SignalAuthority::default());
+        let child = std::mem::replace(&mut agent.child, Box::new(NoChild));
+        agent.child = Box::new(UnderAuthority {
+            child,
+            authority: Arc::clone(&authority),
+        });
+        Some((pid, agent.child_started, authority))
+    }
+
     /// PRD #1666 part 3, round 5-wake: the pid of `id`'s child and when that
     /// child started, read as it was spawned ([`RunningAgent::child_started`]),
     /// so a caller can tell the child from a later process reusing its pid.
@@ -19558,6 +20049,140 @@ impl AgentPtyRegistry {
                     .get(id)
                     .and_then(|agent| agent.record.cwd.clone())
             }))
+    }
+
+    /// Issue #1965: settle how `agent_id`'s pane ended and the last lines its
+    /// screen showed, for an orchestration role whose entry is still
+    /// registered. Called once by the pane's reader after EOF, off any async
+    /// runtime: replaying the scrollback costs up to tens of milliseconds for
+    /// a full ring (`crate::pane_screen_text`), which is paid with no registry
+    /// lock held. A second call, an entry a close already removed, and a pane
+    /// that is no orchestration role leave everything as it was.
+    pub fn record_pane_ending(
+        &self,
+        agent_id: &str,
+        termination: Option<crate::inbox_display::PaneTermination>,
+    ) {
+        let (bytes, rows, cols) = {
+            let inner = self.inner.lock();
+            let Some(agent) = inner.agents.get(agent_id) else {
+                return;
+            };
+            if agent.ending.is_some()
+                || !matches!(
+                    agent.tab_membership,
+                    Some(TabMembership::Orchestration { .. })
+                )
+            {
+                return;
+            }
+            (agent.bus.snapshot(), agent.pty_rows, agent.pty_cols)
+        };
+        let last_output = crate::pane_screen_text::visible_tail_lines(
+            &bytes,
+            rows,
+            cols,
+            crate::ended_role::MAX_LAST_OUTPUT_LINES,
+        );
+        let mut inner = self.inner.lock();
+        if let Some(agent) = inner.agents.get_mut(agent_id)
+            && agent.ending.is_none()
+        {
+            agent.ending = Some(crate::ended_role::PaneEnding {
+                termination,
+                last_output,
+            });
+        }
+    }
+
+    /// Issue #1965: where [`Self::announce_ended_role`] sends. Installed once
+    /// by the daemon.
+    pub fn set_ended_role_broadcast(
+        &self,
+        tx: tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
+    ) {
+        *self.ended_role_broadcast.lock().unwrap() = Some(tx);
+    }
+
+    /// Issue #1965: tell every attached client that `agent_id`'s role exited,
+    /// with what [`Self::record_pane_ending`] settled — the record
+    /// [`Self::ended_roles`] lists for its pane. Nothing for an agent that is no
+    /// longer listed there (closed, handed over, no role, or a live successor
+    /// already in its pane), or with no daemon to send through.
+    pub fn announce_ended_role(&self, agent_id: &str) {
+        let Some(tx) = self.ended_role_broadcast.lock().unwrap().clone() else {
+            return;
+        };
+        if let Some(role) = self
+            .ended_roles()
+            .into_iter()
+            .find(|role| role.agent_id == agent_id)
+        {
+            let _ = tx.send(crate::event::BroadcastMsg::RoleEnded(role));
+        }
+    }
+
+    /// Issue #1965: every orchestration role whose agent exited on its own and
+    /// whose pane is still its own — not closed (a close removes the entry),
+    /// not handed to a successor, and with no live agent under the same pane
+    /// id. These are the roles [`Self::agent_records`] no longer lists, which
+    /// both clients would otherwise lose. Sorted by agent id, as the records
+    /// are.
+    pub fn ended_roles(&self) -> Vec<crate::ended_role::EndedRole> {
+        let inner = self.inner.lock();
+        // One pass, so the listing stays linear in the registry however many
+        // exited entries it holds.
+        let live_panes: std::collections::HashSet<&str> = inner
+            .agents
+            .values()
+            .filter(|other| !other.exited.load(Ordering::SeqCst))
+            .filter_map(|other| other.pane_id_env.as_deref())
+            .collect();
+        let pane_has_live_agent = |pane_id: &str| live_panes.contains(pane_id);
+        let mut ended: Vec<(u64, crate::ended_role::EndedRole)> = inner
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.exited.load(Ordering::SeqCst) && !agent.pane_handed_over)
+            .filter_map(|(id, agent)| {
+                let pane_id = agent.pane_id_env.as_deref()?;
+                let Some(TabMembership::Orchestration {
+                    name,
+                    role_index,
+                    role_name,
+                    orchestration_id,
+                    display_title,
+                    ..
+                }) = agent.tab_membership.as_ref()
+                else {
+                    return None;
+                };
+                if pane_has_live_agent(pane_id) {
+                    return None;
+                }
+                let ending = agent.ending.clone().unwrap_or_default();
+                Some((
+                    id.parse::<u64>().unwrap_or(0),
+                    crate::ended_role::EndedRole {
+                        pane_id: pane_id.to_string(),
+                        agent_id: id.clone(),
+                        role_index: *role_index,
+                        role_name: role_name.clone(),
+                        orchestration_id: orchestration_id.clone(),
+                        orchestration_name: name.clone(),
+                        display_title: display_title.clone(),
+                        termination: ending.termination,
+                        last_output: ending.last_output,
+                    },
+                ))
+            })
+            .collect();
+        ended.sort_by_key(|(id, _)| *id);
+        // Two exited generations of one pane: the newest says how it ends now.
+        let mut seen = std::collections::HashSet::new();
+        let mut newest_first: Vec<_> = ended.into_iter().rev().map(|(_, role)| role).collect();
+        newest_first.retain(|role| seen.insert(role.pane_id.clone()));
+        newest_first.reverse();
+        newest_first
     }
 
     /// PRD #1589: the registered agent records, including exited ones, plus
@@ -20501,6 +21126,7 @@ impl AgentPtyRegistry {
                 child_role: ChildRole::PaneCommand,
                 child_started: None,
                 wrapper_child_exit: None,
+                ending: None,
                 removal: Arc::default(),
                 input_mode: Arc::default(),
                 ingress: crate::ingress_ledger::IngressLedger::new(),
@@ -21164,6 +21790,32 @@ impl AgentPtyRegistry {
                 .flatten()
                 .any(|d| path_within(d, dir))
             || inner.dispatch_dir_holds.iter().any(|d| path_within(d, dir))
+    }
+
+    /// PRD #1790 stage 2: every directory something this registry runs or is
+    /// starting is rooted in — the ones [`Self::dir_in_use_locked`] compares —
+    /// as recorded, copied out under one acquisition of the registry lock so
+    /// the caller can resolve each one (symlinks, `..`) without holding it.
+    pub fn rooted_dirs_snapshot(&self) -> Vec<PathBuf> {
+        let inner = self.inner.lock();
+        let mut out: Vec<PathBuf> = Vec::new();
+        for agent in inner.agents.values() {
+            if !agent.exited.load(Ordering::SeqCst) {
+                out.extend(agent.rooted_dirs());
+            }
+        }
+        for agent in inner.unconfirmed_agents.values() {
+            out.extend(agent.root_dirs.iter().cloned());
+        }
+        out.extend(
+            inner
+                .pending_spawn_dirs
+                .values()
+                .chain(inner.respawning_dirs.values())
+                .flatten()
+                .cloned(),
+        );
+        out
     }
 
     /// Issue #1612: [`Self::dir_in_use_locked`], asked under one acquisition of
@@ -22286,20 +22938,30 @@ impl AgentPtyRegistry {
             }
             let fields = &mut *inner;
             let retired = &mut fields.retired_hook_tokens;
+            let stopped = &mut fields.stopped_by_shutdown;
             let mut children: Vec<ShutdownChild> = fields
                 .agents
                 .drain()
                 .map(|(id, agent)| {
                     retired.record(&agent.hook_token, agent.pane_id_env.as_deref(), &id);
                     agent.removal.closed();
+                    // PR #2431 round 6: a generation whose reader had not seen
+                    // its stream end is one this drain stops. Its reader then
+                    // finds it removed and closed, which ends its attempt as
+                    // interrupted by the shutdown.
+                    if agent.crashed != Some(true) {
+                        stopped.insert(id.clone());
+                    }
                     agent.into()
                 })
                 .collect();
-            inner.unconfirmed_agents.retain(|_, agent| {
+            let stopped = &mut fields.stopped_by_shutdown;
+            fields.unconfirmed_agents.retain(|id, agent| {
                 let Some(pending) = agent.child.take() else {
                     return true;
                 };
                 pending.removal.closed();
+                stopped.insert(id.clone());
                 children.push(ShutdownChild {
                     child: pending.child,
                     process_group: pending.process_group,
@@ -22307,7 +22969,41 @@ impl AgentPtyRegistry {
                 });
                 false
             });
+            fields.shutdown_drained = true;
             return children;
+        }
+    }
+
+    /// PR #2431 round 6: whether this registry's shutdown drain stopped every
+    /// generation in `agent_ids` while it was still running — so each one's
+    /// attempt ends as interrupted by the shutdown. False when the registry
+    /// is not shutting down, when `agent_ids` is empty, and for a generation
+    /// that a close removed before the drain or whose stream had already
+    /// ended on its own. Waits, within the drain's own settle bound, for a
+    /// drain that set the shutdown latch but has not run yet.
+    pub(crate) async fn stopped_by_shutdown<'a>(
+        &self,
+        agent_ids: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let agent_ids: Vec<&str> = agent_ids.into_iter().collect();
+        if agent_ids.is_empty() || !self.is_shutting_down() {
+            return false;
+        }
+        let deadline =
+            Instant::now() + AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + Duration::from_secs(1);
+        loop {
+            {
+                let inner = self.inner.lock();
+                if inner.shutdown_drained {
+                    return agent_ids
+                        .iter()
+                        .all(|id| inner.stopped_by_shutdown.contains(*id));
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(FORCE_REAP_POLL_INTERVAL).await;
         }
     }
 
@@ -24151,6 +24847,119 @@ mod spawn_tests {
              that follows must find nothing registered and must not fabricate a crashed record"
         );
 
+        registry.shutdown_all();
+    }
+
+    /// Issue #1965: an orchestration role whose command exits on its own is
+    /// reported by `ended_roles` with the exit code the deck saw and the last
+    /// lines its pane showed; a live role, an exited pane that is no role, and
+    /// a role after its pane is closed are not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ended_roles_report_an_exited_role_with_its_exit_code_and_last_output() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        registry.set_ended_role_broadcast(tx);
+        let role = |command: &'static str, pane: &str, index: usize, name: &str| SpawnOptions {
+            command: Some(command),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "mixed".to_string(),
+                role_index: index,
+                role_name: name.to_string(),
+                is_start_role: index == 0,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: Some("orch-1965".to_string()),
+            }),
+            ..SpawnOptions::default()
+        };
+        registry
+            .spawn_agent(role("cat", "role-pane-0", 0, "coder"))
+            .expect("spawn the live role");
+        let dead_id = registry
+            .spawn_agent(role(
+                "sh -c 'echo ended-role-sentinel-1965; exit 3'",
+                "role-pane-1",
+                1,
+                "reviewer",
+            ))
+            .expect("spawn the role that dies");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "plain-pane".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a plain pane that exits");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let ended = loop {
+            let ended = registry.ended_roles();
+            if ended.iter().any(|role| role.termination.is_some())
+                || tokio::time::Instant::now() >= deadline
+            {
+                break ended;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            ended.len(),
+            1,
+            "only the exited role is reported: {ended:?}"
+        );
+        let reviewer = &ended[0];
+        assert_eq!(reviewer.pane_id, "role-pane-1");
+        assert_eq!(reviewer.agent_id, dead_id);
+        assert_eq!(reviewer.role_index, 1);
+        assert_eq!(reviewer.role_name, "reviewer");
+        assert_eq!(reviewer.orchestration_id.as_deref(), Some("orch-1965"));
+        assert!(
+            matches!(
+                reviewer.termination,
+                Some(crate::inbox_display::PaneTermination::PaneCommandExited { code: 3, .. })
+            ),
+            "the exit code the deck saw: {:?}",
+            reviewer.termination
+        );
+        assert_eq!(reviewer.reason(), "its command exited (code 3)");
+        assert!(
+            reviewer
+                .last_output
+                .iter()
+                .any(|line| line.contains("ended-role-sentinel-1965")),
+            "the pane's last output: {:?}",
+            reviewer.last_output
+        );
+
+        // Every attached client was told, once, with the same record. The
+        // ending is recorded before it is announced, so the loop above can
+        // see it first: wait (bounded) for the announcement, then take what
+        // else was sent.
+        let mut announced = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while announced.is_empty() {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(crate::event::BroadcastMsg::RoleEnded(role))) => announced.push(role),
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        while let Ok(msg) = rx.try_recv() {
+            if let crate::event::BroadcastMsg::RoleEnded(role) = msg {
+                announced.push(role);
+            }
+        }
+        assert_eq!(
+            announced,
+            vec![reviewer.clone()],
+            "the role_ended broadcast"
+        );
+
+        registry.close_agent(&dead_id).expect("close the dead role");
+        assert!(
+            registry.ended_roles().is_empty(),
+            "a closed role's pane is gone, and so is its report"
+        );
         registry.shutdown_all();
     }
 
@@ -26922,6 +27731,77 @@ mod spawn_tests {
             status.exit_code(),
             0,
             "child saw DOT_AGENT_DECK_VIA_DAEMON — agent_pty::spawn must scrub it"
+        );
+    }
+
+    /// PRD #1790 stage 3 (audit S4, round-4 S2): a resume request or a
+    /// Start over's fresh-start request in the daemon's own environment
+    /// reaches no spawned agent, whether or not the spawn's `PATH` leads with
+    /// a shim directory (telemetry on or off); a request the spawn itself
+    /// supplies, as a restore or a start over does, does, and a restore does
+    /// not carry an inherited fresh-start request beside its own.
+    #[test]
+    fn spawn_scrubs_an_inherited_resume_request_and_keeps_an_explicit_one() {
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let resume = crate::telemetry::shim::RESUME_ENV_KEYS;
+        let fresh = crate::telemetry::shim::FRESH_ENV_KEYS;
+        let keys: Vec<&str> = resume.iter().chain(fresh.iter()).copied().collect();
+        let prior: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior values are restored before the lock is released.
+        unsafe {
+            for family in [resume, fresh] {
+                std::env::set_var(family[0], "claude");
+                std::env::set_var(family[1], "01234567-89ab-4cde-8fab-0123456789ab");
+                std::env::set_var(family[2], "inherited-token");
+            }
+        }
+        // Exit 1 when any resume variable is set, 2 when any fresh one is,
+        // 3 for both, else 0.
+        let probe = "sh -c 'r=${DOT_AGENT_DECK_RESUME_AGENT:+1}${DOT_AGENT_DECK_RESUME_SESSION:+1}${DOT_AGENT_DECK_RESUME_TOKEN:+1}; f=${DOT_AGENT_DECK_FRESH_AGENT:+1}${DOT_AGENT_DECK_FRESH_SESSION:+1}${DOT_AGENT_DECK_FRESH_TOKEN:+1}; exit $(( ${r:+1}+0 + ${f:+2}+0 ))'";
+        let status_of = |env: Vec<(String, String)>| {
+            let pty = spawn(SpawnOptions {
+                command: Some(probe),
+                env,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+            let mut child = pty.child;
+            child.wait().expect("wait should succeed").exit_code()
+        };
+        let path = std::env::var("PATH").unwrap_or_default();
+        let shim_path = vec![("PATH".to_string(), format!("/state/telemetry/bin:{path}"))];
+        let without_shim = status_of(Vec::new());
+        let with_shim = status_of(shim_path.clone());
+        let mut restore_env = shim_path.clone();
+        restore_env.push((resume[2].to_string(), "restore-token".to_string()));
+        let restore = status_of(restore_env);
+        let mut start_over_env = shim_path;
+        start_over_env.push((fresh[2].to_string(), "start-over-token".to_string()));
+        let start_over = status_of(start_over_env);
+        unsafe {
+            for (key, value) in keys.iter().zip(prior) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        assert_eq!(
+            without_shim, 0,
+            "telemetry off: an inherited request reached the child"
+        );
+        assert_eq!(
+            with_shim, 0,
+            "telemetry on: an inherited request reached the child"
+        );
+        assert_eq!(
+            restore, 1,
+            "a restore carries its own resume request and no inherited fresh-start one"
+        );
+        assert_eq!(
+            start_over, 2,
+            "a start over carries its own fresh-start request and no inherited resume one"
         );
     }
 

@@ -505,8 +505,9 @@ GATES — CLAUDE.md is the authority, this is the summary:
   it in the report is neither. Before fixing a red your change did not cause,
   check whether an open PR already fixes it (`gh pr list --search '<test
   name>'`); if one does, name that PR in your report and leave the red to it.
-- CLAUDE.md rule 9: if this PRD adds a new user-visible surface, ask about the
-  experimental flag before building it.
+- CLAUDE.md rule 9: a new user-visible surface ships visible. Put it behind
+  the experimental flag only if the PRD or a person explicitly asks for one; do
+  not ask the flag question yourself.
 - CLAUDE.md rule 12: if it touches the daemon, the TUI↔daemon protocol, orchestration or
   hooks, answer the PROTOCOL_VERSION-versus-.breaking.md question explicitly
   rather than silently, and run the cross-version check.

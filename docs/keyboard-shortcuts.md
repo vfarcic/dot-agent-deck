@@ -1,6 +1,6 @@
 # Keyboard Shortcuts
 
-Everything on this page is the TUI's, except [Editing an agent's prompt](#editing-an-agents-prompt), which works the same in both clients. The desktop app has its own shortcuts, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts); `keybindings.toml` does not affect it.
+Everything on this page is the TUI's, except [Editing an agent's prompt](#editing-an-agents-prompt), which works the same in both clients, and [Scrolling back through a pane](#scrolling-back-through-a-pane), which also says how the desktop app scrolls a pane. The desktop app has its own shortcuts, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts); `keybindings.toml` does not affect it.
 
 Press `?` in command mode to see the shortcuts in the TUI. The overlay and the bottom button bar are generated from your active [keybindings](#customizing-keybindings), so they show your real keys.
 
@@ -119,7 +119,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `/` | Filter cards |
 | `Esc` | Clear the filter |
 | `r` | Rename the selected agent |
-| `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory, or to update it when the directory already has one; the footer then reads `[Update g]` (see [Quick setup](orchestration.md#quick-setup)). The desktop app has no `g`: press **Generate config** (**Update config**) on the agent's row or in its pane, or say "generate config with" and its name |
+| `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory, or to update it when the directory already has one; the footer then reads `[Update g]` (see [Quick setup](orchestration.md#quick-setup)). The desktop app has no `g`: press **Generate config** (**Update config**) in the agent's pane, or say "generate config with" and its name |
 | `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
 | `o` | Open the selected agent's pull request in your system browser (uses `$BROWSER` when set; a `$BROWSER` that puts the address into a shell command, such as `sh -c %s`, is refused); when no browser can be opened, for example in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no [pull request badge](session-management.md#pull-request-badge) it says the agent has none. The desktop app has no `o`: click the badge or say "open the PR", and it opens inside the app ([Dashboard → Pull requests](desktop/dashboard.md#pull-requests)) |
 | `m` | Open the **Host of this deck** overlay: disk, load and memory of the machine the deck runs on (see [Session Management](session-management.md#check-the-machine-a-deck-runs-on)); `Esc` closes it |
@@ -129,6 +129,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `d`, `n`, `w`, `t`, `z`, `e` | The same as `Ctrl+` with that letter (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
 | `Ctrl+M`, `Ctrl+S`, `Ctrl+G`, `Ctrl+U`, `Ctrl+R` | The same as the letter alone (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
 | `v` | Open [copy mode](#copy-mode) on the focused pane |
+| `I` / `X` | Open the **Interrupted work** list, or hide the row above the footer that counts its items, such as `3 interrupted items from before the restart` (see [Interrupted Work](interrupted-work.md)) |
 | `?` | Toggle the help overlay |
 
 ### Scrolling back through a pane
@@ -139,11 +140,14 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 
 What there is to scroll depends on what the program in the pane writes:
 
-- **Agents that keep their own transcript and handle the mouse**, such as `claude`: while you are typing in the pane, the wheel and scroll keys go to the agent and it scrolls its own history.
-- **Agents that redraw their whole screen in place**, such as `codex`: nothing scrolls off the top, so the deck has no history to show. A scroll in command mode briefly shows `Nothing to scroll — this pane has no scrollback to move through` (`Nothing to scroll — no scrollback` in a narrow pane). It clears after a moment or on your next key, and that key still does what it normally does.
+- **Agents that keep their own transcript and handle the mouse**: Claude Code with its full-screen interface (`"tui": "fullscreen"`), Codex, OpenCode and Pi. While you are typing in the pane, the wheel and scroll keys go to the agent and it scrolls its own history, also while it is working. In command mode the deck has no copy of that history to scroll.
+- **Agents that write their output into the terminal**, such as Claude Code with its default interface: the deck keeps the history, and the wheel and `PageUp` / `PageDown` in command mode scroll it.
+- **Agents that redraw their whole screen in place without keeping a transcript**: nothing scrolls off the top, so the deck has no history to show. A scroll in command mode briefly shows `Nothing to scroll — this pane has no scrollback to move through` (`Nothing to scroll — no scrollback` in a narrow pane). It clears after a moment or on your next key, and that key still does what it normally does.
 - **A full-screen program or dialog in the pane** (a picker, a permission dialog, an editor): scrolling does nothing, with no message, until it closes; the history is still there afterwards.
 
 A pane the deck starts is empty at first, so there is nothing above the agent's first output to scroll back to.
+
+In the desktop app an agent's pane scrolls the same way: `PageUp` / `PageDown` in the pane go to the agent; the wheel goes to the agent when it handles the mouse, and otherwise scrolls the pane's history, as `Shift+PageUp` / `Shift+PageDown` do. The desktop app also scrolls a pane by voice; see [Scrolling an agent's pane](desktop/voice.md#scrolling-an-agents-pane).
 
 ## Copying text
 
@@ -254,7 +258,8 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Star prompt** | Shown at startup about once every 10 launches of the TUI or the desktop app, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again. The desktop app shows the same reminder with the same keys, and the two share it: a choice in either holds in both ([Desktop app → The star reminder](desktop/index.md#the-star-reminder)) |
 | **Help overlay** | `?` | `?`, `Esc` or `q` closes it |
 | **Host of this deck** | `m` (or `Ctrl+M`) | `Esc`, `q`, `m` or `Ctrl+M` closes it |
-| **Restart notice** | `a`, or `[Agents]` in the footer, while the footer says the deck restarted | `Up` / `Down` (or `k` / `j`) and `PageUp` / `PageDown` scroll the list · `c` dismisses the notice · `Esc`, `q` or `a` closes the list and keeps the notice |
+| **Restart notice** | `a`, or `[Agents]` in the footer, while the footer says the deck restarted | `Up` / `Down` (or `k` / `j`) and `PageUp` / `PageDown` scroll the list · `c` dismisses the notice · `Esc`, `q` or `a` closes the list and keeps the notice · when the list also counts interrupted items, `I` opens the **Interrupted work** list |
+| **Interrupted work** | `I`, or `[Show I]` on the row that counts interrupted items | `j` / `k` (or `Down` / `Up`) select an item · `Enter` opens its details, and in the details shows its kept reports' text, `n` / `p` paging through them · `r` reclaims the selected unit, orchestration or issue dispatch after a `y` / `n` question · `d` dismisses the selected item · `D` dismisses all after a `y` / `n` question · `Esc` or `q` goes back, and from the list closes it, as `I` does. `X` hides the row while the list is open. See [Interrupted Work](interrupted-work.md). |
 
 The **Quit**, **Close**, **Stop** and configuration confirmations discard keys you typed ahead that are still waiting to be read when they open, so such a key does not choose for you. `Down`, `Enter` and the Stop confirmation's `y` do nothing when they would move to or confirm a choice the dialog does not show in full, with its `>` marker and its whole name, such as one a small terminal cuts off or the dialog's buttons cover: press `Esc` to cancel, or make the terminal larger. A button works only when it is shown whole inside the dialog, so in a terminal too short to show the buttons inside it they do nothing. This applies to the TUI's dialogs. In a terminal that small, the Schedules manager's delete confirmation, the star prompt and the New Agent directory picker do not have this protection yet, so make the terminal larger before answering them.
 
@@ -335,6 +340,8 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `restart_notice` | `a` | List the agents a deck restart stopped |
 | `dismiss_restart_notice` | `c` | Dismiss the restart notice |
 | `copy_mode` | `v` | Open copy mode on the focused pane |
+| `interrupted_work` | `I` | Open the [Interrupted work](interrupted-work.md) list |
+| `hide_interrupted_work` | `X` | Hide the interrupted work row above the footer |
 
 Not remappable, and they work alongside your bindings: `Down` / `Up` for card selection, `Tab` / `Shift+Tab` / `Left` / `Right` for tabs, `Ctrl+PageUp` / `Ctrl+PageDown`, `S` for the Schedules manager, and `Ctrl+C`, which always opens the quit dialog from command mode. There is no `quit` action.
 

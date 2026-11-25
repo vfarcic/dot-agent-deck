@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   ArrowRight,
   Blocks,
-  BookMarked,
   Bot,
   Check,
   CheckCircle2,
@@ -47,11 +46,12 @@ import { AddDaemonDialog, AddDaemonOpener } from "./components/AddDaemonDialog";
 import { HandoffRail } from "./components/HandoffRail";
 import { DeckAttention } from "./components/DeckAttention";
 import { SelectDeckNote } from "./components/SelectDeckNote";
-import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
+import { ProfilesPanel, ProjectsPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
-import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
+import { OpenCardReference, OpenPullRequest, PrBrowserHostContext, type CardReferenceTarget } from "./lib/prBrowser";
+import { openableReference } from "./lib/agentCardsTree";
 import { LocalUpgradeFlow } from "./components/LocalUpgradeFlow";
 import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
 import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
@@ -69,7 +69,6 @@ import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { stopDaemonConfirmCopy, stopDaemonOffer } from "./lib/stopDaemon";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
-import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useQuestionNotifications } from "./hooks/useQuestionNotifications";
 import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
@@ -84,10 +83,12 @@ import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoice
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey, boundAgentKey, sameIncarnation } from "./lib/agentKey";
+import { confirmInboxActionFor, type InboxScreenNow } from "./lib/inboxVoice";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
-import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext, type VoiceActionContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { useRestartNotice } from "./hooks/useRestartNotice";
+import { INTERRUPTED_UNREAD, interruptedFooter, listedCount, mayHaveInterrupted } from "./lib/interruptedWork";
 import { bindViewIncarnation, viewAgent, viewAgentReplaced, viewBound } from "./lib/viewIdentity";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -110,7 +111,14 @@ import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bri
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
+import { PAGE_UP, PANE_AGENT_GONE, PANE_COVERED, PANE_SCROLLING_DOWN, PANE_SCROLLING_UP, PANE_TERMINAL_HIDDEN, paneScrollFailed, scrollAgentPane } from "./lib/paneScroll";
+import { getTerminal } from "./lib/terminalRegistry";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
+
+/** Issue #2454: how many times one open of an agent is reported before giving up. */
+export const AGENT_OPENED_ATTEMPTS = 3;
+/** Issue #2454: the wait before a failed report of an open is sent again. */
+export const AGENT_OPENED_RETRY_MS = 2000;
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
 /**
@@ -164,12 +172,54 @@ const PROJECT_STALE_PREPARATION_CODE = "stale-preparation: ";
 const PROJECT_UNSUPPORTED_PLATFORM_CODE = "unsupported-platform: ";
 /** PRD #1401 — what opening a pull request answers when its agent is no longer listed. */
 export const PULL_REQUEST_AGENT_GONE = "That agent is no longer on its daemon.";
+/** Issue #2418 — what opening a card's checked reference answers when its daemon no longer lists that card. */
+const CARD_REFERENCE_GONE = "That card is no longer on its daemon, so its page was not opened.";
+/** Issue #2418 — …when the card's daemon is not answering. */
+const CARD_REFERENCE_DECK_SILENT = "That card's daemon is not answering, so its page was not opened.";
+/** Issue #2418 — …when the card no longer carries that reference as the deck checked it. */
+const cardReferenceChanged = (name: string, what: string) => `${name}'s card no longer shows that ${what} as the deck checked it, so it was not opened.`;
 /** PRD #1401 — "open it in the browser" with no pull request open. */
 export const PULL_REQUEST_NONE_OPEN = "No pull request is open.";
 /** PRD #1401 — a spoken scroll while one of the app's dialogs is over the pull request. */
 export const PULL_REQUEST_COVERED = "Close what is in front of the pull request first.";
-/** PRD #1401 — a pull request in the in-app browser: the view it opened over, and which frame it is in. */
-type OpenPrBrowser = PullRequestBrowserSession & { over: DeckView; opened: number };
+/**
+ * PRD #1401 — a pull request in the in-app browser: the view it opened over,
+ * and which frame it is in. Issue #2418 — `card` when a card's checked
+ * reference opened it: the card it came from, which it lasts as long as its
+ * daemon lists, whether or not that card's agent is still running.
+ */
+type OpenPrBrowser = PullRequestBrowserSession & { over: DeckView; opened: number; card?: { instanceId: string; key: string } };
+
+/**
+ * An accepted open, from the pull request badge or a card's reference, given
+ * the page on screen (`open`) and any switch still waiting (`pending`). With
+ * no page open it opens one, numbered from `opened`. With the page on
+ * another address, or a switch waiting, it is a switch, which the page makes
+ * and only then the toolbar shows (`switchPrBrowser`). With the page already
+ * on that address and nothing waiting, the page is not reloaded, but the
+ * session takes the new request's subject (its name, deck, agent, and whether
+ * a card owns it), so the browser closes with what asked for it last rather
+ * than with whatever first opened the address (issue #2418 review).
+ */
+function admitPrBrowser(open: OpenPrBrowser | undefined, pending: OpenPrBrowser | undefined, wanted: Omit<OpenPrBrowser, "opened">, opened: { current: number }): { show: OpenPrBrowser; switchTo?: undefined } | { show?: undefined; switchTo: OpenPrBrowser } {
+  if (!open) {
+    opened.current += 1;
+    return { show: { ...wanted, opened: opened.current } };
+  }
+  if (pending || open.url !== wanted.url) return { switchTo: { ...wanted, opened: open.opened } };
+  return { show: { ...wanted, opened: open.opened } };
+}
+
+/**
+ * Issue #2418 — the card a checked reference names, as its deck's daemon lists
+ * it now: by deck, the daemon process that listed it, and its key. Only from a
+ * daemon that builds the card tree, whose checked references are its own.
+ */
+function listedCard(cards: DeckRuntimeState["agentCards"], target: Pick<CardReferenceTarget, "deckId" | "instanceId" | "cardKey">) {
+  const snapshot = cards?.[target.deckId];
+  if (!snapshot?.tree) return undefined;
+  return snapshot.entries.find((entry) => entry.instance_id === target.instanceId && entry.key === target.cardKey);
+}
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -184,7 +234,7 @@ function evidenceOpenOnFirstLoad(): boolean {
  * rather than an overlay the Deck button and `Escape` silently leave open —
  * the property the `Record<DeckOverlay, …>` of setters this replaced carried.
  */
-const DECK_OVERLAYS = Object.keys({ projects: true, prompts: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
+const DECK_OVERLAYS = Object.keys({ projects: true, profiles: true, orchestration: true, settings: true } satisfies Record<DeckOverlay, true>) as DeckOverlay[];
 
 /**
  * The registry entry voice's `open_deck` row invokes — typed against the
@@ -576,6 +626,52 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (agentView && !viewBound(agentView) && paneAgent) setView(() => ({ ...agentView, incarnation: paneAgent.incarnation }));
   }, [agentView, paneAgent, setView]);
   /**
+   * Issue #2454 — opening an agent (its full-window pane from the dashboard, or
+   * its overlay on the deck) tells its daemon, once per open, which clears the
+   * "Needs you" the agent's card report raised. Sent when the view's agent
+   * resolves to a listed record, bound to the process that listed it; leaving
+   * the view forgets it, so opening the same agent again tells the daemon again.
+   * A send that fails is tried again while the same view stays open, at most
+   * {@link AGENT_OPENED_ATTEMPTS} times in all (Qodo on PR #2460).
+   *
+   * Each open is its own object, and a retry checks that object by identity,
+   * not the agent's key: reopening the same agent makes a new open, so a retry
+   * still pending from the open the user left sends nothing, and leaving an
+   * open cancels its pending retry (PR #2430 review: a stale retry otherwise
+   * cleared a Needs you raised after the reopen).
+   */
+  const agentOpened = runtime.agentOpened;
+  const openedSent = useRef<{ key: string; retry?: number } | undefined>(undefined);
+  const forgetOpen = useCallback(() => {
+    if (openedSent.current?.retry !== undefined) window.clearTimeout(openedSent.current.retry);
+    openedSent.current = undefined;
+  }, []);
+  useEffect(() => forgetOpen, [forgetOpen]);
+  useEffect(() => {
+    if (!agentView || !paneAgent) {
+      if (!agentView) forgetOpen();
+      return;
+    }
+    const key = `${agentView.deckId}\u0000${paneAgent.id}\u0000${paneAgent.incarnation ?? ""}`;
+    const paneId = paneAgent.paneId;
+    if (openedSent.current?.key === key || !agentOpened || !paneId) return;
+    forgetOpen();
+    const open: { key: string; retry?: number } = { key };
+    openedSent.current = open;
+    const { deckId } = agentView;
+    const { id, incarnation } = paneAgent;
+    const send = (attempt: number) => {
+      agentOpened(deckId, id, paneId, incarnation).catch(() => {
+        if (attempt >= AGENT_OPENED_ATTEMPTS || openedSent.current !== open) return;
+        open.retry = window.setTimeout(() => {
+          open.retry = undefined;
+          if (openedSent.current === open) send(attempt + 1);
+        }, AGENT_OPENED_RETRY_MS);
+      });
+    };
+    send(1);
+  }, [agentOpened, agentView, paneAgent, forgetOpen]);
+  /**
    * Issue #1143 — the last record this pane's deck gave, so the pane can still
    * be a pane while that deck is not answering.
    *
@@ -627,6 +723,30 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * set, which detaches that terminal's own connection only.
    */
   const restart = useRestartNotice(runtime.fleet);
+  /*
+    PRD #1790 stage 2 — the restart notice's hint line, as the TUI's restart
+    notice adds one: while it is up and a daemon lists interrupted work, the
+    footer's words and a Show that opens the dashboard and, when one daemon
+    lists it, that daemon's "Interrupted work" dialog. Without such items the
+    notice is unchanged.
+  */
+  const interruptedWork = runtime.interruptedWork;
+  /* PR #2431 review — every daemon the dashboard draws a banner for, an empty list it could not read whole included. */
+  const interruptedListing = interruptedWork ? Object.entries(interruptedWork.decks).filter(([, deck]) => mayHaveInterrupted(deck.list)) : [];
+  const interruptedTotal = interruptedListing.reduce((sum, [, deck]) => sum + listedCount(deck.list), 0);
+  const restartInterrupted: RestartInterrupted | undefined = restart.notice && interruptedWork && interruptedListing.length > 0
+    ? {
+      text: interruptedTotal > 0 ? interruptedFooter(interruptedTotal) : INTERRUPTED_UNREAD,
+      context: {
+        showInterruptedWork: (deckId?: string) => {
+          railContext.navigate({ kind: "overview" });
+          const target = deckId ?? (interruptedListing.length === 1 ? interruptedListing[0][0] : undefined);
+          if (target !== undefined) interruptedWork.openDialog(target);
+          return undefined;
+        },
+      },
+    }
+    : undefined;
   /**
    * PRD #2174 — the star reminder, shown at startup about once every ten
    * launches of either client. The shell's, not a screen's, because it comes
@@ -856,16 +976,27 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       const pullRequest = agent.pullRequest;
       if (!pullRequest) return `${name} has no pull request.`;
       if (!pullRequest.url) return `${name}'s pull request #${pullRequest.number} has no github.com address the app can open.`;
-      const wanted = { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view };
-      /* With a page open this is a switch, which the page makes and only then
-         the toolbar shows (`switchPrBrowser`); the page already on it, with
-         no other switch waiting, needs nothing. */
-      if (prBrowser) {
-        if (prBrowserRequest || prBrowser.url !== wanted.url) setPrBrowserRequest({ ...wanted, opened: prBrowser.opened });
-      } else {
-        prBrowserOpened.current += 1;
-        setPrBrowser({ ...wanted, opened: prBrowserOpened.current });
-      }
+      const admitted = admitPrBrowser(prBrowser, prBrowserRequest, { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view }, prBrowserOpened);
+      if (admitted.switchTo) setPrBrowserRequest(admitted.switchTo);
+      else setPrBrowser(admitted.show);
+      return undefined;
+    },
+    /* Issue #2418 — a pull request or issue a card's agent reported, at the
+       address the deck checked. Allowed and named from the CARD as its
+       daemon lists it now, not from the deck's running agents: the deck
+       keeps the card of an agent that stopped and was not closed, and that
+       card's references open too (review F2). The pull request badge's own path above is
+       unchanged. */
+    openCheckedReference: (target) => {
+      const deck = runtime.fleet.find((entry) => entry.connection.deckId === target.deckId);
+      if (deck?.connection.status !== "connected") return CARD_REFERENCE_DECK_SILENT;
+      const card = listedCard(runtime.agentCards, target);
+      if (!card) return CARD_REFERENCE_GONE;
+      const reference = (card.checked_refs ?? []).find((candidate) => candidate.kind === target.kind && openableReference(candidate) && candidate.number === target.number && candidate.url === target.url);
+      if (!reference) return cardReferenceChanged(displayText(card.name, DISPLAY_LIMITS.name), target.kind === "issue" ? "issue" : "pull request");
+      const admitted = admitPrBrowser(prBrowser, prBrowserRequest, { deckId: target.deckId, agentId: card.agent_id, agentLabel: card.name, number: target.number, url: target.url, kind: target.kind, card: { instanceId: card.instance_id, key: card.key }, over: view }, prBrowserOpened);
+      if (admitted.switchTo) setPrBrowserRequest(admitted.switchTo);
+      else setPrBrowser(admitted.show);
       return undefined;
     },
     /* Closed only once the system browser has the page: a hand-off that
@@ -881,7 +1012,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     },
     closePullRequest: closePrBrowser,
     pullRequestBack: () => { if (prBrowser) void onPrBrowserPage(prBrowser.opened, prBrowserHost.back()); },
-  }), [closePrBrowser, forgetPrBrowser, onPrBrowserPage, prBrowser, prBrowserHost, prBrowserRequest, runtime.fleet, view]);
+  }), [closePrBrowser, forgetPrBrowser, onPrBrowserPage, prBrowser, prBrowserHost, prBrowserRequest, runtime.agentCards, runtime.fleet, view]);
   /* The page has moved to `request`, or failed to: the toolbar names it only
      once the host has it there, and a failure is said under the toolbar of
      the pull request still on screen. The host runs its calls in order, so a
@@ -899,8 +1030,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const openPullRequest = useCallback((target: { deckId: string; agentId: string }) => VOICE_ACTIONS.openPullRequest.run(pullRequestContext, target), [pullRequestContext]);
   const prBrowserDeck = prBrowser ? runtime.fleet.find((entry) => entry.connection.deckId === prBrowser.deckId) : undefined;
   /* Gone from a deck that is ANSWERING — a deck that is not reports no agents
-     at all, which is not evidence the agent ended (see `paneAgentRetired`). */
-  const prBrowserAgentGone = prBrowser !== undefined && prBrowserDeck?.connection.status === "connected" && !prBrowserDeck.agents.some((agent) => agent.id === prBrowser.agentId);
+     at all, which is not evidence the agent ended (see `paneAgentRetired`).
+     A page a card's reference opened goes with the CARD, once a list from
+     its daemon no longer holds it: its agent stopping is not that, since
+     the deck keeps a stopped agent's card until it is closed (issue #2418
+     review, F2). */
+  const prBrowserCards = prBrowser?.card ? runtime.agentCards?.[prBrowser.deckId] : undefined;
+  const prBrowserAgentGone = prBrowser !== undefined && prBrowserDeck?.connection.status === "connected" && (prBrowser.card
+    ? prBrowserCards !== undefined && listedCard(runtime.agentCards, { deckId: prBrowser.deckId, instanceId: prBrowser.card.instanceId, cardKey: prBrowser.card.key }) === undefined
+    : !prBrowserDeck.agents.some((agent) => agent.id === prBrowser.agentId));
   const prBrowserViewLeft = prBrowser !== undefined && JSON.stringify(prBrowser.over) !== JSON.stringify(view);
   useEffect(() => {
     /* The browser's subject went away (its agent ended, or the view it was
@@ -1339,13 +1477,46 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          PRD #1401 — while the pull request browser is open it is what is in
          front, so the four scrolls move its PAGE instead, from outside it (a
          fixed script per direction, and nothing read back), unless one of the
-         app's own dialogs is over the browser. */
+         app's own dialogs is over the browser.
+
+         Issue #1673 — with an agent's pane open and no pull request over it,
+         the pane is what is in front, so the four scrolls move the pane
+         (`scrollAgentPane`: the PageUp / PageDown the agent scrolls itself by,
+         or the terminal's own history), never the dashboard behind it. */
       ...(prBrowser
         ? { scrollDashboard: (move: DashboardScroll) => {
           if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
           void onPrBrowserPage(prBrowser.opened, prBrowserHost.scroll(move));
           return undefined;
         } }
+        : agentView
+          ? { scrollDashboard: (move: DashboardScroll) => {
+            /* The pane is itself an `aria-modal` overlay, so `modalOpen()` is
+               always true here; what matters is whether anything is drawn
+               OVER it — a raised sheet, a dialog, a confirmation, the Daemon
+               menu. Settings beneath the pane leaves the pane in front. */
+            if (dialogLayerUp() || confirmationOpen || overlayAbove(document.querySelector(".agent-pane-overlay"))) return PANE_COVERED;
+            if (!voicePane) return PANE_AGENT_GONE;
+            if (voicePane.terminalHidden) return PANE_TERMINAL_HIDDEN;
+            const target = { deckId: voicePane.deckId, agentId: voicePane.agentId, incarnation: voicePane.incarnation };
+            /* Straight to the agent, not through the terminal's `onData`:
+               voice's own scroll is not a hand edit of the prompt (Qodo on
+               PR #2476). `dispatchLost` already held this to the pane the
+               utterance was said over. */
+            /* The write settles after the dispatch returns, so its sentence
+               goes through `reportPending`, called here inside the row's
+               `run`: the resolver's "Scrolling up." is not shown, and the
+               row then says the scroll happened or why it did not, unless a
+               newer utterance has reported since (Qodo on PR #2476). */
+            const sendKey = (key: string) => {
+              const work = runtime.sendTerminalInput(target, key).then(() => undefined, (cause: unknown) => paneScrollFailed(cause));
+              const sentence = key === PAGE_UP ? PANE_SCROLLING_UP : PANE_SCROLLING_DOWN;
+              const reportPending = panelVoiceContext.current?.reportPending;
+              if (reportPending) reportPending(sentence, work, sentence);
+              else void work;
+            };
+            return scrollAgentPane(getTerminal(voicePane.deckId, voicePane.agentId, voicePane.incarnation), move, sendKey, voicePane.inputBlocked);
+          } }
         : overviewVoiceContext.current?.scrollDashboard
           ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
           : {}),
@@ -1394,7 +1565,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view, voicePane, runtime.sendTerminalInput]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -1486,11 +1657,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={dismissStarNotice} antigravity={antigravityToast} onDismissAntigravity={dismissAntigravityToast} trust={trustNotice} onDismissTrust={dismissTrustNotice} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} restartInterrupted={restartInterrupted} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={dismissStarNotice} antigravity={antigravityToast} onDismissAntigravity={dismissAntigravityToast} trust={trustNotice} onDismissTrust={dismissTrustNotice} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} generateConfig={paneGenerateConfig} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} antigravityNotice={antigravityToast} onDismissAntigravityNotice={dismissAntigravityToast} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} generateConfig={paneGenerateConfig} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} restartInterrupted={restartInterrupted} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} antigravityNotice={antigravityToast} onDismissAntigravityNotice={dismissAntigravityToast} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1530,6 +1701,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const starReady = !connectionBanner && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
+    <OpenCardReference.Provider value={pullRequestContext.openCheckedReference}>
     <VoiceOn.Provider value={voiceOn}>
       <AddDaemonOpener.Provider value={openAddDaemon}>
       <VoiceNumberingContext.Provider value={numbering}>
@@ -1574,6 +1746,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </VoiceNumberingContext.Provider>
       </AddDaemonOpener.Provider>
     </VoiceOn.Provider>
+    </OpenCardReference.Provider>
     </OpenPullRequest.Provider>
   );
 }
@@ -1838,7 +2011,7 @@ function tileKey(agent: { daemonId: string; id: string; incarnation?: string }):
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, generateConfig, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, starNotice, onDismissStarNotice, antigravityNotice, onDismissAntigravityNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; starNotice?: string; onDismissStarNotice?: () => void; antigravityNotice?: string; onDismissAntigravityNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, generateConfig, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, restartInterrupted, starNotice, onDismissStarNotice, antigravityNotice, onDismissAntigravityNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; restartInterrupted?: RestartInterrupted; starNotice?: string; onDismissStarNotice?: () => void; antigravityNotice?: string; onDismissAntigravityNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -1956,8 +2129,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const [evidenceOpen, setEvidenceOpen] = useState(evidenceOpenOnFirstLoad);
   const projectsOpen = overlays.open.projects ?? false;
   const profilesOpen = overlays.open.profiles ?? false;
-  const promptsOpen = overlays.open.prompts ?? false;
-  const [selectedPromptId, setSelectedPromptId] = useState(""); // voice-registry-exempt: which stored prompt the library panel is editing — a selection within that panel
   const [terminalFocus, setTerminalFocus] = useState<{ agentId: string; token: number }>();
   const orchestrationOpen = overlays.open.orchestration ?? false;
   const [paletteOpen, setPaletteOpen] = useState(false); // voice-registry-exempt: the command palette is the registry's own surface: it lists entries and runs them, and opening it runs none
@@ -2081,7 +2252,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   // sit open while another run takes the title (PR #1333 review).
   const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
   orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
-  const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
   const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
@@ -2113,12 +2283,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       setSelectedEvidenceId(snapshot.evidence[0]?.id ?? "");
     }
   }, [selectedEvidenceId, snapshot.evidence]);
-
-  useEffect(() => {
-    if (!selectedPromptId || !prompts.some((prompt) => prompt.id === selectedPromptId)) {
-      setSelectedPromptId(prompts[0]?.id ?? "");
-    }
-  }, [prompts, selectedPromptId]);
 
   useEffect(() => {
     if (!profiles.length || profileOrder.length) return;
@@ -2265,6 +2429,26 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    */
   const closeOverlays = () => DECK_OVERLAYS.forEach((overlay) => setOverlay(overlay, false));
   /**
+   * Issue #2148 — a spoken Retry or Cancel on an agent's deck messages: the
+   * confirmation listing them, which this screen draws as it draws its other
+   * confirmations, and whose button sends each one; the outcome is the toast's.
+   * The tile's own Retry and Cancel act on their one message directly.
+   *
+   * Defined here rather than inside the context below on purpose: `confirm`
+   * and the toast are not capabilities this member owns (every action that
+   * asks first opens `confirm`, and every outcome reports through the toast),
+   * so their setters must not become registry-owned by being named there.
+   */
+  const inboxScreenNow = useRef<InboxScreenNow>({ agents: snapshot.agents, allDecks, confirm });
+  inboxScreenNow.current = { agents: snapshot.agents, allDecks, confirm };
+  const confirmInboxAction: VoiceScreenContext["confirmInboxAction"] = (verb, target) => {
+    const question = confirmInboxActionFor(verb, target, { agents: snapshot.agents, allDecks, confirmationOpen, inboxAction: runtime.inboxAction }, (sentence) => setNotice(sentence), () => inboxScreenNow.current);
+    if (typeof question === "string") return question;
+    setConfirm(question);
+    return undefined;
+  };
+
+  /**
    * PRD #802 M2 — the deck's half of the action registry's context, and the one
    * place the rail buttons, the palette entries, the tile's open/close pair and
    * (since PRD #1195 M1) the in-panel controls reach their state from.
@@ -2308,6 +2492,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
     },
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
+    confirmInboxAction,
   };
 
   /**
@@ -2562,9 +2747,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       : "";
     setConfirm({
       title: `Activate ${config.displayName}?`,
-      // Issue #1044: the task is optional. Without one the orchestrator is still
-      // briefed — the daemon's context names its role and team — and then waits.
-      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and ${config.taskPrompt ? "sends your task prompt to the orchestrator" : "briefs the orchestrator with no task, so it waits for you to type one into its pane"}.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
+      // The orchestrator is briefed — the daemon's context names its role and
+      // team — and then waits for the user to type the task into its pane.
+      body: `This starts ${config.roles.length} live CLI agents in ${config.displayPath} and briefs the orchestrator, which then waits for you to type the task into its pane.${config.displayTitle ? ` The run is named ${displayText(config.displayTitle, DISPLAY_LIMITS.name)}.` : ""} ${commandCopy}${accessCopy} Activating does not rewrite project TOML.`,
       label: "Activate orchestration",
       busyLabel: "Activating…",
       action: async () => {
@@ -2752,7 +2937,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
        all five fields follow the one flag today; if they ever diverge, those
        doors need gates of their own. */
     ...(features.showProjects ? [{ label: "Manage projects", hint: "Choose projects & orchestrations", icon: FolderGit2, run: () => VOICE_ACTIONS.openProjects.run(voiceContext) }] : []),
-    ...(features.showPrompts ? [{ label: "Open prompt library", hint: "Reusable orchestration task prompts", icon: BookMarked, run: () => VOICE_ACTIONS.openPromptLibrary.run(voiceContext) }] : []),
     ...(features.showAgentProfiles ? [{ label: "Open agent profiles", hint: "Configure models & permissions", icon: Bot, run: () => VOICE_ACTIONS.openAgentProfiles.run(voiceContext) }] : []),
     ...(features.showOrchestrations ? [{ label: "Edit orchestration order", hint: "Enable, skip, or reorder roles", icon: Network, run: () => VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext) }] : []),
     { label: "Open settings", hint: "Appearance and other app preferences", icon: Settings2, run: () => VOICE_ACTIONS.openSettings.run(voiceContext) },
@@ -2956,18 +3140,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         onConfigureOrchestration={() => { setOverlay("projects", false); VOICE_ACTIONS.openOrchestrationOrder.run(voiceContext); }}
         allDecks={allDecks}
       />
-      <PromptLibraryPanel
-        open={promptsOpen}
-        prompts={prompts}
-        selectedId={selectedPromptId}
-        onSelect={setSelectedPromptId}
-        onClose={() => setOverlay("prompts", false)}
-        onAdd={() => setSelectedPromptId(addPrompt())}
-        onUpdate={updatePrompt}
-        onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
-      />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setOverlay("profiles", false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
-      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
+      <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
@@ -2979,7 +3153,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} antigravity={antigravityNotice} onDismissAntigravity={onDismissAntigravityNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} restartInterrupted={restartInterrupted} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} antigravity={antigravityNotice} onDismissAntigravity={onDismissAntigravityNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
     </div>
   );
 }
@@ -3005,7 +3179,10 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, worktrees, onDismissWorktree, star, onDismissStar, antigravity, onDismissAntigravity, trust, onDismissTrust }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void; star?: string; onDismissStar?: () => void; antigravity?: string; onDismissAntigravity?: () => void; trust?: TrustRequestNotice; onDismissTrust?: () => void }) {
+/** PRD #1790 stage 2 — the restart notice's interrupted work line: its words, and what its Show opens. */
+interface RestartInterrupted { text: string; context: Pick<VoiceActionContext, "showInterruptedWork"> }
+
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, restartInterrupted, worktrees, onDismissWorktree, star, onDismissStar, antigravity, onDismissAntigravity, trust, onDismissTrust }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; restartInterrupted?: RestartInterrupted; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void; star?: string; onDismissStar?: () => void; antigravity?: string; onDismissAntigravity?: () => void; trust?: TrustRequestNotice; onDismissTrust?: () => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
@@ -3042,6 +3219,13 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
                 scrolls when the list is long. `useRestartNotice` clamps each
                 name it takes. */}
             <span>{sanitizeText(restart)}</span>
+            {/* PRD #1790 stage 2: the TUI's hint line, when a daemon lists interrupted work. */}
+            {restartInterrupted && (
+              <span className="toast-hint" data-testid="restart-toast-interrupted">
+                {restartInterrupted.text}{" "}
+                <button type="button" className="button secondary compact" data-testid="restart-toast-interrupted-show" onClick={() => VOICE_ACTIONS.showInterruptedWork.run(restartInterrupted.context, {})}>Show</button>
+              </span>
+            )}
           </div>
           <button aria-label="Dismiss restart notice" onClick={onDismissRestart}><X size={14} /></button>
         </div>

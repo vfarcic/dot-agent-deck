@@ -95,7 +95,7 @@ Without a terminal you cannot be shown a confirmation dialog, so `close` refuses
 | `not-your-unit` | An agent asked to close something it did not dispatch. | Close it yourself from a shell, or ask the dispatcher that started it. |
 | `own-pane` | An agent asked to close itself or its own team. | Close it from a shell or a client. |
 | `not-attested` / `superseded` | The request came from a pane the deck cannot confirm, or from an agent that has since been replaced in its pane. | Run `close` from the agent now in that pane, or from a shell. |
-| `unknown-unit` | No running unit has that name. Units are not remembered after the daemon restarts. | Check the name with `close --all`. After a restart, see [Worktrees](#worktrees). |
+| `unknown-unit` | No running unit has that name. Units are not remembered after the daemon restarts. | Check the name with `close --all`. After a restart, `dot-agent-deck interrupted list` shows the units the restart interrupted, and reclaims or dismisses them ([Interrupted Work](interrupted-work.md)). |
 | `already-ended` | The unit has already been closed or has ended. | Nothing to close. |
 | `ambiguous` | Units with that name are running in more than one repository. The refusal lists each one with its unit id, worktree and panes. | Close the one you mean with `--unit-id` and its id from that list. |
 | `unknown-pane` | No agent is in that pane. | Check the id with `daemon status`. |
@@ -122,8 +122,8 @@ When the last agent of a dispatched unit is closed, whether you named the unit, 
 | `removed (branch … kept)` | The worktree had no uncommitted changes and was removed. Its branch is kept, because it may hold committed work. |
 | `kept on request` | You passed `--keep-worktree`, so the worktree was left on disk whatever its state. The output also tells you how to find or remove it later. |
 | `kept: uncommitted changes` | The worktree is left on disk so the work can be recovered. |
-| `kept: holds other worktrees` | Other worktrees of the repository are inside it, for example ones an agent created under a git-ignored directory such as `.worktrees/`. Removing it would delete them along with their uncommitted work, so it is kept. The output names up to 16 of them under `holds worktree`, and `git worktree list`, run in the repository, shows them all. Remove those first (`git worktree remove <path>`), then this worktree. The worktree may also have uncommitted changes; this line is shown instead so that you see the worktrees inside it before you discard anything. |
-| `kept: could not check for uncommitted changes or worktrees inside it` | The deck could not tell whether the worktree was clean, or whether other worktrees lie inside it, so it kept it. |
+| `kept: holds other worktrees` | Other worktrees or Git checkouts are inside it, of its own repository or of any other, for example ones an agent created under a git-ignored directory such as `.worktrees/`. Removing it would delete them along with their uncommitted work, so it is kept. The output names up to 16 of them under `holds worktree`; `git worktree list`, run in the repository, shows those of its own repository. Move or remove those first (`git worktree remove <path>`, run in the repository each one belongs to), then this worktree. The worktree may also have uncommitted changes; this line is shown instead so that you see the worktrees inside it before you discard anything. |
+| `kept: could not check for uncommitted changes or worktrees inside it` | The deck could not tell whether the worktree was clean, or whether other worktrees or Git checkouts lie inside it (a folder it could not read, or more files than it looks through), so it kept it. |
 | `kept: removing it failed` | Removing the worktree failed; it is still on disk. |
 | `kept: still in use` | Something else was using the directory at the time. |
 | `cleanup still running: …` | The agents are stopped, but the removal had not finished within about 30 seconds. Check with `dot-agent-deck worktree list`. |
@@ -146,7 +146,7 @@ If the daemon you are running was started by an older version of the deck, it ca
 
 ### Leftover worktrees
 
-To clean up worktrees the deck no longer knows about, such as after a daemon restart, use `dot-agent-deck worktree list` and `dot-agent-deck worktree reclaim` ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)). A kept branch blocks dispatching the same name again until you delete it (`git branch -D agent/dispatch-<name>`).
+After a daemon restart, the units it interrupted are listed in [Interrupted Work](interrupted-work.md), in the TUI (`I`), the desktop app and `dot-agent-deck interrupted list`, where **Reclaim** removes a unit's worktree and keeps its branch. To clean up other worktrees the deck no longer knows about, use `dot-agent-deck worktree list` and `dot-agent-deck worktree reclaim` ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)). A kept branch blocks dispatching the same name again until you delete it (`git branch -D agent/dispatch-<name>`).
 
 ## Exit status and JSON
 

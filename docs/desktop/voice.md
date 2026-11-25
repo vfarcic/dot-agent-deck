@@ -38,7 +38,7 @@ What you can do by voice, by screen:
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog, a confirmation, an upgrade dialog, an agent's output Reader, a daemon's Host figures); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
 | Dashboard | Open Settings; [add a daemon](daemons.md#watch-a-daemon-on-another-machine), such as "add a deck", which opens the Add a daemon form; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; [open a daemon's Host figures](#checking-a-daemons-machine); [open the dashboard's counters](#checking-the-counters); open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); [open an agent's pull request](#pull-requests); [ask an agent to generate the project's config](#generating-a-config); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
-| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; with typing off, say "stop" or "close this agent" on its own to ask to close the open agent (confirm by hand); in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); [open its pull request, or another agent's](#pull-requests); with typing off, [ask it to generate the project's config](#generating-a-config) |
+| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; with typing off, say "stop" or "close this agent" on its own to ask to close the open agent (confirm by hand); in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); with typing off, [scroll back through what the agent wrote](#scrolling-an-agents-pane); [open its pull request, or another agent's](#pull-requests); with typing off, [ask it to generate the project's config](#generating-a-config) |
 | A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
 | Review project commands | [Approve the commands shown and start the orchestration, or cancel](#approving-project-commands) |
 | The star reminder | [Star the repository, be reminded later, or stop being asked](#the-star-reminder) |
@@ -231,7 +231,23 @@ The dashboard looks the same with voice on as with voice off: nothing is left ou
 - When the dashboard is already at the top or the bottom, or fits the window, nothing moves and the app says so.
 - **Saying the number of a row you have scrolled past**, such as "open agent 12" or "twelve", opens that agent as usual and scrolls its row back into view behind the pane, so it is in front of you when you close the pane.
 
-Scrolling by voice works on the dashboard itself, not while the New agent dialog or an agent's pane is open over it.
+Scrolling the dashboard by voice works on the dashboard itself, not while the New agent dialog is open over it. With an agent's pane open, the same words scroll the pane instead; see [Scrolling an agent's pane](#scrolling-an-agents-pane).
+
+## Scrolling an agent's pane
+
+With an agent's pane open and [typing mode](#typing-mode) off, **"scroll up"** and **"scroll down"** move back and forward through what the agent wrote, about a screen at a time, including while the agent is still working. They do what `PageUp` and `PageDown` do when you press them in the pane:
+
+- **Claude Code with its full-screen interface, Codex, OpenCode and Pi** keep their own history, and the agent scrolls it.
+- **Claude Code with its default interface** writes its output into the pane's history, and the words scroll that history, as the wheel does.
+- When the pane has nothing to scroll, nothing moves and the app says `Nothing to scroll — this pane has no scrollback to move through`, the same message the TUI shows.
+- **"scroll to the top"** and **"scroll to the bottom"** do not move an agent's pane, because agents use different keys to jump to either end; the app says to scroll a screen at a time instead. In a pane that shows its history in the app's terminal, such as Claude Code with its default interface, they do go to the top or the bottom.
+- Devin has not been checked, so scrolling a Devin pane by voice is not verified.
+
+In typing mode, the words are typed into the agent's prompt like the rest of what you say; turn typing mode off to scroll.
+
+When the agent's pull request is open over the pane, the words scroll the pull request page instead. When something else is open over the pane, such as Settings or a dialog, nothing scrolls and the app says to close it first. Over a pane, say "scroll down" rather than "next page" or "page down", which are for lists shown a page at a time.
+
+The TUI has no voice control; there, `PageUp` and `PageDown` while you type in the pane do the same (see [Scrolling back through a pane](../keyboard-shortcuts.md#scrolling-back-through-a-pane)).
 
 ## Pull requests
 
@@ -260,6 +276,15 @@ Say **"generate config"**, or something with the same meaning such as "create th
 
 Saying it never sends anything by itself: the app answers `Confirm generating a config with <agent> — nothing has been sent yet.` (in a pane, `Confirm generating a config with the open agent — nothing has been sent yet.`), and you press **Yes** by hand. "Close" closes the confirmation the way **No** does. After **Yes**, the agent's pane opens and shows `Config request sent to the agent's inbox.`; if the request could not be sent, the app says why, as the button does. If you ask the same agent again before the first request has answered, the pane shows the answer to your latest request. Said with the New agent dialog open, or on another screen, it runs nothing and the app says that generating a config works from the agent dashboard or an agent's pane, with the New agent dialog closed.
 
+## Retrying or cancelling a deck message
+
+When an agent's tile on the Daemons screen lists a deck message with **Retry** and **Cancel** (see [Delivery in the TUI and desktop app](../orchestration.md#delivery-in-the-tui-and-desktop-app)), you can choose by voice too. Name the agent the message was sent to, the way you would to open it:
+
+- **"retry the message to the tester"** or **"resend the tester's deck message"** opens a confirmation that lists the messages it would send again, each by who sent it and its subject. A message that has run out of attempts is left out, because it can only be cancelled.
+- **"cancel the message to the tester"** or **"drop the messages to the coder"** opens a confirmation that lists the messages it would stop delivering. Say "message": a bare "cancel" or "never mind" closes what is on top and cancels no message.
+
+When the agent has several such messages, the confirmation covers all of them; to choose one, use its own button on the tile. Saying it never retries or cancels anything by itself: the app answers `Confirm retrying the deck messages to <agent> — nothing has been sent yet.` (or `Confirm cancelling …`), and you press **Retry** or **Cancel message** by hand. "Close" closes the confirmation the way **No** or **Keep it** does. Afterwards the app says what happened, in the words the tile's buttons use, with a count beside each result when the confirmation covered several messages. Closing the confirmation while it is still working stops it before the next message, and so does choosing another daemon while it is open; the app then says how many messages it reached and why it stopped. If no message to that agent is waiting on you, the app says so and opens nothing. With **All daemons** selected, choose a daemon first. Said on the Dashboard or in an agent's pane, the app says that retrying or cancelling a deck message works from the Daemons screen. Said without an agent ("retry the message"), the app asks which agent you mean. With [Send on-screen names](#settings--voice) set to **Off**, both commands are refused, as every command that names an agent is; use the tile's buttons instead.
+
 ## Approving project commands
 
 While **Review project commands** is open ([Approving Project Commands](../project-trust.md)), say **"approve and start"**, or any request that says *approve*, such as "approve the commands" or "I approve", to press **Approve and start**: it approves exactly the text on screen and starts the orchestration. A start that does not say *approve*, such as "start it" or "go ahead", does not approve anything. Say **"cancel"**, **"never mind"** or **"close"** to cancel the review, which starts nothing. When the deck opened the review itself because it refused to start an orchestration ([Answering the deck's request](../project-trust.md#answering-the-decks-request)), its buttons are **Deny** and **Approve**: an *approve* request presses **Approve**, which approves the text and starts nothing itself, and "cancel", "never mind" or "close" presses **Deny**. With no review open, the app says there is nothing to approve. An approval applies only to the review that was on screen when you spoke: if it was cancelled, replaced by another, or re-shown with changed text before your words were understood, nothing is approved and the app asks you to look again.
@@ -285,6 +310,20 @@ To close the figures, say **"close"**, **"close it"**, **"close host"** (the nam
 ## Checking the counters
 
 On the dashboard, say **"show the counters"**, **"show the stats"** or ask "how many agents are running?" to open the list under the counters button at the top of the dashboard: every count, from **AGENTS** to **DAEMONS** ([Dashboard → Check what is running](dashboard.md#check-what-is-running)). To close it, say **"close"** or **"close the counters"**; if something else is open over the dashboard, "close" closes that first. Its button, `Esc` or a click elsewhere also closes it. The app does not read the counts aloud.
+
+## Interrupted work
+
+When a daemon restart left work behind, its section of the dashboard shows a banner such as `3 interrupted items from before the restart` ([Interrupted Work](../interrupted-work.md)). Say **"show interrupted work"**, **"what did the restart leave behind?"** or **"show the leftovers"** to open that daemon's **Interrupted work** dialog, as the banner's **Show** does. Without a name, the app asks each connected daemon again first and opens the dialog of the one that has interrupted work. With several daemons listing interrupted work, name the one you mean, for example "show interrupted work on build box"; if you do not, nothing opens and the app asks which one.
+
+With the dialog open:
+
+- **"reclaim"**, **"reclaim the second one"** or **"reclaim fix-login"** checks what reclaiming that item would do and reads the answer back, such as "Reclaim would remove its worktree and keep its branch." The worktree is removed only when you confirm on screen.
+- **"dismiss the first one"** or **"forget that one"** asks, in the dialog, whether to dismiss that item, naming it; it is dismissed when you confirm on screen.
+- **"dismiss all"** or **"clear the list"** asks whether to dismiss every listed item; they are dismissed when you confirm on screen.
+- **"show the details of the first one"**, **"show its reports"**, **"next reports"** and **"previous reports"** show an item and its kept reports on screen. The app does not read them aloud.
+- **"restore the agent"**, **"bring back fix-login"** or **"resume fix-login's conversation"** opens the question that restores that item's agent ([Interrupted Work → Restore an agent](../interrupted-work.md#restore-an-agent)). **Restore and continue**, **Restore only** and **Start over in this worktree** are chosen on screen, since each starts an agent that spends credits and may push or send.
+
+Name an item by its place in the list ("the second one", "the last one") or by its name or branch. With no item named, these act on the selected row.
 
 ## Long lists are shown in pages
 

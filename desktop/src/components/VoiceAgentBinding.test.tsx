@@ -76,10 +76,13 @@ describe("a voice dispatch holds to the daemon process its agent was listed by",
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
   afterEach(() => vi.useRealTimers());
 
-  /// Scenario: A nameless stop or config request is resolving when another agent replaces the viewed pane, its daemon restarts, or its agent is replaced. No confirmation dispatch may target the new subject and the report explains the refusal; the unchanged pane remains a positive control.
+  /// Scenario: A nameless stop, config request or pane scroll is resolving when another agent replaces the viewed pane, its daemon restarts, or its agent is replaced. No confirmation dispatch may target the new subject and the report explains the refusal; the unchanged pane remains a positive control.
   it.each([
     ["stop_agent", "confirmStopAgent", "stop"],
     ["generate_config", "confirmGenerateConfig", "generate config"],
+    // Issue #1673: a scroll over a pane moves that pane, so it is held to it too.
+    ["scroll_up", "scrollUp", "scroll up"],
+    ["scroll_to_bottom", "scrollToBottom", "scroll to the bottom"],
   ].flatMap(([action, invoke, said]) => ["other-agent", "restarted", "replaced", "unchanged"].map((change) => ({ action, invoke, said, change }))))("desktop/config-gen/003: holds a paramless $action to its declared subject ($change)", async ({ action, invoke, said, change }) => {
     const voice = microphone();
     let release!: (answer: VoiceResultDto) => void;

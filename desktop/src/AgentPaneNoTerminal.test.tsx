@@ -134,7 +134,7 @@ function harness(remoteStatus: "connected" | "disconnected" = "connected", retir
 const BUILD_BOX_ROW = "row-build-box";
 
 /** The overview's open control for one agent, named as the row renders it. */
-const openControl = (name: string) => screen.getByRole("button", { name: `Open ${name} agent` });
+const openControl = (name: string) => screen.getByRole("row", { name: `Open ${name} agent` });
 
 /**
  * PRD #1105 — a pane can be open for an agent this app has attached no terminal

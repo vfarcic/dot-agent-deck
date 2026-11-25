@@ -333,6 +333,79 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
     );
 }
 
+/// Launch the deck on a one-pane snapshot (`name`, `sleep 600`) against a fresh
+/// daemon whose every fresh spawn waits `delay_ms` first, as a daemon's first
+/// installed Claude Code spawn does while it copies its editor helper (issue
+/// #2421: 9 s measured on a loaded machine, where the deck gave up after 5 s).
+fn launch_restoring_with_slow_starts(name: &str, delay_ms: u64) -> (TuiDeck, tempfile::TempDir) {
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+    stage_session_snapshot(&session_file, session_dir.path(), &[(name, "sleep 600")]);
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .with_env(
+            dot_agent_deck::agent_pty::ENV_TEST_SPAWN_DELAY_MS,
+            delay_ms.to_string(),
+        )
+        .launch_with_fixture("plain-project");
+    (deck, session_dir)
+}
+
+/// Scenario: Stage a one-pane `session.toml` (`r-slow`, running `sleep 600`)
+/// and launch the deck against a fresh daemon whose every start takes seven
+/// seconds, longer than the five the deck used to wait for one. The pane must
+/// come back as a quick restore brings it back: its card titled `r-slow`, and
+/// the deck in pane input on it, not an unnamed card in command mode.
+#[spec("session/restore/001")]
+#[test]
+fn restore_001_a_slow_start_still_restores_the_named_pane() {
+    let (deck, _session_dir) = launch_restoring_with_slow_starts("r-slow", 7_000);
+    let restored = common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
+        let grid = deck.snapshot_grid();
+        grid.contains("r-slow") && grid.contains("[Command Mode Ctrl+D]")
+    });
+    assert!(
+        restored,
+        "issue #2421: a restore whose start takes 7 s must still bring the pane back named \
+         `r-slow` and focused (the footer offering `[Command Mode Ctrl+D]`), as the desktop app \
+         waits 15 s for the same start.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Stage a one-pane `session.toml` (`r-late`, running `sleep 600`)
+/// and launch the deck against a fresh daemon whose every start takes
+/// seventeen seconds, longer than the deck waits for one. The deck gives up on
+/// the restore, but the daemon still starts the agent, and its card must reach
+/// the dashboard titled with the saved name `r-late`, not with its command.
+#[spec("session/restore/001")]
+#[test]
+fn restore_001_a_start_the_deck_gave_up_on_keeps_its_saved_name() {
+    let (deck, _session_dir) = launch_restoring_with_slow_starts("r-late", 17_000);
+    // The control: the agent the daemon started after the deck stopped
+    // waiting does reach the dashboard, whatever it is called.
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(45)), || {
+            deck.snapshot_grid().contains("1 agent(s)")
+        }),
+        "the agent the daemon started late must reach the dashboard.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let named = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+        deck.snapshot_grid().contains("r-late")
+    });
+    assert!(
+        named,
+        "issue #2421: an agent restored from `session.toml` must carry its saved name `r-late` \
+         even when the deck stopped waiting for its start, rather than surfacing under its \
+         command.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 /// Scenario: Launch the deck against a fresh (empty) daemon with NO snapshot on
 /// disk and NO `--continue` flag — the both-empty case. The deck must land on a
 /// clean empty dashboard ("No active agents") with no restore warning, and

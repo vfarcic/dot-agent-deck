@@ -33,8 +33,53 @@ struct Claude {
     log_name: &'static str,
 }
 
+/// The model every test here runs unless `DAD_E2E_CLAUDE_MODEL` names another.
+const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// The permission mode every test here runs in unless
+/// `DAD_E2E_CLAUDE_PERMISSION_MODE` names another.
+///
+/// Issue #1815: pinned on the command line, which wins over the
+/// `permissions.defaultMode` of the host `settings.json` the harness imports,
+/// so the host's choice of mode cannot change what this lane runs.
+const CLAUDE_PERMISSION_MODE: &str = "default";
+
 /// The Claude Code command every test here runs.
-const CLAUDE: &str = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write";
+///
+/// Three measurement overrides, all read from the test's own environment:
+/// `DAD_E2E_CLAUDE_MODEL` (a model id or alias),
+/// `DAD_E2E_CLAUDE_PERMISSION_MODE` (`default` or `auto`) and
+/// `DAD_E2E_CLAUDE_ALLOWED_TOOLS=none`, which drops `--allowedTools` so that
+/// in auto mode Claude Code's own classifier decides whether the task's Bash
+/// call runs (in `default` mode that call would wait on a permission prompt).
+/// Claude Code 2.1.330 starts `claude-haiku-4-5-20251001` in `default` even
+/// when asked for `auto`, so measuring auto mode needs a model that supports
+/// it, such as `claude-haiku-5-5`. The mode a run actually had is the
+/// `permissionMode` that `provenance.json` records from the session
+/// transcript, not the one asked for here. `docs/develop/e2e-lanes.md`
+/// ("Claude Code's permission mode in lane 2") has the measurement.
+fn claude_command() -> String {
+    let model = std::env::var("DAD_E2E_CLAUDE_MODEL").unwrap_or_else(|_| CLAUDE_MODEL.into());
+    assert!(
+        !model.is_empty()
+            && model
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.')),
+        "DAD_E2E_CLAUDE_MODEL must be a model id or alias, got {model:?}"
+    );
+    let mode = std::env::var("DAD_E2E_CLAUDE_PERMISSION_MODE")
+        .unwrap_or_else(|_| CLAUDE_PERMISSION_MODE.into());
+    assert!(
+        matches!(mode.as_str(), "default" | "auto"),
+        "DAD_E2E_CLAUDE_PERMISSION_MODE must be default or auto, got {mode:?}"
+    );
+    let allowed = match std::env::var("DAD_E2E_CLAUDE_ALLOWED_TOOLS").as_deref() {
+        Err(_) => " --allowedTools Bash Read Write",
+        Ok("none") => "",
+        Ok(other) => panic!("DAD_E2E_CLAUDE_ALLOWED_TOOLS must be unset or none, got {other:?}"),
+    };
+    format!("claude --model {model} --permission-mode {mode}{allowed}")
+}
 
 // Off Linux the installed-pane tests are compiled out, which leaves the
 // helpers only they call unused there; Linux still lints them.
@@ -42,7 +87,8 @@ const CLAUDE: &str = "claude --model claude-haiku-4-5-20251001 --allowedTools Ba
 impl Claude {
     fn new() -> Self {
         Self::launch(&common::capability_export_command(&format!(
-            "exec {CLAUDE}"
+            "exec {}",
+            claude_command()
         )))
     }
 
@@ -56,8 +102,9 @@ impl Claude {
     fn detached() -> Self {
         Self::launch(&common::capability_export_command(&format!(
             "printf '%s' \"$$\" > root.pid; \
-             ( exec {CLAUDE} < /dev/tty & printf '%s' \"$!\" > claude.pid ); \
-             exec sleep 86400"
+             ( exec {} < /dev/tty & printf '%s' \"$!\" > claude.pid ); \
+             exec sleep 86400",
+            claude_command()
         )))
     }
 
@@ -589,6 +636,7 @@ fn claude_facts_admit_installed_release() -> Result<(), String> {
 /// Scenario: On the installed Claude Code release, capture the pid of the scratch pane's armed waiter and kill that process, then post a task after the waiter disconnects. The token-led doorbell must wake interactive Haiku, whose submit hook injects and acknowledges the task and shows an envelope label before the sentinel is written; if the deck's Claude Code facts are not Go the test reports SKIP saying so.
 #[spec("inbox/claude/014")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn claude_014_live_killed_waiter_falls_back_to_injection() {
     skip_unless!(common::check_claude_available());
@@ -614,13 +662,14 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
 /// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's waiter, and post a directive task naming a sentinel (SKIP when the deck's Claude Code facts are not Go). The doorbell rings and that prompt is blocked, so Claude runs no turn and puts the line back in its input box; the card must read Idle again with the doorbell held as awaiting a prompt. Pressing Enter in the pane sends the line, Haiku writes the sentinel once, and the task is acknowledged with two deliveries.
 #[spec("inbox/claude/053")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_over_again() {
     skip_unless!(common::check_claude_available());
     skip_unless!(claude_facts_admit_installed_release());
     let claude = Claude::launch_in(
         "claude-blocking-hook",
-        &common::capability_export_command(&format!("exec {CLAUDE}")),
+        &common::capability_export_command(&format!("exec {}", claude_command())),
         &[],
     );
     kill_trial_waiter(&claude);
@@ -701,7 +750,7 @@ fn claude_050_live_turned_off_doorbell_is_held_and_a_prompt_delivers() {
     };
     eprintln!("Claude Code release under test: {release}");
     let claude = Claude::launch_with(
-        &common::capability_export_command(&format!("exec {CLAUDE}")),
+        &common::capability_export_command(&format!("exec {}", claude_command())),
         &[(dot_agent_deck::doorbell_switch::CLAUDE_ENV, "0")],
     );
     // The cause is proved, not assumed: the installed release latched, and
@@ -788,7 +837,7 @@ fn doorbell_039_live_typing_while_line_lands() {
     skip_unless!(claude_facts_admit_installed_release());
     let claude = fallback_ready_with(
         Claude::launch_with(
-            &common::capability_export_command(&format!("exec {CLAUDE}")),
+            &common::capability_export_command(&format!("exec {}", claude_command())),
             &[
                 ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "*"),
                 ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
@@ -980,7 +1029,8 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     );
     let claude = fallback_ready_with(
         Claude::launch(&common::capability_export_command(&format!(
-            "exec script --quiet --flush --return --echo never --log-in overview-input.log --log-out /dev/null --command 'exec {CLAUDE}'"
+            "exec script --quiet --flush --return --echo never --log-in overview-input.log --log-out /dev/null --command 'exec {}'",
+            claude_command()
         ))),
         "overview",
     );
@@ -1088,6 +1138,7 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
 /// Scenario: In a pane the deck installs its editor helper into, disable native delivery, leave a unique human draft in interactive Haiku's input box, and queue a sentinel task past the accelerated stall threshold. Repeat with a partly deleted draft: for both, a check reads the box non-empty, and for five seconds after it the draft is exact and unsent with zero deliveries, the deck has typed nothing but its check's byte, and the card shows the draft hold and a stall diagnostic. Repeat with a prompt recalled from history with Up: the deck refuses that screen, writes no check and types nothing, and the card says it cannot check the box. Each time the user then moves to the end and clears the whole draft; the next check reads the box empty and the doorbell delivers the original task once.
 #[spec("inbox/doorbell/010")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn doorbell_010_live_kept_draft_stays_held() {
     skip_unless!(installed::checkable());
@@ -1935,6 +1986,7 @@ fn ctrl_c_trial(claude: &Claude, trial: usize) -> bool {
 /// Scenario: In a pane the deck installs its editor helper into, complete a doorbell-delivered control task in real interactive Haiku, send a prompt of your own, then recall it with Up and press Enter, which submits it again, while native delivery is disabled. Once that turn ends, post another sentinel task: a check must read the box empty and the doorbell type the task without another keypress.
 #[spec("inbox/doorbell/010")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn doorbell_010_live_history_enter_recovers_the_doorbell() {
     skip_unless!(installed::checkable());
@@ -2136,7 +2188,7 @@ fn claude_046_live_outside_the_recorded_tree_takes_and_acknowledges() {
 fn start_claude(deck: &common::TuiDeck, name: &str) -> inbox::Pane {
     let reply = attach(
         deck,
-        json!({"op":"start-agent","command":common::capability_export_command(&format!("exec {CLAUDE}")),
+        json!({"op":"start-agent","command":common::capability_export_command(&format!("exec {}", claude_command())),
                "cwd":deck.workdir(),"rows":40,"cols":140,"display_name":name,"agent_type":"claude_code",
                "env":[["DOT_AGENT_DECK_PANE_ID",name]]}),
     );

@@ -719,11 +719,6 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 8] = [
         true,
     ),
     (
-        "PROMPTS_STORAGE_KEY",
-        "dot-agent-deck.desktop.prompts.v1",
-        true,
-    ),
-    (
         "STORAGE_KEY",
         "dot-agent-deck.desktop.agent-profiles.v1",
         true,
@@ -748,6 +743,12 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 8] = [
         "dot-agent-deck.overview.mode",
         false,
     ),
+    // Issue #2418 — which cards' trees are open in the Cards view, per window,
+    // mirroring the mode key above: it describes this display and holds the
+    // cards' identities (a deck's opaque token, a daemon instance id and a card
+    // key of pane and agent ids), no credential and no project content. Keys
+    // of cards their daemon no longer lists are pruned.
+    ("CARDS_OPEN_STORAGE_KEY", "dot-agent-deck.cards.open", false),
 ];
 
 /// The namespace every stored key shares, used to find a literal that looks
@@ -1766,7 +1767,7 @@ pub struct VoiceSettings {
     #[test]
     fn the_localstorage_scan_reads_the_key_expression_it_is_handed() {
         let source = r#"
-window.localStorage.setItem(PROMPTS_STORAGE_KEY, JSON.stringify({ prompts }));
+window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns }));
 const raw = window.localStorage.getItem("dot-agent-deck.desktop.api-key.v1");
 window.localStorage.removeItem(`${base}.${mode}`);
 window.localStorage.clear();
@@ -1785,7 +1786,7 @@ localStorage.setItem(modeScopedKey("dot-agent-deck.desktop.new.v1"), token);
                 .map(|(line, op, arg)| (*line, op.as_str(), arg.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                (2, "setItem", "PROMPTS_STORAGE_KEY"),
+                (2, "setItem", "OVERVIEW_COLUMNS_STORAGE_KEY"),
                 (3, "getItem", "\"dot-agent-deck.desktop.api-key.v1\""),
                 (4, "removeItem", "`${base}.${mode}`"),
                 (
@@ -1807,7 +1808,7 @@ localStorage.setItem(modeScopedKey("dot-agent-deck.desktop.new.v1"), token);
         for (_, _, argument) in &keyed {
             assert_eq!(
                 pinned.contains(argument.as_str()),
-                argument == "PROMPTS_STORAGE_KEY",
+                argument == "OVERVIEW_COLUMNS_STORAGE_KEY",
                 "unexpected verdict for {argument}"
             );
         }
@@ -1895,7 +1896,7 @@ const { setItem } = window.localStorage;
  * never reads localStorage — see PRD #803.
  */
 // window.localStorage.setItem(ROGUE_KEY, secret);
-window.localStorage.getItem(PROMPTS_STORAGE_KEY);
+window.localStorage.getItem(OVERVIEW_COLUMNS_STORAGE_KEY);
 "#;
         let masked = mask_comments(prose);
         assert!(
@@ -1908,7 +1909,7 @@ window.localStorage.getItem(PROMPTS_STORAGE_KEY);
             vec![StorageUse::Keyed {
                 line: 7,
                 op: "getItem".to_string(),
-                argument: "PROMPTS_STORAGE_KEY".to_string()
+                argument: "OVERVIEW_COLUMNS_STORAGE_KEY".to_string()
             }]
         );
 

@@ -32,7 +32,8 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use semver::Version;
 
@@ -891,48 +892,118 @@ pub(crate) fn spawn_start_dir(
     std::fs::canonicalize(&dir).unwrap_or(dir)
 }
 
-/// The daemon's instance, made by the first installed spawn.
+/// How long after a failed attempt to make the daemon's instance the next
+/// installed spawn tries again (issue #2467).
+pub const HELPER_RETRY: Duration = Duration::from_secs(60);
+
+/// A value made once, by the first attempt that succeeds. A failed attempt
+/// is remembered for `after`: until then every caller gets its error without
+/// a new attempt, and the first caller after it tries again. Issue #2467:
+/// the daemon's instance was a `OnceLock` of the first attempt's result, so
+/// one failed copy of the helper (a full runtime tmpfs) turned input-box
+/// checks off for the daemon's whole life, however much room was freed.
+#[derive(Debug)]
+pub struct Retrying<T> {
+    made: OnceLock<T>,
+    failed: Mutex<Option<(Instant, SetupError)>>,
+    after: Duration,
+}
+
+impl<T> Retrying<T> {
+    pub const fn new(after: Duration) -> Self {
+        Self {
+            made: OnceLock::new(),
+            failed: Mutex::new(None),
+            after,
+        }
+    }
+
+    /// The value, made by `make` now when there is none and no failure
+    /// younger than `after` as of `now`. Attempts don't overlap.
+    pub fn get_or_try(
+        &self,
+        now: Instant,
+        make: impl FnOnce() -> Result<T, SetupError>,
+    ) -> Result<&T, SetupError> {
+        if let Some(made) = self.made.get() {
+            return Ok(made);
+        }
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(made) = self.made.get() {
+            return Ok(made);
+        }
+        if let Some((at, error)) = *failed
+            && now.saturating_duration_since(at) < self.after
+        {
+            return Err(error);
+        }
+        match make() {
+            Ok(value) => {
+                *failed = None;
+                Ok(self.made.get_or_init(|| value))
+            }
+            Err(error) => {
+                *failed = Some((now, error));
+                Err(error)
+            }
+        }
+    }
+}
+
+/// The daemon's instance, made by the first installed spawn whose attempt
+/// succeeds; a failed one is tried again after [`HELPER_RETRY`].
 #[cfg(target_os = "linux")]
 fn daemon_instance() -> Result<&'static Instance, SetupError> {
-    use super::instance::{DaemonId, candidate_roots};
-    static INSTANCE: OnceLock<Result<Instance, SetupError>> = OnceLock::new();
+    static INSTANCE: Retrying<Instance> = Retrying::new(HELPER_RETRY);
     INSTANCE
-        .get_or_init(|| {
-            let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
-            let roots = candidate_roots(&crate::config::state_dir(), runtime.as_deref());
-            let mut exe = std::fs::File::open("/proc/self/exe")?;
-            let size = exe.metadata().map(|m| m.len()).unwrap_or_default();
-            let daemon = DaemonId::this_process()?;
-            // A root whose path another user could change is passed over for
-            // the next; any other failure is the instance's.
-            let mut created = Err(SetupError::PathCharacters);
-            for root in roots {
-                created = Instance::create(&root, daemon.clone(), &mut exe);
-                if !matches!(created, Err(SetupError::UntrustedDirectory)) {
-                    break;
-                }
-                tracing::info!(
-                    target: "composer_probe",
-                    root = %root.display(),
-                    "editor helper root passed over: its path isn't trusted"
-                );
-            }
-            let instance = created?;
-            let swept = instance.swept();
-            tracing::info!(
+        .get_or_try(Instant::now(), make_daemon_instance)
+        .inspect_err(|error| {
+            tracing::warn!(
                 target: "composer_probe",
-                dir = %instance.dir().display(),
-                helper_bytes = size,
-                removed = swept.removed.len(),
-                kept = swept.kept,
-                scan_error = ?swept.scan_error,
-                unknown = swept.unknown,
-                "editor helper instance created"
+                ?error,
+                retry_after_secs = HELPER_RETRY.as_secs(),
+                "editor helper instance not made: input-box checks are off for the panes \
+                 spawned until a later spawn makes it"
             );
-            Ok(instance)
         })
-        .as_ref()
-        .map_err(|e| *e)
+}
+
+/// One attempt at the daemon's instance.
+#[cfg(target_os = "linux")]
+fn make_daemon_instance() -> Result<Instance, SetupError> {
+    use super::instance::{DaemonId, candidate_roots};
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let roots = candidate_roots(&crate::config::state_dir(), runtime.as_deref());
+    let mut exe = std::fs::File::open("/proc/self/exe")?;
+    let size = exe.metadata().map(|m| m.len()).unwrap_or_default();
+    let daemon = DaemonId::this_process()?;
+    // A root whose path another user could change is passed over for
+    // the next; any other failure is the instance's.
+    let mut created = Err(SetupError::PathCharacters);
+    for root in roots {
+        created = Instance::create(&root, daemon.clone(), &mut exe);
+        if !matches!(created, Err(SetupError::UntrustedDirectory)) {
+            break;
+        }
+        tracing::info!(
+            target: "composer_probe",
+            root = %root.display(),
+            "editor helper root passed over: its path isn't trusted"
+        );
+    }
+    let instance = created?;
+    let swept = instance.swept();
+    tracing::info!(
+        target: "composer_probe",
+        dir = %instance.dir().display(),
+        helper_bytes = size,
+        removed = swept.removed.len(),
+        kept = swept.kept,
+        scan_error = ?swept.scan_error,
+        unknown = swept.unknown,
+        "editor helper instance created"
+    );
+    Ok(instance)
 }
 
 /// The installation decision for a spawn of generation `generation` running
@@ -981,9 +1052,40 @@ pub fn at_spawn(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::spawn_start_dir;
+    use super::{Retrying, SetupError, spawn_start_dir};
     use spec::spec;
     use std::ffi::OsString;
+    use std::time::{Duration, Instant};
+
+    /// Scenario: Ask a retrying value whose first attempt fails as a full disk does (ENOSPC), again within its 60 s wait, then after it, then once more. The failure is returned without a new attempt inside the wait, the attempt after it makes the value, and the value is kept with no further attempt (issue #2467: the daemon's editor helper instance was cached failed for the daemon's life).
+    #[spec("inbox/probe/065")]
+    #[test]
+    fn probe_065_a_failed_instance_is_tried_again_after_its_wait() {
+        let retrying = Retrying::<u32>::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let full = SetupError::Io(Some(libc::ENOSPC));
+        let mut attempts = 0;
+        let mut attempt = |result: Result<u32, SetupError>| {
+            attempts += 1;
+            result
+        };
+        assert_eq!(retrying.get_or_try(t0, || attempt(Err(full))), Err(full));
+        assert_eq!(
+            retrying.get_or_try(t0 + Duration::from_secs(59), || attempt(Ok(1))),
+            Err(full),
+            "inside the wait the failure stands"
+        );
+        assert_eq!(
+            retrying.get_or_try(t0 + Duration::from_secs(60), || attempt(Ok(5))),
+            Ok(&5)
+        );
+        assert_eq!(
+            retrying.get_or_try(t0 + Duration::from_secs(61), || attempt(Err(full))),
+            Ok(&5),
+            "a made value is kept"
+        );
+        assert_eq!(attempts, 2);
+    }
 
     /// Scenario: Work out where a spawn's child starts, for the key-binding baseline read before it (Codex's project files are its directory's chain). A spawn naming a directory starts there, relative to the daemon's own; one naming none, or naming something that isn't a directory, starts in the child's `HOME` (the spawn's over the daemon's), as the PTY builder starts it, not in the daemon's directory (the reva21 review's U2-1).
     #[spec("inbox/probe/014")]

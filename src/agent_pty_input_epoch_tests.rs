@@ -529,3 +529,63 @@ async fn probe_045_a_spawned_generation_shares_one_input() {
         .unwrap();
     assert!(bus.input().touched(), "a duplicate touches");
 }
+
+/// Scenario: A fresh generation's output asks for the cursor position, as Codex does at start-up and on each resize, and an attached client's terminal answers it, as the desktop app's does; the box stays untouched. Each of these instead touches it: a reply in row 1 at column 2 or later (a modified F3 key has that shape), a reply to no query, a second reply to one query, and a reply split over two ops. A reply to a query a fence closed after passes ahead of it (issue #2467, which narrowed OQ3).
+#[spec("inbox/probe/105")]
+#[test]
+fn probe_105_a_clients_cursor_reply_leaves_the_box_untouched() {
+    use crate::composer_probe::epoch::OutputNote;
+    let asked = |input: &GenerationInput| {
+        input.on_output(&[OutputNote::Query(QueryKind::Cpr)], Instant::now());
+    };
+    for reply in [
+        &b"\x1b[1;1R"[..],
+        b"\x1b[24;1R",
+        b"\x1b[38;153R",
+        b"\x1b[2;5R",
+    ] {
+        let input = GenerationInput::default();
+        asked(&input);
+        assert_eq!(input.reply_class(QueryKind::Cpr), (true, true));
+        assert!(
+            matches!(input.enqueue(Writer::Human, reply), Enqueued::Exempt(_)),
+            "{reply:?}"
+        );
+        assert!(!input.touched(), "{reply:?}");
+        assert_eq!(input.reply_class(QueryKind::Cpr), (false, false), "settled");
+    }
+    for (label, query, ops) in [
+        ("F3 shape", true, vec![&b"\x1b[1;2R"[..]]),
+        ("F3 shape, far column", true, vec![b"\x1b[1;80R"]),
+        ("no query", false, vec![b"\x1b[3;7R"]),
+        ("split", true, vec![b"\x1b[3;", b"7R"]),
+    ] {
+        let input = GenerationInput::default();
+        if query {
+            asked(&input);
+        }
+        for op in ops {
+            input.enqueue(Writer::Human, op);
+        }
+        assert!(input.touched(), "{label}");
+    }
+    let input = GenerationInput::default();
+    asked(&input);
+    input.enqueue(Writer::Human, b"\x1b[3;7R");
+    assert!(!input.touched());
+    input.enqueue(Writer::Human, b"\x1b[3;7R");
+    assert!(input.touched(), "a second reply to one query");
+    // Pass-ahead: a reply to a query noted after a fence's trigger passes;
+    // one to a query noted at or before it doesn't.
+    let input = GenerationInput::default();
+    input.advance_output(4);
+    asked(&input);
+    let trigger = input.output_offset();
+    assert!(!input.pass_ahead(Writer::Human, b"\x1b[3;7R", trigger));
+    let input = GenerationInput::default();
+    let trigger = input.output_offset();
+    input.advance_output(4);
+    asked(&input);
+    assert!(input.pass_ahead(Writer::Human, b"\x1b[3;7R", trigger));
+    assert!(!input.touched());
+}

@@ -106,6 +106,13 @@ pub struct LaunchDetails<'a> {
     pub cwd_moved_from: Option<&'a str>,
     pub name: Option<&'a str>,
     pub membership: Option<&'a TabMembership>,
+    /// The agent's child process id and when it started, as spawned
+    /// ([`crate::launch_records::LaunchRecord::pid`]).
+    pub pid: Option<u32>,
+    pub pid_start: Option<u64>,
+    /// The launch nonce a restore handed the spawn
+    /// ([`crate::launch_records::LaunchRecord::launch_nonce`]).
+    pub launch_nonce: Option<&'a str>,
 }
 
 /// How a generation's end reads in the journal.
@@ -1046,6 +1053,9 @@ impl WorkTracker {
             orchestration,
             orchestration_id,
             ts_ms: crate::launch_records::now_ms(),
+            pid: launch.pid,
+            pid_start: launch.pid.and(launch.pid_start),
+            launch_nonce: launch.launch_nonce.map(str::to_string),
         };
         if let Err(error) = crate::launch_records::write(state_dir, &record) {
             tracing::warn!(
@@ -1362,11 +1372,33 @@ impl WorkTracker {
         branch: &str,
         workspace: &Path,
     ) -> Option<WorkId> {
+        let work = self.mint_launch()?;
+        self.dispatch_held(work, parent, branch, workspace)
+    }
+
+    /// [`Self::dispatch_minted`] for a work id the caller minted earlier
+    /// ([`Self::mint_launch`]), so the worktree it created could name it.
+    pub fn dispatch_held(
+        &self,
+        work: WorkId,
+        parent: Option<&WorkId>,
+        branch: &str,
+        workspace: &Path,
+    ) -> Option<WorkId> {
         let refs = Refs {
             branch: self.plain(branch),
             ..Refs::default()
         };
-        self.hold_launch(Launch::Dispatch, parent, refs, workspace)
+        self.hold_launch_as(work, Launch::Dispatch, parent, refs, workspace)
+    }
+
+    /// A fresh work id for a launch that has not been held yet, or `None`
+    /// when there is no journal (PR #2431 round 2). Writes nothing: a launch
+    /// minted here and never held leaves no line behind. Minted before the
+    /// launch creates its worktree, so the worktree's ownership marker can
+    /// name the launch ([`crate::worktree_owner::Creator::for_launch`]).
+    pub fn mint_launch(&self) -> Option<WorkId> {
+        self.journal()?.mint_work_id()
     }
 
     /// The unit dispatched as `work` was registered as `unit_id`: its
@@ -1440,8 +1472,22 @@ impl WorkTracker {
         refs: Refs,
         workspace: &Path,
     ) -> Option<WorkId> {
+        let work = self.mint_launch()?;
+        self.hold_launch_as(work, launch, parent, refs, workspace)
+    }
+
+    /// [`Self::hold_launch`] for a work id the caller minted earlier
+    /// ([`Self::mint_launch`]). `None`, holding nothing, when there is no
+    /// journal.
+    pub fn hold_launch_as(
+        &self,
+        work: WorkId,
+        launch: Launch,
+        parent: Option<&WorkId>,
+        refs: Refs,
+        workspace: &Path,
+    ) -> Option<WorkId> {
         let journal = self.journal()?;
-        let work = journal.mint_work_id()?;
         // Resolved before the book's lock: it reads the filesystem.
         let workspace = journal.workspace(workspace);
         let mut book = self.book();
@@ -1534,6 +1580,28 @@ impl WorkTracker {
         let how = how.or(launch.close_as).unwrap_or(CloseHow::PaneClosed);
         drop(book);
         self.close(work, how);
+    }
+
+    /// PR #2431 round 5: launch `work`'s spawn was cut short by this daemon
+    /// shutting down ([`crate::spawn::SpawnError::ShutdownWhileStarting`]).
+    /// When something of it was written, its `opened` is written if it is
+    /// still held and it stays open: the attempts the shutdown interrupted
+    /// list it as interrupted work after the restart. Answers whether it was
+    /// kept; when nothing of it was written it is forgotten, as
+    /// [`Self::launch_failed`] forgets it, since nothing lists it then.
+    pub fn launch_interrupted(&self, work: &WorkId) -> bool {
+        let Some(journal) = self.journal() else {
+            return false;
+        };
+        let mut book = self.book();
+        let launch = book.launches.remove(work).unwrap_or_default();
+        if !launch.written {
+            drop(book);
+            self.forget(work);
+            return false;
+        }
+        Self::flush_locked(journal, &mut book, work);
+        !launch.closed
     }
 
     /// Orchestration instance `instance` lost its last role pane: its work
