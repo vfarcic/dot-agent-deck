@@ -1367,5 +1367,11 @@ reason = "The batch confirmation's +N more, one per text group: lists every name
 [[site]]
 file = "desktop/src/components/AgentCardBatchDialog.tsx"
 handler = "onClick"
+code = "showNext"
+reason = "The batch confirmation's Show next text, shown while Send waits for a batch of several distinct texts to have each been in view: it scrolls the next text not yet seen into view. It moves the open dialog's scroll and acts on nothing; the hint beside it says how many texts there are, Send itself stays hand-only (PRD #802 D5), and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) (PR #2491 audit K1)."
+
+[[site]]
+file = "desktop/src/components/AgentCardBatchDialog.tsx"
+handler = "onClick"
 code = "() => setSkippedOpen((open) => !open)"
 reason = "The batch confirmation's skipped line: lists the skipped agents grouped by reason where the line counts them by reason. It changes what the open dialog shows and acts on nothing; the line itself says how many were skipped and why, and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) and is sent only by hand."

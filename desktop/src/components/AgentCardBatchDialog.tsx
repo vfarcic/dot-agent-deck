@@ -1,4 +1,4 @@
-import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import { ChevronRight } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
@@ -148,6 +148,84 @@ export const INCLUDED_SHOWN = 8;
 const INCLUDED_FOLD_AFTER = 10;
 
 /**
+ * PR #2491 audit K1 (remainder) — how much of a quotation must have been in
+ * the body's view for it to count as seen: nearly all of it, or, for a text
+ * taller than half the view, at least half the view's height of it.
+ */
+const SEEN_SHARE = 0.9;
+/** The ratios at which the observer reports a quotation, so a tall one is measured as it scrolls through. */
+const SEEN_THRESHOLDS = Array.from({ length: 21 }, (_, at) => at / 20);
+
+/** Whether a quotation at `quote` is shown enough inside a body at `root` to count as seen. */
+export function quotationInView(quote: Pick<DOMRectReadOnly, "top" | "bottom" | "height">, root: Pick<DOMRectReadOnly, "top" | "bottom" | "height">): boolean {
+  if (quote.height <= 0 || root.height <= 0) return false;
+  const shown = Math.min(quote.bottom, root.bottom) - Math.max(quote.top, root.top);
+  return shown > 0 && shown >= Math.min(quote.height * SEEN_SHARE, root.height / 2);
+}
+
+/**
+ * PR #2491 audit K1 (remainder) — which of the confirmation's distinct texts
+ * have been in view at least once, by their key (`keys`, in the order they
+ * are quoted). Each quotation carries `data-batch-text={index}`. Watched with
+ * an `IntersectionObserver` on the scrolling body where the webview has one,
+ * else measured on mount, on the body's scroll and on a window resize. While
+ * `watch` is false nothing is watched; a new preview starts unseen.
+ */
+function useSeenTexts(body: RefObject<HTMLElement | null>, keys: readonly string[], watch: boolean, previewing: boolean) {
+  // voice-registry-exempt: which quoted texts the user has had in view, an invariant of the open confirmation and not a control
+  const [seen, setSeen] = useState<ReadonlySet<string>>(() => new Set());
+  const current = useRef(keys);
+  current.current = keys;
+  const mark = useCallback((key: string) => {
+    // voice-registry-exempt: records that a quoted text was in view; nothing is sent or changed
+    setSeen((held) => (held.has(key) ? held : new Set([...held, key])));
+  }, []);
+  useEffect(() => {
+    // voice-registry-exempt: a new preview's texts start unseen
+    if (previewing) setSeen(new Set());
+  }, [previewing]);
+  const signature = keys.join("\u0001");
+  useEffect(() => {
+    const root = body.current;
+    if (!watch || !root) return;
+    const quotes = [...root.querySelectorAll<HTMLElement>("[data-batch-text]")];
+    const keyOf = (node: Element) => current.current[Number((node as HTMLElement).dataset.batchText)];
+    if (typeof IntersectionObserver === "function") {
+      const observer = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const key = keyOf(entry.target);
+          if (key !== undefined && entry.isIntersecting && quotationInView(entry.boundingClientRect, entry.rootBounds ?? root.getBoundingClientRect())) mark(key);
+        }
+      }, { root, threshold: SEEN_THRESHOLDS });
+      quotes.forEach((node) => observer.observe(node));
+      return () => observer.disconnect();
+    }
+    const measure = () => {
+      const bounds = root.getBoundingClientRect();
+      for (const node of quotes) {
+        const key = keyOf(node);
+        if (key !== undefined && quotationInView(node.getBoundingClientRect(), bounds)) mark(key);
+      }
+    };
+    measure();
+    root.addEventListener("scroll", measure, { passive: true });
+    window.addEventListener("resize", measure);
+    return () => {
+      root.removeEventListener("scroll", measure);
+      window.removeEventListener("resize", measure);
+    };
+  }, [body, mark, signature, watch]);
+  /** Scroll the first text not yet seen into view, and count it as seen: it is now in front of the user. */
+  const showNext = useCallback(() => {
+    const at = current.current.findIndex((key) => !seen.has(key));
+    if (at < 0) return;
+    body.current?.querySelector<HTMLElement>(`[data-batch-text="${at}"]`)?.scrollIntoView?.({ block: "center" });
+    mark(current.current[at]);
+  }, [body, mark, seen]);
+  return { seen, showNext };
+}
+
+/**
  * Why a group of skipped agents is skipped, in a few words after its count
  * ("150 don't offer Go ahead"), by the code the daemon skipped them with. A
  * code this build does not know reads "for another reason"; each agent's row
@@ -215,7 +293,17 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
   const previewed = rowsOf(view.groups);
   const included = previewed.filter((row) => row.entry.outcome === "included");
   const textGroups = sameText(included);
-  const distinctTexts = textGroups.filter(([first]) => first.entry.prompt !== undefined && first.entry.prompt !== null).length;
+  const quoted = textGroups.filter(([first]) => first.entry.prompt !== undefined && first.entry.prompt !== null);
+  const distinctTexts = quoted.length;
+  /* PR #2491 audit K1 (remainder): with more than one distinct text, Send
+     waits until each has been in view at least once. One text — however many
+     agents share it — is in view with the heading, as before. */
+  const textKeys = quoted.map(([first]) => `${rowKey(first)}\u0000${first.entry.prompt}`);
+  const textIndex = new Map(quoted.map(([first], index) => [rowKey(first), index]));
+  const body = useRef<HTMLDivElement>(null);
+  const gated = view.stage === "review" && distinctTexts > 1;
+  const { seen, showNext } = useSeenTexts(body, textKeys, gated, view.stage === "previewing");
+  const unseen = gated ? textKeys.filter((key) => !seen.has(key)).length : 0;
   const toggleGroup = (groupKey: string) => setOpenGroups((current) => {
     const next = new Set(current);
     if (!next.delete(groupKey)) next.add(groupKey);
@@ -260,7 +348,7 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
           <h2 id="agent-cards-batch-title">{done ? `${label}: what happened` : `${label}?`}</h2>
           <p className="agent-cards-batch-scope">{scope}</p>
         </header>
-        <div className="agent-cards-batch-body">
+        <div ref={body} className="agent-cards-batch-body" data-testid="agent-cards-batch-body">
           {view.stage === "previewing" && <p role="status">Asking the deck what each agent would get…</p>}
           {view.refusal && <p className="agent-cards-batch-refusal" role="status" data-testid="agent-cards-batch-refusal">{displayText(view.refusal, DISPLAY_LIMITS.message)}</p>}
           {view.stage === "sending" && <p role="status">Sending… the result for each agent shows here when every daemon has answered.</p>}
@@ -278,7 +366,7 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
                     const listed = foldNames(group, open);
                     /* Every distinct text is quoted with who wrote it, however long the list (audit K1). */
                     const what = (several: boolean) => (first.entry.prompt
-                      ? <><p className="agent-cards-batch-text-source"><GroupSource rows={group} /></p><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt"><ExactText text={first.entry.prompt} /></blockquote><ExactTextNote text={first.entry.prompt} /></>
+                      ? <><p className="agent-cards-batch-text-source"><GroupSource rows={group} /></p><blockquote className="agent-card-prompt-text agent-cards-batch-prompt" data-testid="agent-cards-batch-prompt" data-batch-text={textIndex.get(groupKey)}><ExactText text={first.entry.prompt} /></blockquote><ExactTextNote text={first.entry.prompt} /></>
                       : <p className="agent-cards-batch-what">{closeWords(first.entry.kind, label, several)}</p>);
                     const badge = (row: BatchRow) => row.entry.prompt_source === "agent" && <SourceBadge source="agent" />;
                     /* One agent: its row holds the text, as it always did; the quotation's mark says who wrote it. */
@@ -362,8 +450,14 @@ export function AgentCardBatchDialog({ view, controls, daemonName }: {
             ? <button type="button" className="button primary" data-testid="agent-cards-batch-close" onClick={() => VOICE_ACTIONS.closeCardBatch.run(controls)}>Close</button>
             : (
               <>
+                {unseen > 0 && (
+                  <>
+                    <p id="agent-cards-batch-unseen" className="agent-cards-batch-unseen" role="status" data-testid="agent-cards-batch-unseen">{`Scroll to see all ${distinctTexts} texts`}</p>
+                    <button type="button" className="button secondary" data-testid="agent-cards-batch-next-text" onClick={showNext}>Show next text</button>
+                  </>
+                )}
                 <button type="button" className="button secondary" data-testid="agent-cards-batch-cancel" disabled={view.stage === "sending"} onClick={() => VOICE_ACTIONS.closeCardBatch.run(controls)}>Cancel</button>
-                <button type="button" className="button primary" data-testid="agent-cards-batch-send" disabled={view.stage !== "review" || included.length === 0} onClick={() => VOICE_ACTIONS.sendCardBatch.run(controls)}>Send</button>
+                <button type="button" className="button primary" data-testid="agent-cards-batch-send" disabled={view.stage !== "review" || included.length === 0 || unseen > 0} aria-describedby={unseen > 0 ? "agent-cards-batch-unseen" : undefined} onClick={() => VOICE_ACTIONS.sendCardBatch.run(controls)}>Send</button>
               </>
             )}
         </footer>

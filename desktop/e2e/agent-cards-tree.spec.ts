@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 /**
  * Issue #2418 — the Cards tree's layout, "Row, wrapping, roots stay put", in a
@@ -73,6 +73,9 @@ for (const width of WIDTHS) {
     expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(900 + TOLERANCE);
     const send = dialog.getByRole("button", { name: "Send", exact: true });
     const cancel = dialog.getByRole("button", { name: "Cancel", exact: true });
+    // Seven different texts: Send waits until each has been in view (PR #2491 audit K1).
+    await expect(send).toBeDisabled();
+    await expect(dialog.getByTestId("agent-cards-batch-unseen")).toHaveText("Scroll to see all 7 texts");
     await expect(send).toBeInViewport();
     await expect(cancel).toBeInViewport();
     const prompts = dialog.getByTestId("agent-cards-batch-prompt");
@@ -83,15 +86,79 @@ for (const width of WIDTHS) {
       await expect(prompt).toBeInViewport();
       expect(await prompt.evaluate((node) => node.scrollWidth <= node.clientWidth), "the quote wraps without horizontal clipping").toBe(true);
     }
+    await expect(send).toBeEnabled();
+    await expect(dialog.getByTestId("agent-cards-batch-unseen")).toHaveCount(0);
     await cancel.click();
     await expect(dialog).toHaveCount(0);
     await expect(page.getByTestId("agent-cards-batch-results")).toHaveCount(0);
     await page.getByTestId("agent-cards-batch-action-batch-go").click();
+    // A new preview: each of its seven texts is brought into view again before Send (PR #2491 audit K1).
+    await showEveryText(page.getByTestId("agent-cards-batch-confirm"));
     await page.getByTestId("agent-cards-batch-confirm").getByRole("button", { name: "Send", exact: true }).click();
     await expect(page.getByTestId("agent-cards-batch-results")).toBeVisible();
     await expectNoSidewaysScroll(page);
   });
 }
+
+/// Scenario: In a 1440 by 500 window, tick every root of the tree and start a Go ahead batch in which two agents wrote their own text, both below the dialog's fold. Send is disabled, with "Scroll to see all 3 texts" beside it. Scrolling the dialog's body to its end brings both into view, Send is enabled, and it sends exactly the agents the confirmation listed.
+test("desktop/agent-cards/109 — with several distinct texts, Send waits until each has been in view (audit K1)", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 500 });
+  await openCardsTree(page);
+  const { roots, cards } = await page.evaluate(() => {
+    type Entry = Record<string, unknown> & { name: string; agent_id: string; parent?: string; actions: unknown[] };
+    const hook = (window as unknown as { __dadFixtureCards: { snapshot(): { revision: number; batch?: boolean; entries: Entry[] }; push(next: unknown): void } }).__dadFixtureCards;
+    const next = hook.snapshot();
+    next.batch = true;
+    const own = new Map([[next.entries.length - 2, "K1-AGENT-A: also delete the scratch branch."], [next.entries.length - 1, "K1-AGENT-B: push straight to main."]]);
+    next.entries.forEach((entry, at) => {
+      const text = own.get(at);
+      entry.actions = [{ id: "go-ahead", label: "Go ahead", kind: "prompt", prompt: text ?? "K1-CATALOG: go ahead.", prompt_source: text ? "agent" : "catalog", text_input: false, confirm: false, confirm_detail: null, icon: "play",
+        placement: "card", custom: text !== undefined, source: text ? "agent" : "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: `tok-k1-${entry.agent_id}` }, ...entry.actions];
+    });
+    next.revision += 1;
+    hook.push(next);
+    return { roots: next.entries.filter((entry) => !entry.parent).length, cards: next.entries.length };
+  });
+  const boxes = page.locator("article[data-card-key][data-depth='0']").getByTestId("agent-card-select");
+  await expect(boxes).toHaveCount(roots);
+  for (const box of await boxes.all()) await box.check();
+  await expect(page.getByTestId("agent-cards-selection-count")).toHaveText(`${cards} selected`);
+  await page.getByTestId("agent-cards-batch-action-go-ahead").click();
+  const dialog = page.getByTestId("agent-cards-batch-confirm");
+  await expect(dialog).toHaveAttribute("data-stage", "review");
+  const prompts = dialog.getByTestId("agent-cards-batch-prompt");
+  await expect(prompts).toHaveCount(3);
+  await expect(prompts.first()).toHaveText("K1-CATALOG: go ahead.");
+  await expect(dialog.getByRole("heading", { level: 3 }).first()).toHaveText(`Sends to ${cards} agents: 3 different texts`);
+  const body = dialog.locator(".agent-cards-batch-body");
+  const fold = await body.evaluate((node) => ({ top: node.scrollTop, height: node.clientHeight, scroll: node.scrollHeight }));
+  expect(fold.top).toBe(0);
+  expect(fold.scroll, "the body scrolls").toBeGreaterThan(fold.height);
+  await expect(prompts.nth(1)).not.toBeInViewport();
+  await expect(prompts.nth(2)).not.toBeInViewport();
+  const send = dialog.getByRole("button", { name: "Send", exact: true });
+  await expect(send).toBeDisabled();
+  await expect(dialog.getByTestId("agent-cards-batch-unseen")).toHaveText("Scroll to see all 3 texts");
+  await expect(dialog.getByRole("button", { name: "Show next text" })).toBeVisible();
+  // A click on the disabled Send sends nothing.
+  await send.click({ force: true });
+  await expect(page.getByTestId("agent-cards-batch-results")).toHaveCount(0);
+  // The user scrolls the dialog's body through its texts.
+  for (const prompt of await prompts.all()) {
+    await prompt.evaluate((node) => node.scrollIntoView({ block: "center" }));
+    await expect(prompt).toBeInViewport();
+  }
+  await expect(send).toBeEnabled();
+  await expect(dialog.getByTestId("agent-cards-batch-unseen")).toHaveCount(0);
+  await send.click();
+  const results = page.getByTestId("agent-cards-batch-results");
+  await expect(results).toBeVisible();
+  // Exactly the agents the confirmation counted got it: every one of them, each once.
+  await expect(results.getByTestId("agent-cards-batch-entry")).toHaveCount(cards);
+  const names = await results.locator(".agent-cards-batch-name").allTextContents();
+  expect(new Set(names).size).toBe(cards);
+  await expect(results.getByRole("status")).toHaveText(`Queued for all ${cards}`);
+});
 
 /// Scenario: an agent offers a daemon-valid multiline prompt whose final instruction is a hundred lines down. In its agent's Card panel, the action's hover cannot hold the text and says so; pressing the icon sends nothing, a separate review shows the entire prompt, and only the review's Send delivers it.
 test("desktop/agent-cards/024 — a prompt the hover cannot show whole requires the review step before sending (R2-A1)", async ({ page }) => {
@@ -139,6 +206,13 @@ test("desktop/agent-cards/027 — a single over-wide label counts as overflow in
   await expect(line.getByTestId("agent-card-issue-labels-more")).toHaveText("+1");
   expect(chips.filter((chip) => chip.drawn)).toHaveLength(0);
 });
+
+/** PR #2491 audit K1 — bring each of a batch confirmation's distinct texts into view with Show next text, as the user can, until Send stops waiting. */
+async function showEveryText(dialog: Locator): Promise<void> {
+  const next = dialog.getByRole("button", { name: "Show next text" });
+  for (let shown = 0; shown < 50 && await next.count() > 0; shown += 1) await next.click();
+  await expect(dialog.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
+}
 
 async function openCardsTree(page: Page, scene: "tree" | "tree-nested" = "tree"): Promise<void> {
   await page.addInitScript(() => {

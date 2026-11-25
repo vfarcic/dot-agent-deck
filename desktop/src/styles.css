@@ -2421,6 +2421,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-batch-prompt { min-width: 0; }
 .agent-cards-batch-error { margin: 0; color: var(--red); overflow-wrap: anywhere; }
 .agent-cards-batch-buttons { flex: none; padding: 10px 16px 14px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--line); }
+/* PR #2491 audit K1: why Send waits, beside it, while a batch of several texts has one not yet in view. */
+.agent-cards-batch-unseen { margin: 0 auto 0 0; align-self: center; color: var(--muted); font-size: var(--text-sm); }
 @media (max-width: 640px) { .agent-cards-batch-backdrop { padding: 0; } .agent-cards-batch { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }
 
 /* PRD #1790 stage 2 — a deck's interrupted work: its banner, the dialog, and the restart notice's hint line. */
