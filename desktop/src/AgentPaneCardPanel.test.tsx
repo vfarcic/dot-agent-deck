@@ -200,4 +200,27 @@ describe("the agent pane's Card panel (PR #2491 decision 2026-11-25)", () => {
     expect(within(pane()).getByTestId(`terminal-${third.id}`)).toBe(terminal);
     expect(first.id).not.toBe(third.id);
   });
+
+  /// Scenario: An agent reports a `url`, a `pull_request` and an `issue` field, each an `https://` address it chose, and the user opens its pane from its card. The Card panel shows each address as plain text the user can select and copy, not as a link.
+  it("desktop/agent-cards/103: an agent-written field value is plain text, never a link", () => {
+    window.localStorage.setItem(MODE_KEY, "cards");
+    const shell = renderShell();
+    const field = (name: string, type: string, value: string) => ({ name, label: name, description: null, type, icon: null, placement: "detail", custom: false, source: "agent", value });
+    const withFields = cardFor(shell.agents[0].id, "first-card", {
+      revision: 2,
+      fields: [
+        field("links", "url", "https://agent-controlled.invalid/"),
+        field("pull-request", "pull_request", "https://github.com/o/r/pull/7"),
+        field("issue", "issue", "https://github.com/o/r/issues/3"),
+      ],
+    } as Partial<AgentCardEntry>);
+    shell.update([withFields, shell.entries[1], shell.entries[2]], 2);
+    fireEvent.click(card(withFields));
+    const fields = panel()!.querySelector<HTMLElement>("dl[aria-label='Fields']")!;
+    for (const value of ["https://agent-controlled.invalid/", "https://github.com/o/r/pull/7", "https://github.com/o/r/issues/3"]) {
+      expect(within(fields).getByText(value).closest("a")).toBeNull();
+    }
+    expect(fields.querySelector("a")).toBeNull();
+    expect(panel()!.querySelector("a[href='https://agent-controlled.invalid/']")).toBeNull();
+  });
 });

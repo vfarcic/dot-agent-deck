@@ -17784,6 +17784,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** `spokenLabelMatch` answers `found`, `none` or `ambiguous`; two buttons labelled "Send report" beside one labelled "Report" make "send report" ambiguous, not Report; a partial label two buttons share ("deploy", "press deploy") is ambiguous; "answer it" still finds the button labelled "Answer it", and "press deploy staging" still finds Deploy staging once the phrase as said matches nothing; spoken, each ambiguous label is refused with "…'s card has more than one action called …, so nothing was sent.", no review opens and nothing is sent (PR #2491 review J3, audit K2).
 - **Does not assert:** the batch routes' ambiguity sentence, beyond sharing the matcher.
 
+##### desktop/agent-cards/103 — An agent-written field value is plain text, never a link.
+- **Test:** vitest `desktop/agent-cards/103: …` in `desktop/src/AgentPaneCardPanel.test.tsx`.
+- **Layer:** desktop shell (jsdom), real `DeckShell` with a stand-in terminal.
+- **Asserts:** a card's `url`, `pull_request` and `issue` fields holding `https://` addresses the agent chose show in the Card panel's Fields as text, with no `<a>` anywhere in the fields and none pointing at the agent's address (PR #2491 audit K3).
+- **Does not assert:** that the deck-checked reference badges still open their pages (`025`, `018`).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

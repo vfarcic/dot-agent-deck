@@ -108,7 +108,7 @@ Clicking a card, its **+N**, **Show card** in a table row's menu, or saying "sho
 The panel has two parts, each labelled:
 
 - **Status**, marked **deck checked**: the deck's status and the agent's type, why an orchestration role exited and its last output, the pull request of its branch, the **Pull requests and issues** it reported, and **Sent from this card**, the last actions you sent the agent, each with the exact text and whether it was delivered, kept after the card stops offering them.
-- **Report**, marked **agent says**: its summary and its own status, or "No report from this agent yet.", why it needs you (the words the card's bell shows when you hover it), its fields, and its questions, each with its answers as buttons.
+- **Report**, marked **agent says**: its summary and its own status, or "No report from this agent yet.", why it needs you (the words the card's bell shows when you hover it), its fields, and its questions, each with its answers as buttons. A field is shown as text: a web address the agent put in one is not a link, so select and copy it to open it. The pull requests and issues the deck checked open from their badges.
 
 Under them, **Actions** holds an icon for every action the agent offers, the same icons as on the card, in the same box, with the same text when you hover one, including the ones placed **Only in the Card panel**. They behave as on the card: an action from your catalog is sent when you press it, and one that asks first or whose text the agent wrote opens the review. Under the icons, the panel says what became of each one you pressed. The deck's own actions are not repeated: the pane itself is **Open**, you reply by typing into the agent's terminal, and the pane's **Close agent** closes it.
 

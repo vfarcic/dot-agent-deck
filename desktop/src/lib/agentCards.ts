@@ -204,13 +204,6 @@ export function fieldValueText(value: unknown): string {
   }
 }
 
-/** A field value the Card panel may offer as a link: an `http(s)` URL and nothing else. */
-export function linkOf(type: string, value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  if (type !== "url" && type !== "pull_request" && type !== "issue") return undefined;
-  return /^https?:\/\//i.test(value) ? value : undefined;
-}
-
 /**
  * What a spoken label names on a card (PR #2491 review J3, audit K2): one
  * action, none, or more than one — an ambiguous label is refused, never read

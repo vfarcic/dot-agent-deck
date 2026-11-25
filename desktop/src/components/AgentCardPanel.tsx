@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { BellRing } from "lucide-react";
 
-import { cardStatusClass, cardStatusLabel, deliverySentence, fieldValueText, formatClockTime, linkOf, multilineText, needsYouSentence, reportStatusLabel, resultSentence, disabledReasonSentence, type CardResults, type PlacedCard } from "../lib/agentCards";
+import { cardStatusClass, cardStatusLabel, deliverySentence, fieldValueText, formatClockTime, multilineText, needsYouSentence, reportStatusLabel, resultSentence, disabledReasonSentence, type CardResults, type PlacedCard } from "../lib/agentCards";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle } from "../lib/displayText";
 import { agentTypeText, issueLabels, referenceDetail, referenceView } from "../lib/agentCardsTree";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
@@ -118,12 +118,15 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
             {entry.fields.length > 0 && (
               <dl className="agent-card-fields is-detail" aria-label="Fields">
                 {entry.fields.map((field) => {
+                  /* PR #2491 audit K3: a field is what the agent says, so a
+                     web address in it is text to select and copy, never a
+                     link; the pull requests and issues the deck checked
+                     itself open from their badges above. */
                   const text = fieldValueText(field.value);
-                  const link = linkOf(field.type, field.value);
                   return (
                     <div key={field.name} className="agent-card-field" data-field={field.name}>
                       <dt title={field.description ? displayTitle(field.description) : undefined}>{displayText(field.label, DISPLAY_LIMITS.name)}{field.custom && <span className="card-custom" title="Not in the catalog: the agent added it">custom</span>}</dt>
-                      <dd className={field.type === "long_text" ? "is-long" : undefined}>{link ? <a href={link} target="_blank" rel="noreferrer noopener">{displayText(text, DISPLAY_LIMITS.detail)}</a> : field.type === "long_text" ? multilineText(text) : displayText(text, DISPLAY_LIMITS.detail)}</dd>
+                      <dd className={field.type === "long_text" ? "is-long" : undefined}>{field.type === "long_text" ? multilineText(text) : displayText(text, DISPLAY_LIMITS.detail)}</dd>
                     </div>
                   );
                 })}
