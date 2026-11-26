@@ -306,7 +306,7 @@ test.describe("visible pages for voice-selected lists", () => {
     await decks.first().click();
     await page.getByTestId("new-agent-use-directory").click();
     const modes = page.getByTestId("new-agent-modes");
-    await expect(modes.getByRole("button")).toHaveCount(3);
+    await expect(modes.getByRole("button")).toHaveCount(4); // No mode, schedule, schedule: issues, dispatcher
     await expect(page.getByTestId("new-agent-mode-page")).toHaveCount(0);
     const geometry = await modes.evaluate((element) => {
       const chips = [...element.querySelectorAll<HTMLElement>("button")];

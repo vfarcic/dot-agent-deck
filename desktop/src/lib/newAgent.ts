@@ -232,10 +232,10 @@ export const AUTHORING_WITHHELD = {
 /**
  * The authoring chips a deck's options offer, or why none are.
  *
- * A chip is offered only when the deck lists its kind in `authoringKinds` —
- * which the deck does exactly when it can compose that seed — and
- * `schedule: issues` only when the deck's experimental flag is on, as the TUI
- * shows that option only with the flag. Nothing is offered while the options
+ * A chip is offered exactly when the deck lists its kind in `authoringKinds` —
+ * which the deck does exactly when it can compose that seed. `schedule: issues`
+ * is no exception since issue #193 graduated it from the experimental flag, as
+ * the TUI offers it without the flag. Nothing is offered while the options
  * are still loading, and a deck older than the options query, or one that
  * lists no kind this app knows, is given the reason instead.
  */
@@ -244,7 +244,7 @@ export function authoringModes(options: NewAgentOptions | undefined): { offered:
   if (options.kind === "unsupported") return { offered: [], withheld: AUTHORING_WITHHELD.unsupported };
   const composable = AUTHORING_MODES.filter((mode) => options.authoringKinds.includes(mode.kind));
   if (composable.length === 0) return { offered: [], withheld: AUTHORING_WITHHELD.none };
-  return { offered: composable.filter((mode) => mode.kind !== "schedule-issues" || options.experimental) };
+  return { offered: composable };
 }
 
 /**

@@ -233,9 +233,10 @@ fn new_pane_013_authoring_spawn_records_last_command() {
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
     deck.wait_for_string("No mode"); // Mode cycler is up at "No mode"
     // PRD #220: "dispatcher" graduated and is now the LAST cycler slot, so
-    // saturating lands there; step back one to reach "schedule".
+    // saturating lands there; step back two, past `schedule: issues` (issue
+    // #193), to reach "schedule".
     deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
-    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
+    deck.send_keys(b"\x1b[D\x1b[D"); // Left ×2 → schedule
     deck.wait_for_string("schedule mode"); // selection landed on the schedule authoring mode
     deck.send_keys(b"\r"); // Mode → Name
     deck.send_keys(b"\r"); // Name → Command

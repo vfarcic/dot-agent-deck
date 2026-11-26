@@ -14,7 +14,8 @@ expression: text
     │  Mode:  [No mode] [Orch: ci-deployment-alpha]                        │    
     │         [Orch: ci-deployment-bravo]                                  │    
     │         [Orch: release-pipeline-charlie]                             │    
-    │         [Orch: nightly-regression-delta] [schedule] [dispatcher]     │    
+    │         [Orch: nightly-regression-delta] [schedule]                  │    
+    │         [schedule: issues] [dispatcher]                              │    
     │                                                                      │    
     │  Name:    myname                                                     │    
     │                                                                      │    

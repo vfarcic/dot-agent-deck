@@ -1555,7 +1555,7 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
 }
 
 // ---------------------------------------------------------------------------
-// scheduler/form/007 — the experimental `schedule: issues` authoring option (PRD
+// scheduler/form/007 — the `schedule: issues` authoring option (PRD
 // #120) seeds the authoring agent with ISSUE-DISPATCH instructions, distinct
 // from the plain `schedule` seed. The option lives on the new-pane Mode cycler
 // (reached via Ctrl+n, NOT the mode-locked manager Add/Edit form), so this test
@@ -1565,17 +1565,15 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
 
 /// Scenario: With `default_command` set to a `stub-issue-authoring` recorder shim
 /// (posts SessionStart, then records every gated-delivered seed line) and the
-/// `experimental` flag ON, open the new-pane dialog (Ctrl+n → Space confirms the
-/// dir → the new-pane form) and cycle the Mode field to the experimental
+/// `experimental` flag OFF, open the new-pane dialog (Ctrl+n → Space confirms the
+/// dir → the new-pane form) and cycle the Mode field to the
 /// `schedule: issues` authoring option (appended after the plain `schedule`
 /// option; the cycler caps at the last option so an over-count of Rights is
 /// safe). Submitting via `[Submit]` spawns the seeded authoring agent. Assert the
 /// delivered seed is ISSUE-DISPATCH specific — it tells the agent to call
 /// `dot-agent-deck schedule add --repo …` and gathers `max_per_run` — neither of
 /// which appears in the plain-`schedule` seed (which calls `schedule add --name`
-/// and never mentions repo/max_per_run). RED today: no `schedule: issues` option
-/// exists, so cycling never lands on it and the `schedule: issues mode` title
-/// wait times out.
+/// and never mentions repo/max_per_run).
 #[spec("scheduler/form/007")]
 #[test]
 fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
@@ -1609,16 +1607,16 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
-        // PRD #120: the `schedule: issues` modal option ships behind the
-        // experimental flag — turn it ON so the cycler offers it.
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        // Issue #193: the `schedule: issues` option graduated from the
+        // experimental flag, so pin the flag OFF to prove it is offered anyway.
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "0")
         .with_env("PATH", path_env)
         .with_env(PROFILE_SELECTOR, "standin")
         .with_env(PROFILE_BINARY, profiled_binary(&shim_dir))
         .launch_with_fixture("schedule-mode");
     deck.wait_for_string("No active agents");
 
-    // Open the new-pane form and cycle the Mode field to the experimental
+    // Open the new-pane form and cycle the Mode field to the
     // `schedule: issues` authoring option.
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
