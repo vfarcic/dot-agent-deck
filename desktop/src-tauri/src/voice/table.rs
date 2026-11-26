@@ -1528,18 +1528,27 @@ mod tests {
                     "cancel_inbox_message",
                     "confirmCancelInboxMessage",
                     vec!["deck"]
-                ), // PRD #2374: the agent cards, on the dashboard only.
+                ), // PRD #2374: the agent cards, on the dashboard and, since PR #2491, the agent pane.
                 ("set_overview_mode", "setOverviewMode", vec!["overview"]),
-                ("show_agent_card", "showAgentCard", vec!["overview"]),
-                ("next_agent_card", "nextAgentCard", vec!["overview"]),
-                ("previous_agent_card", "previousAgentCard", vec!["overview"]),
-                ("next_needs_you_card", "nextNeedsYouCard", vec!["overview"]),
+                (
+                    "show_agent_card",
+                    "showAgentCard",
+                    vec!["overview", "agent"]
+                ),
+                ("next_agent_card", "nextAgentCard", vec!["agent"]),
+                ("previous_agent_card", "previousAgentCard", vec!["agent"]),
+                (
+                    "next_needs_you_card",
+                    "nextNeedsYouCard",
+                    vec!["overview", "agent"]
+                ),
                 (
                     "filter_needs_you_cards",
                     "toggleNeedsYouFilter",
                     vec!["overview"]
                 ),
-                ("close_agent_card", "closeAgentCard", vec!["overview"]),
+                ("show_card_tab", "showCardTab", vec!["agent"]),
+                ("show_terminal_tab", "showTerminalTab", vec!["agent"]),
                 ("open_card_tree", "openCardTree", vec!["overview"]),
                 ("close_card_tree", "closeCardTree", vec!["overview"]),
                 (
@@ -1548,8 +1557,88 @@ mod tests {
                     vec!["overview"]
                 ),
                 ("open_card_issue", "openCardIssue", vec!["overview"]),
-                ("run_card_action", "runCardAction", vec!["overview"]),
-                ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
+                (
+                    "run_card_action",
+                    "runCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "run_card_action_batch",
+                    "runCardActionBatch",
+                    vec!["overview"]
+                ),
+                ("select_agent_card", "selectAgentCard", vec!["overview"]),
+                ("unselect_agent_card", "unselectAgentCard", vec!["overview"]),
+                (
+                    "clear_card_selection",
+                    "clearCardSelection",
+                    vec!["overview"]
+                ),
+                (
+                    "run_card_action_on_selection",
+                    "runSelectionBatch",
+                    vec!["overview"]
+                ),
+                (
+                    "open_card_actions_editor",
+                    "openCardActionsEditor",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "add_card_action",
+                    "addCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "edit_card_action",
+                    "editCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "remove_card_action",
+                    "removeCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "refresh_card_actions",
+                    "refreshCardActions",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "choose_card_action_icon",
+                    "chooseCardActionIcon",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "ask_before_sending_card_action",
+                    "askBeforeSendingCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "send_card_action_without_asking",
+                    "sendCardActionWithoutAsking",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "offer_card_action_on_every_card",
+                    "offerCardActionOnEveryCard",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "offer_card_action_when_agents_choose",
+                    "offerCardActionWhenAgentsChoose",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "show_card_action_on_the_card",
+                    "showCardActionOnCard",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "show_card_action_only_in_the_card_tab",
+                    "showCardActionOnlyInCardTab",
+                    vec!["overview", "agent"]
+                ),
             ]
         );
     }
@@ -2542,20 +2631,35 @@ mod tests {
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",
-                // PRD #2374: the agent cards, on the dashboard only.
+                // PRD #2374: the agent cards, on the dashboard. PR #2491
+                // decision 2026-11-25: moving between agents and the Card
+                // panel are the agent pane's, below.
                 "set_overview_mode",
                 "show_agent_card",
-                "next_agent_card",
-                "previous_agent_card",
                 "next_needs_you_card",
                 "filter_needs_you_cards",
-                "close_agent_card",
                 "open_card_tree",
                 "close_card_tree",
                 "open_card_pull_request",
                 "open_card_issue",
                 "run_card_action",
-                "reply_to_agent_card"
+                "run_card_action_batch",
+                "select_agent_card",
+                "unselect_agent_card",
+                "clear_card_selection",
+                "run_card_action_on_selection",
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_card_tab"
             ]
         );
         assert_eq!(
@@ -2596,7 +2700,30 @@ mod tests {
                 // Issue #1402: ask to close the agent shown in the pane.
                 "stop_agent",
                 // PRD #2119: ask the pane's agent to generate the config.
-                "generate_config"
+                "generate_config",
+                // PR #2491 decision 2026-11-25: the pane's Card tab (2026-11-26), the
+                // moves between agents, another agent's card and its actions.
+                "show_agent_card",
+                "next_agent_card",
+                "previous_agent_card",
+                "next_needs_you_card",
+                "show_card_tab",
+                "show_terminal_tab",
+                "run_card_action",
+                // PR #2491 review T1: the Card actions editor, which the Card
+                // panel's Edit opens over the pane, and its form's rows.
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_card_tab"
             ]
         );
         // PRD #1401 — over the pull request browser: the rows callable

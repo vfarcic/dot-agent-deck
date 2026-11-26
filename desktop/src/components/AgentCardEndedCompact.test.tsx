@@ -3,13 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import { placedCardKey, type PlacedCard } from "../lib/agentCards";
 import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
 import type { AgentCardEntry, EndedRole } from "../types";
-import { AgentCardOverlay } from "./AgentCardOverlay";
+import { AgentCardPanel } from "./AgentCardPanel";
 import { AgentCardsDeckBody } from "./AgentCardsGrid";
 
 /*
  * Issue #1965 on the compact card of issue #2418: an exited orchestration
  * role's reason sits on the card's one-line status line, at any depth of the
- * tree, and the card's overlay shows the reason and the last output in full.
+ * tree, and the agent pane's Card tab shows the reason and the last output
+ * in full.
  */
 
 function card(agentId: string, name: string, overrides: Partial<AgentCardEntry> = {}): PlacedCard {
@@ -53,8 +54,8 @@ const REVIEWER: EndedRole = {
 describe("an exited role on the compact card (issue #1965, issue #2418)", () => {
   /// Scenario: The Cards tree shows an orchestrator with its reviewer role opened under it; the reviewer's command exited at
   /// spawn. The reviewer's card, one level down, says Exited, why and its last output on its status line, not on a line of its
-  /// own, and a click on that text opens the card's overlay like the rest of the card.
-  it("says why on the status line of a card under another, and opens the overlay from there", () => {
+  /// own, and a click on that text opens the agent like the rest of the card.
+  it("says why on the status line of a card under another, and opens the agent's card from there", () => {
     const orchestrator = card("1", "orchestrator", { status: "idle" });
     const reviewer = card("4", "reviewer", { parent: orchestrator.entry.key });
     const showAgentCard = vi.fn(() => undefined);
@@ -82,12 +83,12 @@ describe("an exited role on the compact card (issue #1965, issue #2418)", () => 
     expect(showAgentCard).toHaveBeenCalledTimes(1);
   });
 
-  /// Scenario: The overlay of the exited reviewer's card is open. It shows Exited, the reason, and every line of the last output,
-  /// each on its own line, where the card had to cut them short.
-  it("shows the reason and every line of the last output in the overlay", () => {
+  /// Scenario: The exited reviewer's pane is open with its Card tab. The Card tab shows Exited, the reason, and every line of the
+  /// last output, each on its own line, where the card had to cut them short.
+  it("shows the reason and every line of the last output in the Card tab", () => {
     const reviewer = card("4", "reviewer");
-    render(<AgentCardOverlay card={reviewer} lastName="reviewer" position={1} count={1} step={undefined} results={{}} tree controls={{ closeAgentCard: vi.fn() } as never} ended={REVIEWER} />);
-    const section = screen.getByTestId("agent-card-overlay-ended");
+    render(<AgentCardPanel card={reviewer} name="reviewer" results={{}} tree controls={{ runCardAction: vi.fn(), openCardReference: vi.fn(), stepAgentCard: vi.fn() }} ended={REVIEWER} />);
+    const section = screen.getByTestId("agent-card-panel-ended");
     expect(section).toHaveTextContent(ENDED_ROLE_WORDS.status);
     expect(section).toHaveTextContent("its command exited (code 1)");
     expect(section).toHaveTextContent(`${ENDED_ROLE_WORDS.lastOutput}:`);

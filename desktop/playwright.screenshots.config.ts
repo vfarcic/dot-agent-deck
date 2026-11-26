@@ -88,6 +88,9 @@ export default defineConfig({
     baseURL: `http://127.0.0.1:${PORT}`,
     viewport: { width: 1280, height: 800 },
     deviceScaleFactor: 2,
+    // The context's starting scheme only: every shot sets its own theme, the
+    // OS preference and the app's Appearance choice both, once per theme of
+    // the run (`useTheme` in `screenshots/support.ts`, PR #2491).
     colorScheme: "dark",
     locale: "en-US",
     timezoneId: "UTC",

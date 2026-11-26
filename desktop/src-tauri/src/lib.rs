@@ -1854,6 +1854,15 @@ pub(crate) struct DesktopAgentCards {
     /// drops them otherwise). `false` for an older daemon, whose cards the
     /// webview draws as roots with no roll-up.
     tree: bool,
+    /// Issue #2399: the daemon advertised batch card actions, so the webview
+    /// may offer them (`agent_card_invoke_batch`). `false` for an older
+    /// daemon, which the shared client never sends a batch.
+    batch: bool,
+    /// Issue #2399 (PR #2491 scope extension): the daemon advertised the
+    /// card-action editor's request, so the webview may edit its card
+    /// actions (`agent_card_catalog_edit`). `false` for an older daemon,
+    /// whose actions the editor shows read-only.
+    catalog_edit: bool,
 }
 
 impl DesktopAgentCards {
@@ -1866,6 +1875,8 @@ impl DesktopAgentCards {
             entries: list.entries,
             catalog_errors: list.catalog_errors,
             tree: answer.tree,
+            batch: answer.batch,
+            catalog_edit: answer.catalog_edit,
         }
     }
 }
@@ -2143,6 +2154,466 @@ async fn agent_card_invoke(
             "this deck's daemon does not support agent cards; upgrade it to act on cards",
         ),
     })
+}
+
+/// Issue #2399: preview or execute action `action_id` on many cards of deck
+/// `deck_id` in one request (`mode` `preview` or `execute`). `instance_id` is
+/// the daemon process that listed the cards; the shared client binds the call
+/// to it and withholds it from a daemon that does not advertise batches. An
+/// execution's `entries` carry the token and instance their preview
+/// answered, and the daemon checks each as a single press. The answer is the
+/// daemon's, one outcome per entry; a replaced or older daemon answers every
+/// entry `failed` with `daemon_replaced` / `unsupported`, nothing sent. The
+/// wait is bounded ([`card_batch_reply_timeout`]).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn agent_card_invoke_batch(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    action_id: String,
+    mode: dot_agent_deck::agent_cards::CardBatchMode,
+    request_id: String,
+    entries: Vec<dot_agent_deck::agent_cards::CardBatchEntry>,
+) -> Result<dot_agent_deck::agent_cards::CardBatchResult, String> {
+    ensure_main_webview(&webview)?;
+    agent_card_invoke_batch_on(
+        &state,
+        &deck_id,
+        &instance_id,
+        &action_id,
+        mode,
+        &request_id,
+        entries,
+    )
+    .await
+}
+
+/// Issue #2399 (PR #2491 scope extension): the card-action editor. With no
+/// `edit`, read deck `deck_id`'s editable card actions; with one, ask its
+/// daemon to apply it to the daemon's own user config and answer the actions
+/// afterwards. The webview names no file: the daemon writes only its own user
+/// config. `instance_id` is the daemon process whose card actions the user was
+/// shown; a daemon that replaced it is sent nothing, and a request naming none
+/// is refused unsent (an `Option` so that refusal is said in words rather than
+/// as a missing argument). A refused edit is the
+/// daemon's reason; a daemon without the editor's capability is sent nothing.
+/// The wait is bounded
+/// ([`crate::daemon_bridge::DECK_REPLY_TIMEOUT`]).
+#[tauri::command]
+async fn agent_card_catalog_edit(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: Option<String>,
+    edit: Option<dot_agent_deck::card_catalog::CatalogActionEdit>,
+) -> Result<dot_agent_deck::card_catalog::EditableCardCatalog, String> {
+    ensure_main_webview(&webview)?;
+    agent_card_catalog_edit_on(&state, &deck_id, instance_id.as_deref(), edit).await
+}
+
+/// What the editor says for a deck whose daemon cannot edit card actions.
+pub(crate) const CARD_CATALOG_EDIT_UNSUPPORTED: &str = "this deck's daemon is from a release whose card actions cannot be edited from the app; upgrade it, or edit its user config file";
+
+/// PR #2491 review (Qodo 4): why a read or an edit bound to the daemon process
+/// whose card actions the user was shown reached no daemon: another process
+/// answers at the deck now. An edit adds that nothing was saved.
+pub(crate) const CARD_CATALOG_DAEMON_REPLACED: &str =
+    "the deck's daemon was restarted since its cards were read";
+
+/// PR #2491 audit (A1): why a read or an edit that names no daemon process
+/// reached no daemon. Without the process whose card actions the user was
+/// shown, a replacement could not be told from it, so nothing is sent. An
+/// edit adds that nothing was saved.
+pub(crate) const CARD_CATALOG_DAEMON_UNNAMED: &str =
+    "the app did not say which of the deck's daemon processes its card actions were read from";
+
+/// The words in an edit's failure that say it may have been saved: its answer
+/// was lost after it was sent. The webview's bridge looks for them
+/// (`CARD_CATALOG_EDIT_MAY_HAVE_SAVED` in `desktop/src/lib/bridge.ts`) to tell
+/// such a failure from a refusal (issue #2399 review 8).
+pub(crate) const CARD_CATALOG_EDIT_MAY_HAVE_SAVED: &str = "it may have been saved";
+
+/// [`agent_card_catalog_edit`] minus the webview. Reaching and trusting the
+/// deck and the exchange run against one deadline,
+/// [`crate::daemon_bridge::DECK_REPLY_TIMEOUT`] from when it starts, so a deck
+/// that never answers holds the editor no longer than any round trip. A
+/// refusal is the daemon's reason as it gave it, and nothing was written. An
+/// edit that failed, or ran out of time, once it was being written says it
+/// may have been saved ([`CARD_CATALOG_EDIT_MAY_HAVE_SAVED`]); the editor then
+/// reads the catalog once more instead of repeating the edit. One that failed
+/// or ran out of time before that, connecting or on the `Hello`, says nothing
+/// was saved. The request is bound to the daemon process `instance_id` names
+/// (PR #2491 review, Qodo 4), as a batch is: a daemon that replaced it is sent
+/// nothing, and the answer is [`CARD_CATALOG_DAEMON_REPLACED`]. A request that
+/// names no process (`None`, or an empty id) is refused before the deck is
+/// reached (PR #2491 audit, A1), answering [`CARD_CATALOG_DAEMON_UNNAMED`]:
+/// without an identity there is nothing to tell a replacement by, so missing
+/// identity never selects an unbound request.
+pub(crate) async fn agent_card_catalog_edit_on(
+    state: &DesktopState,
+    deck_id: &str,
+    instance_id: Option<&str>,
+    edit: Option<dot_agent_deck::card_catalog::CatalogActionEdit>,
+) -> Result<dot_agent_deck::card_catalog::EditableCardCatalog, String> {
+    let deadline = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+    let until = tokio::time::Instant::now() + deadline;
+    let edits = edit.is_some();
+    let Some(instance) = instance_id.filter(|id| !id.is_empty()) else {
+        let unsent = if edits { "; nothing was saved" } else { "" };
+        return Err(format!("{CARD_CATALOG_DAEMON_UNNAMED}{unsent}"));
+    };
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = match tokio::time::timeout_at(until, state.daemon.trusted(scope.endpoint())).await
+    {
+        Ok(Ok(daemon)) => daemon,
+        Ok(Err(error)) => return Err(safe_message(error)),
+        Err(_) => {
+            return Err(format!(
+                "the deck could not be reached within {}s; nothing was saved",
+                deadline.as_secs()
+            ));
+        }
+    };
+    daemon.require_compatible()?;
+    let (unsent, unknown) = if edits {
+        (
+            "; nothing was saved".to_string(),
+            format!("; {CARD_CATALOG_EDIT_MAY_HAVE_SAVED}, so check the list before saving again"),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    // PR #2491 review (Qodo 4): bound, like a batch, to the daemon process
+    // whose card actions the user was shown, so the `Hello` that would carry
+    // the request refuses a daemon that replaced it and nothing is sent.
+    let client = daemon
+        .client
+        .bound_to(Incarnation::from(Some(instance.to_string())));
+    // PR #2491 review (Qodo 10): the connection and its `Hello` first, with
+    // nothing of the edit written, so a failure or the bound running out here
+    // says plainly that nothing was saved; only once the edit is being
+    // written may it have been saved whatever became of the answer.
+    let connection =
+        match tokio::time::timeout_at(until, client.card_catalog_edit_connection()).await {
+            Ok(Ok(Some(connection))) => connection,
+            Ok(Ok(None)) => return Err(CARD_CATALOG_EDIT_UNSUPPORTED.to_string()),
+            Ok(Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed)) => {
+                return Err(format!("{CARD_CATALOG_DAEMON_REPLACED}{unsent}"));
+            }
+            Ok(Err(ClientError::Server(reason))) => return Err(safe_message(reason)),
+            Ok(Err(error)) => return Err(safe_message(format!("{error}{unsent}"))),
+            Err(_) => {
+                return Err(format!(
+                    "the deck did not answer within {}s{unsent}",
+                    deadline.as_secs()
+                ));
+            }
+        };
+    match tokio::time::timeout_at(until, connection.send(edit)).await {
+        Ok(Ok(catalog)) => Ok(catalog),
+        Ok(Err(ClientError::Server(reason))) => Err(safe_message(reason)),
+        Ok(Err(ClientError::Unanswered(detail))) => Err(safe_message(format!(
+            "the deck's answer was lost or could not be read ({detail}){unknown}"
+        ))),
+        Ok(Err(error)) => Err(safe_message(format!("{error}{unknown}"))),
+        Err(_) => Err(format!(
+            "the deck did not answer within {}s{unknown}",
+            deadline.as_secs()
+        )),
+    }
+}
+
+/// Issue #2399 re-review: the outcome of an executed entry whose fate the
+/// bridge cannot confirm — the same word as the daemon's
+/// [`dot_agent_deck::agent_cards::BATCH_UNKNOWN`], which a daemon answers for
+/// an entry of a batch it started and cannot account for (codes `interrupted`
+/// and `answer_not_kept`). From this bridge it carries
+/// [`CODE_CARD_BATCH_NO_ANSWER`] when [`card_batch_reply_timeout`] ran out, and
+/// [`CODE_CARD_BATCH_CONNECTION_LOST`] when the connection broke after the
+/// request was written. The entry may have been delivered, may still be, or
+/// may not be: a timeout can be spent before the request was written, so it is
+/// not proof the request was sent either. It is neither `failed` ("not sent")
+/// nor `delivered`.
+pub(crate) const CARD_BATCH_UNKNOWN: &str = dot_agent_deck::agent_cards::BATCH_UNKNOWN;
+/// The code an entry carries beside [`CARD_BATCH_UNKNOWN`] when the bound ran
+/// out with no answer, whether or not the request had been written by then.
+pub(crate) const CODE_CARD_BATCH_NO_ANSWER: &str = "no_answer";
+
+/// The extra time an executed batch is allowed for each entry it names.
+///
+/// A daemon runs an execution's entries one after another and answers once,
+/// after the last, so the wait grows with the batch. A prompt entry is an
+/// in-memory post; a close waits for its agent to stop, which the daemon gives
+/// a termination grace of seconds before it removes the agent's pane. Ten
+/// seconds an entry is headroom over that, not a tuned value: the bound is
+/// there so a daemon that took the request and went quiet does not hold the
+/// dialog forever, not to hurry a daemon that is working.
+pub(crate) const CARD_BATCH_ENTRY_ALLOWANCE: Duration = Duration::from_secs(10);
+
+/// The longest one executed batch command takes, however many entries it
+/// names (PR #2491 review): reaching and trusting the deck, then sending the
+/// request and waiting for its answer, all within one deadline taken when the
+/// command starts.
+///
+/// While it waits, the batch dialog holds the app (`useInertBackground`) and
+/// refuses Cancel, `Escape` and voice's `close`, so the wait is a freeze of
+/// the whole window; at [`CARD_BATCH_ENTRY_ALLOWANCE`] an entry alone, a
+/// 256-entry batch would hold it for over 40 minutes. Three minutes is the
+/// most of that freeze we accept. A working daemon's prompt entries are
+/// in-memory posts that take milliseconds each. A close entry's own wait for
+/// its agent to stop is bounded by the deck's termination grace (3 s,
+/// `AGENT_TERMINATE_GRACE`), but the rest of a close (releasing the pane, a
+/// kept worktree) is not bounded by it, so a batch of many closes on a loaded
+/// host can run past the ceiling. Past it, every entry reads No answer, as
+/// any unanswered batch does: the daemon keeps going, and each card's own
+/// delivery history shows what it did.
+pub(crate) const CARD_BATCH_EXECUTE_CEILING: Duration = Duration::from_secs(180);
+
+/// How long the desktop waits for a daemon's answer to one batch request.
+///
+/// A preview reads the cards and sends nothing, so it is any round trip
+/// ([`crate::daemon_bridge::DECK_REPLY_TIMEOUT`]). An execution is that plus
+/// [`CARD_BATCH_ENTRY_ALLOWANCE`] for each entry it names (a repeated entry
+/// counts, which only lengthens the wait), capped at
+/// [`CARD_BATCH_EXECUTE_CEILING`].
+pub(crate) fn card_batch_reply_timeout(
+    mode: dot_agent_deck::agent_cards::CardBatchMode,
+    entries: usize,
+) -> Duration {
+    match mode {
+        dot_agent_deck::agent_cards::CardBatchMode::Preview => {
+            crate::daemon_bridge::DECK_REPLY_TIMEOUT
+        }
+        dot_agent_deck::agent_cards::CardBatchMode::Execute => {
+            let entries = u32::try_from(entries).unwrap_or(u32::MAX);
+            crate::daemon_bridge::DECK_REPLY_TIMEOUT
+                .saturating_add(CARD_BATCH_ENTRY_ALLOWANCE.saturating_mul(entries))
+                .min(CARD_BATCH_EXECUTE_CEILING)
+        }
+    }
+}
+
+/// What an executed entry the daemon did not answer in `waited` says.
+pub(crate) fn card_batch_no_answer_message(waited: Duration) -> String {
+    format!(
+        "the deck did not answer within {}s, so it is not known whether this agent got it; the deck may still deliver it. Check the agent before sending again",
+        waited.as_secs()
+    )
+}
+
+/// The code an executed entry carries beside [`CARD_BATCH_UNKNOWN`] when no
+/// readable answer came back after the request was sent: the daemon closed
+/// the connection, the reply was cut off, or it arrived and could not be read.
+pub(crate) const CODE_CARD_BATCH_CONNECTION_LOST: &str = "connection_lost";
+/// The code an executed entry carries beside `failed` when the request never
+/// left the desktop: the deck could not be reached, its `Hello` failed, or the
+/// desktop refused it before sending.
+pub(crate) const CODE_CARD_BATCH_NOT_SENT: &str = "not_sent";
+/// The code an entry carries when the daemon refused: the `Hello` the request
+/// would have followed, or the whole request. The daemon refuses a whole
+/// request only before it runs any entry; once an execution starts it answers
+/// per entry. An executed entry carries it beside `failed`, a previewed one
+/// beside `skipped`.
+pub(crate) const CODE_CARD_BATCH_DECK_REFUSED: &str = "deck_refused";
+
+/// What an executed entry says when the deck's answer was lost or could not be
+/// read after the request was sent: the connection broke, the reply was cut
+/// off, or it arrived and could not be decoded (`detail` is the client's own
+/// words).
+pub(crate) fn card_batch_connection_lost_message(detail: &str) -> String {
+    format!(
+        "the deck's answer was lost or could not be read after the request was sent ({detail}), so it is not known whether this agent got it. Check the agent before sending again"
+    )
+}
+
+/// [`agent_card_invoke_batch`] minus the webview.
+///
+/// The whole command — acquiring the trusted link (waiting for the deck's
+/// establishment gate, and a handshake when the held link is stale), then the
+/// batch exchange — runs against one deadline, [`card_batch_reply_timeout`]
+/// from when it starts (PR #2491 review). A preview sends nothing, so a deck
+/// that cannot be reached, cannot be trusted or does not answer is an error,
+/// and a deck that answered and declined the preview answers every entry
+/// `skipped` with the reason, so the user reads why rather than that nobody
+/// answered: a handshake classified incompatible, a `Hello` on another
+/// attach protocol or one the desktop does not admit, a replaced daemon, an
+/// older daemon without batches, or the request refused whole. An execution
+/// answers every entry, and which outcome depends on what the bridge can
+/// place:
+///
+/// - a failure known to come before the request was written (the deck could
+///   not be reached or trusted, its `Hello` failed or was declined, it is a
+///   successor of the daemon that listed the cards), and the daemon refusing
+///   the whole request, make every entry `failed`: no entry ran. The daemon
+///   refuses a whole request only before it runs any entry; an execution it
+///   started answers per entry, an entry it cannot account for being
+///   `unknown` with its own code, and that answer is passed on as it is. The
+///   deadline running out while the link is still being acquired is one of
+///   these: the request is written only after the link is held.
+/// - a failure after it was written (the connection broke, the reply was cut
+///   off or unreadable) makes every entry [`CARD_BATCH_UNKNOWN`] with
+///   [`CODE_CARD_BATCH_CONNECTION_LOST`]: the daemon may have delivered it, or
+///   be delivering it still, so "not sent" would be a claim nobody can make.
+///   The client says which by answering [`ClientError::Unanswered`] for every
+///   failure after the first byte of the request.
+/// - the bound running out makes every entry [`CARD_BATCH_UNKNOWN`] with
+///   [`CODE_CARD_BATCH_NO_ANSWER`] once the link is held. The bound does not
+///   say whether the request was written before it ran out (a hung connect or
+///   `Hello` of the exchange spends it too), so the outcome is unconfirmed
+///   rather than sent.
+///
+/// Nothing is sent again: the user decides, from the cards, whether to.
+async fn agent_card_invoke_batch_on(
+    state: &DesktopState,
+    deck_id: &str,
+    instance_id: &str,
+    action_id: &str,
+    mode: dot_agent_deck::agent_cards::CardBatchMode,
+    request_id: &str,
+    entries: Vec<dot_agent_deck::agent_cards::CardBatchEntry>,
+) -> Result<dot_agent_deck::agent_cards::CardBatchResult, String> {
+    use dot_agent_deck::agent_cards::CardBatchMode;
+    let every =
+        |outcome: &str, code: &str, message: &str| dot_agent_deck::agent_cards::CardBatchResult {
+            request_id: request_id.to_string(),
+            entries: entries
+                .iter()
+                .map(|entry| dot_agent_deck::agent_cards::CardBatchOutcome {
+                    pane_id: entry.pane_id.clone(),
+                    agent_id: entry.agent_id.clone(),
+                    outcome: outcome.into(),
+                    code: Some(code.into()),
+                    message: Some(safe_message(message)),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+    // One deadline for the whole command, the link's acquisition included.
+    let deadline = card_batch_reply_timeout(mode, entries.len());
+    let until = tokio::time::Instant::now() + deadline;
+    let failed = dot_agent_deck::agent_cards::BATCH_FAILED;
+    // The request was not written: a preview fails, an execution's entries
+    // are each `failed` with `code`.
+    let not_sent = |code: &str, error: &str| match mode {
+        CardBatchMode::Preview => Err(safe_message(error)),
+        CardBatchMode::Execute => Ok(every(failed, code, &format!("{error}; nothing was sent"))),
+    };
+    // The deck refused, and ran no entry: an execution's entries are each
+    // `failed` (`unsent` says what was not done), a preview's each `skipped`,
+    // with the deck's reason.
+    let refused = |code: &str, reason: &str, unsent: &str| match mode {
+        CardBatchMode::Preview => Ok(every(
+            dot_agent_deck::agent_cards::BATCH_SKIPPED,
+            code,
+            &format!("{reason}; nothing is sent to this agent"),
+        )),
+        CardBatchMode::Execute => Ok(every(failed, code, &format!("{reason}; {unsent}"))),
+    };
+    // The deck answered and declined to take the request on this link: a
+    // preview's entries are each `skipped` with the reason, an execution's
+    // each `failed`, not sent.
+    let declined = |error: &str| match mode {
+        CardBatchMode::Preview => Ok(every(
+            dot_agent_deck::agent_cards::BATCH_SKIPPED,
+            CODE_CARD_BATCH_DECK_REFUSED,
+            &format!("{error}; nothing is sent to this agent"),
+        )),
+        CardBatchMode::Execute => not_sent(CODE_CARD_BATCH_NOT_SENT, error),
+    };
+    let daemon = match crate::dto::DeckScope::resolve(Some(deck_id)) {
+        Ok(scope) => {
+            match tokio::time::timeout_at(until, state.daemon.trusted(scope.endpoint())).await {
+                Ok(Ok(daemon)) => daemon,
+                Ok(Err(error)) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
+                Err(_) => {
+                    return not_sent(
+                        CODE_CARD_BATCH_NOT_SENT,
+                        &format!(
+                            "the deck could not be reached within {}s",
+                            deadline.as_secs()
+                        ),
+                    );
+                }
+            }
+        }
+        Err(error) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
+    };
+    // The handshake was answered and classified incompatible.
+    if let Err(error) = daemon.require_compatible() {
+        return declined(&error);
+    }
+    let reply = daemon.client.invoke_card_action_batch(
+        instance_id,
+        mode,
+        action_id,
+        request_id,
+        entries.clone(),
+    );
+    let answer = match tokio::time::timeout_at(until, reply).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed)) => {
+            return refused(
+                dot_agent_deck::agent_cards::CODE_DAEMON_REPLACED,
+                "the deck's daemon was restarted after these cards were read",
+                "nothing was sent",
+            );
+        }
+        Ok(Err(ClientError::Unanswered(detail))) => {
+            return match mode {
+                CardBatchMode::Preview => Err(safe_message(format!(
+                    "the deck's answer to the preview was lost or could not be read ({detail})"
+                ))),
+                CardBatchMode::Execute => Ok(every(
+                    CARD_BATCH_UNKNOWN,
+                    CODE_CARD_BATCH_CONNECTION_LOST,
+                    &card_batch_connection_lost_message(&detail),
+                )),
+            };
+        }
+        // The `Hello` on the request's own connection was answered on another
+        // attach protocol, or one this desktop does not admit: nothing was
+        // sent.
+        Ok(Err(error @ (ClientError::ProtocolMismatch { .. } | ClientError::NotAdmitted(_)))) => {
+            return declined(&error.to_string());
+        }
+        // The daemon refused the `Hello` or the request: either way it ran no
+        // entry, though the request itself may have reached it. The daemon
+        // refuses a batch whole only before it runs any entry; once it runs
+        // one, its answer is per entry and arrives as `Answered` below.
+        Ok(Err(error @ ClientError::Server(_))) => {
+            return refused(
+                CODE_CARD_BATCH_DECK_REFUSED,
+                &format!("the deck refused the request: {error}"),
+                "nothing was delivered",
+            );
+        }
+        // Every failure after the request's first byte is `Unanswered`, so
+        // what is left failed before it: connecting, or the `Hello`.
+        Ok(Err(error)) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error.to_string()),
+        Err(_) => {
+            return match mode {
+                CardBatchMode::Preview => Err(safe_message(format!(
+                    "the daemon took the connection but did not answer the preview within {}s",
+                    deadline.as_secs()
+                ))),
+                CardBatchMode::Execute => Ok(every(
+                    CARD_BATCH_UNKNOWN,
+                    CODE_CARD_BATCH_NO_ANSWER,
+                    &card_batch_no_answer_message(deadline),
+                )),
+            };
+        }
+    };
+    match answer {
+        GatedQuery::Answered(result) => Ok(result),
+        GatedQuery::Unsupported => refused(
+            "unsupported",
+            "this deck's daemon does not support batch card actions; upgrade it to act on several cards at once",
+            "nothing was sent",
+        ),
+    }
 }
 
 /// Has the selection moved since this receiver last observed it?
@@ -4062,6 +4533,7 @@ async fn desktop_voice_resolve(
     endpoints: Option<crate::settings::EndpointSettings>,
     dictation: Option<voice::VoiceDictationTarget>,
     reading: Option<voice::VoiceReadingState>,
+    dashboard: Option<voice::VoiceDashboard>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -4107,6 +4579,7 @@ async fn desktop_voice_resolve(
             endpoints: endpoints.as_ref(),
             dictation: dictation.as_ref(),
             reading: reading.unwrap_or_default(),
+            dashboard: dashboard.as_ref(),
             other_agents: &others,
         },
         voice::Transcript::new(utterance),
@@ -4128,6 +4601,9 @@ struct VoiceDeclaration<'a> {
     dictation: Option<&'a voice::VoiceDictationTarget>,
     /// PRD #1497 — reading mode and the app's own speech, two booleans.
     reading: voice::VoiceReadingState,
+    /// PR #2491 (2026-11-25) — the agent dashboard's view and Needs you only,
+    /// while the dashboard is the screen.
+    dashboard: Option<&'a voice::VoiceDashboard>,
     /// PRD #2374 (PR #2378 review) — under All daemons, each other observed
     /// deck's agents, by deck id ([`other_deck_agents`]), which voice reaches
     /// beside the selected deck's ([`voice::VoiceDeck::agents`]). Empty when
@@ -4168,6 +4644,7 @@ async fn resolve_declared_utterance(
         declared.new_agent,
         declared.dictation,
         declared.reading,
+        declared.dashboard,
         transcript,
         labels,
         show_deck,
@@ -4272,6 +4749,7 @@ async fn desktop_voice_choice(
             endpoints: endpoints.as_ref(),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            dashboard: None,
             other_agents: &others,
         },
     ))
@@ -7905,6 +8383,8 @@ pub fn run() {
             agent_cards_consume,
             agent_cards_list,
             agent_card_invoke,
+            agent_card_invoke_batch,
+            agent_card_catalog_edit,
             interrupted_work_list,
             interrupted_work_show,
             interrupted_work_reclaim,
@@ -8695,6 +9175,7 @@ mod tests {
                 endpoints: Some(endpoints),
                 dictation: None,
                 reading: voice::VoiceReadingState::default(),
+                dashboard: None,
                 other_agents: &[],
             },
             voice::Transcript::new(said),
@@ -8895,6 +9376,7 @@ mod tests {
             endpoints: Some(endpoints),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            dashboard: None,
             other_agents: &[],
         };
         assert_eq!(

@@ -53,12 +53,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    DesktopAgent, IntentAnswer, IntentRequest, IntentResolver, MeaningRequest, NO_MATCH_ACTION,
-    ParamKind, REMOTE_TIMEOUT, Screen, Strictness, Transcript, VoiceChoice, VoiceDeck,
-    VoiceDictationTarget, VoiceDirectories, VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm,
-    VoiceOutcome,
+    DashboardView, DesktopAgent, IntentAnswer, IntentRequest, IntentResolver, MeaningRequest,
+    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Strictness, Transcript, VoiceChoice,
+    VoiceDashboard, VoiceDeck, VoiceDictationTarget, VoiceDirectories, VoiceDirectoryEntry,
+    VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome, VoiceReadingState,
     dictation::normalise,
-    handle_utterance_after_local_intercepts, handle_utterance_with_dictation,
+    handle_utterance_after_local_intercepts, handle_utterance_with_modes,
     meaning::{Place, every_action},
     resolver::{MeaningFuture, ResolveFuture},
     schema::DECK_HIDDEN_HINT,
@@ -221,6 +221,10 @@ struct PhraseFixture {
     /// It is the transcript's own slice, so it is compared exactly.
     #[serde(default)]
     resolved_command: Option<String>,
+    /// The card button's label grounded in the transcript, before the webview
+    /// matches it against the selected cards' available actions.
+    #[serde(default)]
+    resolved_card_action: Option<String>,
     #[serde(default)]
     pending_action: bool,
     /// PRD #1541 — run the utterance with typing mode on for the planted
@@ -238,6 +242,38 @@ struct PhraseFixture {
     /// sentence (no candidates) goes red instead of passing on the kind.
     #[serde(default)]
     candidates: Option<Vec<String>>,
+    /// PR #2491, 2026-11-25 — the agent dashboard's view as the voice panel
+    /// declares it with the utterance, `table` or `cards`. Set together with
+    /// `needs_you_only`, on the overview only. Absent means nothing about the
+    /// dashboard is declared, which is every fixture that predates it.
+    #[serde(default)]
+    dashboard_view: Option<String>,
+    /// Whether Needs you only is on, declared with `dashboard_view`.
+    #[serde(default)]
+    needs_you_only: Option<bool>,
+    /// The filter a `needs_you_filter` param must resolve to, `on` or `off`.
+    #[serde(default)]
+    resolved_needs_you: Option<String>,
+    /// The view an `overview_mode` param must resolve to, `table` or `cards`.
+    #[serde(default)]
+    resolved_view: Option<String>,
+}
+
+impl PhraseFixture {
+    /// The dashboard this fixture declares, if any.
+    fn dashboard(&self) -> Option<VoiceDashboard> {
+        let view = match self.dashboard_view.as_deref()? {
+            "table" => DashboardView::Table,
+            "cards" => DashboardView::Cards,
+            other => panic!("{}: unknown dashboard_view `{other}`", self.name),
+        };
+        Some(VoiceDashboard {
+            view,
+            needs_you_only: self.needs_you_only.unwrap_or_else(|| {
+                panic!("{}: `dashboard_view` needs `needs_you_only`", self.name)
+            }),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -443,7 +479,8 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 
 /// Scenario: Validate every checked-in phrase and the planted fleet before any
 /// live-model gate. With local opt-in, verify outcomes through the shipping
-/// keyed API backend with the deck shown or hidden as each fixture specifies.
+/// keyed API backend with the deck shown or hidden as each fixture specifies,
+/// including card selection versus opening and the selected cards' action label.
 #[tokio::test]
 // Quarantined (CLAUDE.md rule 6), owner vfarcic; local-only, never in CI. It
 // was red on every one of five full runs on 2026-11-19 and on all four on
@@ -452,7 +489,10 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 // `dictate-a-submit-word-in-passing-finished` and
 // `dismiss-antigravity-notice-by-its-label` each failed in at least three of
 // those four (rates on #2138) — so it stays ignored until those are fixed and
-// the rest is deterministic enough.
+// the rest is deterministic enough. `needs-you-only-on-clear-the-filter` (PR
+// #2491, 2026-11-25) was picked as `filter_needs_you_cards` and refused by the
+// meaning check in 2 of 5 runs, twice: "clear the filter" said while Needs you
+// only is on, now that the model is told the filter is on.
 #[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
     run_fixtures(manifest()).await;
@@ -489,13 +529,54 @@ fn paraphrase_manifest() -> FixtureManifest {
 
 /// Scenario: Parse the checked-in phrase and paraphrase manifests and check
 /// every fixture against the command table, the screens and the planted fleet,
-/// decks, directories and New agent form, with no model and no credential. This
+/// decks, directories, New agent form and card-action expectations, with no model and no credential. This
 /// keeps the fixtures checked in every run while 001 and 002 are quarantined.
 #[test]
 fn voice_desktop_phrases_010_phrase_and_paraphrase_fixtures_validate_without_a_model() {
     let world = planted_world();
     validate_fixtures(&manifest(), &world);
     validate_fixtures(&paraphrase_manifest(), &world);
+}
+
+/// Scenario: Read the checked-in phrases for "show all cards" and its kin. With Needs you only declared on, in either view, "show all cards", "show all" and "show every agent" are fixtures for turning the filter off; with it declared off on the Table view, "show all cards" is a fixture for switching to the Cards view. No model and no credential (PR #2491, 2026-11-25: `desktop/agent-cards/120`).
+#[test]
+fn voice_desktop_phrases_011_show_all_cards_has_fixtures_for_both_needs_you_states() {
+    let fixtures = manifest().fixtures;
+    let find = |utterance: &str, view: &str, on: bool| {
+        fixtures
+            .iter()
+            .find(|fixture| {
+                fixture.utterance == utterance
+                    && fixture.dashboard_view.as_deref() == Some(view)
+                    && fixture.needs_you_only == Some(on)
+            })
+            .unwrap_or_else(|| {
+                panic!("no fixture for {utterance:?} on {view} with Needs you only {on}")
+            })
+    };
+    for (utterance, view) in [
+        ("show all cards", "table"),
+        ("show all cards", "cards"),
+        ("show all", "cards"),
+        ("show every agent", "table"),
+    ] {
+        let fixture = find(utterance, view, true);
+        assert_eq!(fixture.action, "filter_needs_you_cards", "{}", fixture.name);
+        assert_eq!(
+            fixture.resolved_needs_you.as_deref(),
+            Some("off"),
+            "{}",
+            fixture.name
+        );
+    }
+    let fixture = find("show all cards", "table", false);
+    assert_eq!(fixture.action, "set_overview_mode", "{}", fixture.name);
+    assert_eq!(
+        fixture.resolved_view.as_deref(),
+        Some("cards"),
+        "{}",
+        fixture.name
+    );
 }
 
 /// Scenario: Classify start sentences over the open New agent form, bypassing command selection, and read only whether each says where to start or names what to start.
@@ -1557,6 +1638,29 @@ fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
     } = world;
     let form_choices = new_agent_form.form.as_ref().expect("planted");
     for fixture in &fixtures.fixtures {
+        // PR #2491, 2026-11-25: the dashboard is declared on the overview,
+        // its view and its filter together.
+        assert_eq!(
+            fixture.dashboard_view.is_some(),
+            fixture.needs_you_only.is_some(),
+            "{}: `dashboard_view` and `needs_you_only` are declared together",
+            fixture.name
+        );
+        if fixture.dashboard().is_some() {
+            assert_eq!(fixture.screen, "overview", "{}", fixture.name);
+        }
+        for (expected, allowed) in [
+            (&fixture.resolved_needs_you, ["on", "off"]),
+            (&fixture.resolved_view, ["table", "cards"]),
+        ] {
+            if let Some(value) = expected {
+                assert!(
+                    allowed.contains(&value.as_str()),
+                    "{}: {value}",
+                    fixture.name
+                );
+            }
+        }
         // PRD #1184: a chain fixture names every step, the first being its
         // `action`, and each a row of the table.
         assert_eq!(
@@ -1705,8 +1809,13 @@ fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
             );
         }
         if let Some(expected) = fixture.resolved_filter.as_deref() {
+            // Issue #2399 review 12: the Card actions form's icon is a
+            // `filter_text` too, held to the transcript the same way, and is
+            // chosen with no directory browser on screen.
             assert!(
-                fixture.listing || fixture.hostile_listing,
+                fixture.listing
+                    || fixture.hostile_listing
+                    || fixture.action == "choose_card_action_icon",
                 "{}: a `resolved_filter` needs `listing = true` or `hostile_listing = true`, \
                  since the Filter box is the directory browser's",
                 fixture.name
@@ -1722,6 +1831,25 @@ fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
             assert!(
                 fixture.form,
                 "{}: a `resolved_command` needs `form = true`, since Command is the live form's",
+                fixture.name
+            );
+        }
+        if let Some(expected) = fixture.resolved_card_action.as_deref() {
+            let row = table()
+                .row(&fixture.action)
+                .expect("card action row exists");
+            assert!(
+                fixture.outcome == OutcomeKind::Dispatch
+                    && row
+                        .params
+                        .iter()
+                        .any(|param| param.kind == ParamKind::CardAction),
+                "{}: `resolved_card_action` needs a dispatch with a card_action parameter",
+                fixture.name
+            );
+            assert!(
+                !expected.is_empty() && fixture.utterance.to_lowercase().contains(expected),
+                "{}: `resolved_card_action` must be the lowercased card label in the utterance",
                 fixture.name
             );
         }
@@ -1820,9 +1948,10 @@ async fn run_fixtures(fixtures: FixtureManifest) {
             deck_id: "deck-local".to_string(),
             agent_id: "agent-tester".to_string(),
         };
+        let dashboard = fixture.dashboard();
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
-            handle_utterance_with_dictation(
+            handle_utterance_with_modes(
                 resolver.as_ref(),
                 table(),
                 screen,
@@ -1831,6 +1960,8 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                 fixture_directories,
                 fixture_new_agent,
                 fixture.typing_mode.then_some(&typing_target),
+                VoiceReadingState::default(),
+                dashboard.as_ref(),
                 transcript,
                 Default::default(),
                 !fixture.deck_hidden,
@@ -1916,6 +2047,24 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                 let command_matches = match fixture.resolved_command.as_deref() {
                     Some(expected) => {
                         resolved_of(&answer.outcome, ParamKind::CommandText) == Some(expected)
+                    }
+                    None => true,
+                };
+                let needs_you_matches = match fixture.resolved_needs_you.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::NeedsYouFilter) == Some(expected)
+                    }
+                    None => true,
+                };
+                let view_matches = match fixture.resolved_view.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::OverviewMode) == Some(expected)
+                    }
+                    None => true,
+                };
+                let card_action_matches = match fixture.resolved_card_action.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::CardAction) == Some(expected)
                     }
                     None => true,
                 };
@@ -2016,6 +2165,9 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                     && prefix_matches
                     && filter_matches
                     && command_matches
+                    && card_action_matches
+                    && needs_you_matches
+                    && view_matches
                     && deck_named
                     && deck_eligible
                     && unavailable_named
@@ -2028,12 +2180,14 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
                          resolved_orchestration={:?} dictate_prefix={:?} resolved_filter={:?} \
                          resolved_command={:?} candidates={:?} resolved_kind={:?} \
-                         resolved_status={:?}, got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
+                         resolved_status={:?} resolved_card_action={:?}, got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
                          resolved_filter={:?} resolved_command={:?} candidates={:?} resolved_kind={:?} \
-                         resolved_status={:?} model_value={:?} sentence={:?}",
-                        if !candidates_match {
+                         resolved_status={:?} resolved_card_action={:?} model_value={:?} sentence={:?}",
+                        if !needs_you_matches || !view_matches {
+                            "the dashboard param resolved to another value; "
+                        } else if !candidates_match {
                             "the tie does not offer the expected candidates; "
                         } else if !deck_named {
                             "the report does not name the preselected deck; "
@@ -2060,6 +2214,7 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                         fixture.candidates,
                         fixture.resolved_kind,
                         fixture.resolved_status,
+                        fixture.resolved_card_action,
                         actual_action,
                         resolved_deck(&answer.outcome),
                         resolved_dir(&answer.outcome),
@@ -2072,6 +2227,7 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                         offered_values(&answer.outcome),
                         resolved_of(&answer.outcome, ParamKind::AgentKind),
                         resolved_of(&answer.outcome, ParamKind::AgentStatus),
+                        resolved_of(&answer.outcome, ParamKind::CardAction),
                         model_value(&answer.outcome),
                         // The app's own sentence, which says WHY a refusal
                         // refused — the kinds alone cannot tell a model's
