@@ -82,9 +82,10 @@ Background: 2 commands, 1 subagent · 3h 12m
 What the status reads depends on when the agent started the command:
 
 - **Waiting**, when a command it started in the turn that just ended is still running. The agent has handed that work off and its result is still to come, so the card does not read **Idle** yet. It turns **Idle** when those commands end.
+- A turn Claude Code starts by itself, to tell the agent that one of its background commands or subagents finished, is not a new turn here. If the agent started three background commands and the first two finish, the turns that report them leave the card on **Waiting** while the third still runs.
 - **Idle**, when everything still running was started in an earlier turn, or only subagents are still running.
 
-So a command keeps a card on **Waiting** only until the agent's next turn ends. For example:
+So a command keeps a card on **Waiting** only until the agent's next turn ends, not counting those reporting turns. For example:
 
 - A dev server the agent started in the background reads **Waiting** until it exits or the agent finishes another turn. If you do not want that, ask the agent to stop the server, or send it any prompt.
 - If you send the agent a prompt while a command from its last turn is still running, and that turn ends with the command still running, the card reads **Idle** with the `Background:` line.
@@ -107,6 +108,7 @@ What each agent reports:
 | **Waiting** while a command it started in its last turn runs | Yes | Yes | Yes | Yes | Yes | Yes |
 
 - On Windows, background commands are not counted for any agent; subagents still are. So no card reads **Waiting** on Windows.
+- OpenCode also starts a turn by itself when a background command finishes, and for OpenCode that turn still counts as a new turn: once it ends, a command the agent started before it reads as an earlier turn's, so the card reads **Idle** with the `Background:` line. Only Claude Code's reporting turns are left out of the count.
 - **Waiting** says only that the agent started the command in that turn and that it is still running, not that the agent will pick up its result by itself when it ends.
 - An OpenCode subagent counts while its session is working, and stops counting when that session finishes, fails or is deleted.
 - The deck's Pi extension and the Devin and Antigravity hooks do not report subagents, so a Pi, Devin or Antigravity card counts commands only.
