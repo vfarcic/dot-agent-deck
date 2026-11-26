@@ -830,9 +830,20 @@ enum RemoteCmd {
     /// question; when agents or orchestration roles would stop, it asks first
     /// on a terminal and, with no terminal to ask on, installs and keeps the
     /// running daemon. Exits non-zero only when a stage fails.
+    ///
+    /// With `--all` instead of a name, upgrades every remote deck whose daemon
+    /// is older than this client, one after another, asking about each
+    /// daemon's own agents and roles; decks already current, newer or without
+    /// a daemon are skipped. Prints one line per deck at the end, and exits
+    /// non-zero when any deck failed or could not be checked (issue #1600).
     Upgrade {
         /// Friendly name of the registry entry to upgrade.
-        name: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// Upgrade every remote deck on the deck list whose daemon is older
+        /// than this client.
+        #[arg(long, conflicts_with_all = ["version", "no_install"])]
+        all: bool,
         /// Target version. Defaults to the local client's version.
         #[arg(long, default_value = env!("DAD_VERSION"))]
         version: String,
@@ -3002,10 +3013,14 @@ fn main() -> ExitCode {
             RemoteCmd::Doctor { name } => run_remote_doctor(&name),
             RemoteCmd::Upgrade {
                 name,
+                all,
                 version,
                 no_install,
                 json,
-            } => run_remote_upgrade(&name, version, no_install, json),
+            } => match name {
+                Some(name) if !all => run_remote_upgrade(&name, version, no_install, json),
+                _ => run_remote_upgrade_all(json),
+            },
         },
         Some(Commands::Worktree { cmd }) => match cmd {
             WorktreeCmd::List { json } => run_worktree_list_cli(json),
@@ -4036,6 +4051,98 @@ fn run_remote_upgrade(name: &str, version: String, no_install: bool, json: bool)
         println!("{}", outcome.summary(name));
     }
     if outcome.is_failure() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck remote upgrade --all [--json]` (issue #1600): check every
+/// remote deck on the deck list and upgrade the ones whose daemon is older,
+/// through [`dot_agent_deck::daemon_upgrade_batch`], the batch every client
+/// shares. Each daemon with live work asks its own question when stdin and
+/// stdout are terminals; otherwise no one can answer and it keeps running.
+/// With `--json`, stdout carries only the report. Exits non-zero when any
+/// deck failed or could not be checked ([`BatchReport::is_failure`]).
+///
+/// [`BatchReport::is_failure`]: dot_agent_deck::daemon_upgrade_batch::BatchReport::is_failure
+fn run_remote_upgrade_all(json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_upgrade::{NoDecider, RestartDecider, TtyDecider};
+    use dot_agent_deck::daemon_upgrade_batch::{
+        BatchDeck, BatchEvent, RemoteBatchDeck, check_all, run_plan,
+    };
+    use std::io::{IsTerminal, Write};
+
+    let path = dot_agent_deck::remote::default_remotes_path();
+    // Progress goes to stdout, or to stderr under `--json` so stdout holds the
+    // report alone.
+    let report: fn() -> Box<dyn Write> = if json {
+        || Box::new(std::io::stderr())
+    } else {
+        || Box::new(std::io::stdout())
+    };
+    let decks = match RemoteBatchDeck::from_deck_list(&path, report) {
+        Ok(decks) => decks,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let decks: Vec<&dyn BatchDeck> = decks.iter().map(|d| d as &dyn BatchDeck).collect();
+    let mut out = report();
+    if !decks.is_empty() {
+        let _ = writeln!(
+            out,
+            "Checking {} remote deck{}…",
+            decks.len(),
+            if decks.len() == 1 { "" } else { "s" }
+        );
+    }
+    let plan = check_all(&decks);
+    let _ = writeln!(out, "{}", plan.summary());
+
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let tty;
+    let decider: &dyn RestartDecider = if interactive {
+        tty = TtyDecider::new(std::io::stdin().lock(), report());
+        &tty
+    } else {
+        &NoDecider
+    };
+    let result = run_plan(
+        &decks,
+        &plan,
+        decider,
+        &|| false,
+        &mut |event| match event {
+            BatchEvent::Started { deck, .. } => {
+                let _ = writeln!(out, "\nUpgrading '{deck}'…");
+            }
+            BatchEvent::Progress { deck, progress, .. } => {
+                dot_agent_deck::connect::print_upgrade_progress(&deck, &progress, &mut *out)
+            }
+            BatchEvent::Finished { report, .. } => {
+                if let dot_agent_deck::daemon_upgrade_batch::DeckResult::Ran { outcome } =
+                    &report.result
+                {
+                    let _ = writeln!(out, "{}", outcome.summary(&report.deck));
+                }
+            }
+        },
+    );
+
+    if json {
+        match serde_json::to_string(&result) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("remote upgrade --all: could not encode the report: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if !result.decks.is_empty() {
+        let _ = writeln!(out, "\n{}", result.summary());
+    }
+    if result.is_failure() {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS

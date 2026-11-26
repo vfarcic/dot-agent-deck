@@ -1,0 +1,29 @@
+---
+source: tests/render_upgrade_all_dialog.rs
+expression: text
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Upgrade all daemons ─────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                              │  
+  │ Upgrading, one daemon at a time…                                                             │  
+  │ mac-studio: Upgrading: restarting the daemon…                                                │  
+  │ pi: Skipped: already runs 0.52.0.                                                            │  
+  │ build-box: Waiting to be upgraded.                                                           │  
+  │ laptop: Failed: it could not be checked: ssh: connect to host laptop port 22: No route to    │  
+  │ host                                                                                         │  
+  │                                                                                              │  
+  │ Restarting the daemon on mac-studio stops 2 agents and 1 orchestration role:                 │  
+  │   Agent lead (pane 4, in /home/u/project)                                                    │  
+  │   Agent coder (pane 5)                                                                       │  
+  │   Role orchestrator of release-team, pane 4 (the orchestrator)                               │  
+  │ Keep current daemon leaves them running on the old version; the new version stays installed  │  
+  │ for its next restart.                                                                        │  
+  │                                                                                              │  
+  │ > Keep current daemon                                                                        │  
+  │   Restart now                                                                                │  
+  │                                                                                              │  
+  │ ↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc keeps the current daemon                │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

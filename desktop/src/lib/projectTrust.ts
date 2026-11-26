@@ -95,6 +95,21 @@ export function requestAnsweredElsewhereNotice(orchestration: string): string {
   return `The approval request for orchestration '${orchestration}' was answered elsewhere.`;
 }
 
+/**
+ * Issue #2511 — the marker saying requests are waiting while something the user
+ * is in holds their review back, the TUI's words (`approvals_waiting_label` in
+ * `src/trust_prompt.rs`).
+ */
+export function approvalsWaitingLabel(count: number): string {
+  return count === 1 ? "1 approval waiting" : `${count} approvals waiting`;
+}
+
+/** The marker's second word, saying what clicking it does. */
+export const REVIEW_WAITING = "Review";
+
+/** What voice's "show the approval" answers with no request waiting. */
+export const NO_APPROVAL_WAITING = "No approval is waiting.";
+
 /** The deck a review is for, as the dialog labels it. */
 export const DECK_LABEL = "Daemon";
 /** A role's `start` flag, in the TUI prompt's words (`src/trust_prompt.rs`). */

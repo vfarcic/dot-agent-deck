@@ -100,7 +100,7 @@ import { ProjectTrustDialog } from "./components/ProjectTrustDialog";
 import { StarPromptGate } from "./components/StarPromptDialog";
 import { AntigravityNoticeGate } from "./components/AntigravityNoticeDialog";
 import { TrustRequestGate } from "./components/TrustRequestGate";
-import type { TrustRequestNotice } from "./lib/trustRequests";
+import { showHeldTrustRequest, type TrustRequestNotice } from "./lib/trustRequests";
 import { chooseShownStarPrompt, useStarPrompt } from "./lib/starPrompt";
 import { chooseShownAntigravityNotice, useAntigravityNotice } from "./lib/antigravityNotice";
 import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
@@ -1447,6 +1447,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          and replaced, or re-shown with new text, while the words were being
          worked out is not approved (PRD #1885 review, auditor 3). */
       approveProjectCommands: () => approveShownReview(declaredTrustReview),
+      /* Issue #2511 — the "approval waiting" marker, while it shows; with no
+         approval waiting it answers that none is. */
+      showApprovalRequest: () => showHeldTrustRequest(),
       /* PRD #2174 — the star reminder's three buttons, while it is showing;
          with none showing each answers that it is not. */
       starRepo: () => chooseShownStarPrompt("star"),
@@ -1723,7 +1726,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         <StarPromptGate due={star.due} ready={starReady && !antigravityNotice.due} onChoose={star.choose} />
         <AntigravityNoticeGate due={antigravityNotice.due} ready={starReady} onChoose={antigravityNotice.choose} />
         {/* Issue #2330: a review a deck asked for waits behind what the star reminder waits behind. */}
-        <TrustRequestGate runtime={runtime} fleet={runtime.fleet} ready={starReady} onNotice={setTrustNotice} />
+        <TrustRequestGate runtime={runtime} fleet={runtime.fleet} ready={starReady} summonable={!choiceOpen} onNotice={setTrustNotice} />
         {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}
         {prBrowser && (
           <PullRequestBrowser

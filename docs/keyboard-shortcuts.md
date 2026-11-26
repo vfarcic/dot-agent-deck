@@ -334,6 +334,7 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `open_scheduled_tasks` | `s` | Open the Schedules manager |
 | `open_pull_request` | `o` | Open the selected agent's pull request in the system browser |
 | `open_upgrade` | `u` | Open the upgrade dialog |
+| `upgrade_all_daemons` | `U` | Open the Upgrade all daemons dialog, which upgrades every remote daemon older than this TUI ([Remote Environments](remote-environments.md#upgrade-every-remote-at-once)) |
 | `scroll_pane_up` | `PageUp` | Scroll the focused pane back |
 | `scroll_pane_down` | `PageDown` | Scroll the focused pane forward |
 | `host_metrics` | `m` | Open the Host of this deck overlay |

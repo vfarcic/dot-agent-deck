@@ -95,6 +95,9 @@ pub enum Action {
     OpenPullRequest,
     /// Issue #1635: open the upgrade dialog the footer's update badge names.
     OpenUpgrade,
+    /// Issue #1600: open the Upgrade all daemons dialog, which checks every
+    /// remote deck on the deck list and upgrades the older ones.
+    UpgradeAllDaemons,
     ScrollPaneUp,
     ScrollPaneDown,
     /// PRD #1258 M3: open the overlay showing the attached deck's host — disk
@@ -365,6 +368,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "open_upgrade",
         default: "u",
         description: "Upgrade",
+    },
+    // Issue #1600: upgrade every remote deck's daemon at once. Default `U`,
+    // the capital of the upgrade key and free in command mode.
+    ActionSpec {
+        action: Action::UpgradeAllDaemons,
+        section: Section::Dashboard,
+        name: "upgrade_all_daemons",
+        default: "U",
+        description: "Upgrade all daemons",
     },
     // PRD #341 M5: the keyboard equivalent of the mouse wheel over the focused
     // agent pane. Command mode is the safe resting state, so reading back

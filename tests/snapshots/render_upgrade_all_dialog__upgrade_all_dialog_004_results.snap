@@ -1,0 +1,25 @@
+---
+source: tests/render_upgrade_all_dialog.rs
+expression: text
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Upgrade all daemons ─────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                              │  
+  │ Upgrade all: 1 upgraded, 2 skipped, 1 failed of 4 remote decks.                              │  
+  │ mac-studio: Upgraded: now runs 0.52.0 (was 0.51.0).                                          │  
+  │ pi: Skipped: already runs 0.52.0.                                                            │  
+  │ build-box: Not started: you stopped the upgrade before it reached this deck.                 │  
+  │ laptop: Failed: it could not be checked: ssh: connect to host laptop port 22: No route to    │  
+  │ host                                                                                         │  
+  │                                                                                              │  
+  │ > Close                                                                                      │  
+  │                                                                                              │  
+  │ PgUp/PgDn scroll · Enter or Esc closes                                                       │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

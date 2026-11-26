@@ -41,6 +41,14 @@ pub(crate) fn pid_file(path: &Path) -> Option<i32> {
 
 pub(crate) struct Remote {
     pub(crate) dir: TempDir,
+    /// The deck's name on the deck list, and the SSH host its row names.
+    pub(crate) name: String,
+    pub(crate) host: String,
+    /// The deck list `assert_installed` reads; a [`Fleet`] points it at the
+    /// list every remote shares.
+    pub(crate) registry: PathBuf,
+    /// The directory holding this remote's `ssh` shim.
+    pub(crate) stubs: PathBuf,
     pub(crate) child: Child,
     pub(crate) attach: PathBuf,
     pub(crate) installed: PathBuf,
@@ -57,6 +65,19 @@ impl Remote {
     }
 
     pub(crate) fn with_lifetime(seconds: u64) -> Self {
+        Self::build(DECK, "fixture.invalid", seconds, false)
+    }
+
+    /// A remote named `name` on its own SSH host. With `reports_old_version`,
+    /// its daemon's `Hello` says [`OLD_VERSION`] rather than the build's own
+    /// release (`DOT_AGENT_DECK_DAEMON_VERSION_OVERRIDE`), as an older
+    /// release's daemon would: `remote upgrade --all` reads that to decide
+    /// whether to upgrade it (issue #1600). Its successor clears the override.
+    pub(crate) fn named(name: &str, host: &str, reports_old_version: bool) -> Self {
+        Self::build(name, host, 180, reports_old_version)
+    }
+
+    fn build(name: &str, host: &str, seconds: u64, reports_old_version: bool) -> Self {
         common::init_test_env();
         let dir = common::harness_tempdir().expect("owned remote sandbox");
         let root = dir.path();
@@ -116,10 +137,15 @@ impl Remote {
             ),
             ("DOT_AGENT_DECK_BUILD_ID_OVERRIDE".into(), OLD_BUILD.into()),
         ];
-        let child = Command::new(&installed)
+        let mut serve = Command::new(&installed);
+        serve
             .args(["daemon", "serve"])
             .env_clear()
-            .envs(remote_env.iter().cloned())
+            .envs(remote_env.iter().cloned());
+        if reports_old_version {
+            serve.env("DOT_AGENT_DECK_DAEMON_VERSION_OVERRIDE", OLD_VERSION);
+        }
+        let child = serve
             .current_dir(&home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -141,7 +167,8 @@ impl Remote {
         script(
             &stubs.join("ssh"),
             &format!(
-                "#!/usr/bin/env python3\nimport json, os, sys\nargs = sys.argv[1:]\ni = args.index('fixture.invalid')\ncommand = ' '.join(args[i+1:])\nwith open({}, 'a') as log: log.write(command + '\\n')\nfor prefix in ['/opt/homebrew', '/usr/local', '/home/linuxbrew/.linuxbrew']:\n    command = command.replace(prefix + '/bin/brew', {})\nenv = json.loads({})\nos.chdir(env['HOME'])\nos.execve('/bin/sh', ['sh', '-c', command], env)\n",
+                "#!/usr/bin/env python3\nimport json, os, sys\nargs = sys.argv[1:]\ni = args.index({})\ncommand = ' '.join(args[i+1:])\nwith open({}, 'a') as log: log.write(command + '\\n')\nfor prefix in ['/opt/homebrew', '/usr/local', '/home/linuxbrew/.linuxbrew']:\n    command = command.replace(prefix + '/bin/brew', {})\nenv = json.loads({})\nos.chdir(env['HOME'])\nos.execve('/bin/sh', ['sh', '-c', command], env)\n",
+                serde_json::to_string(host).unwrap(),
                 serde_json::to_string(&root.join("ssh.log").display().to_string()).unwrap(),
                 serde_json::to_string(&root.join("absent-brew").display().to_string()).unwrap(),
                 serde_json::to_string(&ssh_env.to_string()).unwrap(),
@@ -158,11 +185,18 @@ impl Remote {
         script(&stubs.join("brew"), "#!/bin/sh\nexit 1\n");
         let wrapper = |old: bool| {
             format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'dot-agent-deck {}'; exit 0; fi\nif [ \"$1\" = hooks ]; then printf installed > {}; exit 0; fi\nif [ \"$1\" = daemon ] && [ \"$2\" = serve ]; then printf '%s\\n' \"$$\" > {}; fi\nexport DOT_AGENT_DECK_BUILD_ID_OVERRIDE={}\nexec {} \"$@\"\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'dot-agent-deck {}'; exit 0; fi\nif [ \"$1\" = hooks ]; then printf installed > {}; exit 0; fi\nif [ \"$1\" = daemon ] && [ \"$2\" = serve ]; then printf '%s\\n' \"$$\" > {}; fi\nexport DOT_AGENT_DECK_BUILD_ID_OVERRIDE={}\n{}\nexec {} \"$@\"\n",
                 if old { OLD_VERSION } else { &version },
                 quoted(&root.join("hooks-installed")),
                 quoted(&successor),
                 if old { OLD_BUILD } else { NEW_BUILD },
+                // The new build reports its own release: a successor must not
+                // inherit the old daemon's version override.
+                if old {
+                    ""
+                } else {
+                    "unset DOT_AGENT_DECK_DAEMON_VERSION_OVERRIDE"
+                },
                 quoted(&retained),
             )
         };
@@ -170,9 +204,13 @@ impl Remote {
         let old_wrapper = wrapper(true);
         let registry = root.join("remotes.toml");
         fs::write(&registry, format!(
-            "[[remotes]]\nname = \"{DECK}\"\ntype = \"ssh\"\nhost = \"fixture.invalid\"\nport = 22\nversion = \"{OLD_VERSION}\"\nadded_at = \"2026-10-03T00:00:00Z\"\n"
+            "[[remotes]]\nname = \"{name}\"\ntype = \"ssh\"\nhost = \"{host}\"\nport = 22\nversion = \"{OLD_VERSION}\"\nadded_at = \"2026-10-03T00:00:00Z\"\n"
         )).unwrap();
         let remote = Self {
+            name: name.to_owned(),
+            host: host.to_owned(),
+            registry: registry.clone(),
+            stubs: stubs.clone(),
             child,
             attach,
             installed,
@@ -291,7 +329,8 @@ impl Remote {
     pub(crate) fn piped(&self, extra: &[&str]) -> Output {
         let mut command = Command::new(common::contained_deck_binary());
         command
-            .args(["remote", "upgrade", DECK])
+            .args(["remote", "upgrade"])
+            .arg(&self.name)
             .args(extra)
             .env_clear()
             .envs(self.env.iter().cloned())
@@ -336,12 +375,14 @@ impl Remote {
             format!("dot-agent-deck {}", self.version)
         );
         let registry: toml::Value =
-            toml::from_str(&fs::read_to_string(self.dir.path().join("remotes.toml")).unwrap())
-                .unwrap();
-        assert_eq!(
-            registry["remotes"][0]["version"].as_str(),
-            Some(self.version.as_str())
-        );
+            toml::from_str(&fs::read_to_string(&self.registry).unwrap()).unwrap();
+        let row = registry["remotes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"].as_str() == Some(self.name.as_str()))
+            .expect("the deck list keeps this remote's row");
+        assert_eq!(row["version"].as_str(), Some(self.version.as_str()));
     }
 
     pub(crate) fn assert_kept(&mut self) {
@@ -431,6 +472,90 @@ impl Drop for Remote {
                 fs::read_to_string(self.dir.path().join("ssh.log")).unwrap_or_default(),
                 fs::read_to_string(self.dir.path().join("daemon.log")).unwrap_or_default()
             );
+        }
+    }
+}
+
+/// Several sandboxed remotes on one deck list, for `remote upgrade --all`
+/// (issue #1600). Each remote keeps its own HOME, daemon and installer; one
+/// `ssh` shim in front of theirs hands each command to the remote whose host
+/// it names, so the client reaches every remote the way it reaches one.
+pub(crate) struct Fleet {
+    pub(crate) remotes: Vec<Remote>,
+    dir: TempDir,
+    pub(crate) env: Vec<(String, String)>,
+}
+
+impl Fleet {
+    pub(crate) fn new(remotes: Vec<Remote>) -> Self {
+        let dir = common::harness_tempdir().expect("owned fleet sandbox");
+        let stubs = dir.path().join("stubs");
+        let routes: std::collections::BTreeMap<String, String> = remotes
+            .iter()
+            .map(|r| (r.host.clone(), r.stubs.join("ssh").display().to_string()))
+            .collect();
+        script(
+            &stubs.join("ssh"),
+            &format!(
+                "#!/usr/bin/env python3\nimport json, os, sys\nroutes = json.loads({})\nfor arg in sys.argv[1:]:\n    if arg in routes:\n        os.execv(routes[arg], [routes[arg]] + sys.argv[1:])\nsys.stderr.write('fleet ssh: no remote for ' + ' '.join(sys.argv[1:]) + '\\n')\nsys.exit(255)\n",
+                serde_json::to_string(&serde_json::to_string(&routes).unwrap()).unwrap(),
+            ),
+        );
+        let registry = dir.path().join("remotes.toml");
+        let rows: String = remotes
+            .iter()
+            .map(|r| fs::read_to_string(&r.registry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&registry, rows).unwrap();
+        let mut remotes = remotes;
+        for remote in &mut remotes {
+            remote.registry = registry.clone();
+        }
+        // The first remote's client side, with the shared list and the
+        // dispatching shim first on PATH.
+        let env = remotes[0]
+            .env
+            .iter()
+            .map(|(key, value)| match key.as_str() {
+                "DOT_AGENT_DECK_REMOTES" => (key.clone(), registry.display().to_string()),
+                "PATH" => (key.clone(), format!("{}:{value}", stubs.display())),
+                _ => (key.clone(), value.clone()),
+            })
+            .collect();
+        Self { remotes, dir, env }
+    }
+
+    pub(crate) fn tty(&self, args: &[&str]) -> Terminal {
+        Terminal::new(args, &self.env, self.dir.path())
+    }
+
+    pub(crate) fn piped(&self, args: &[&str]) -> Output {
+        let mut command = Command::new(common::contained_deck_binary());
+        command
+            .args(args)
+            .env_clear()
+            .envs(self.env.iter().cloned())
+            .current_dir(self.dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id() as i32;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        match rx.recv_timeout(common::load_scaled(WAIT * 3)) {
+            Ok(output) => output.unwrap(),
+            Err(error) => {
+                // SAFETY: this owned command established its own process group.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+                panic!("piped upgrade --all must not wait for a question: {error}");
+            }
         }
     }
 }
