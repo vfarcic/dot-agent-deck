@@ -381,11 +381,13 @@ pub fn is_text_changed(error: &str) -> bool {
 /// A field's label (`Command: `, `State: `), and the scroll hint.
 ///
 /// The terminal's own foreground, faded with `Modifier::DIM`, so it sits
-/// behind the value on light and dark themes alike (issue #2518). It was
-/// `Color::Gray`, ANSI 7, which a light theme that keeps the slot light shows
-/// at about 2.5:1 on its background. A terminal that ignores `DIM` draws the
-/// label at full contrast, which is still legible, with the `: ` after it
-/// separating it from the value.
+/// behind the value on light and dark themes alike (issue #2518). Faded
+/// halfway toward the background, as xterm draws faint text, black on white
+/// measures about 3.95:1; `theme/contrast/003` holds a dimmed label to 3:1 and
+/// the value beside it to 4.5:1. It was `Color::Gray`, ANSI 7, which a light
+/// theme that keeps the slot light shows at about 1.3:1 to 2.5:1 on its
+/// background. A terminal that ignores `DIM` draws the label at full contrast,
+/// which is still legible, with the `: ` after it separating it from the value.
 fn label_style() -> Style {
     Style::default()
         .fg(Color::Reset)

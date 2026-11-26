@@ -9881,8 +9881,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### theme/contrast/003 — The trust prompt's field labels and the values the user approves are legible on light and dark terminals, and the values stand out from their labels.
 - **Layer:** L1 (`trust_prompt::render_to_buffer`, colour read from the buffer's cells; `tests/palette_contrast.rs`).
 - **Agent:** none.
-- **Asserts:** in the `Review project commands` prompt for a never-approved orchestration, every cell of the `Project:`, `command:`, `description:` and `prompt:` labels and of the values beside them is `Color::Reset` or a named ANSI colour that clears the `theme/contrast/002` floors on white and on black; no value cell is `DIM`; each label's style differs from its value's (issue #2518). A paired non-spec unit guard proves the gate rejects `Color::White` and `Color::Gray`.
-- **Does not assert:** how much `Modifier::DIM` lowers a label's contrast, or that a terminal honours it; the prompt's Yellow title, border and change marks, or its Cyan footer; the desktop dialog.
+- **Asserts:** in the `Review project commands` prompt for a never-approved orchestration, every cell of the values beside the `Project:`, `command:`, `description:` and `prompt:` labels is `Color::Reset` or a named ANSI colour that clears the `theme/contrast/002` floors on white and on black, and none is `DIM`; every label cell clears the same floors, or, when it is `DIM`, clears 3:1 on the two theme-matched terminals after a reference 50% fade toward the background (about 3.95:1 on white for the terminal's own foreground); each label's style differs from its value's (issue #2518). A paired non-spec unit guard proves the gates reject `Color::White` and `Color::Gray`, dimmed or not, and pins the fade's arithmetic.
+- **Does not assert:** how a specific terminal renders `Modifier::DIM` (kitty's default fades further than the reference, alacritty fades toward black), or that it honours it; the prompt's Yellow title, border and change marks, or its Cyan footer; the desktop dialog.
 - **Platform coverage:** mac+linux+windows.
 
 #### theme/guard

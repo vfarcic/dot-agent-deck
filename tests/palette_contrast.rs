@@ -288,6 +288,61 @@ fn text_foreground_is_legible(color: Color) -> Result<(), String> {
     Ok(())
 }
 
+/// How far a terminal fades `Modifier::DIM` text toward its background, as
+/// a fraction of the distance: xterm and VTE draw faint text at about half
+/// intensity. Terminals differ (kitty's default `dim_opacity` fades further,
+/// alacritty scales the colour toward black, which on a light theme fades
+/// nothing), so this is a reference value, like the xterm palette above.
+const DIM_FADE: f64 = 0.5;
+
+/// `fg` faded by [`DIM_FADE`] toward `bg`.
+fn dimmed((fr, fg, fb): Rgb, (br, bg, bb): Rgb) -> Rgb {
+    let mix = |f: u8, b: u8| {
+        let v = f64::from(f) + (f64::from(b) - f64::from(f)) * DIM_FADE;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    (mix(fr, br), mix(fg, bg), mix(fb, bb))
+}
+
+/// Whether a field label drawn in `color` with `modifier` is legible on a
+/// light and a dark terminal.
+///
+/// Without `Modifier::DIM` a label is text like any other and is held to
+/// [`text_foreground_is_legible`]. With it, the label is resolved on the two
+/// theme-matched terminals (the terminal's own foreground is taken as black on
+/// white and white on black), faded by [`DIM_FADE`], and held to
+/// [`AA_NON_TEXT`], 3:1: a dimmed label is the secondary text of its row by
+/// design, the same few field names in every prompt, while the value beside it,
+/// what the user decides on, carries the 4.5:1 floor undimmed. At the reference
+/// fade the terminal's own foreground lands at about 3.95:1 on white and 5.3:1
+/// on black; `Color::Gray` dimmed lands at about 1.1:1 on white.
+fn label_is_legible(color: Color, modifier: ratatui::style::Modifier) -> Result<(), String> {
+    if !modifier.contains(ratatui::style::Modifier::DIM) {
+        return text_foreground_is_legible(color);
+    }
+    let (on_light, on_dark) = if color == Color::Reset {
+        (DARK_BG, LIGHT_BG)
+    } else {
+        let (base, bright) = reference_srgb(color).ok_or_else(|| {
+            format!("{color:?} is not the terminal's foreground or a named ANSI colour")
+        })?;
+        (base, bright)
+    };
+    for (label, fg, bg) in [
+        ("light terminal", on_light, LIGHT_BG),
+        ("dark terminal", on_dark, DARK_BG),
+    ] {
+        let ratio = contrast_ratio(dimmed(fg, bg), bg);
+        if ratio < AA_NON_TEXT {
+            return Err(format!(
+                "{color:?} with DIM renders at {ratio:.2}:1 on a {label}, below the \
+                 {AA_NON_TEXT}:1 floor for a dimmed label"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The cells of the first row of `buffer` holding `text`, one per character.
 fn cells_of<'a>(buffer: &'a ratatui::buffer::Buffer, text: &str) -> Vec<&'a ratatui::buffer::Cell> {
     let area = buffer.area;
@@ -362,7 +417,7 @@ fn contrast_003_trust_prompt_labels_and_values_are_legible_on_light_and_dark_ter
         let label_cells = &label_cells[..label.chars().count()];
 
         for cell in label_cells {
-            if let Err(why) = text_foreground_is_legible(cell.fg) {
+            if let Err(why) = label_is_legible(cell.fg, cell.modifier) {
                 panic!("the trust prompt's `{label}` label: {why}");
             }
         }
@@ -386,9 +441,10 @@ fn contrast_003_trust_prompt_labels_and_values_are_legible_on_light_and_dark_ter
     }
 }
 
-// Unit-guard for `text_foreground_is_legible` (not a `#[spec]` catalog entry):
-// the gate `contrast_003` relies on must reject the two colours issue #2518
-// retired, and accept the terminal's own foreground.
+// Unit-guard for `text_foreground_is_legible` and `label_is_legible` (not a
+// `#[spec]` catalog entry): the gates `contrast_003` relies on must reject the
+// two colours issue #2518 retired, measure DIM rather than wave it through, and
+// accept the terminal's own foreground.
 #[test]
 fn text_foreground_gate_rejects_white_and_gray() {
     assert!(text_foreground_is_legible(Color::Reset).is_ok());
@@ -399,4 +455,20 @@ fn text_foreground_gate_rejects_white_and_gray() {
              no longer rejects the defect it was written for"
         );
     }
+
+    use ratatui::style::Modifier;
+    assert!(label_is_legible(Color::Reset, Modifier::DIM).is_ok());
+    for faded in [Color::Gray, Color::White, Color::DarkGray, Color::Yellow] {
+        assert!(
+            label_is_legible(faded, Modifier::DIM).is_err(),
+            "{faded:?} with DIM must fail a dimmed label's floor — if it does not, \
+             `contrast_003` passes a label by its foreground alone"
+        );
+    }
+    // The fade is measured: the terminal's own foreground, dimmed, on white.
+    let ratio = contrast_ratio(dimmed(DARK_BG, LIGHT_BG), LIGHT_BG);
+    assert!(
+        (ratio - 3.95).abs() < 0.01,
+        "black faded halfway toward white must measure about 3.95:1, got {ratio:.2}"
+    );
 }
