@@ -14,6 +14,7 @@ import { deckName } from "../lib/displayText";
 import type { WorktreeKeptEntry } from "../lib/worktreeClose";
 import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
+import type { UpgradeAllEvent } from "../lib/upgradeAll";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
@@ -495,6 +496,15 @@ export function useDeckRuntime(): DeckRuntimeState {
   const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
     ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
+  // Issue #1600: Upgrade all — its check, its run and Stop after this daemon.
+  // Its results are the dialog's to show, as a single Upgrade's are.
+  const upgradeAll = useMemo(() => (typeof bridge.checkUpgradeAll === "function" && typeof bridge.runUpgradeAll === "function" && typeof bridge.stopUpgradeAll === "function"
+    ? {
+      check: () => bridge.checkUpgradeAll!(),
+      run: (batchId: string, onEvent: (event: UpgradeAllEvent) => void) => bridge.runUpgradeAll!(batchId, onEvent),
+      stop: (batchId: string) => bridge.stopUpgradeAll!(batchId),
+    }
+    : undefined), [bridge]);
 
   // PRD #882: the geometry the daemon has applied per agent. Held here rather
   // than inside each tile because the push is per agent and arrives on one
@@ -682,6 +692,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     runAction,
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
+    ...(upgradeAll ? { upgradeAll } : {}),
     ...(inboxAction ? { inboxAction } : {}),
     ...(generateConfig ? { generateConfig } : {}),
     ...(agentOpened ? { agentOpened } : {}),

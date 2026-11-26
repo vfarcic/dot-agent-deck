@@ -318,7 +318,7 @@ describe("the Antigravity notice in the app", () => {
   beforeEach(() => window.localStorage.clear());
 
   const listing: DeckDirectoryListing = { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false };
-  const optionsFor = (lastCommand: string): NewAgentOptions => ({ kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand });
+  const optionsFor = (lastCommand: string): NewAgentOptions => ({ kind: "deck", agents: [], authoringKinds: [], lastCommand });
 
   /** Open New agent, use the home directory, and Start with the Command the deck last ran. */
   async function startFromNewAgent(command: string): Promise<void> {
@@ -355,7 +355,7 @@ describe("the Antigravity notice in the app", () => {
     fireEvent.change(within(dialog).getByTestId("new-agent-command"), { target: { value: "" } });
     return dialog;
   }
-  const agyDeck: NewAgentOptions = { kind: "deck", agents: [], experimental: false, authoringKinds: ["dispatcher"], defaultCommand: "agy" };
+  const agyDeck: NewAgentOptions = { kind: "deck", agents: [], authoringKinds: ["dispatcher"], defaultCommand: "agy" };
 
   /** Scenario: on a deck whose `default_command` is `agy`, the user chooses the dispatcher mode, leaves Command empty and starts. The empty Command starts `agy`, so the start is announced as `agy` and the notice comes up. */
   it("counts a start whose empty Command a built-in mode resolves to agy", async () => {

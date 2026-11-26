@@ -373,6 +373,10 @@ pub enum UiMode {
     /// (default `u`) or a click on the footer's update badge. Its state lives
     /// in `UiState::upgrade_dialog`.
     Upgrade,
+    /// Issue #1600: the Upgrade all daemons dialog, opened by the
+    /// `upgrade_all_daemons` key (default `U`). Its state lives in
+    /// `UiState::upgrade_all`.
+    UpgradeAll,
     /// PRD #1666 §6.4: the picker of the selected card's deck messages that
     /// wait on the user's Retry or Cancel, opened by the `inbox_attention` key
     /// (default `i`). Its state lives in `UiState::inbox_attention`.
@@ -613,11 +617,10 @@ impl DirPickerState {
 /// [`schedule_authoring_seed_prompt`](crate::authoring_seeds::schedule_authoring_seed_prompt).
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
-/// PRD #120: display name of the flag-gated issue-dispatch authoring option in
-/// the new-pane Mode cycler — distinct from the plain `schedule` option. It is
-/// appended AFTER `schedule` and shown only when
-/// [`crate::features::show_issue_dispatch_authoring`] is true. Selecting it
-/// spawns a throwaway authoring agent seeded with
+/// PRD #120: display name of the issue-dispatch authoring option in the
+/// new-pane Mode cycler — distinct from the plain `schedule` option. It is
+/// appended AFTER `schedule` (issue #193 graduated it from the experimental
+/// flag, so every `Ctrl+n` form offers it). Selecting it spawns a throwaway authoring agent seeded with
 /// [`issue_dispatch_authoring_seed_prompt`](crate::authoring_seeds::issue_dispatch_authoring_seed_prompt), which calls `schedule add --repo …`.
 const ISSUE_DISPATCH_MODE_NAME: &str = "schedule: issues";
 
@@ -667,7 +670,7 @@ const DISPATCHER_MODE_NAME: &str = "dispatcher";
 enum BuiltinOption {
     /// PRD #127: author a scheduled task.
     Schedule,
-    /// PRD #120: author an issue-dispatch scheduled task (experimental-gated).
+    /// PRD #120: author an issue-dispatch scheduled task.
     IssueDispatch,
     /// PRD #220: an agent that knows the `dispatch` verb.
     Dispatcher,
@@ -1164,13 +1167,8 @@ struct NewPaneFormState {
     command: String,
     // Mode-row selection fields. Issue #1199: the row is `No mode`, then one
     // chip per orchestration, then the built-in options ([`BuiltinOption`]) —
-    // `schedule`, the flag-gated `schedule: issues`, and `dispatcher`.
+    // `schedule`, `schedule: issues`, and `dispatcher`.
     orchestrations: Vec<OrchestrationConfig>,
-    /// PRD #120: snapshot of [`crate::features::show_issue_dispatch_authoring`]
-    /// taken at form-construction time (the input seam). When true the cycler
-    /// offers the `schedule: issues` option after `schedule`; when false it is
-    /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
-    show_issue_dispatch: bool,
     /// PRD #220: when true the cycler offers the `dispatcher` option after
     /// `schedule: issues`. True for the ordinary `Ctrl+n` form (the feature has
     /// graduated out of the experimental flag); false only for the mode-locked
@@ -1261,10 +1259,6 @@ impl NewPaneFormState {
             name,
             command,
             orchestrations,
-            // PRD #120: gate at the input seam (CLAUDE.md #9) — snapshot the
-            // render wrapper once at construction so the count/name/cycler-cap
-            // all observe one consistent value.
-            show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
             // PRD #220: GRADUATED — the `dispatcher` option is offered to everyone.
             // It shipped behind `features::show_dispatcher()`; that wrapper is gone
             // and this branch is inlined (CLAUDE.md #9). The field itself stays,
@@ -1449,10 +1443,6 @@ impl NewPaneFormState {
             name: SCHEDULE_MODE_NAME.to_string(),
             command,
             orchestrations: Vec::new(),
-            // PRD #120: the manager's mode-locked form is plain-schedule authoring
-            // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
-            // the locked form hides the cycler entirely, so it never appears here.
-            show_issue_dispatch: false,
             show_dispatcher: false,
             selection_index: 0,
             has_mode_field: true,
@@ -1485,9 +1475,8 @@ impl NewPaneFormState {
         1 + self.orchestrations.len()
     }
 
-    /// PRD #120: cycler index of the flag-gated `schedule: issues` option —
-    /// appended directly after `schedule`. Only meaningful when
-    /// `show_issue_dispatch` is true.
+    /// PRD #120: cycler index of the `schedule: issues` option — appended
+    /// directly after `schedule`.
     fn issue_dispatch_index(&self) -> usize {
         self.schedule_index() + 1
     }
@@ -1495,7 +1484,7 @@ impl NewPaneFormState {
     /// PRD #220: cycler index of the dispatcher option — appended after
     /// `schedule: issues`. Only meaningful when `show_dispatcher` is true.
     fn dispatcher_index(&self) -> usize {
-        self.issue_dispatch_index() + if self.show_issue_dispatch { 1 } else { 0 }
+        self.issue_dispatch_index() + 1
     }
 
     /// Whether the built-in "schedule" authoring option is currently selected.
@@ -1503,9 +1492,9 @@ impl NewPaneFormState {
         self.selection_index == self.schedule_index()
     }
 
-    /// PRD #120: whether the flag-gated `schedule: issues` option is selected.
+    /// PRD #120: whether the `schedule: issues` option is selected.
     fn is_issue_dispatch_selected(&self) -> bool {
-        self.show_issue_dispatch && self.selection_index == self.issue_dispatch_index()
+        self.selection_index == self.issue_dispatch_index()
     }
 
     /// PRD #220: whether the dispatcher option is selected.
@@ -1530,12 +1519,9 @@ impl NewPaneFormState {
 
     fn mode_option_count(&self) -> usize {
         // +1 for the built-in "schedule" authoring option appended at the end,
-        // +1 more for the flag-gated "schedule: issues" option when shown,
+        // +1 more for the "schedule: issues" option,
         // +1 more for the dispatcher option (PRD #220).
-        1 + self.orchestrations.len()
-            + 1
-            + if self.show_issue_dispatch { 1 } else { 0 }
-            + if self.show_dispatcher { 1 } else { 0 }
+        1 + self.orchestrations.len() + 1 + 1 + if self.show_dispatcher { 1 } else { 0 }
     }
 
     fn select_next_mode(&mut self) {
@@ -1592,8 +1578,8 @@ impl NewPaneFormState {
             } else {
                 format!("Orch: {name}")
             }
-        } else if self.show_issue_dispatch && idx == self.issue_dispatch_index() {
-            // PRD #120: the flag-gated issue-dispatch authoring option.
+        } else if idx == self.issue_dispatch_index() {
+            // PRD #120: the issue-dispatch authoring option.
             ISSUE_DISPATCH_MODE_NAME.to_string()
         } else if self.show_dispatcher && idx == self.dispatcher_index() {
             // PRD #220: the dispatcher mode.
@@ -2014,6 +2000,11 @@ struct UiState {
     /// to the daemon, with the orchestration's name for the status line.
     /// [`poll_trust_requests`] sends them.
     trust_request_denials: Vec<(u64, String, String)>,
+    /// Issue #2511: how many requests wait unshown because another dialog
+    /// (or a held restore) holds their review back, for the footer's
+    /// "approval waiting" badge. `0` when none waits, when the deck is free
+    /// for them, and while a review is open.
+    trust_requests_held: usize,
     /// PRD #1666 part 2 (G-fix7e): where this frame drew the restart notice's
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
@@ -2190,6 +2181,12 @@ struct UiState {
     /// if `Ctrl+C` took the deck to the quit dialog, so the upgrade key
     /// reopens it on the same run.
     upgrade_dialog: Option<crate::upgrade_dialog::UpgradeDialog>,
+    /// Issue #1600: the open Upgrade all daemons dialog and the work behind
+    /// it. Kept while its upgrades run, so the key reopens the same run.
+    upgrade_all: Option<(
+        crate::upgrade_all_dialog::UpgradeAllDialog,
+        crate::upgrade_all_dialog::Job,
+    )>,
     /// Issue #1635: the upgrade that put this TUI's own copy's newer build on
     /// disk, kept until the TUI restarts: that copy is no longer offered, and
     /// the badge says to restart when nothing else is behind.
@@ -2759,6 +2756,7 @@ impl UiState {
             trust_requests_seen: std::collections::BTreeSet::new(),
             trust_request_retry_at: None,
             trust_request_denials: Vec::new(),
+            trust_requests_held: 0,
             restart_notice_area: None,
             confirm_choices_drawn: None,
             confirm_drawing: None,
@@ -2800,6 +2798,7 @@ impl UiState {
             question_notified: HashSet::new(),
             upgrade_check: None,
             upgrade_dialog: None,
+            upgrade_all: None,
             upgrade_installed: None,
             upgrade_results: None,
             upgrade_recheck: false,
@@ -5984,6 +5983,10 @@ pub enum Action {
     /// Issue #1635: a click on one of the upgrade dialog's buttons — mouse
     /// parity for its keys.
     UpgradeChoose(crate::upgrade_dialog::UpgradeChoice),
+    /// Issue #1600: open the Upgrade all daemons dialog (default `U`).
+    OpenUpgradeAll,
+    /// Issue #1600: a click on one of its buttons — mouse parity for its keys.
+    UpgradeAllChoose(crate::upgrade_all_dialog::Choice),
     /// PRD #127 finding #4: the manager dialog's `[Add]` button — mouse parity
     /// for the `a` key. Closes the dialog and spawns the seeded authoring agent
     /// with a blank context (same outcome as pressing `a`).
@@ -8187,6 +8190,115 @@ fn apply_upgrade_effect(ui: &mut UiState, effect: crate::upgrade_dialog::Effect)
 fn sync_upgrade_state(ui: &mut UiState, snapshot: &AppState, state: &SharedState) {
     ui.upgrade_check = snapshot.upgrade_check.clone();
     drain_upgrade_results(ui, state);
+    drain_upgrade_all(ui);
+}
+
+/// Issue #1600: open the Upgrade all daemons dialog, which starts checking
+/// every remote deck on the deck list at once. A dialog kept because its
+/// batch is still running is reopened instead.
+fn open_upgrade_all_dialog(ui: &mut UiState) {
+    if ui.upgrade_all.is_some() {
+        ui.mode = UiMode::UpgradeAll;
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let job = crate::upgrade_all_dialog::Job::check(&handle);
+            ui.upgrade_all = Some((crate::upgrade_all_dialog::UpgradeAllDialog::new(), job));
+            ui.mode = UiMode::UpgradeAll;
+        }
+        Err(e) => {
+            ui.status_message = Some((
+                format!("Upgrade all daemons could not start: {e}"),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+}
+
+/// Issue #1600: the dialog owns the keyboard while it is open.
+fn handle_upgrade_all_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    match ui.upgrade_all.as_mut() {
+        Some((dialog, _)) => {
+            let effect = dialog.handle_key(key);
+            apply_upgrade_all_effect(ui, effect);
+        }
+        None => ui.mode = UiMode::Normal,
+    }
+    Action::Continue
+}
+
+/// Issue #1600: close the dialog. An open question is answered Keep current
+/// daemon, the answer every way out gives.
+fn close_upgrade_all(ui: &mut UiState) {
+    if let Some((_, mut job)) = ui.upgrade_all.take() {
+        job.answer(crate::daemon_upgrade::RestartChoice::KeepCurrent);
+    }
+}
+
+/// Issue #1600: act on what a key or a click did in the dialog.
+fn apply_upgrade_all_effect(ui: &mut UiState, effect: crate::upgrade_all_dialog::Effect) {
+    use crate::upgrade_all_dialog::Effect;
+    match effect {
+        Effect::None => {}
+        Effect::Close => {
+            close_upgrade_all(ui);
+            ui.mode = UiMode::Normal;
+        }
+        Effect::Start => {
+            if let (Some((_, job)), Ok(handle)) = (
+                ui.upgrade_all.as_mut(),
+                tokio::runtime::Handle::try_current(),
+            ) {
+                job.run(&handle);
+            }
+        }
+        Effect::Stop => {
+            if let Some((_, job)) = ui.upgrade_all.as_ref() {
+                job.stop();
+            }
+        }
+        Effect::Answer(choice) => {
+            if let Some((_, job)) = ui.upgrade_all.as_mut() {
+                job.answer(choice);
+            }
+        }
+    }
+}
+
+/// Issue #1600: hand what the check and the run reported to the dialog, once
+/// a frame. While the dialog is not on screen, a question brings it back in
+/// command mode, so a daemon does not wait on an answer nobody can see; in any
+/// other mode, where keys belong to something else, the status bar says what
+/// is waiting, as it does when the batch finishes.
+fn drain_upgrade_all(ui: &mut UiState) {
+    let Some((dialog, job)) = ui.upgrade_all.as_mut() else {
+        return;
+    };
+    let was_asking = asking(dialog);
+    let was_done = matches!(dialog.phase(), crate::upgrade_all_dialog::Phase::Done(_));
+    job.poll(dialog);
+    let now_asking = !was_asking && asking(dialog);
+    let now_done = !was_done && matches!(dialog.phase(), crate::upgrade_all_dialog::Phase::Done(_));
+    if ui.mode == UiMode::UpgradeAll || !(now_asking || now_done) {
+        return;
+    }
+    if now_asking && ui.mode == UiMode::Normal {
+        ui.mode = UiMode::UpgradeAll;
+        return;
+    }
+    let key = display_notation(&ui.keybindings, KbAction::UpgradeAllDaemons);
+    let message = if now_asking {
+        format!("Upgrade all daemons is waiting for your answer. Press {key} to see it.")
+    } else {
+        format!("Upgrade all daemons finished. Press {key} to see the results.")
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// Whether a daemon in the batch is waiting on the dialog's answer.
+fn asking(dialog: &crate::upgrade_all_dialog::UpgradeAllDialog) -> bool {
+    matches!(dialog.phase(), crate::upgrade_all_dialog::Phase::Running(run) if run.question.is_some())
 }
 
 /// Issue #1635: what `Effect::Run(index)` upgrades: the plan the open dialog
@@ -9878,6 +9990,11 @@ fn handle_normal_key(
     if pressed(KbAction::OpenUpgrade) {
         return Action::OpenUpgrade;
     }
+    // Issue #1600: check every remote deck and upgrade the older ones
+    // (default `U`).
+    if kb.matches(KbAction::UpgradeAllDaemons, &key) {
+        return Action::OpenUpgradeAll;
+    }
     // PRD #385 M5: copy mode on the focused pane (default `v`). The
     // dispatcher resolves the pane and does nothing when none is focused.
     if kb.matches(KbAction::CopyMode, &key) {
@@ -11187,6 +11304,7 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     // the user was about to type into: no key may act behind it.
     if mode == UiMode::CloseConfirm
         || mode == UiMode::Upgrade
+        || mode == UiMode::UpgradeAll
         || mode == UiMode::TrustPrompt
         || mode == UiMode::AntigravityNotice
     {
@@ -11536,6 +11654,8 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             // Issue #1635: the upgrade dialog's buttons live in
             // `modal_button_rects` too.
             | UiMode::Upgrade
+            // Issue #1600: and so do Upgrade all daemons'.
+            | UiMode::UpgradeAll
             // PRD #1885: the trust prompt's approve and cancel labels live in
             // `modal_button_rects` once a frame shows them; a click anywhere
             // else is consumed rather than reaching what is behind it.
@@ -11577,6 +11697,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::ScheduledTasks
         // Issue #1635: the upgrade dialog is a topmost modal.
         | UiMode::Upgrade
+        // Issue #1600: so is Upgrade all daemons.
+        | UiMode::UpgradeAll
         // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
         | UiMode::InboxAttention
         // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
@@ -13440,6 +13562,13 @@ fn dispatch_action(
             }
         }
         Action::OpenUpgrade => open_upgrade_dialog(ui),
+        Action::OpenUpgradeAll => open_upgrade_all_dialog(ui),
+        Action::UpgradeAllChoose(choice) => {
+            if let Some((dialog, _)) = ui.upgrade_all.as_mut() {
+                let effect = dialog.choose(choice);
+                apply_upgrade_all_effect(ui, effect);
+            }
+        }
         Action::UpgradeChoose(choice) => {
             if let Some(dialog) = ui.upgrade_dialog.as_mut() {
                 let effect = dialog.choose(choice);
@@ -14367,6 +14496,8 @@ fn open_next_trust_restore(ui: &mut UiState) {
 /// daemon as the New Agent form's is. A request whose orchestration reads as
 /// approved by then opens nothing.
 fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneController) {
+    // Issue #2511: recounted below when a dialog holds a request back.
+    ui.trust_requests_held = 0;
     for (id, digest, orchestration) in std::mem::take(&mut ui.trust_request_denials) {
         let message = match pane.deny_trust_request(id, &digest) {
             Ok(_) => crate::trust_prompt::request_denied_message(&orchestration),
@@ -14413,6 +14544,23 @@ fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneCon
             .iter()
             .any(|request| request.id == *id && request.digest == *digest)
     });
+    // Issue #2511: a request held back by another dialog or a held restore
+    // is said in the footer ("1 approval waiting") rather than waiting
+    // silently; it opens on its own once that closes. Not while a review is
+    // open: that is what is on screen.
+    if ui.trust_prompt.is_none()
+        && (!ui.pending_trust_restores.is_empty()
+            || !matches!(ui.mode, UiMode::Normal | UiMode::PaneInput))
+    {
+        ui.trust_requests_held = list
+            .requests
+            .iter()
+            .filter(|request| {
+                !ui.trust_requests_seen
+                    .contains(&(request.id, request.digest.clone()))
+            })
+            .count();
+    }
     if ui.trust_prompt.is_some()
         || !ui.pending_trust_restores.is_empty()
         || !matches!(ui.mode, UiMode::Normal | UiMode::PaneInput)
@@ -15191,6 +15339,20 @@ fn handle_key_event(
                 Action::Continue
             }
             UiMode::Upgrade => handle_upgrade_key(key, ui),
+            // Issue #1600: `Ctrl+C` keeps its safety net here too. A running
+            // batch's dialog is kept, so its key reopens the same run.
+            UiMode::UpgradeAll if is_ctrl_c => {
+                if !ui
+                    .upgrade_all
+                    .as_ref()
+                    .is_some_and(|(dialog, _)| dialog.is_running())
+                {
+                    close_upgrade_all(ui);
+                }
+                open_quit_confirm(ui, false);
+                Action::Continue
+            }
+            UiMode::UpgradeAll => handle_upgrade_all_key(key, ui),
             // Resolved before the shortcuts above, so never reached here.
             UiMode::CopyMode => Action::Continue,
             // PRD #1885: `Ctrl+C` keeps its PRD #40 safety net; leaving for
@@ -20213,6 +20375,14 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             .map(|(choice, rect)| (Action::UpgradeChoose(choice), rect))
             .collect();
     }
+    if ui.mode == UiMode::UpgradeAll
+        && let Some((dialog, _)) = ui.upgrade_all.as_mut()
+    {
+        ui.modal_button_rects = crate::upgrade_all_dialog::render(frame, area, dialog)
+            .into_iter()
+            .map(|(choice, rect)| (Action::UpgradeAllChoose(choice), rect))
+            .collect();
+    }
     if ui.mode == UiMode::TrustPrompt
         && let Some(prompt) = ui.trust_prompt.as_mut()
     {
@@ -22153,6 +22323,98 @@ fn render_bottom_bar_below_notice(
             }
         }
     }
+    // Issue #2511: drawn after every mode's footer (Filter, Rename and Copy
+    // mode draw their own), so a held request is said whatever the bar shows.
+    // The two text inputs keep their text and cursor clear of it (Qodo, PR
+    // #2525): the badge goes right of what is typed, or not at all.
+    let typed_end = match ui.mode {
+        UiMode::Filter => Some(area.x + 2 + text_cells(&ui.filter_text) + 1),
+        UiMode::Rename => Some(area.x + 8 + text_cells(&ui.rename_text) + 1),
+        _ => None,
+    };
+    render_trust_waiting_badge(frame, ui, full_area, typed_end);
+}
+
+/// The terminal cells `text` takes, saturated to `u16`.
+fn text_cells(text: &str) -> u16 {
+    u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+}
+
+/// Issue #2511: the desktop app's "approval waiting" marker, in its words, at
+/// the right end of the bar's LAST row, which a tall dialog does not reach:
+/// left of whatever is pressable at that end (the update badge, Rename's
+/// Save/Cancel), or, with no room beside them, over the rightmost of them,
+/// whose click targets it then drops. With `typed_end` (a text input's end,
+/// cursor included) it starts no further left than that and covers no
+/// button, and is left out when there is no such room, so typing is never
+/// hidden. Nothing to press: the review opens on its own once the dialog
+/// holding it back closes.
+fn render_trust_waiting_badge(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    area: Rect,
+    typed_end: Option<u16>,
+) {
+    if ui.trust_requests_held == 0 || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text = format!(
+        " {} ",
+        crate::trust_prompt::approvals_waiting_label(ui.trust_requests_held)
+    );
+    let bw =
+        u16::try_from(unicode_width::UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX);
+    if bw > area.width {
+        return;
+    }
+    let row = area.y + area.height - 1;
+    let right = area.x + area.width;
+    // Step left past the pressable rects at the row's right end.
+    let mut end = right;
+    loop {
+        let start = end.saturating_sub(bw);
+        let blocking = ui
+            .button_rects
+            .iter()
+            .filter(|(_, rect)| rect.y <= row && row < rect.y + rect.height)
+            .filter(|(_, rect)| rect.x < end && start < rect.x + rect.width)
+            .map(|(_, rect)| rect.x)
+            .min();
+        match blocking {
+            Some(x) if x >= area.x + bw => end = x,
+            Some(_) if typed_end.is_some() => return,
+            Some(_) => {
+                // No room beside them: over the rightmost, as the bar's own
+                // status message does.
+                end = right;
+                break;
+            }
+            None => break,
+        }
+    }
+    if typed_end.is_some_and(|typed| end - bw < typed) {
+        return;
+    }
+    let badge_area = Rect {
+        x: end - bw,
+        y: row,
+        width: bw,
+        height: 1,
+    };
+    frame.render_widget(Clear, badge_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        badge_area,
+    );
+    // A click on it presses nothing hidden beneath it.
+    ui.button_rects
+        .retain(|(_, rect)| rect.intersection(badge_area).is_empty());
 }
 
 /// PRD #80 M5: render a left-aligned row of modal buttons into `row` and
@@ -23539,6 +23801,8 @@ fn render_help_overlay(
         // Issue #1635: opens the upgrade dialog while the footer's update
         // badge shows.
         help_key_line(&lettered(KbAction::OpenUpgrade), "Upgrade (update badge)"),
+        // Issue #1600: every remote deck's daemon that is older than this TUI.
+        help_key_line(&n(KbAction::UpgradeAllDaemons), "Upgrade all daemons"),
         // PRD #1666 part 2 (G-fix7d): while the footer shows the restart
         // notice.
         help_key_line(
@@ -38119,6 +38383,33 @@ mod tests {
         ));
     }
 
+    /// Issue #1600: `U` opens Upgrade all daemons and `u` still opens the
+    /// update badge's Upgrade, so the capital does not shadow the letter.
+    #[test]
+    fn capital_u_opens_upgrade_all_daemons_and_u_still_opens_upgrade() {
+        let press = |code: KeyCode, mods: KeyModifiers| {
+            handle_normal_key(
+                KeyEvent::new(code, mods),
+                &mut default_ui(),
+                1,
+                Some(SessionStatus::Idle),
+                &KeybindingConfig::default(),
+            )
+        };
+        assert!(matches!(
+            press(KeyCode::Char('U'), KeyModifiers::SHIFT),
+            Action::OpenUpgradeAll
+        ));
+        assert!(matches!(
+            press(KeyCode::Char('U'), KeyModifiers::NONE),
+            Action::OpenUpgradeAll
+        ));
+        assert!(matches!(
+            press(KeyCode::Char('u'), KeyModifiers::NONE),
+            Action::OpenUpgrade
+        ));
+    }
+
     /// Scenario: In command mode, press `Ctrl+r`, `Ctrl+g`, `Ctrl+s`,
     /// `Ctrl+m` and `Ctrl+u` with a card selected: each does what its plain
     /// letter does — rename, generate config, the Schedules manager, the host
@@ -43596,10 +43887,11 @@ mod tests {
         // PRD #127 M3.2: + the built-in "schedule" authoring option.
         // PRD #220: + the built-in "dispatcher" option, which graduated out of the
         // experimental flag and is now offered on every `Ctrl+n` form.
-        assert_eq!(f.mode_option_count(), 4); // "No mode" + 1 orch + "schedule" + "dispatcher"
+        // Issue #193: + "schedule: issues", graduated the same way.
+        assert_eq!(f.mode_option_count(), 5); // "No mode" + 1 orch + "schedule" + "schedule: issues" + "dispatcher"
 
         let f = NewPaneFormState::new(PathBuf::from("/tmp"), String::new(), String::new(), vec![]);
-        assert_eq!(f.mode_option_count(), 3); // "No mode" + "schedule" + "dispatcher"
+        assert_eq!(f.mode_option_count(), 4); // "No mode" + "schedule" + "schedule: issues" + "dispatcher"
     }
 
     /// Issue #1199: the Mode row's built-in options carry their own chip names
@@ -43670,8 +43962,9 @@ mod tests {
             vec![make_orchestration("tdd")],
         );
         // 0=No mode, 1=tdd, 2=schedule (PRD #127 M3.2 built-in),
-        // 3=dispatcher (PRD #220, graduated out of the experimental flag).
-        assert_eq!(f.mode_option_count(), 4);
+        // 3=schedule: issues (issue #193), 4=dispatcher (PRD #220); both
+        // graduated out of the experimental flag.
+        assert_eq!(f.mode_option_count(), 5);
 
         // Can't go below 0
         f.select_previous_mode();
@@ -43687,14 +43980,21 @@ mod tests {
         assert!(f.is_schedule_selected());
         assert!(f.selected_orchestration().is_none());
 
-        // PRD #220: index 3 is the built-in "dispatcher" option, now the LAST slot.
+        // Issue #193: index 3 is the built-in "schedule: issues" option.
         f.select_next_mode();
         assert_eq!(f.selection_index, 3);
+        assert!(f.is_issue_dispatch_selected());
+        assert_eq!(f.selected_builtin(), Some(BuiltinOption::IssueDispatch));
+        assert_eq!(f.mode_option_name(3), ISSUE_DISPATCH_MODE_NAME);
+
+        // PRD #220: index 4 is the built-in "dispatcher" option, now the LAST slot.
+        f.select_next_mode();
+        assert_eq!(f.selection_index, 4);
         assert!(f.is_dispatcher_selected());
 
         // Can't go past last (dispatcher)
         f.select_next_mode();
-        assert_eq!(f.selection_index, 3);
+        assert_eq!(f.selection_index, 4);
     }
 
     // PRD #127 M3.2: with the built-in "schedule" authoring option, the Mode
@@ -43967,8 +44267,6 @@ mod tests {
             String::new(),
             vec![make_orchestration("a")],
         );
-        // Both experimental options on, independent of the ambient env flag.
-        f.show_issue_dispatch = true;
         f.show_dispatcher = true;
 
         // "No mode" + 1 orchestration + schedule + schedule: issues + dispatcher.
@@ -44009,7 +44307,6 @@ mod tests {
             String::new(),
             vec![],
         );
-        f.show_issue_dispatch = true;
         f.show_dispatcher = true;
         f.selection_index = f.dispatcher_index();
         assert!(
@@ -44203,7 +44500,6 @@ mod tests {
     fn each_authoring_option_seeds_the_text_the_daemon_composes_for_its_kind() {
         let dir = PathBuf::from("/tmp/picked repo");
         let mut form = NewPaneFormState::new(dir.clone(), String::new(), String::new(), vec![]);
-        form.show_issue_dispatch = true;
         form.show_dispatcher = true;
         let cases = [
             (form.schedule_index(), AuthoringKind::Schedule),
@@ -44235,7 +44531,6 @@ mod tests {
     fn each_authoring_option_names_its_kind_to_the_daemon() {
         let dir = PathBuf::from("/tmp/picked repo");
         let mut form = NewPaneFormState::new(dir, String::new(), String::new(), vec![]);
-        form.show_issue_dispatch = true;
         form.show_dispatcher = true;
         for (selection_index, kind) in [
             (form.schedule_index(), AuthoringKind::Schedule),
@@ -44530,9 +44825,9 @@ mod tests {
             String::new(),
             vec![make_orchestration("review")],
         );
-        // 0=No mode, 1=review, 2=schedule, 3=dispatcher.
+        // 0=No mode, 1=review, 2=schedule, 3=schedule: issues, 4=dispatcher.
         assert_eq!(f.schedule_index(), 2);
-        assert_eq!(f.mode_option_count(), 4);
+        assert_eq!(f.mode_option_count(), 5);
 
         // PRD #220: `schedule` is no longer the LAST slot — the graduated
         // `dispatcher` option now sits after it, so cycling to the cap lands
@@ -46471,9 +46766,11 @@ mod tests {
         assert!(pc.denials.lock().unwrap().is_empty());
     }
 
-    /// Scenario: A request waits while another dialog is open, while a held
-    /// restore still waits for its own review, and while the daemon reads the
-    /// orchestration as approved it opens nothing at all.
+    /// Scenario: A request waits while another dialog is open, and the footer
+    /// says "1 approval waiting" (issue #2511) until it opens on its own once
+    /// the dialog closes; it waits while a held restore still waits for its
+    /// own review, and while the daemon reads the orchestration as approved it
+    /// opens nothing at all.
     #[test]
     fn request_tui_004_a_request_waits_for_the_deck_to_be_free() {
         let tmp = tempdir().expect("tempdir");
@@ -46481,14 +46778,62 @@ mod tests {
         let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
         let snapshot = requesting(&pc.view, 9, 1);
 
+        // Every footer says it, the modes that draw their own bar too
+        // (Greptile, PR #2525); Rename keeps its Save/Cancel clickable.
+        for mode in [UiMode::Filter, UiMode::Rename] {
+            let mut ui = default_ui();
+            ui.mode = mode;
+            poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
+            assert!(ui.trust_prompt.is_none(), "waits behind {mode:?}");
+            let rows = draw_sized(&mut ui, 120, 40);
+            assert!(
+                rows.last()
+                    .is_some_and(|row| row.contains("1 approval waiting")),
+                "{mode:?}'s footer says a request is waiting: {rows:#?}"
+            );
+            if mode == UiMode::Filter {
+                // A filter long enough to reach the badge keeps its end
+                // visible: no badge rather than one over the typing.
+                ui.filter_text = "x".repeat(47) + "END";
+                let rows = draw_sized(&mut ui, 80, 24);
+                let last = rows.last().expect("a footer");
+                assert!(
+                    last.contains("END"),
+                    "the filter's end stays visible: {last:?}"
+                );
+                assert!(!last.contains("approval waiting"), "{last:?}");
+            }
+            if mode == UiMode::Rename {
+                for action in [Action::SaveRename, Action::CancelRename] {
+                    assert!(
+                        ui.button_rects.iter().any(|(a, _)| {
+                            std::mem::discriminant(a) == std::mem::discriminant(&action)
+                        }),
+                        "Rename's {action:?} is still clickable beside the badge"
+                    );
+                }
+            }
+        }
+
         let mut ui = default_ui();
         ui.mode = UiMode::Help;
         poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
         assert!(ui.trust_prompt.is_none(), "waits behind another dialog");
         assert_eq!(ui.mode, UiMode::Help);
+        let rows = draw_sized(&mut ui, 120, 40);
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.contains("1 approval waiting")),
+            "the footer says a request is waiting: {rows:#?}"
+        );
         ui.mode = UiMode::Normal;
         poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
         assert_eq!(ui.mode, UiMode::TrustPrompt, "opens once the deck is free");
+        let rows = draw_sized(&mut ui, 120, 40);
+        assert!(
+            !rows.join("\n").contains("approval waiting"),
+            "no badge while the review is open"
+        );
 
         let mut ui = default_ui();
         *pc.approved.lock().unwrap() = true;
@@ -47338,6 +47683,7 @@ mod tests {
             | UiMode::CloseConfirm
             | UiMode::HostMetrics
             | UiMode::Upgrade
+            | UiMode::UpgradeAll
             | UiMode::InboxAttention
             | UiMode::RestartNotice
             | UiMode::CopyMode
@@ -47366,6 +47712,7 @@ mod tests {
             UiMode::CloseConfirm,
             UiMode::HostMetrics,
             UiMode::Upgrade,
+            UiMode::UpgradeAll,
             UiMode::InboxAttention,
             UiMode::RestartNotice,
             UiMode::CopyMode,

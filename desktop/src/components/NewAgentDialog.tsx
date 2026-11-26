@@ -1298,8 +1298,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
             ...(modesPaged ? { modePaging: { page: modeSlice.page, elsewhere: modeElsewhere.map((item) => ({ name: item.label, page: item.page })) } } : {}),
             agentTypes: agents.map((agent) => ({ id: agent.id, label: agent.displayName })),
             /* The authoring chips this form withholds — for a deck that cannot
-               compose them, or `schedule: issues` with its flag off — so a
-               spoken one is refused BY NAME instead of becoming the nearest
+               compose them — so a spoken one is refused BY NAME instead of becoming the nearest
                offered chip. Resolvable never; see `withheld_modes` in Rust. */
             withheldModes: AUTHORING_MODES.filter((candidate) => !authoring.offered.some((offered) => offered.kind === candidate.kind)).map(({ kind, label }) => ({ id: kind, label })),
           }

@@ -166,9 +166,9 @@ dot-agent-deck schedule add \
 - `--shape` cannot be combined with `--repo`.
 - `{{issue_number}}` in the prompt is replaced with each issue's number. The agent works inside that issue's worktree, so the number is usually enough context; `--prompt "/prd-full {{issue_number}}"` runs one of your own skills instead.
 
-The same schedule as TOML is in [Worked examples](#an-issue-dispatch-schedule). A schedule with an `[scheduled_tasks.issue_dispatch]` table runs whether or not the `experimental` flag is on.
+The same schedule as TOML is in [Worked examples](#an-issue-dispatch-schedule).
 
-**With an authoring agent:** the **schedule: issues** mode in the TUI's New Agent form, or the **schedule: issues** chip in the desktop app's **New agent**, starts an agent that builds one with you. Both appear only when the `experimental` flag is on: for the TUI, set `experimental = true` under `[features]` in `.dot-agent-deck.toml` or launch it with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the variable wins); for the desktop app, the flag of the daemon you create the agent on decides. See [Configuration](configuration.md).
+**With an authoring agent:** the **schedule: issues** mode in the TUI's New Agent form, or the **schedule: issues** chip in the desktop app's **New agent**, starts an agent that builds one with you.
 
 Check it: `dot-agent-deck schedule list` shows the schedule, and `dot-agent-deck schedule run-now --name "Issues vfarcic/dot-ai"` runs it once. Once the run has cloned the repository, a tab opens per dispatched issue, and `git -C ~/dispatch/"Issues vfarcic-dot-ai" worktree list` lists one worktree per issue.
 

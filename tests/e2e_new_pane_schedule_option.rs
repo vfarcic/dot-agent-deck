@@ -48,12 +48,12 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
     deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
 
     // Saturate the cycler (it caps at the last option), then step back ONE.
-    // PRD #220: the built-in "schedule" option is no longer last — the graduated
-    // "dispatcher" option sits after it — so saturating alone lands on the wrong
-    // one. Saturate-then-Left is stable against the orchestration counts of
+    // PRD #220 / issue #193: the built-in "schedule" option is no longer last —
+    // `schedule: issues` and the "dispatcher" option sit after it — so saturating
+    // alone lands on the wrong one. Saturate-then-Left is stable against the orchestration counts of
     // whatever fixture this runs on, which is why the Rights are not just counted.
     deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
-    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
+    deck.send_keys(b"\x1b[D\x1b[D"); // Left ×2 → schedule (past `schedule: issues`)
 
     // Wait until selection actually LANDS on the schedule option before
     // snapshotting. The dialog title becomes "… — schedule mode" only when
@@ -143,9 +143,10 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
     deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
     // Right ×8 saturates the cycler on "dispatcher" (PRD #220: it graduated and is
-    // now the last slot); Left ×1 steps back to "schedule".
+    // now the last slot); Left ×2 steps back past `schedule: issues` (issue #193)
+    // to "schedule".
     deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
-    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
+    deck.send_keys(b"\x1b[D\x1b[D"); // Left ×2 → schedule (past `schedule: issues`)
     deck.wait_for_string("schedule mode"); // selection landed on the schedule mode
 
     // Force an EXPLICIT stand-in command instead of letting the blank Command
@@ -221,9 +222,10 @@ fn new_pane_009_schedule_chip_contained_when_row_overflows() {
     // authoring option is selected (`select_next_mode` caps at the last option,
     // so an over-count of Rights is safe).
     // Right ×8 saturates the cycler on "dispatcher" (PRD #220: it graduated and is
-    // now the last slot); Left ×1 steps back to "schedule".
+    // now the last slot); Left ×2 steps back past `schedule: issues` (issue #193)
+    // to "schedule".
     deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → dispatcher (cap)
-    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
+    deck.send_keys(b"\x1b[D\x1b[D"); // Left ×2 → schedule (past `schedule: issues`)
 
     // Wait until selection actually LANDS on the schedule option before
     // snapshotting. The dialog title becomes "… — schedule mode" only when
@@ -253,6 +255,7 @@ fn new_pane_009_schedule_chip_contained_when_row_overflows() {
         "[Orch: ci-deployment-alpha]",
         "[Orch: ci-deployment-bravo]",
         "[schedule]",
+        "[schedule: issues]",
         "[dispatcher]",
     ];
     for chip in chips {
@@ -274,61 +277,47 @@ fn new_pane_009_schedule_chip_contained_when_row_overflows() {
     );
 }
 
-/// Scenario: Open the new-pane dialog (Ctrl+n → Space confirms the dir) in the
-/// `schedule-mode` fixture and inspect the Mode cycler in two flag states. With
-/// the `experimental` flag ON (`DOT_AGENT_DECK_EXPERIMENTAL=1`) the cycler must
-/// offer a NEW issue-dispatch authoring option labelled `schedule: issues`
-/// ALONGSIDE the existing built-in `[schedule]` option. With the flag OFF
-/// (control launch, no env var) the `schedule: issues` option must be HIDDEN
-/// while the plain `[schedule]` option still shows. L2 like
-/// `prompt/new-pane/007-009` (the dialog renderer + `NewPaneFormState` are
-/// private — no public L1 render seam — so the real dialog is driven via PTY and
-/// asserted on the rendered vt100 grid). RED today: no `schedule: issues` option
-/// exists in any flag state, so the experimental-ON grid never carries it.
+/// Scenario: Launch the deck in the `schedule-mode` fixture with the
+/// `experimental` flag explicitly OFF and open the new-pane dialog (Ctrl+n →
+/// Space confirms the dir). The Mode cycler offers the issue-dispatch authoring
+/// option `[schedule: issues]` alongside the plain `[schedule]` option, because
+/// issue #193 graduated it from the flag.
 #[spec("prompt/new-pane/010")]
 #[test]
-fn new_pane_010_issue_dispatch_option_flag_gated() {
-    // The exact label of the new flag-gated issue-dispatch authoring option.
-    const ISSUE_OPTION: &str = "schedule: issues";
+fn new_pane_010_issue_dispatch_option_offered_without_the_flag() {
+    // The exact label of the issue-dispatch authoring option.
+    const ISSUE_OPTION: &str = "[schedule: issues]";
 
-    // --- experimental ON: the issue-dispatch authoring option is offered. ---
-    let on = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+    // The flag pinned OFF rather than merely unset, so an ambient
+    // `DOT_AGENT_DECK_EXPERIMENTAL=1` in the developer's shell cannot make this
+    // pass for the wrong reason.
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "0")
         .launch_with_fixture("schedule-mode");
-    on.wait_for_string("No active agents");
-    on.send_keys(b"\x0e"); // Ctrl+n → directory picker
-    on.send_keys(b" "); // Space → confirm current dir → new-pane form
-    // The Mode field is up at "No mode"; the chip row (all options) paints in the
-    // SAME frame, so once "No mode" is on the grid the issue-dispatch chip — if
-    // the flag enables it — is already painted alongside it.
-    on.wait_for_string("No mode");
-    let on_grid = on.snapshot_grid();
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // Space → confirm current dir → new-pane form
+    // The chip row paints whole in one frame; wait on that frame rather than on
+    // "No mode" alone, so a frame caught mid-paint cannot read as a missing chip.
+    let matched = std::cell::RefCell::new(String::new());
+    deck.wait_until_grid("the new-pane form with its Mode chips", |grid| {
+        let complete = grid.contains("No mode") && grid.contains("[dispatcher]");
+        if complete {
+            *matched.borrow_mut() = grid.to_string();
+        }
+        complete
+    });
+    let grid = matched.into_inner();
+    // `[schedule]` ends in `]` right after "schedule", so it never matches inside
+    // the longer `[schedule: issues]` chip — it identifies the plain one.
     assert!(
-        on_grid.contains(ISSUE_OPTION),
-        "with experimental ON the new-pane Mode cycler must offer a `{ISSUE_OPTION}` \
-         issue-dispatch authoring option alongside the plain `[schedule]` option, but the \
-         option is absent.\nGrid:\n{on_grid}"
-    );
-
-    // --- experimental OFF (control): the option is hidden; plain schedule stays. ---
-    let off = TuiDeck::launch_with_fixture("schedule-mode");
-    off.wait_for_string("No active agents");
-    off.send_keys(b"\x0e");
-    off.send_keys(b" ");
-    off.wait_for_string("No mode");
-    let off_grid = off.snapshot_grid();
-    // The plain built-in `[schedule]` option still shows when the flag is OFF.
-    // (`[schedule]` ends in `]` right after "schedule", so it never matches inside
-    // the longer `[schedule: issues]` chip — it uniquely identifies the plain one.)
-    assert!(
-        off_grid.contains("[schedule]"),
-        "with experimental OFF the plain built-in `[schedule]` option must still show.\n\
-         Grid:\n{off_grid}"
+        grid.contains("[schedule]"),
+        "the plain built-in `[schedule]` option must show.\nGrid:\n{grid}"
     );
     assert!(
-        !off_grid.contains(ISSUE_OPTION),
-        "with experimental OFF the `{ISSUE_OPTION}` issue-dispatch option must be HIDDEN, but \
-         it is present.\nGrid:\n{off_grid}"
+        grid.contains(ISSUE_OPTION),
+        "with the experimental flag OFF the new-pane Mode cycler must still offer \
+         `{ISSUE_OPTION}` (issue #193 graduated it), but the option is absent.\nGrid:\n{grid}"
     );
 }
 

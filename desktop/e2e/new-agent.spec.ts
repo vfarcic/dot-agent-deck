@@ -150,7 +150,7 @@ test.describe("the New agent flow", () => {
 
   /**
    * Scenario (PRD #1223 M7): on the fleet, open New agent and choose the
-   * remote deck, whose own experimental flag is on. Use its home directory
+   * remote deck. Use its home directory
    * with Space. The Mode row offers the three authoring agents; move to
    * `schedule: issues` with the arrow keys, clear the prefilled Command and
    * Start. The blank Command resolves to `claude` rather than the daemon's

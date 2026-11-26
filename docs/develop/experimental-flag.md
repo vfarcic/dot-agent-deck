@@ -90,7 +90,6 @@ This lets work-in-progress code merge to `main` without exposing unfinished UI d
 | Wrapper (in `src/features.rs`) | Surface | PRD | Graduation |
 |---|---|---|---|
 | `show_experimental_footer()` | The experimental dashboard footer | #139 | — |
-| `show_issue_dispatch_authoring()` | The new-pane `schedule: issues` modal authoring option (PRD #120 creation UX) | #120 | `graduate-issue-dispatch` |
 | `show_command_entry_lock()` | The orchestration command-entry lock: the `Ctrl+E` binding, the keystroke gate on a focused worker pane, and the waiting-pane focus steering | #393 | `graduate-command-entry-lock` |
 | `show_desktop_deck()` | The desktop app's deck — the multi-pane terminal screen: its rail entry, the dashboard's **Open daemons** buttons, a requested deck view (shown as the overview instead), and voice's `open_deck` (offered `callable: false` and refused at dispatch) | #1198 | `graduate-desktop-deck` |
 | `show_desktop_projects()` | The desktop app's Projects panel: its rail entry and command-palette entry | #1198 | `graduate-desktop-projects` |
@@ -107,6 +106,7 @@ This lets work-in-progress code merge to `main` without exposing unfinished UI d
 | Surface | PRD | Graduated |
 |---|---|---|
 | The new-pane `dispatcher` Mode-cycler option (PRD #220) — its `show_dispatcher()` wrapper is deleted and the branch inlined to `true`. The `dispatch` CLI verb and its daemon handler were never gated. Documented for users at [`docs/dispatcher-mode.md`](../dispatcher-mode.md). | #220 | in #220's own PR, before shipping |
+| The `schedule: issues` authoring option (PRD #120): the TUI's New Agent Mode-cycler option and the desktop's **New agent** chip. The `show_issue_dispatch_authoring()` wrapper is deleted and its branch inlined to `true`; the desktop chip, which followed the **daemon's** flag through `NewAgentOptions.experimental`, now follows only the deck's `authoring_kinds`, and the desktop crate no longer passes that flag to the webview. The daemon still sends `NewAgentOptions.experimental` unchanged, because a desktop build from before the graduation shows the chip only when it reads `true`. The `issue_dispatch` task type, its config and `schedule add --repo` were never gated. The maintainer graduated it on 2026-11-25 without the issue's dogfood checklist. | #120 | issue #193 |
 
 ## Removed instead of graduated
 
@@ -115,5 +115,3 @@ A gated surface can also leave the flag by being deleted, when it turns out not 
 | Surface | PRD | Removed |
 |---|---|---|
 | The desktop app's Prompts library (issue #1198): a list of saved task texts whose one consumer was the Orchestrations editor's **Insert saved prompt**, which filled that editor's **Task prompt** field. Both went, with the `show_desktop_prompts()` wrapper, the `showPrompts` field and the daemon-side library issue #824 had added on `main` before any release shipped it: the library duplicated agents' own skills, and typing the task into the orchestrator's pane gives the same result as the field. | #1310 | issue #1310 |
-
-> **`show_issue_dispatch_authoring()` is a render seam, like the others (redesigned 2026-06-24).** An earlier iteration gated `issue_dispatch` *behaviour* (the daemon's schedule-fire activation seam) — that is **gone**. A configured `issue_dispatch` task now runs **unconditionally**; the flag, config parsing, and the `schedule add --repo …` CLI are all flag-free. The wrapper now gates ONLY the new-pane Mode-cycler `schedule: issues` authoring option (a render/input seam in `src/ui.rs`) — i.e. the experimental *creation UX* for the task type, not the task type itself. This keeps the flag presentation-only, consistent with the default model.

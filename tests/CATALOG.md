@@ -504,6 +504,13 @@ The deck asks for the approval itself when it refuses to start an unapproved orc
 - **Does not assert:** the desktop app's own UI (its vitest and Playwright specs); `delegate`, `pane restart` and `pane spawn` callers (`trust_requests` unit tests record them the same way).
 - **Platform coverage:** mac+linux.
 
+##### config-trust/request/006 — A request held behind a dialog is said in the TUI's footer, and opens when the dialog closes.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, with a PTY-attached TUI already showing Help, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** with Help open when the refused run-now raises the request, the review does not cover Help and the footer says `1 approval waiting` (issue #2511); `Esc` closes Help, the review opens on its own with `Asked by: scheduled task 'held-sched'` and its footer, and the badge is gone.
+- **Does not assert:** the badge's placement beside Rename's buttons or in Filter mode (`ui.rs` `request_tui_004`); the desktop app's marker (its vitest and Playwright specs).
+- **Platform coverage:** mac+linux.
+
 #### config-trust/rearm
 
 ##### config-trust/rearm/001 — A warm reattach never re-arms the orchestrator with changed, unapproved instructions.
@@ -3673,15 +3680,15 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### prompt/new-pane/009 — Every Mode chip, the built-in `[schedule]` included, stays fully visible inside the modal at 80 columns, where the chip row is wider than the capped modal and wraps onto further rows (PRD #168).
 - **Layer:** L2 (the real dialog is driven via PTY keystrokes and asserted on the rendered vt100 grid; the L1 half of the wrap is `render/layout/007`).
 - **Agent:** none (drives Ctrl+n → dir-picker → new-pane form at 80×24, then cycles the Mode field to the `schedule` option).
-- **Asserts:** with two long orchestration chips widening the Mode row past the modal's 90%-of-terminal cap at 80 columns, selecting the trailing `[schedule]` option leaves every chip — `[No mode]`, both `[Orch: …]` chips, `[schedule]` and `[dispatcher]` — fully visible between the modal borders, and the chips occupy more than one row.
+- **Asserts:** with two long orchestration chips widening the Mode row past the modal's 90%-of-terminal cap at 80 columns, selecting the `[schedule]` option leaves every chip — `[No mode]`, both `[Orch: …]` chips, `[schedule]`, `[schedule: issues]` and `[dispatcher]` — fully visible between the modal borders, and the chips occupy more than one row.
 - **Does not assert:** which chip lands on which row; the selected-chip highlight and click rects on a wrapped row (covered at L1 by `ui::tests::new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets`); the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/010 — The new-pane Mode cycler offers an experimental `schedule: issues` issue-dispatch authoring option only when the experimental flag is ON; it is hidden when OFF while the plain `[schedule]` option still shows (PRD #120).
+##### prompt/new-pane/010 — The new-pane Mode cycler offers the `schedule: issues` issue-dispatch authoring option alongside the plain `[schedule]` option with the experimental flag OFF (PRD #120; graduated from the flag in issue #193).
 - **Layer:** L2 (no public L1 render seam for the dialog — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
-- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form in two flag states).
-- **Asserts:** launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`, opening the new-pane form shows a `schedule: issues` option on the Mode cycler alongside the existing `[schedule]` option; a control launch with no env var (flag OFF) renders the plain `[schedule]` option but NOT `schedule: issues`. RED until the option exists: today no flag state carries `schedule: issues`, so the experimental-ON grid never contains it.
-- **Does not assert:** the authoring seed delivered when the option is selected (covered by `scheduler/form/007`); the post-submit layout; the chip's exact position in the cycler.
+- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form).
+- **Asserts:** launched with `DOT_AGENT_DECK_EXPERIMENTAL=0` (the flag pinned OFF), opening the new-pane form shows both the plain `[schedule]` chip and the `[schedule: issues]` chip on the Mode row. Until issue #193 this test asserted the opposite for the flag OFF: the option was hidden unless the flag was on.
+- **Does not assert:** the authoring seed delivered when the option is selected (covered by `scheduler/form/007`); the post-submit layout; the chip's exact position in the cycler; the desktop's `schedule: issues` chip (covered by `desktop/src/lib/newAgent.test.ts` and `desktop/src/components/NewAgentDialog.test.tsx`).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/new-pane/011 — The new-agent Command field seeds from the last command you spawned when no `default_command` is configured (PRD #196).
@@ -5334,7 +5341,7 @@ note).
 ##### render/layout/007 — A new-pane Mode chip row wider than the capped modal wraps onto further rows instead of clipping, and the fields below re-flow (PRD #168).
 - **Layer:** L1 (in-process `TestBackend` via `render_new_pane_form_to_buffer`; no PTY, no subprocess). Structural assertions first, an `insta` snapshot of the frame after them.
 - **Agent:** none (renders the new-pane form with four long orchestration names into an 80×30 buffer).
-- **Asserts:** every Mode chip — `[No mode]`, the four `[Orch: …]` chips, `[schedule]` and `[dispatcher]` — renders whole, exactly once, between the modal's `│ … │` borders; the chips occupy more than one row; and the `Name:` and `Command:` fields still render on rows of their own below them.
+- **Asserts:** every Mode chip — `[No mode]`, the four `[Orch: …]` chips, `[schedule]`, `[schedule: issues]` and `[dispatcher]` — renders whole, exactly once, between the modal's `│ … │` borders; the chips occupy more than one row; and the `Name:` and `Command:` fields still render on rows of their own below them.
 - **Does not assert:** the highlight and click rects of a chip on a wrapped row (covered by `ui::tests::new_pane_form_wrapped_mode_chips_keep_highlight_and_click_targets`); the live binary at 80 columns (covered by `prompt/new-pane/009`); behaviour on a terminal too short for the form (covered by `render/layout/005`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -8064,6 +8071,20 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** real SSH authentication, release-download compatibility, desktop behavior, or survival of a role map (covered synthetically by /006).
 - **Platform coverage:** mac+linux (Unix); credentials required locally, never run in CI.
 
+##### remote/upgrade/009 — Upgrade all restarts the idle older daemon, asks the busy one about its own work, and skips the current one.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, three sandboxed SSH installers and real daemons behind one host-routing SSH shim).
+- **Agent:** three synthetic cat stand-ins on the busy daemon, including two orchestration roles.
+- **Asserts:** the check reports three decks and two to upgrade; the idle older daemon restarts without a question before the next deck; the busy one asks once, naming its deck, agents, panes and orchestration; Enter keeps its daemon, agents and role map; the current deck is neither installed nor restarted; the run ends with the counts and one line per deck.
+- **Does not assert:** real SSH, independently compiled releases, real-agent work, the TUI or desktop dialogs.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/010 — A deck that fails does not stop Upgrade all, and the batch exits non-zero.
+- **Layer:** L2 (lane 1, real CLI with piped stdout, sandboxed SSH installers and daemons, one deck the SSH shim refuses).
+- **Agent:** none.
+- **Asserts:** with `--json`, stdout is one report naming every deck in deck-list order; an install failure is `failed` at the installing stage and its daemon keeps running; an unreachable deck is `failed` as not checked; the older idle deck after both is still upgraded and restarted; the exit status is non-zero.
+- **Does not assert:** real SSH, TTY rendering or release compatibility.
+- **Platform coverage:** linux+mac.
+
 #### remote/connect
 
 ##### remote/connect/001 — Upgrade-and-connect choices render the attached daemon without repeated consent.
@@ -8208,6 +8229,57 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** the floor is one hour and `focus_recheck_floor()` is it; a focus-in is due with no check started yet, not due within the hour, due at the hour and after five hours, and due when the wall clock moved backwards (issue #2450).
 - **Does not assert:** the checker loop reacting to a real focus-in (`upgrade/tui-upgrade/005`), the desktop app's focus re-check (`desktop/src/hooks/useSelfUpgradeCheck.test.ts`, `self_upgrade_check_006`–`007`).
+- **Platform coverage:** mac+linux+windows.
+
+#### upgrade/upgrade-all-dialog
+
+##### upgrade/upgrade-all-dialog/001 — Upgrade all daemons shows the plan for every remote deck and starts on Cancel.
+- **Layer:** L1 (`upgrade_all_dialog::UpgradeAllDialog` + ratatui `TestBackend` + `insta`), fed a `daemon_upgrade_batch::BatchPlan`.
+- **Agent:** none.
+- **Asserts:** the checking line; the plan's headline and one line per deck in the shared words (to upgrade, already current, could not be checked); the question naming how many daemons; `> Cancel` selected, and Enter alone closes.
+- **Does not assert:** the check itself (`daemon_upgrade_batch` unit tests, `remote/upgrade/009`), the spawned TUI.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/002 — A busy daemon's question names its own agents and roles and defaults to Keep current daemon.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** the deck being upgraded and its stage; the question naming that deck, its agents (pane, directory) and its orchestration role; `> Keep current daemon` selected; Esc answers Keep.
+- **Does not assert:** a real daemon's stop set (`remote/upgrade/009`), the answer reaching the daemon (`upgrade_all_dialog` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/003 — Stop after this daemon waits for the daemon being upgraded and offers nothing else.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** Stop after this daemon is the running batch's only button; after it, the dialog says it is stopping and shows no button; a finished deck's line reads as kept running.
+- **Does not assert:** the batch starting no further deck (`daemon_upgrade_batch::tests::stopping_finishes_the_current_deck_and_starts_no_other`).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/004 — The results show the counts and one line per deck.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** the headline counts; upgraded, skipped, not started and failed lines in the shared words; only Close, and Enter closes.
+- **Does not assert:** the CLI's summary (`remote/upgrade/009`), the desktop's (`desktop/src/components/UpgradeAllDialog.test.tsx`).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/005 — Restart now waits until every agent a busy daemon names has been on screen.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** with 30 agents on a 24-row terminal the dialog scrolls to the question, the last agent is off screen, the hint says to read the whole list, and Restart now does nothing; after PageDown brings the last agent on screen Restart now is answered.
+- **Does not assert:** the desktop dialog, which scrolls its own list in the browser.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/006 — Rows scrolled past between two frames keep Restart now refused.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** ten PageDowns before one draw put the last agent on screen without the rows between ever being drawn, and Restart now does nothing; paging back up a frame at a time shows them and Restart now is answered.
+- **Does not assert:** the desktop dialog, which scrolls its own list in the browser.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/007 — On a short terminal, paging moves at most one screen, so no agent is skipped before Restart now.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** on a 13-row terminal, Restart now does nothing at every step until paging has reached the end; every one of the 30 agents was drawn on some frame before it becomes available.
+- **Does not assert:** the desktop dialog.
 - **Platform coverage:** mac+linux+windows.
 
 #### upgrade/tui-upgrade
@@ -10597,11 +10669,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the unchanged-pick / pre-fill path (covered by `scheduler/form/003`); the in-`src` `build_schedule_authoring_mode` seed unit tests (the coder's); the Add path (covered by `scheduler/form/002`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/form/007 — Selecting the experimental `schedule: issues` Mode option seeds the authoring agent with ISSUE-DISPATCH instructions (calls `schedule add --repo …`, gathers `max_per_run`), distinct from the plain `schedule` seed (PRD #120).
-- **Layer:** L2 (drives the real new-pane dialog via PTY — the experimental issue-dispatch option lives on the Ctrl+n Mode cycler, not the mode-locked manager form, so this drives Ctrl+n directly; observed via a `stub-issue-authoring` recorder shim on disk that records the gated-delivered seed). `default_command = "stub-issue-authoring"`; the deck is launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+##### scheduler/form/007 — Selecting the `schedule: issues` Mode option seeds the authoring agent with ISSUE-DISPATCH instructions (calls `schedule add --repo …`, gathers `max_per_run`), distinct from the plain `schedule` seed (PRD #120).
+- **Layer:** L2 (drives the real new-pane dialog via PTY — the issue-dispatch option lives on the Ctrl+n Mode cycler, not the mode-locked manager form, so this drives Ctrl+n directly; observed via a `stub-issue-authoring` recorder shim on disk that records the gated-delivered seed). `default_command = "stub-issue-authoring"`; the deck is launched with `DOT_AGENT_DECK_EXPERIMENTAL=0`, since the option graduated from the flag (issue #193).
 - **Agent:** the shimmed `stub-issue-authoring` authoring agent (records the gated-delivered seed).
-- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) opening the new-pane form (Ctrl+n → Space confirms the dir) and cycling the Mode field to the `schedule: issues` option (waited on via the selection-dependent ` … — schedule: issues mode ` title), then submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed contains the issue-dispatch guidance `schedule add --repo` AND `max_per_run` — neither present in the plain `schedule` seed (which calls `schedule add --name`). RED today: no `schedule: issues` option exists, so cycling never lands on it and the `schedule: issues mode` title wait times out.
-- **Does not assert:** the flag-gated visibility of the option in the cycler (covered by `prompt/new-pane/010`); the CLI write the agent ultimately performs (covered by `scheduler/cli/004`); the full seed-prompt text (loose substring on the issue-dispatch-specific tokens); the plain `schedule` seed (covered by `scheduler/form/002`).
+- **Asserts:** (PRD #1666 S5: the seed is posted to the authoring agent's inbox; the recorder shim posts its SessionStart and hands its pane to the shared profiled agent, which the deck types its doorbell into under the e2e stand-in profile, selected from the daemon's own environment, and which answers it with `inbox fetch` and records what it fetched, so the seed it records is the one posted.) opening the new-pane form (Ctrl+n → Space confirms the dir) and cycling the Mode field to the `schedule: issues` option (waited on via the selection-dependent ` … — schedule: issues mode ` title), then submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed contains the issue-dispatch guidance `schedule add --repo` AND `max_per_run` — neither present in the plain `schedule` seed (which calls `schedule add --name`).
+- **Does not assert:** the option's visibility with the flag off (covered by `prompt/new-pane/010`); the CLI write the agent ultimately performs (covered by `scheduler/cli/004`); the full seed-prompt text (loose substring on the issue-dispatch-specific tokens); the plain `schedule` seed (covered by `scheduler/form/002`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/idle-worker

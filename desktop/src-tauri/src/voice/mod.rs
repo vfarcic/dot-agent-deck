@@ -335,7 +335,7 @@ pub struct VoiceNewAgent {
 ///
 /// **The chips and the picker entries are the ones the dialog actually
 /// offers**, never a list this crate knows: the Mode row varies by the deck's
-/// capabilities, the deck's experimental flag, and whether the chosen
+/// capabilities and whether the chosen
 /// directory is a project with orchestrations; the agent list is the deck's
 /// own registry, or the desktop's labelled fallback for a deck that does not
 /// report one. A spoken mode or agent type resolves against these and nothing
@@ -354,8 +354,8 @@ pub struct VoiceNewAgentForm {
     /// The agents the deck offers, as the dialog declares them — its registry, or this app's fallback copy for a deck that reports none.
     pub agent_types: Vec<VoiceChoice>,
     /// The Mode chips the dialog KNOWS and withholds on this form — an
-    /// authoring kind the deck cannot compose, or `schedule: issues` with the
-    /// deck's experimental flag off. Never resolvable: they are here so that a
+    /// authoring kind the deck cannot compose (since issue #193 the deck's
+    /// experimental flag withholds none). Never resolvable: they are here so that a
     /// user who names one is told it is not offered, instead of being handed
     /// the nearest chip that is (a model shown only the offered chips was
     /// measured substituting `schedule` for "schedule issues").

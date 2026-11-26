@@ -2203,8 +2203,6 @@ pub enum DesktopNewAgentOptions {
         default_dir: Option<String>,
         /// The agent registry the DECK was built with, in its order.
         agents: Vec<DesktopAgentOption>,
-        /// The deck's own experimental flag.
-        experimental: bool,
         /// The authoring kinds the deck can compose a seed for.
         authoring_kinds: Vec<String>,
         /// This deck's last New agent form command, plain or authoring: the

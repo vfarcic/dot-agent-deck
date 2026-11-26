@@ -90,7 +90,7 @@ function runtime(voice: ReturnType<typeof microphone>, fleet: DeckSnapshot[]) {
     setZoom: vi.fn(async (level: number) => level),
     voiceCommands: vi.fn(async () => []),
     listDirectories: vi.fn(async () => ({ kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false })),
-    newAgentOptions: vi.fn(async () => ({ kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand: "claude" })),
+    newAgentOptions: vi.fn(async () => ({ kind: "deck", agents: [], authoringKinds: [], lastCommand: "claude" })),
     resolveVoice, ...voice,
   } as unknown as DeckRuntimeState;
 }
