@@ -146,6 +146,11 @@ pub struct UpgradeAllDialog {
     selected: usize,
     /// How many body rows are scrolled past.
     scroll: usize,
+    /// A question just arrived: the next draw scrolls to its first row.
+    scroll_to_question: bool,
+    /// Every row of the open question has been on screen. Restart now is
+    /// refused until it has, so nothing is stopped that was not shown.
+    question_seen: bool,
 }
 
 impl Default for UpgradeAllDialog {
@@ -160,6 +165,8 @@ impl UpgradeAllDialog {
             phase: Phase::Checking,
             selected: 0,
             scroll: 0,
+            scroll_to_question: false,
+            question_seen: false,
         }
     }
 
@@ -266,6 +273,8 @@ impl UpgradeAllDialog {
                 self.reset_selection();
                 Effect::Stop
             }
+            // Nothing is stopped that the user could not have read.
+            Choice::RestartNow if !self.question_seen => Effect::None,
             Choice::Keep | Choice::RestartNow => {
                 if let Phase::Running(run) = &mut self.phase {
                     run.question = None;
@@ -338,11 +347,20 @@ impl UpgradeAllDialog {
         if let Phase::Running(run) = &mut self.phase {
             run.question = Some(question);
             self.selected = 0;
+            self.scroll_to_question = true;
+            self.question_seen = false;
         }
     }
 
-    /// The body: one line per deck, in deck-list order. A daemon's question is
-    /// [`Self::question_lines`], drawn in the footer so it is always in view.
+    /// Whether Restart now can be chosen: every agent and role the question
+    /// names has been on screen.
+    pub fn question_seen(&self) -> bool {
+        self.question_seen
+    }
+
+    /// The body: one line per deck, in deck-list order. A daemon's question,
+    /// [`Self::question_lines`], is drawn below it, scrolled into view when it
+    /// arrives.
     pub fn body_lines(&self) -> Vec<(String, Style)> {
         let mut lines = Vec::new();
         let deck = |name: &str| display_line(name, crate::untrusted_text::REMOTE_NAME_MAX_BYTES);
@@ -425,8 +443,8 @@ impl UpgradeAllDialog {
         lines
     }
 
-    /// The open question, with what it would stop, for the footer above its
-    /// buttons; empty when no daemon is asking.
+    /// The open question, with what it would stop; empty when no daemon is
+    /// asking.
     pub fn question_lines(&self) -> Vec<(String, Style)> {
         let Phase::Running(Run {
             question: Some(question),
@@ -519,8 +537,11 @@ fn check_style(check: &DeckCheck) -> Style {
 fn hint(dialog: &UpgradeAllDialog) -> &'static str {
     match dialog.phase() {
         Phase::Checking => "Esc closes",
+        Phase::Running(run) if run.question.is_some() && !dialog.question_seen => {
+            "PgDn to read the whole list before Restart now · Esc keeps the current daemon"
+        }
         Phase::Running(run) if run.question.is_some() => {
-            "↑/↓ choose · Enter confirms · Esc keeps the current daemon"
+            "↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc keeps the current daemon"
         }
         Phase::Running(run) if run.stopping => "Wait for the daemon being upgraded to finish.",
         Phase::Running(_) => "Enter or Esc stops after this daemon",
@@ -542,29 +563,28 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &mut UpgradeAllDialog) -> V
         .border_style(Style::default().fg(Color::Yellow));
     let text_width = usize::from(width.saturating_sub(4)).max(1);
 
-    let mut body: Vec<Line<'static>> = Vec::new();
-    for (text, style) in dialog.body_lines() {
-        let clean = crate::untrusted_text::strip_control_and_bidi(&text, false);
-        for row in crate::upgrade_dialog::wrap(&clean, text_width) {
-            body.push(Line::styled(row, style));
+    let push = |body: &mut Vec<Line<'static>>, lines: Vec<(String, Style)>| {
+        for (text, style) in lines {
+            let clean = crate::untrusted_text::strip_control_and_bidi(&text, false);
+            for row in crate::upgrade_dialog::wrap(&clean, text_width) {
+                body.push(Line::styled(row, style));
+            }
         }
-    }
+    };
+    let mut body: Vec<Line<'static>> = Vec::new();
+    push(&mut body, dialog.body_lines());
+    // A daemon's question follows the deck list, in the part that scrolls, so
+    // a long list of agents can be read in full on any terminal.
+    let question = dialog.question_lines();
+    let question_start = (!question.is_empty()).then(|| {
+        body.push(Line::from(""));
+        body.len()
+    });
+    push(&mut body, question);
 
     let buttons = dialog.buttons();
     let selected = dialog.selected();
-    // The footer never scrolls: a daemon's question stays in view above the
-    // buttons that answer it, however long the deck list above is.
     let mut footer: Vec<Line<'static>> = vec![Line::from("")];
-    let question = dialog.question_lines();
-    for (text, style) in &question {
-        let clean = crate::untrusted_text::strip_control_and_bidi(text, false);
-        for row in crate::upgrade_dialog::wrap(&clean, text_width) {
-            footer.push(Line::styled(row, *style));
-        }
-    }
-    if !question.is_empty() {
-        footer.push(Line::from(""));
-    }
     let first_button_row = footer.len();
     for choice in &buttons {
         let (cursor, style) = if Some(*choice) == selected {
@@ -575,16 +595,27 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &mut UpgradeAllDialog) -> V
         footer.push(Line::styled(format!("{cursor} {}", choice.label()), style));
     }
     footer.push(Line::from(""));
+
+    // Border (2), the blank row above the body (1) and the hint (1) leave
+    // the rest.
+    let room = usize::from(max_height).saturating_sub(2 + 1 + footer.len() + 1);
+    let max_scroll = body.len().saturating_sub(room);
+    if let Some(start) = question_start
+        && std::mem::take(&mut dialog.scroll_to_question)
+    {
+        dialog.scroll = start;
+    }
+    dialog.scroll = dialog.scroll.min(max_scroll);
+    let scroll = dialog.scroll;
+    // The question's last row reached the screen: Restart now may be chosen.
+    if question_start.is_some() && room > 0 && scroll + room >= body.len() {
+        dialog.question_seen = true;
+    }
+    // Chosen once this frame has said whether the question was seen.
     footer.push(Line::styled(
         hint(dialog),
         plain().add_modifier(Modifier::DIM),
     ));
-
-    // Border (2) and the blank row above the body (1) leave the rest.
-    let room = usize::from(max_height).saturating_sub(2 + 1 + footer.len());
-    let max_scroll = body.len().saturating_sub(room);
-    dialog.scroll = dialog.scroll.min(max_scroll);
-    let scroll = dialog.scroll;
     if scroll + room < body.len() {
         footer[0] = Line::styled("↓ more — PgDn", Style::default().fg(Color::Yellow));
     }
@@ -883,6 +914,20 @@ mod tests {
         );
         dialog.ask(question());
         dialog.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            Effect::None,
+            "Restart now waits until the question has been on screen"
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render(frame, area, &mut dialog);
+            })
+            .unwrap();
+        assert!(dialog.question_seen());
         assert_eq!(
             dialog.handle_key(key(KeyCode::Enter)),
             Effect::Answer(RestartChoice::RestartNow)

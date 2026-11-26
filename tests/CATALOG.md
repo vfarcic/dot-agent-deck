@@ -8254,6 +8254,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the CLI's summary (`remote/upgrade/009`), the desktop's (`desktop/src/components/UpgradeAllDialog.test.tsx`).
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-all-dialog/005 — Restart now waits until every agent a busy daemon names has been on screen.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** with 30 agents on a 24-row terminal the dialog scrolls to the question, the last agent is off screen, the hint says to read the whole list, and Restart now does nothing; after PageDown brings the last agent on screen Restart now is answered.
+- **Does not assert:** the desktop dialog, which scrolls its own list in the browser.
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.

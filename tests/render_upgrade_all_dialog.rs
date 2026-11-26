@@ -24,7 +24,11 @@ use ratatui::backend::TestBackend;
 use spec::spec;
 
 fn draw(dialog: &mut UpgradeAllDialog) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    draw_at(dialog, 100, 30)
+}
+
+fn draw_at(dialog: &mut UpgradeAllDialog, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| {
             let area = frame.area();
@@ -244,4 +248,57 @@ fn upgrade_all_dialog_004_the_results_are_one_line_per_deck() {
     insta::assert_snapshot!("upgrade_all_dialog_004_results", text);
     assert_eq!(dialog.buttons(), [Choice::Close]);
     assert_eq!(dialog.handle_key(key(KeyCode::Enter)), Effect::Close);
+}
+
+/// Scenario: A busy daemon names more agents than the terminal can show. The dialog scrolls to the question, Restart now does nothing until PageDown has brought the last agent on screen, and Keep current daemon works at any time.
+#[spec("upgrade/upgrade-all-dialog/005")]
+#[test]
+fn upgrade_all_dialog_005_restart_now_waits_until_every_agent_was_on_screen() {
+    let mut dialog = UpgradeAllDialog::new();
+    dialog.apply(&Update::Checked(Ok(plan())));
+    dialog.choose(Choice::Upgrade);
+    dialog.apply(&started(0, "mac-studio"));
+    let many = RestartStopSet {
+        agents: (0..30)
+            .map(|i| RestartAgent {
+                id: format!("a{i}"),
+                label: format!("worker-{i:02}"),
+                pane_id: Some(format!("{i}")),
+                cwd: None,
+            })
+            .collect(),
+        roles: Vec::new(),
+    };
+    dialog.ask(Question {
+        deck: "mac-studio".into(),
+        at_stake: many,
+        stale: false,
+    });
+    let first = draw_at(&mut dialog, 100, 24);
+    assert!(
+        first.contains("Restarting the daemon on mac-studio stops 30 agents:"),
+        "the question is scrolled into view: {first}"
+    );
+    assert!(
+        !first.contains("worker-29"),
+        "the list is longer than the screen: {first}"
+    );
+    assert!(
+        first.contains("PgDn to read the whole list before Restart now"),
+        "{first}"
+    );
+    assert!(!dialog.question_seen());
+    assert_eq!(dialog.choose(Choice::RestartNow), Effect::None);
+
+    while !dialog.question_seen() {
+        dialog.handle_key(key(KeyCode::PageDown));
+        let shown = draw_at(&mut dialog, 100, 24);
+        if dialog.question_seen() {
+            assert!(shown.contains("worker-29"), "{shown}");
+        }
+    }
+    assert_eq!(
+        dialog.choose(Choice::RestartNow),
+        Effect::Answer(RestartChoice::RestartNow)
+    );
 }

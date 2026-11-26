@@ -25,5 +25,5 @@ expression: text
   │ > Keep current daemon                                                                        │  
   │   Restart now                                                                                │  
   │                                                                                              │  
-  │ ↑/↓ choose · Enter confirms · Esc keeps the current daemon                                   │  
+  │ ↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc keeps the current daemon                │  
   └──────────────────────────────────────────────────────────────────────────────────────────────┘
