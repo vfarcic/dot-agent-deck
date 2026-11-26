@@ -66,7 +66,7 @@ function makeDialogRuntime(voice: ReturnType<typeof microphone>) {
     if (!listing) throw new Error(`No fixture directory at ${path}`);
     return { kind: "listing" as const, ...listing, displayPath: listing.path, truncated: false };
   });
-  runtime.newAgentOptions = vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] }));
+  runtime.newAgentOptions = vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: ["schedule", "schedule-issues", "dispatcher"] }));
   return { runtime, resolveVoice };
 }
 
@@ -80,7 +80,7 @@ function makeFleetDialogRuntime(voice: ReturnType<typeof microphone>) {
     if (!listing) throw new Error(`No fixture directory at ${path}`);
     return { kind: "listing" as const, ...listing, displayPath: listing.path, truncated: false };
   });
-  runtime.newAgentOptions = vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] }));
+  runtime.newAgentOptions = vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: ["schedule", "schedule-issues", "dispatcher"] }));
   return { runtime, resolveVoice };
 }
 

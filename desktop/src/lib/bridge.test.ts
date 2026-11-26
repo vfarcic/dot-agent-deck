@@ -2151,20 +2151,23 @@ describe("FixtureDeckBridge scenarios", () => {
   });
 
   /**
-   * Scenario (PRD #1223 M7): the fleet preview's remote deck has its own
-   * experimental flag on and the local deck's is off, and both list the three
-   * authoring kinds. An authoring start on the remote deck adds the agent and
+   * Scenario (PRD #1223 M7): both of the fleet preview's decks list the three
+   * authoring kinds, and neither reports a flag the dialog would read (issue
+   * #193). An authoring start on the remote deck adds the agent and
    * records its command; played as an older deck, the same start is refused
    * in the crate's own words and adds nothing.
    */
-  it("answers each fixture deck's own flag and refuses an authoring start on an older one", async () => {
+  it("lists every authoring kind on each fixture deck and refuses an authoring start on an older one", async () => {
     const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
     window.history.replaceState({}, "", "/?fixture=1&state=fleet");
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
     await bridge.connect();
-    expect(await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).toMatchObject({ experimental: true, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] });
-    expect(await bridge.newAgentOptions(FIXTURE_DAEMON_ID)).toMatchObject({ experimental: false });
+    for (const deckId of [FIXTURE_REMOTE_DAEMON_ID, FIXTURE_DAEMON_ID]) {
+      const options = await bridge.newAgentOptions(deckId);
+      expect(options).toMatchObject({ authoringKinds: ["schedule", "schedule-issues", "dispatcher"] });
+      expect(options).not.toHaveProperty("experimental");
+    }
     const started = await bridge.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, command: "claude", cwd: "/home/build/scratch", displayName: "scratch", authoringKind: "dispatcher" });
     expect(started.agentId).toBeDefined();
     // Issue #1496: recorded on the agent, as the live daemon records it.

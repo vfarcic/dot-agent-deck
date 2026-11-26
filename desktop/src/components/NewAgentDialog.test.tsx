@@ -48,7 +48,6 @@ const DECK_OPTIONS: NewAgentOptions = {
     { id: "claude", displayName: "ClaudeCode", defaultCommand: "claude" },
     { id: "pi", displayName: "Pi", defaultCommand: "pi --thinking" },
   ],
-  experimental: false,
   authoringKinds: [],
 };
 
@@ -1397,16 +1396,14 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
   const modeLabels = () => within(screen.getByTestId("new-agent-modes")).getAllByRole("button").map((chip) => chip.textContent);
 
   /**
-   * Scenario: reach the form on a daemon that lists all three authoring kinds
-   * with its experimental flag off. The Mode row offers No mode, schedule and
-   * dispatcher — not `schedule: issues`, which the TUI shows only with the
-   * flag. With the flag on, it is offered between the other two.
+   * Scenario: reach the form on a daemon that lists all three authoring kinds.
+   * The Mode row offers No mode, schedule, schedule: issues and dispatcher, in
+   * the TUI's order — `schedule: issues` with no experimental flag involved,
+   * since issue #193 graduated it, as the TUI offers it.
    */
-  it.each([
-    ["off", false, ["No mode", "schedule", "dispatcher"]],
-    ["on", true, ["No mode", "schedule", "schedule: issues", "dispatcher"]],
-  ])("offers the authoring chips the daemon lists, schedule: issues only with the daemon's flag %s", async (_flag, experimental, expected) => {
-    renderDialog(fakeRuntime({ newAgentOptions: optionsOf({ experimental }) }));
+  it("offers every authoring chip the daemon lists, schedule: issues included", async () => {
+    const expected = ["No mode", "schedule", "schedule: issues", "dispatcher"];
+    renderDialog(fakeRuntime({ newAgentOptions: optionsOf() }));
     await reachForm();
 
     await waitFor(() => expect(modeLabels()).toEqual(expected));
@@ -1422,7 +1419,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
    */
   it.each([
     ["an older deck", vi.fn(async (): Promise<NewAgentOptions> => ({ kind: "unsupported", desktopAgents: DECK_OPTIONS.kind === "deck" ? DECK_OPTIONS.agents : [] })), "does not report which authoring agents"],
-    ["a daemon that composes no seed", optionsOf({ authoringKinds: [], experimental: true }), "cannot compose authoring seeds"],
+    ["a daemon that composes no seed", optionsOf({ authoringKinds: [] }), "cannot compose authoring seeds"],
   ])("withholds every authoring chip on %s and says why", async (_case, newAgentOptions, reason) => {
     renderDialog(fakeRuntime({ newAgentOptions }));
     await reachForm();
@@ -1468,6 +1465,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
     const none = await screen.findByTestId("new-agent-mode-none");
     fireEvent.keyDown(none, { key: "ArrowRight" });
     fireEvent.keyDown(screen.getByTestId("new-agent-mode-schedule"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByTestId("new-agent-mode-schedule-issues"), { key: "ArrowRight" });
     expect(screen.getByTestId("new-agent-mode-dispatcher")).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByTestId("new-agent-mode-dispatcher")).toHaveFocus();
 
@@ -1476,7 +1474,7 @@ describe("New agent dialog — authoring agents (PRD #1223 M7)", () => {
     expect(runtime.runAction).toHaveBeenLastCalledWith(expect.objectContaining({ command: "opencode --model mini", authoringKind: "dispatcher" }));
 
     // Left wraps back past No mode onto the last chip; a typed command is sent verbatim.
-    const typed = fakeRuntime({ newAgentOptions: optionsOf({ experimental: true }) });
+    const typed = fakeRuntime({ newAgentOptions: optionsOf() });
     cleanupAndRender(typed);
     await reachForm();
     fireEvent.keyDown(await screen.findByTestId("new-agent-mode-none"), { key: "ArrowLeft" });

@@ -1,4 +1,4 @@
-import { createFixtureCardCatalog, createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, fleetAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, FIXTURE_REMOTE_DAEMON_ID, type FixtureState } from "../data/fixture";
+import { createFixtureCardCatalog, createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, fleetAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, FIXTURE_REMOTE_DAEMON_ID, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -1120,8 +1120,7 @@ export interface VoiceDashboardDto {
  * `form` is present only while the form's fields are live — a deck and a
  * directory chosen, no start in flight, and no start confirmation open — and
  * carries the Mode chips and agent entries AS OFFERED: they vary by the
- * deck's capabilities, its experimental flag and whether the directory is a
- * project, and a spoken `mode_ref` or `agent_type_ref` resolves against these
+ * deck's capabilities and whether the directory is a project, and a spoken `mode_ref` or `agent_type_ref` resolves against these
  * and nothing else.
  */
 export interface VoiceNewAgentDto {
@@ -4470,7 +4469,6 @@ class FixtureDeckBridge implements DeckBridge {
       kind: "deck",
       ...(defaultCommand === undefined ? {} : { defaultCommand }),
       agents: fixtureAgentRegistry(),
-      experimental: FIXTURE_EXPERIMENTAL_DECKS.has(deckId),
       authoringKinds: ["schedule", "schedule-issues", "dispatcher"],
       ...remembered,
     };

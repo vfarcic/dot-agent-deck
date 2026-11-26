@@ -247,7 +247,7 @@ Each topic or pool name must be 1–64 lowercase letters, digits or hyphens, sta
 
 ## Turn on experimental features
 
-Some new surfaces ship behind one switch, `experimental`, which is off by default. In the TUI it enables, among others, the `Ctrl+e` command-entry lock in orchestration tabs and the `schedule: issues` mode; in the desktop app, the deck screen and the Projects, Orchestrations and Agent Profiles screens.
+Some new surfaces ship behind one switch, `experimental`, which is off by default. In the TUI it enables, among others, the `Ctrl+e` command-entry lock in orchestration tabs; in the desktop app, the deck screen and the Projects, Orchestrations and Agent Profiles screens.
 
 For the TUI and the daemon, either set it in the project's `.dot-agent-deck.toml`:
 

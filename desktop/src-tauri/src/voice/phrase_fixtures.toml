@@ -2625,7 +2625,7 @@ outcome = "unavailable"
 # PRD #1223 — the rest of the New agent form by voice. `form = true` plants a
 # live form (it implies the dialog is open): Mode chips No mode, Orch:
 # billing-run, schedule and dispatcher — NO `schedule: issues`, because the
-# planted deck's experimental flag is off — and the picker auto, Claude Code,
+# planted deck does not list that kind — and the picker auto, Claude Code,
 # OpenCode, Pi, Codex. Without it the form is not live, and each fill row must
 # say where it works rather than guess.
 [[fixtures]]

@@ -284,7 +284,7 @@ describe("the star reminder in the app", () => {
     let answer!: (due: boolean) => void;
     const starPromptLaunch = vi.fn(() => new Promise<boolean>((resolve) => { answer = resolve; }));
     const listing: DeckDirectoryListing = { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false };
-    const options: NewAgentOptions = { kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand: "claude" };
+    const options: NewAgentOptions = { kind: "deck", agents: [], authoringKinds: [], lastCommand: "claude" };
     render(<DeckShell runtime={runtimeOf({ starPromptLaunch, listDirectories: vi.fn(async () => structuredClone(listing)), newAgentOptions: vi.fn(async () => structuredClone(options)) })} initialView={{ kind: "overview" }} />);
     fireEvent.click(await screen.findByTestId("overview-new-agent"));
     const dialog = await screen.findByTestId("new-agent-dialog");

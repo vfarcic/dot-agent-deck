@@ -270,34 +270,32 @@ describe("New agent rules (PRD #1223 M4)", () => {
 });
 
 describe("New agent rules — authoring agents (PRD #1223 M7)", () => {
-  const deckOptions = (authoringKinds: string[], experimental: boolean): NewAgentOptions => ({ kind: "deck", agents: [], experimental, authoringKinds });
+  const deckOptions = (authoringKinds: string[]): NewAgentOptions => ({ kind: "deck", agents: [], authoringKinds });
   const kinds = (options: NewAgentOptions | undefined) => authoringModes(options).offered.map((mode) => mode.kind);
 
   /**
    * Scenario: the chips a daemon's options offer. Nothing while the options are
    * loading; the kinds the daemon lists, in the TUI's order whatever order it
-   * lists them in; `schedule-issues` only under the daemon's experimental flag;
-   * and a kind this app does not know is ignored rather than offered.
+   * lists them in, `schedule-issues` included with no flag involved (issue
+   * #193); and a kind this app does not know is ignored rather than offered.
    */
-  it("offers the kinds the daemon lists, in the TUI's order, schedule-issues only under its flag", () => {
+  it("offers the kinds the daemon lists, in the TUI's order, schedule-issues included", () => {
     expect(authoringModes(undefined)).toEqual({ offered: [] });
-    expect(kinds(deckOptions(["dispatcher", "schedule-issues", "schedule"], false))).toEqual(["schedule", "dispatcher"]);
-    expect(kinds(deckOptions(["dispatcher", "schedule-issues", "schedule"], true))).toEqual(["schedule", "schedule-issues", "dispatcher"]);
-    expect(kinds(deckOptions(["dispatcher", "future-kind"], true))).toEqual(["dispatcher"]);
-    expect(authoringModes(deckOptions(["schedule"], false)).offered).toEqual([{ kind: "schedule", label: "schedule" }]);
+    expect(kinds(deckOptions(["dispatcher", "schedule-issues", "schedule"]))).toEqual(["schedule", "schedule-issues", "dispatcher"]);
+    expect(kinds(deckOptions(["dispatcher", "future-kind"]))).toEqual(["dispatcher"]);
+    expect(authoringModes(deckOptions(["schedule"])).offered).toEqual([{ kind: "schedule", label: "schedule" }]);
+    expect(authoringModes(deckOptions(["schedule-issues"])).offered).toEqual([{ kind: "schedule-issues", label: "schedule: issues" }]);
   });
 
   /**
    * Scenario: the daemons that offer no authoring chip say why — an older deck
    * that has no options query, and a daemon that lists no kind this app knows,
-   * each in its own words. A deck that lists only `schedule-issues` with its
-   * flag off offers nothing and gives no reason, because it can compose one.
+   * each in its own words.
    */
   it("gives an older deck and a daemon that composes nothing their reason", () => {
     expect(authoringModes({ kind: "unsupported", desktopAgents: [] })).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.unsupported });
-    expect(authoringModes(deckOptions([], true))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
-    expect(authoringModes(deckOptions(["future-kind"], true))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
-    expect(authoringModes(deckOptions(["schedule-issues"], false))).toEqual({ offered: [] });
+    expect(authoringModes(deckOptions([]))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
+    expect(authoringModes(deckOptions(["future-kind"]))).toEqual({ offered: [], withheld: AUTHORING_WITHHELD.none });
   });
 
   /**

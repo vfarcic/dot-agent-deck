@@ -55,7 +55,7 @@ The form stays disabled until a directory is chosen; **Dir** then shows it.
 | **No mode** | A single agent running **Command**. |
 | `Orch: <name>` | The orchestration of that name from the chosen project's `.dot-agent-deck.toml`: every role in it. The **Command** field is hidden (each role has its own command), and the button reads **Activate orchestration**. See [Orchestration](../orchestration.md). |
 | **schedule** | An agent that helps you write a schedule. See [Schedules](../scheduled-tasks.md). |
-| **schedule: issues** | An agent that helps you write an issue-dispatch schedule. Offered only when the chosen daemon has the `experimental` flag on. |
+| **schedule: issues** | An agent that helps you write an issue-dispatch schedule. See [Schedules](../scheduled-tasks.md). |
 | **dispatcher** | A dispatcher agent. See [Dispatcher Mode](../dispatcher-mode.md). |
 
 If a project defines two orchestrations with the same name, both chips are shown disabled with a sentence asking you to rename one. A daemon too old to say which schedule and dispatcher agents it can start gets a sentence saying why those chips are missing.
