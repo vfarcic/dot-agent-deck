@@ -119,8 +119,8 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(first.invokeCardAction).toHaveBeenCalledWith(expect.anything(), "go", expect.objectContaining({ actionToken: "tok-go-2" }));
   });
 
-  /// Scenario: press an agent-written action's icon in the agent's Card panel. Nothing is sent until the single-action review shows the exact prompt and its Send is pressed, using the same definition token.
-  it("a Card panel icon requires review of the agent-written action before sending its token (B2, A4, R2-A1)", async () => {
+  /// Scenario: press an agent-written action's icon in the agent's Card tab. Nothing is sent until the single-action review shows the exact prompt and its Send is pressed, using the same definition token.
+  it("a Card tab icon requires review of the agent-written action before sending its token (B2, A4, R2-A1)", async () => {
     const live = runtime([hostile("Run the tests.", "tok-shown")]);
     render(<OverviewWithCardPane runtime={live} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
@@ -178,7 +178,7 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(marker.backgroundColor).not.toBe(text.backgroundColor);
   });
 
-  /// Scenario: review and send an action from the agent's Card panel, then let the agent replace the action's text and token. The review and the panel say the first send happened; the new definition does not inherit that sent result: the panel shows none for it, and the review keeps showing the text it sent with its result, not the new text (PR #2491 review J4).
+  /// Scenario: review and send an action from the agent's Card tab, then let the agent replace the action's text and token. The review and the panel say the first send happened; the new definition does not inherit that sent result: the panel shows none for it, and the review keeps showing the text it sent with its result, not the new text (PR #2491 review J4).
   it("an answer belongs to the action's definition: a reused action id does not show the old text's answer (S1)", async () => {
     const first = runtime([hostile("Run the tests.", "tok-go-1")]);
     const view = render(<OverviewWithCardPane runtime={first} />);
@@ -196,8 +196,8 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(step.textContent).not.toContain("Something else.");
   });
 
-  /// Scenario: read a compact card without a summary, then open its agent's Card panel. The compact card shows the agent's custom action only as an icon whose text is in its hover, never on the card, and the panel's icon says the agent suggested it, with its text in its hover, and shows the fields under the agent's label.
-  it("a card without a summary keeps its custom action's text and labelled fields in the Card panel (S2)", () => {
+  /// Scenario: read a compact card without a summary, then open its agent's Card tab. The compact card shows the agent's custom action only as an icon whose text is in its hover, never on the card, and the panel's icon says the agent suggested it, with its text in its hover, and shows the fields under the agent's label.
+  it("a card without a summary keeps its custom action's text and labelled fields in the Card tab (S2)", () => {
     const card = entry("7", "coder", {
       report: { source: "agent", status: "working", summary: null, published_at: "2026-11-17T00:00:00Z", revision: 1 },
       fields: [{ name: "risk", label: "Risk", description: null, type: "text", icon: null, placement: "card", custom: true, source: "agent", value: "low" }],
@@ -212,7 +212,7 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(icon.textContent).toBe("");
     expect(icon.getAttribute("data-tip")).toContain("Go on.");
     expect(screen.queryByText("Go on.")).toBeNull();
-    // Issue #2418: the fields are the Card panel's, under the agent's label.
+    // Issue #2418: the fields are the Card tab's, under the agent's label.
     expect(screen.queryByText("low")).toBeNull();
     fireEvent.click(screen.getByTestId("agent-card-details"));
     const panel = screen.getByTestId("agent-card-panel");
@@ -225,8 +225,8 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(within(says).getByText("agent says")).toBeInTheDocument();
   });
 
-  /// Scenario: open, from its table row's Show card, the Card panel of an agent whose card no longer offers an action it sent earlier. The panel lists what was sent from the card with the exact text, invisible characters marked, and how far it got.
-  it("the Card panel lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {
+  /// Scenario: open, from its table row's Show card, the Card tab of an agent whose card no longer offers an action it sent earlier. The panel lists what was sent from the card with the exact text, invisible characters marked, and how far it got.
+  it("the Card tab lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {
     const card = entry("7", "coder", {
       recent_deliveries: [{ action_id: "go", label: "Go ahead", text: "Run\tthe tests.", token: "tok-old", outcome: "sent", message_id: "m-42", state: "delivered", detail: null, at: "2026-11-17T10:00:00Z" }],
     });

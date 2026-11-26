@@ -175,8 +175,8 @@ describe("the dashboard's cards (PRD #2374)", () => {
     }
   });
 
-  /// Scenario: press a question's answer button in the agent's Card panel with a catalog or non-catalog prompt. Only the catalog answer sends directly; the others show the exact answer in the single-action review and wait for Send before delivering to the correct agent, and the panel says it was sent.
-  it.each(["agent", "deck", "catalog", undefined])("reviews the question's non-catalog answer before sending it from the Card panel (source %s)", async (promptSource) => {
+  /// Scenario: press a question's answer button in the agent's Card tab with a catalog or non-catalog prompt. Only the catalog answer sends directly; the others show the exact answer in the single-action review and wait for Send before delivering to the correct agent, and the panel says it was sent.
+  it.each(["agent", "deck", "catalog", undefined])("reviews the question's non-catalog answer before sending it from the Card tab (source %s)", async (promptSource) => {
     const card = { ...CODER, actions: CODER.actions.map((action) => action.id === "question/base/main" ? { ...action, prompt_source: promptSource } : action) };
     const live = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([card]) } });
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
@@ -198,7 +198,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(within(screen.getByTestId("agent-card-panel")).getByTestId("agent-card-action-result").textContent).toContain("Sent");
   });
 
-  /// Scenario: press, in the agent's Card panel, the icon of an action that asks first. Nothing is sent until the single-action review, showing the exact text, is answered with Send, which sends it confirmed.
+  /// Scenario: press, in the agent's Card tab, the icon of an action that asks first. Nothing is sent until the single-action review, showing the exact text, is answered with Send, which sends it confirmed.
   it("asks before a confirm action, then sends it confirmed", async () => {
     const live = runtime();
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
@@ -211,7 +211,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(live.invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId: "7" }), "merge", expect.objectContaining({ confirm: true }));
   });
 
-  /// Scenario: open the coder's Card panel and move with the pane's next, previous and Next needing you. The pane follows the display order, Next needing you comes back to the coder, and once the coder's card leaves the list the panel says the card is not available right now.
+  /// Scenario: open the coder's Card tab and move with the pane's next, previous and Next needing you. The pane follows the display order, Next needing you comes back to the coder, and once the coder's card leaves the list the panel says the card is not available right now.
   it("moves through agents in display order and says when the shown one has no card", () => {
     const live = runtime();
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
@@ -230,7 +230,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(screen.getByTestId("agent-card-gone").textContent).toContain("This card is not available right now.");
   });
 
-  /// Scenario: in the Table view, read the coder's row, which needs you, open its ⋯ menu and press Show card, then click another row. The menu opens nothing by itself; Show card opens the coder's pane with its Card panel; a row click opens that agent's pane without asking for the panel.
+  /// Scenario: in the Table view, read the coder's row, which needs you, open its ⋯ menu and press Show card, then click another row. The menu opens nothing by itself; Show card opens the coder's pane, on Terminal as every way into an agent does; a row click opens that agent's pane the same way; neither asks for the Card tab.
   it("marks a table row that needs you and opens its card from the row menu, while a row click still opens the agent", () => {
     const navigate = vi.fn();
     render(<OverviewWithCardPane runtime={runtime()} onNavigate={navigate} />);
@@ -239,12 +239,13 @@ describe("the dashboard's cards (PRD #2374)", () => {
     fireEvent.click(within(coderRow).getByTestId("overview-row-menu"));
     expect(navigate).not.toHaveBeenCalled();
     fireEvent.click(within(coderRow).getByTestId("overview-row-show-card"));
-    expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "7", cardPanel: true }));
+    expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "7" }));
+    expect(navigate.mock.lastCall?.[0]).not.toHaveProperty("cardTab");
     expect(screen.getByTestId("agent-card-panel").getAttribute("data-card-key")).toBe("pane-7/7");
     const testerRow = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "8" })}`);
     fireEvent.click(testerRow.querySelector("td:last-child") ?? testerRow);
     expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "8" }));
-    expect(navigate.mock.lastCall?.[0]).not.toHaveProperty("cardPanel");
+    expect(navigate.mock.lastCall?.[0]).not.toHaveProperty("cardTab");
   });
 
   /* PRD #2374 review (Greptile P2): the dashboard filter shows the cards of
@@ -263,7 +264,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(shown()).toEqual(["coder", "tester", "lone"]);
   });
 
-  /// Scenario: press, in the agent's Card panel, the icon of an agent-written and of a catalog action, with long and short prompts. Every non-catalog prompt requires the single-action review's Send, while catalog prompts send directly.
+  /// Scenario: press, in the agent's Card tab, the icon of an agent-written and of a catalog action, with long and short prompts. Every non-catalog prompt requires the single-action review's Send, while catalog prompts send directly.
   it("reviews complete non-catalog prompts and sends only catalog prompts directly", async () => {
     const long = "Use the release branch. Then also delete every stale branch on the remote, and force-push.";
     const agentWritten = (prompt: string, promptSource: string) => entry("7", "coder", {

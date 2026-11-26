@@ -69,7 +69,7 @@ export type ReferenceControls = Pick<VoiceActionContext, "openCardReference"> & 
  * Issue #2418 — one reference the agent reported, drawn from the deck's check
  * of it: a pull request or issue badge that opens its page, or a short text
  * saying it is still to be checked or why it cannot be. The card draws it on
- * its reference line, and the agent pane's Card panel in its list of every
+ * its reference line, and the agent pane's Card tab in its list of every
  * reference (`scope: "panel"`, whose test ids carry `-panel`); both open a
  * page through the same action, so the same address checks apply.
  */
@@ -169,7 +169,7 @@ function CardReferences({ card, refs, name, controls }: { card: PlacedCard; refs
             aria-label={`${more} more: ${label}`}
             title={`${more} more that do not fit here. ${label}`}
             onMouseDown={(event) => event.stopPropagation()}
-            onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, { ...cardRef(card), cardSection: "references" })}
+            onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, { ...cardRef(card), opensOn: "references" })}
           >+{more}</button>
         </span>
       )}
@@ -196,7 +196,7 @@ export function IssueLabelChip({ label, testId, hidden = false }: { label: Issue
  * Issue #2418 (D13) — the labels of the first issue on a card that has any,
  * on one fixed-height line under the references: as many chips as fit whole,
  * and a `+N` counting the rest. The `+N` is text, not a control: like the rest
- * of the card, clicking it opens the agent's pane, whose Card panel lists
+ * of the card, clicking it opens the agent's pane, whose Card tab lists
  * every label.
  */
 function CardLabels({ labels, issue }: { labels: IssueLabelView[]; issue: string }) {
@@ -239,7 +239,7 @@ export const CARD_ICON_LIMIT = 3;
  * in the daemon's order — never a reply (or any action that takes the user's
  * own words), Open, an answer to the agent's own question, a close, which
  * keeps its own control, or an action whose catalog `placement` is `detail`,
- * which is offered only in the agent pane's Card panel. They are the panel's
+ * which is offered only in the agent pane's Card tab. They are the panel's
  * actions, pressed the same way.
  */
 export function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
@@ -248,7 +248,7 @@ export function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
 }
 
 /**
- * PR #2491 decision 2026-11-25 — the actions the agent pane's Card panel
+ * PR #2491 decision 2026-11-25 — the actions the agent pane's Card tab
  * draws as icons: every prompt action a card's icons would draw, and also the
  * ones whose catalog `placement` is `detail`, which are offered only there.
  */
@@ -259,7 +259,7 @@ export function panelIconActions(entry: AgentCardEntry): AgentCardAction[] {
 
 /**
  * The grouped row of action icons a card draws in its bottom row and the
- * agent pane's Card panel draws whole: each icon's hover gives the action's
+ * agent pane's Card tab draws whole: each icon's hover gives the action's
  * label and exact text, and a press takes the same path from both — sent, or,
  * when it asks first, its text is the agent's, or its hover could not show
  * the text whole, the single-action review opens instead (audit 1).
@@ -333,7 +333,7 @@ export interface CardPlace {
  * nothing here decides status, needs-you, roll-ups or references.
  *
  * PR #2491 decision 2026-11-25: a click on the card, its name or anywhere
- * else, opens the agent's pane with its Card panel open, which holds what the
+ * else, opens the agent's pane on Terminal, whose Card tab holds what the
  * agent said, its agent type and every action. Each other control — a badge,
  * the `+N`, the tree toggle, the checkbox, an action icon and Close — does
  * only its own thing: it sits in a wrapper that keeps its click from reaching
@@ -344,7 +344,7 @@ export interface CardPlace {
  * Issue #1965: an exited orchestration role's card says why on its status
  * line, after the daemon's status word, in the words its table row and the
  * TUI's card use: `Exited: <reason>` and its last output. The line truncates
- * like every other, so a report arriving never resizes the card; the Card panel
+ * like every other, so a report arriving never resizes the card; the Card tab
  * shows the reason and the last output in full.
  */
 export function AgentCard({ card, controls, results, place, ended }: {
@@ -375,11 +375,11 @@ export function AgentCard({ card, controls, results, place, ended }: {
      word, the needs-you marker, a reference, a label or a roll-up appearing
      never resizes a card or moves a root (issue #2418 review). A cut line's
      text is in its tooltip. References and labels that do not fit are not
-     cut: a `+N` counts them, and the Card panel lists them all. */
+     cut: a `+N` counts them, and the Card tab lists them all. */
   /* The prompt actions the agent offers now, as icons in the card's bottom
      row (PRD #2374 decision 2026-11-24, placed there by issue #2399 review 2
      so the name and the status keep their lines): each is pressed exactly as
-     its Card panel icon is, so one that asks first, or whose text the agent
+     its Card tab icon is, so one that asks first, or whose text the agent
      wrote, opens the single-action review instead of sending — and so does
      one whose text is too long for its hover to quote whole (audit 1). */
   const iconActions = cardIconActions(entry);
@@ -397,7 +397,7 @@ export function AgentCard({ card, controls, results, place, ended }: {
       data-tone={tone}
       data-faded={place.faded ? "true" : undefined}
       aria-label={`${name}${entry.needs_you ? ", needs you" : ""}`}
-      onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
+      onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, { ...ref, opensOn: "terminal" })}
     >
       <header className="agent-card-header">
         {place.selected !== undefined && controls.toggleCardSelected && (
@@ -418,8 +418,8 @@ export function AgentCard({ card, controls, results, place, ended }: {
             className="agent-card-name"
             data-testid="agent-card-open-agent"
             aria-label={`Open ${name}`}
-            title={`Open ${name} with its card`}
-            onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
+            title={`Open ${name}`}
+            onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, { ...ref, opensOn: "terminal" })}
           >{name}</button>
         </span>
         {/* Issue #2399 re-review N6, PR #2491 review: Needs you is its bell alone on every card, so the name keeps its room beside the checkbox; its words stay its tooltip and what a screen reader reads. */}
@@ -452,9 +452,9 @@ export function AgentCard({ card, controls, results, place, ended }: {
         )}
       </header>
       <div className="agent-card-meta-row">
-        {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the agent's pane with its Card panel.
+        {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the agent's pane on its Terminal tab.
             Its name starts with the kind and status it shows, so a screen reader announces them and a spoken label of what is visible matches it (round 2 review). */}
-        <button type="button" className="agent-card-meta" data-testid="agent-card-details" aria-label={`${place.kind} ${statusText}${endedText ? `, ${endedText}` : ""}: show ${name}'s card`} title={displayTitle(metaTitle)}>
+        <button type="button" className="agent-card-meta" data-testid="agent-card-details" aria-label={`${place.kind} ${statusText}${endedText ? `, ${endedText}` : ""}: open ${name}`} title={displayTitle(metaTitle)}>
           <span className="agent-card-kind" data-testid="agent-card-kind">{place.kind}</span>
           <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status">{statusText}</span>
           {ended && endedText && <span className="agent-card-ended" data-testid="agent-card-ended" title={displayTitle(ended.headline)}>{endedText}</span>}
@@ -478,8 +478,8 @@ export function AgentCard({ card, controls, results, place, ended }: {
                   className="agent-card-actions-more"
                   data-testid="agent-card-actions-more"
                   aria-label={`${moreActions} more actions: show ${name}'s card`}
-                  title={displayTitle(`${moreActions} more ${moreActions === 1 ? "action" : "actions"}: ${iconActions.slice(CARD_ICON_LIMIT).map((action) => action.label).join(", ")}. Open the agent to see every action in its Card panel.`)}
-                  onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
+                  title={displayTitle(`${moreActions} more ${moreActions === 1 ? "action" : "actions"}: ${iconActions.slice(CARD_ICON_LIMIT).map((action) => action.label).join(", ")}. Opens the agent's Card tab, where every action is.`)}
+                  onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, { ...ref, opensOn: "actions" })}
                 >+{moreActions}</button>
               )}
             </CardActionIconRow>

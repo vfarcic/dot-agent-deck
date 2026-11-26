@@ -258,63 +258,71 @@ async function expectTerminalPainted(page: Page, line: string): Promise<void> {
   await page.evaluate(() => new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
 }
 
-// PR #2491 decision 2026-11-25 — a card opens its agent's pane with the Card
-// panel beside the terminal: Contract review's, opened from its card, whose
-// agent asks whether to ship behind a version flag. The panel shows the
-// deck-checked status and pull request, the agent's summary, why it needs you
-// and its question with its two answers, and its actions as icons.
-async function openContractReviewPanel(page: Page): Promise<Locator> {
+// PR #2491 decision 2026-11-26 — a card opens its agent's pane on its
+// Terminal tab, with a Card tab beside it: Contract review's, opened from its
+// card, whose agent asks whether to ship behind a version flag, so its Card
+// tab carries the bell. The Card tab shows the deck-checked status and pull
+// request, the agent's summary, why it needs you and its question with its two
+// answers, and its actions as icons.
+async function openContractReviewPane(page: Page): Promise<Locator> {
   await useDomTerminal(page);
   await openCardsTree(page);
   await page.locator("article[data-card-key]").filter({ hasText: "Contract review" }).getByTestId("agent-card-details").click();
   const pane = page.getByTestId("agent-pane-overlay");
   await expect(pane).toBeVisible();
+  await expect(pane.getByRole("tab", { selected: true })).toHaveAccessibleName("Terminal");
+  await expect(pane.getByRole("tab", { name: "Card, needs you" }).getByTestId("card-tab-bell")).toBeVisible();
+  // PR #2491 review J7: the pane reads as an agent at work, its footer naming the project, not "Unavailable".
+  await expect(pane.locator(".agent-footer")).toContainText("storefront");
+  await expect(pane.locator(".agent-footer")).not.toContainText("Unavailable");
+  return pane;
+}
+
+async function openContractReviewCardTab(page: Page): Promise<Locator> {
+  const pane = await openContractReviewPane(page);
+  await pane.getByRole("tab", { name: /^Card/ }).click();
   const panel = pane.getByTestId("agent-card-panel");
   await expect(panel).toBeVisible();
   await expect(panel.getByText("Ship the change behind a version flag?")).toBeVisible();
   await expect(panel.getByRole("button", { name: "Yes, behind a flag" })).toBeVisible();
-  await expect(pane.getByTestId("agent-pane-card-toggle")).toHaveAttribute("aria-pressed", "true");
   return panel;
 }
 
-desktopScenario("agent-card-panel", async (page) => {
-  const panel = await openContractReviewPanel(page);
-  await expect(panel.getByTestId("agent-card-panel-refs")).toBeVisible();
-  // The panel scrolls on its own: at its end, the question and the action icons are both in view.
-  await panel.evaluate((node) => { node.scrollTop = node.scrollHeight; });
-  await expect(panel.getByTestId("action-icon-group")).toBeInViewport({ ratio: 1 });
-  await expect(panel.getByRole("button", { name: "Yes, behind a flag" })).toBeInViewport({ ratio: 1 });
-  // PR #2491 review J7: the pane beside the panel reads as an agent at work, its footer naming the project, not "Unavailable".
+desktopScenario("agent-card-tab-terminal", async (page) => {
+  await openContractReviewPane(page);
   const rows = page.getByTestId("agent-pane-overlay").locator(".xterm-rows");
   await expect(rows).toContainText("Compared v2 and v3 responses");
   // Written once: the mount's replay is not repeated over a buffer that already holds it.
   expect(await rows.evaluate((node) => (node.textContent ?? "").split("Compared v2 and v3 responses").length - 1)).toBe(1);
-  await expect(page.getByTestId("agent-pane-overlay").locator(".agent-footer")).toContainText("storefront");
-  await expect(page.getByTestId("agent-pane-overlay").locator(".agent-footer")).not.toContainText("Unavailable");
   await expectTerminalPainted(page, "Compared v2 and v3 responses");
   await expectTerminalPainted(page, "Asked on the card: ship it behind a flag?");
 });
 
-// The same pane in a phone-wide window: the Card panel between the pane's
-// header and the terminal, at a fixed height that scrolls. PR #2491 review:
-// the panel is scrolled to its Actions, so the shot shows the action icons and
-// the Edit beside the heading rather than only the top of the panel.
-desktopScenario("agent-card-panel-narrow", async (page) => {
+desktopScenario("agent-card-tab", async (page) => {
+  const panel = await openContractReviewCardTab(page);
+  await expect(panel.getByTestId("agent-card-panel-refs")).toBeVisible();
+  // The Card tab scrolls on its own: at its end, the question and the action icons are both in view.
+  const scroller = page.getByTestId("agent-pane-overlay").locator(".agent-card-tab");
+  await scroller.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await expect(panel.getByTestId("action-icon-group")).toBeInViewport({ ratio: 1 });
+  await expect(panel.getByRole("button", { name: "Yes, behind a flag" })).toBeInViewport({ ratio: 1 });
+});
+
+// The same Card tab in a phone-wide window, scrolled to its Actions, so the
+// shot shows the action icons and the Edit beside the heading.
+desktopScenario("agent-card-tab-narrow", async (page) => {
   await page.setViewportSize({ width: 375, height: 812 });
-  const panel = await openContractReviewPanel(page);
-  const [panelBox, terminalBox] = [await panel.boundingBox(), await page.getByTestId("agent-pane-overlay").locator(".agent-panel").boundingBox()];
-  expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(terminalBox!.y + 1);
+  const panel = await openContractReviewCardTab(page);
   // The header keeps the agent's name and Close agent in the window.
   const pane = page.getByTestId("agent-pane-overlay");
   await expect(pane.getByText("Contract review", { exact: true })).toBeInViewport({ ratio: 1 });
   await expect(pane.getByRole("button", { name: "Close agent", exact: true })).toBeInViewport({ ratio: 1 });
   await expect(pane.getByRole("button", { name: "Back to dashboard" })).toBeInViewport({ ratio: 1 });
-  // PR #2491 review J7: the terminal under the panel shows the agent at work (a line short enough not to wrap at this width).
-  await expectTerminalPainted(page, "One breaking change: the new status.");
+  await expect(pane.getByRole("tab", { name: /^Card/ })).toBeInViewport({ ratio: 1 });
   const actions = panel.getByTestId("agent-card-panel-actions");
   await actions.evaluate((node) => {
-    const scroller = node.closest("[data-testid='agent-card-panel']") as HTMLElement;
-    scroller.scrollTop += node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    const scroller = node.closest(".agent-card-tab") as HTMLElement;
+    scroller.scrollTop += node.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 8;
   });
   await expect(actions.getByRole("heading", { name: /^Actions/ })).toBeInViewport({ ratio: 1 });
   await expect(actions.getByRole("button", { name: "Edit card actions" })).toBeInViewport({ ratio: 1 });

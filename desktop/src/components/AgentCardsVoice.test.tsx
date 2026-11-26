@@ -36,9 +36,10 @@ import { DeckShell } from "../App";
  *    nothing; so does an action or answer whose text is, or quotes, what the
  *    agent wrote (`prompt_source: "agent"` — the answer the deck composes from
  *    the agent's question included, audit A1); only a catalog prompt action is
- *    sent directly. PR #2491 decision 2026-11-25: there is no card overlay and
- *    no reply box — a card opens its agent's pane with the Card panel, which
- *    voice opens, closes and moves between agents with too.
+ *    sent directly. PR #2491 decisions 2026-11-25 and 2026-11-26: there is no
+ *    card overlay and no reply box — a card opens its agent's pane, whose Card
+ *    tab voice switches to and from, and whose moves between agents voice
+ *    drives too.
  */
 
 const commandsSource = readFileSync(resolve("src-tauri/src/voice/commands.toml"), "utf8");
@@ -67,8 +68,8 @@ const CARD_ROWS: Record<string, { row: string; screens: string[]; params: { name
   previousAgentCard: { row: "previous_agent_card", screens: ["agent"], params: [] },
   nextNeedsYouCard: { row: "next_needs_you_card", screens: ["overview", "agent"], params: [] },
   toggleNeedsYouFilter: { row: "filter_needs_you_cards", screens: ["overview"], params: [{ name: "needs_you", kind: "needs_you_filter" }] },
-  openCardPanel: { row: "open_card_panel", screens: ["agent"], params: [] },
-  closeCardPanel: { row: "close_card_panel", screens: ["agent"], params: [] },
+  showCardTab: { row: "show_card_tab", screens: ["agent"], params: [] },
+  showTerminalTab: { row: "show_terminal_tab", screens: ["agent"], params: [] },
   runCardAction: { row: "run_card_action", screens: ["overview", "agent"], params: [{ name: "agent", kind: "agent_ref" }, { name: "action", kind: "card_action" }] },
 };
 
@@ -274,7 +275,7 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(spoken.invokeCardAction).not.toHaveBeenCalled();
   });
 
-  /// Scenario: read the action registry and the command table the crate embeds. The card controls and shared name-open entry are voice-enabled with the expected row ids, screens and parameter names — the Card panel's and the moves between agents on the agent pane — while the review's Send and Cancel and the row menu are kept off voice with a reason and no row, and the retired overlay and reply rows are gone.
+  /// Scenario: read the action registry and the command table the crate embeds. The card controls and shared name-open entry are voice-enabled with the expected row ids, screens and parameter names — the Card and Terminal tabs' and the moves between agents on the agent pane — while the review's Send and Cancel and the row menu are kept off voice with a reason and no row, and the retired overlay, reply and Card panel rows are gone.
   it("desktop/agent-cards/008: every new card control is voice: true with its commands.toml row", () => {
     const rows = commandRows();
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
@@ -286,8 +287,8 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
       expect(invoking[0].screens, `${wanted.row}'s screens`).toEqual(wanted.screens);
       expect(invoking[0].params).toEqual(wanted.params);
     }
-    for (const retired of ["close_agent_card", "reply_to_agent_card"]) expect(rows.map((row) => row.id)).not.toContain(retired);
-    for (const gone of ["closeAgentCard", "replyToAgentCard"]) expect(registry[gone]).toBeUndefined();
+    for (const retired of ["close_agent_card", "reply_to_agent_card", "open_card_panel", "close_card_panel"]) expect(rows.map((row) => row.id)).not.toContain(retired);
+    for (const gone of ["closeAgentCard", "replyToAgentCard", "openCardPanel", "closeCardPanel"]) expect(registry[gone]).toBeUndefined();
     for (const kept of ["confirmCardAction", "closeCardReview", "toggleOverviewRowMenu"]) {
       expect(registry[kept]?.voice).not.toBe(true);
       expect((registry[kept]?.no_voice ?? "").trim().length, `${kept} carries a no_voice reason`).toBeGreaterThan(0);
@@ -300,7 +301,7 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(open[0].params).toEqual([{ name: "agent", kind: "agent_ref" }]);
   });
 
-  /// Scenario: open the agent using the name on its compact card, or by saying "open the voice card agent". Both dispatch the shared open-agent action and show the agent's terminal with its Card panel beside it — opened from its card, or because the agent needs you — without sending a card action.
+  /// Scenario: open the agent using the name on its compact card, or by saying "open the voice card agent". Both dispatch the shared open-agent action and open the agent's pane on its Terminal tab, as every way into an agent does, with its Card tab beside it, without sending a card action.
   it.each(["name", "voice"] as const)("desktop/agent-cards/008: opening by %s uses the shared voice action and shows the agent terminal", async (method) => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;
     const sharedOpen = vi.spyOn(VOICE_ACTIONS.openAgent, "run");
@@ -314,7 +315,10 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
       else await act(async () => { fireEvent.click(screen.getByText("voice-card-agent", { selector: "button" })); });
       await waitFor(() => expect(screen.getByTestId(`terminal-${agentId}`)).toBeInTheDocument());
       expect(sharedOpen).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ deckId: FIXTURE_DAEMON_ID, agentId, from: "overview" }));
-      expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-card-panel")).toBeInTheDocument();
+      const opened = screen.getByTestId("agent-pane-overlay");
+      expect(within(opened).getByRole("tab", { selected: true })).toHaveAccessibleName("Terminal");
+      expect(within(opened).getByRole("tab", { name: /^Card/ })).toBeInTheDocument();
+      expect(within(opened).queryByTestId("agent-card-panel")).toBeNull();
       expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
       expect(invokeCardAction).not.toHaveBeenCalled();
     } finally {
@@ -462,44 +466,63 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "question/plan/ok", expect.objectContaining({ actionToken: "tok-question/plan/ok" }));
   });
 
-  /// Scenario: with an agent's pane open over the dashboard, say "close the card", "show the card", "next agent", "previous agent", "next one that needs me" or "show the second agent's card". Closing and opening the Card panel hide and show it beside the terminal and remember the choice; the moves open the next, previous or next needing-you agent's pane in the dashboard's order; naming another agent's card opens its pane with the panel; none of them sends a card action.
+  /// Scenario: with an agent's pane open over the dashboard, say "show the card", "close the card", "show the terminal", "back to the terminal", "next agent", "previous agent", "next one that needs me" or "show the second agent's card". "show the card" switches the pane to its Card tab; the three ways of leaving it switch back to Terminal; the moves open the next, previous or next needing-you agent's pane in the dashboard's order, on Terminal; naming another agent's card opens that agent's pane on its Card tab; none of them stores anything or sends a card action.
   it.each([
-    { said: "close the card", action: "close_card_panel", invoke: "closeCardPanel", needy: true, shows: "none", stored: "closed" },
-    { said: "show the card", action: "open_card_panel", invoke: "openCardPanel", needy: false, shows: 0, stored: "open" },
-    { said: "next agent", action: "next_agent_card", invoke: "nextAgentCard", needy: true, shows: 1 },
-    { said: "previous agent", action: "previous_agent_card", invoke: "previousAgentCard", needy: true, shows: 1 },
-    { said: "next one that needs me", action: "next_needs_you_card", invoke: "nextNeedsYouCard", needy: true, shows: 1 },
-    { said: "show the second agent's card", action: "show_agent_card", invoke: "showAgentCard", needy: false, shows: 1, names: 1 },
-  ] as const)("desktop/agent-cards/094: in an agent's pane, \"$said\" works the pane's Card panel or moves between agents", async ({ said, action, invoke, needy, shows, stored, names }) => {
+    { said: "show the card", action: "show_card_tab", invoke: "showCardTab", from: "terminal", shows: 0, tab: "card" },
+    { said: "close the card", action: "show_terminal_tab", invoke: "showTerminalTab", from: "card", shows: 0, tab: "terminal" },
+    { said: "show the terminal", action: "show_terminal_tab", invoke: "showTerminalTab", from: "card", shows: 0, tab: "terminal" },
+    { said: "back to the terminal", action: "show_terminal_tab", invoke: "showTerminalTab", from: "card", shows: 0, tab: "terminal" },
+    { said: "next agent", action: "next_agent_card", invoke: "nextAgentCard", from: "card", shows: 1, tab: "terminal" },
+    { said: "previous agent", action: "previous_agent_card", invoke: "previousAgentCard", from: "card", shows: 1, tab: "terminal" },
+    { said: "next one that needs me", action: "next_needs_you_card", invoke: "nextNeedsYouCard", from: "card", shows: 1, tab: "terminal" },
+    { said: "show the second agent's card", action: "show_agent_card", invoke: "showAgentCard", from: "terminal", shows: 1, tab: "card", names: 1 },
+  ] as const)("desktop/agent-cards/094: in an agent's pane, \"$said\" switches the pane's tab or moves between agents", async ({ said, action, invoke, from, shows, tab, names }) => {
     const agents = createFixtureSnapshot("connected").agents;
-    const two = (all: { id: string }[]) => [0, 1].map((at) => ({ ...cardFor(all[at].id, `voice-card-${at}`), ...(needy ? {} : { needs_you: false, needs_you_reasons: [] }) }));
+    const two = (all: { id: string }[]) => [0, 1].map((at) => cardFor(all[at].id, `voice-card-${at}`));
     const params = names === undefined ? [] : [{ name: "agent", kind: "agent_ref", spoken: "the second agent", value: agents[names].id, label: `voice-card-${names}` }];
     const { invokeCardAction, resolveVoice } = renderSpoken({ kind: "dispatch", transcript: said, action, invoke, params, sentence: "Done." } as VoiceResultDto["outcome"], { entries: two, onAgent: true });
     const pane = () => screen.getByTestId("agent-pane-overlay");
-    // Opened by no card: the panel opens only for an agent that needs you.
-    expect(within(pane()).queryByTestId("agent-card-panel") !== null).toBe(needy);
+    const selected = () => within(pane()).getByRole("tab", { selected: true });
+    // Opened by no card: on Terminal, even for an agent that needs you.
+    expect(selected()).toHaveAccessibleName("Terminal");
+    if (from === "card") fireEvent.click(within(pane()).getByRole("tab", { name: /^Card/ }));
+    const stored = { ...window.localStorage };
     await speak(resolveVoice);
-    if (shows === "none") await waitFor(() => expect(within(pane()).queryByTestId("agent-card-panel")).toBeNull());
-    else await waitFor(() => expect(within(pane()).getByTestId("agent-card-panel").getAttribute("data-card-key")).toBe(`pane-${agents[shows].id}/${agents[shows].id}`));
-    if (stored) expect(window.localStorage.getItem("dot-agent-deck.agent-pane.card-panel")).toBe(stored);
-    expect(within(pane()).getByTestId("agent-pane-card-toggle")).toHaveAttribute("aria-pressed", shows === "none" ? "false" : "true");
+    await waitFor(() => expect(within(pane()).getByTestId(`terminal-${agents[shows].id}`)).toBeInTheDocument());
+    await waitFor(() => expect(selected().getAttribute("aria-label")).toMatch(tab === "card" ? /^Card/ : /^Terminal$/));
+    if (tab === "card") expect(within(pane()).getByTestId("agent-card-panel").getAttribute("data-card-key")).toBe(`pane-${agents[shows].id}/${agents[shows].id}`);
+    else expect(within(pane()).queryByTestId("agent-card-panel")).toBeNull();
+    expect({ ...window.localStorage }).toEqual(stored);
     expect(invokeCardAction).not.toHaveBeenCalled();
   });
 
-  /// Scenario: with an agent's pane open and no Card panel showing beside its terminal — the panel is closed, or the agent's daemon shows no cards so the pane has none — say "close the card". The deck refuses out loud that no card is showing, and the remembered Card panel choice is left as it was.
+  /// Scenario: with an agent's pane open and no card showing — the pane is on its Terminal tab, or the agent's daemon shows no cards so the pane has no Card tab — say "close the card". The deck refuses out loud that no card is showing, and the pane stays as it was.
   it.each([
-    { pane: "the panel closed", noCards: false },
-    { pane: "no panel at all", noCards: true },
-  ])("desktop/agent-cards/094: a spoken close of the Card panel with $pane is refused and remembers nothing", async ({ noCards }) => {
+    { pane: "the Terminal tab shown", noCards: false },
+    { pane: "no Card tab at all", noCards: true },
+  ])("desktop/agent-cards/094: a spoken close of the card with $pane is refused and changes nothing", async ({ noCards }) => {
     const calm = (all: { id: string }[]) => [{ ...cardFor(all[0].id, "voice-card-0"), needs_you: false, needs_you_reasons: [] }];
-    const { invokeCardAction, resolveVoice } = renderSpoken({ kind: "dispatch", transcript: "close the card", action: "close_card_panel", invoke: "closeCardPanel", params: [], sentence: "Done." } as VoiceResultDto["outcome"], { entries: calm, onAgent: true, noCards });
+    const { invokeCardAction, resolveVoice } = renderSpoken({ kind: "dispatch", transcript: "close the card", action: "show_terminal_tab", invoke: "showTerminalTab", params: [], sentence: "Done." } as VoiceResultDto["outcome"], { entries: calm, onAgent: true, noCards });
     const pane = () => screen.getByTestId("agent-pane-overlay");
     expect(within(pane()).queryByTestId("agent-card-panel")).toBeNull();
-    expect(within(pane()).queryByTestId("agent-pane-card-toggle") === null).toBe(noCards);
+    expect(within(pane()).queryByRole("tab", { name: /^Card/ }) === null).toBe(noCards);
     await speak(resolveVoice);
     expect(await screen.findByText("No card is showing.")).toBeInTheDocument();
-    expect(window.localStorage.getItem("dot-agent-deck.agent-pane.card-panel")).toBeNull();
+    expect(within(pane()).getByRole("tab", { selected: true })).toHaveAccessibleName("Terminal");
     expect(within(pane()).queryByTestId("agent-card-panel")).toBeNull();
+    expect(invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: on the dashboard, say "show the second agent's card". That agent's pane opens on its Card tab, since the card is what was asked for, showing that agent's card; nothing is sent.
+  it("desktop/agent-cards/094: \"show the coder's card\" from the dashboard opens that agent's pane on its Card tab", async () => {
+    const agents = createFixtureSnapshot("connected").agents;
+    const two = (all: { id: string }[]) => [0, 1].map((at) => cardFor(all[at].id, `voice-card-${at}`));
+    const params = [{ name: "agent", kind: "agent_ref", spoken: "the second agent", value: agents[1].id, label: "voice-card-1" }];
+    const { invokeCardAction, resolveVoice } = renderSpoken({ kind: "dispatch", transcript: "show the second agent's card", action: "show_agent_card", invoke: "showAgentCard", params, sentence: "Done." } as VoiceResultDto["outcome"], { entries: two });
+    await speak(resolveVoice);
+    const pane = await screen.findByTestId("agent-pane-overlay");
+    expect(within(pane).getByRole("tab", { selected: true })).toHaveAccessibleName(/^Card/);
+    expect(within(pane).getByTestId("agent-card-panel").getAttribute("data-card-key")).toBe(`pane-${agents[1].id}/${agents[1].id}`);
     expect(invokeCardAction).not.toHaveBeenCalled();
   });
 

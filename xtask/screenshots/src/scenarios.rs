@@ -183,13 +183,18 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
-        name: "agent-card-panel",
-        description: "An agent's pane opened from its card in the desktop Cards view, with the Card panel beside the terminal: the deck-checked status and pull request, the agent's summary, why it needs you, its question with two answers, and its action icons (PR #2491 decision 2026-11-25).",
+        name: "agent-card-tab-terminal",
+        description: "An agent's pane opened from its card in the desktop Cards view, on its Terminal tab: the agent at work in its terminal, and beside Terminal the Card tab with its bell, because the agent needs you (PR #2491 decision 2026-11-26).",
         clients: &[Client::Desktop],
     },
     Scenario {
-        name: "agent-card-panel-narrow",
-        description: "The same agent pane in a 375-pixel window: the Card panel between the pane's header and the terminal, at a fixed height that scrolls (PR #2491 decision 2026-11-25).",
+        name: "agent-card-tab",
+        description: "The same agent pane on its Card tab, in the terminal's place: the deck-checked status and pull request, the agent's summary, why it needs you, its question with two answers, and its action icons (PR #2491 decision 2026-11-26).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-card-tab-narrow",
+        description: "The same Card tab in a 375-pixel window, scrolled to its Actions with Edit beside the heading (PR #2491 decision 2026-11-26).",
         clients: &[Client::Desktop],
     },
     Scenario {

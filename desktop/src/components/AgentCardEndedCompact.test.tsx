@@ -9,7 +9,7 @@ import { AgentCardsDeckBody } from "./AgentCardsGrid";
 /*
  * Issue #1965 on the compact card of issue #2418: an exited orchestration
  * role's reason sits on the card's one-line status line, at any depth of the
- * tree, and the agent pane's Card panel shows the reason and the last output
+ * tree, and the agent pane's Card tab shows the reason and the last output
  * in full.
  */
 
@@ -54,7 +54,7 @@ const REVIEWER: EndedRole = {
 describe("an exited role on the compact card (issue #1965, issue #2418)", () => {
   /// Scenario: The Cards tree shows an orchestrator with its reviewer role opened under it; the reviewer's command exited at
   /// spawn. The reviewer's card, one level down, says Exited, why and its last output on its status line, not on a line of its
-  /// own, and a click on that text opens the agent with its Card panel like the rest of the card.
+  /// own, and a click on that text opens the agent like the rest of the card.
   it("says why on the status line of a card under another, and opens the agent's card from there", () => {
     const orchestrator = card("1", "orchestrator", { status: "idle" });
     const reviewer = card("4", "reviewer", { parent: orchestrator.entry.key });
@@ -83,9 +83,9 @@ describe("an exited role on the compact card (issue #1965, issue #2418)", () => 
     expect(showAgentCard).toHaveBeenCalledTimes(1);
   });
 
-  /// Scenario: The exited reviewer's pane is open with its Card panel. The panel shows Exited, the reason, and every line of the
+  /// Scenario: The exited reviewer's pane is open with its Card tab. The Card tab shows Exited, the reason, and every line of the
   /// last output, each on its own line, where the card had to cut them short.
-  it("shows the reason and every line of the last output in the Card panel", () => {
+  it("shows the reason and every line of the last output in the Card tab", () => {
     const reviewer = card("4", "reviewer");
     render(<AgentCardPanel card={reviewer} name="reviewer" results={{}} tree controls={{ runCardAction: vi.fn(), openCardReference: vi.fn(), stepAgentCard: vi.fn() }} ended={REVIEWER} />);
     const section = screen.getByTestId("agent-card-panel-ended");

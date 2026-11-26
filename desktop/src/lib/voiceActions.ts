@@ -1,4 +1,4 @@
-import type { DeckView, InboxActionVerb } from "../types";
+import type { CardTabSection, DeckView, InboxActionVerb } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 import type { CardStep, OverviewMode } from "./agentCards";
@@ -130,10 +130,10 @@ export type AgentViewTarget = {
    * listed when it is opened.
    */
   incarnation?: string;
-  /** PR #2491 decision 2026-11-25 — opened from the agent's card: its pane opens with the Card panel open. */
-  cardPanel?: boolean;
-  /** …scrolled to this part of the panel. */
-  cardSection?: CardOverlaySection;
+  /** PR #2491 decision 2026-11-26 — the pane opens on its Card tab: only where the user asked for the card itself (a card's `+N`, voice's "show the coder's card"). */
+  cardTab?: boolean;
+  /** …scrolled to this part of the Card tab. */
+  cardSection?: CardTabSection;
 };
 
 /** One agent, named the way every caller here names one. */
@@ -661,21 +661,23 @@ export type VoiceActionContext = {
   /** Show the dashboard as its table or as cards (remembered per window). */
   setOverviewMode: (mode: OverviewMode) => string | undefined;
   /**
-   * PR #2491 decision 2026-11-25 — open one agent's pane with its Card panel
-   * open; with `section`, scrolled to that part of the panel (a card's `+N`
-   * opens it at its checked references).
+   * PR #2491 decision 2026-11-26 — open one agent's pane from its card: on
+   * Terminal (`"terminal"`, a click on the card or the table's Show card), on
+   * its Card tab (`"card"`, voice's "show the coder's card"), or on its Card
+   * tab at one part of it (a card's `+N`).
    */
-  showAgentCard: (target: AgentCardRef, section?: CardOverlaySection) => string | undefined;
+  showAgentCard: (target: AgentCardRef, opensOn: PaneOpening) => string | undefined;
   /** Open the pane of the next or previous agent in the dashboard's order, or of the next one that needs the user. */
   stepAgentCard: (step: CardStep) => string | undefined;
   /** Show only the cards that need the user, or every card. */
   setNeedsYouFilter: (on: boolean) => string | undefined;
   /**
-   * PR #2491 decision 2026-11-25 — open or close the open agent pane's Card
-   * panel, remembered for the next pane. Served by the shell while an agent's
-   * pane is open over the dashboard.
+   * PR #2491 decision 2026-11-26 — show the open agent pane's Card tab or its
+   * Terminal tab. Remembered for that opening only: the next opening of any
+   * agent starts on Terminal. Served by the shell while an agent's pane is
+   * open; switching to Terminal with no card showing says so and does nothing.
    */
-  setCardPanel: (open: boolean) => string | undefined;
+  choosePaneTab: (tab: "card" | "terminal") => string | undefined;
   /** Close the single-action review on screen without sending. Published only while one is open. */
   closeCardReview: () => string | undefined;
   /** Issue #2418 — open or close the tree under one card: the cards the daemon hung under it. Shows the Cards view. */
@@ -694,7 +696,7 @@ export type VoiceActionContext = {
    * `token` is the version of the action the pressed button showed (the
    * daemon refuses a changed one); `review` opens the review showing the exact
    * text instead of sending — what a control that shows only a label asks for
-   * (review B8); `openPane` also opens the agent's pane, with its Card panel,
+   * (review B8); `openPane` also opens the agent's pane, on Terminal,
    * under the review (the table's row menu).
    */
   runCardAction: (target: AgentCardRef, action: { actionId?: string; label?: string; token?: string; review?: boolean; openPane?: boolean }) => string | undefined;
@@ -777,15 +779,18 @@ export type VoiceActionContext = {
   chooseCardActionIcon: (name: string) => string | undefined;
   /** Tick or untick one of the form's checkboxes — Ask before sending (`confirm`) or Offer on every card (`always`). Writes nothing. */
   setCardActionFlag: (flag: "confirm" | "always", on: boolean) => string | undefined;
-  /** Set the form's Placement: Show on the card (`card`, keeping a file's `compact`) or Only in the Card panel (`detail`). Writes nothing. */
+  /** Set the form's Placement: Show on the card (`card`, keeping a file's `compact`) or Only in the Card tab (`detail`). Writes nothing. */
   setCardActionPlacement: (placement: "card" | "detail") => string | undefined;
 };
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
 export type AgentCardRef = { deckId: string; agentId: string; incarnation?: string };
 
-/** A part of the Card panel a control can open it at. */
-export type CardOverlaySection = "references";
+/**
+ * PR #2491 decision 2026-11-26 — where an agent's pane opened from its card
+ * starts: on Terminal, on its Card tab, or on its Card tab at one part of it.
+ */
+export type PaneOpening = "terminal" | "card" | CardTabSection;
 
 /**
  * One registry entry.
@@ -884,7 +889,7 @@ export const VOICE_ACTIONS = {
          carries `agentLabel` as well, which belongs to the dictation row and
          not in a `DeckView` — a spread would put it in the app's view state,
          where nothing reads it and everything compares it. */
-      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from, ...("incarnation" in target ? { incarnation: target.incarnation } : {}), ...(target.cardPanel ? { cardPanel: true } : {}), ...(target.cardSection ? { cardSection: target.cardSection } : {}) });
+      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from, ...("incarnation" in target ? { incarnation: target.incarnation } : {}), ...(target.cardTab ? { cardTab: true } : {}), ...(target.cardSection ? { cardSection: target.cardSection } : {}) });
     },
   },
 
@@ -1583,14 +1588,16 @@ export const VOICE_ACTIONS = {
   },
 
   showAgentCard: {
-    label: "Open one agent's pane with its Card panel",
+    label: "Open one agent's pane from its card",
     voice: true,
     needs: ["showAgentCard"],
-    /* A click on a card and a spoken "show <agent>'s card" open the agent's
-       pane with its Card panel open; the card's `+N` control names the
-       panel's checked references so it opens scrolled there. */
-    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { cardSection?: CardOverlaySection }) => {
-      const refused = target.cardSection !== undefined ? context.showAgentCard(cardRefOf(target), target.cardSection) : context.showAgentCard(cardRefOf(target));
+    /* PR #2491 decision 2026-11-26 — a spoken "show <agent>'s card" asks for
+       the card itself, so with no `opensOn` (the voice row sends none) the
+       pane opens on its Card tab. A click on a card and the table's Show card
+       pass `"terminal"`, as every way into an agent opens on Terminal; a
+       card's `+N` names the part of the Card tab it counted. */
+    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { opensOn?: PaneOpening }) => {
+      const refused = context.showAgentCard(cardRefOf(target), target.opensOn ?? "card");
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1635,24 +1642,24 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  /* PR #2491 decision 2026-11-25 — the agent pane's Card panel, opened and
-     closed by its header's Card button and by voice. */
-  openCardPanel: {
-    label: "Show the Card panel in the open agent pane",
+  /* PR #2491 decision 2026-11-26 — the agent pane's Card and Terminal tabs,
+     switched by voice (the tab strip itself is the pane's own control). */
+  showCardTab: {
+    label: "Show the Card tab in the open agent pane",
     voice: true,
-    needs: ["setCardPanel"],
-    run: (context: Pick<VoiceActionContext, "setCardPanel"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
-      const refused = context.setCardPanel(true);
+    needs: ["choosePaneTab"],
+    run: (context: Pick<VoiceActionContext, "choosePaneTab"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.choosePaneTab("card");
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
 
-  closeCardPanel: {
-    label: "Hide the Card panel in the open agent pane",
+  showTerminalTab: {
+    label: "Leave the Card tab for the Terminal tab in the open agent pane",
     voice: true,
-    needs: ["setCardPanel"],
-    run: (context: Pick<VoiceActionContext, "setCardPanel"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
-      const refused = context.setCardPanel(false);
+    needs: ["choosePaneTab"],
+    run: (context: Pick<VoiceActionContext, "choosePaneTab"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.choosePaneTab("terminal");
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -2021,8 +2028,8 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  showCardActionOnlyInCardPanel: {
-    label: "Choose Only in the Card panel as the Card actions form's Placement",
+  showCardActionOnlyInCardTab: {
+    label: "Choose Only in the Card tab as the Card actions form's Placement",
     voice: true,
     needs: ["setCardActionPlacement"],
     run: (context: Pick<VoiceActionContext, "setCardActionPlacement"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
@@ -2541,7 +2548,7 @@ export type VoiceDispatchTarget = AgentViewTarget & {
   cardActionToken?: string;
   /** PRD #2374 — open a review showing the action's exact text instead of sending it (review B8). */
   cardActionReview?: boolean;
-  /** PR #2491 decision 2026-11-25 — also open the agent's pane, with its Card panel, under the review (the table's row menu). */
+  /** PR #2491 decision 2026-11-25 — also open the agent's pane, on Terminal, under the review (the table's row menu). */
   cardActionOpenPane?: boolean;
   /**
    * The New agent form the utterance was JUDGED against — its deck and chosen
@@ -2697,7 +2704,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * on the overview and over the Runs screen on the deck. Its Cancel is reached
  * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "setCardPanel" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "choosePaneTab" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the

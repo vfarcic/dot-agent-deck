@@ -819,8 +819,8 @@ pub(crate) mod tests {
                 "previous_agent_card".to_string(),
                 "next_needs_you_card".to_string(),
                 "filter_needs_you_cards".to_string(),
-                "open_card_panel".to_string(),
-                "close_card_panel".to_string(),
+                "show_card_tab".to_string(),
+                "show_terminal_tab".to_string(),
                 "open_card_tree".to_string(),
                 "close_card_tree".to_string(),
                 "open_card_pull_request".to_string(),
@@ -842,7 +842,7 @@ pub(crate) mod tests {
                 "offer_card_action_on_every_card".to_string(),
                 "offer_card_action_when_agents_choose".to_string(),
                 "show_card_action_on_the_card".to_string(),
-                "show_card_action_only_in_the_card_panel".to_string(),
+                "show_card_action_only_in_the_card_tab".to_string(),
                 "none".to_string(),
             ]
         );

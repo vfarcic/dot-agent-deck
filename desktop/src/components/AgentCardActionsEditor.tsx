@@ -181,13 +181,13 @@ function ActionRow({ action, busy, editor }: { action: EditableCardAction; busy:
 
 /**
  * Issue #2399 review 11 — where an action is offered, as the form says it:
- * an icon on its agents' cards (`card`), or only in the agent pane's Card panel
+ * an icon on its agents' cards (`card`), or only in the agent pane's Card tab
  * (`detail`). An action whose file says `compact` is shown as on the card and
  * keeps `compact` unless the other choice is picked.
  */
 const PLACEMENTS: readonly { value: "card" | "detail"; label: string }[] = [
   { value: "card", label: "Show on the card" },
-  { value: "detail", label: "Only in the Card panel" },
+  { value: "detail", label: "Only in the Card tab" },
 ];
 
 /** The form for a new action, or for one listed action (its name fixed). */
@@ -216,7 +216,7 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
       <div className="card-actions-editor-field">
         <label htmlFor={id("label")}>Label</label>
         <input id={id("label")} value={values.label} maxLength={40} aria-describedby={`${id("label")}-hint`} onChange={(event) => setField("label", event.target.value)} />
-        <small id={`${id("label")}-hint`}>What the icon's hover and the Card panel call it. Left empty, the name is used.</small>
+        <small id={`${id("label")}-hint`}>What the icon's hover and the Card tab call it. Left empty, the name is used.</small>
       </div>
       <div className="card-actions-editor-field">
         <label htmlFor={id("prompt")}>Text it sends</label>
@@ -248,10 +248,10 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
       </div>
       <div className="card-actions-editor-field">
         <label htmlFor={id("placement")}>Placement</label>
-        <select id={id("placement")} value={values.placement === "detail" ? "detail" : "card"} aria-describedby={`${id("placement")}-hint`} onChange={(event) => VOICE_ACTIONS[event.target.value === "detail" ? "showCardActionOnlyInCardPanel" : "showCardActionOnCard"].run(controls)}>
+        <select id={id("placement")} value={values.placement === "detail" ? "detail" : "card"} aria-describedby={`${id("placement")}-hint`} onChange={(event) => VOICE_ACTIONS[event.target.value === "detail" ? "showCardActionOnlyInCardTab" : "showCardActionOnCard"].run(controls)}>
           {PLACEMENTS.map((placement) => <option key={placement.value} value={placement.value}>{placement.label}</option>)}
         </select>
-        <small id={`${id("placement")}-hint`}>On the card, the action is an icon on each card that offers it (up to three per card); only in the Card panel, it is an icon in the Card panel of the agent's pane and not on the card.</small>
+        <small id={`${id("placement")}-hint`}>On the card, the action is an icon on each card that offers it (up to three per card); only in the Card tab, it is an icon in the Card tab of the agent's pane and not on the card.</small>
       </div>
       <label className="card-actions-editor-check"><input type="checkbox" checked={values.confirm} onChange={(event) => VOICE_ACTIONS[event.target.checked ? "askBeforeSendingCardAction" : "sendCardActionWithoutAsking"].run(controls)} />Ask before sending</label>
       <label className="card-actions-editor-check"><input type="checkbox" checked={values.always} onChange={(event) => VOICE_ACTIONS[event.target.checked ? "offerCardActionOnEveryCard" : "offerCardActionWhenAgentsChoose"].run(controls)} />Offer on every card</label>

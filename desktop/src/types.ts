@@ -182,7 +182,10 @@ export type AgentBackground = {
   sinceMs?: number;
 };
 export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
-export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
+/** PR #2491 decision 2026-11-26 — `card` is the agent pane's Card tab, offered where the agent's daemon shows cards. */
+export type PanelTab = "terminal" | "card" | "diff" | "checks" | "handoffs" | "artifacts";
+/** The part of the Card tab a pane opened at: a card's references `+N` opens it at the references, its actions `+N` at the actions. */
+export type CardTabSection = "references" | "actions";
 
 /**
  * Which of `AgentTile`'s two presentations to render (PRD #1105 M1).
@@ -1184,10 +1187,15 @@ export type DeckView =
    */
   | {
     kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview"; incarnation?: string;
-    /** PR #2491 decision 2026-11-25 — opened from the agent's card (a click on it, its `+N`, the table's Show card, voice's "show its card"): the pane opens with its Card panel open. */
-    cardPanel?: boolean;
-    /** …and the panel scrolled to this part of it. */
-    cardSection?: "references";
+    /**
+     * PR #2491 decision 2026-11-26 — the pane opens on its Card tab rather than
+     * on Terminal: set only where the user asked for the card itself (a card's
+     * `+N`, voice's "show the coder's card"). Every other way in opens on
+     * Terminal.
+     */
+    cardTab?: boolean;
+    /** …and the Card tab scrolled to this part of it, which takes the keyboard. */
+    cardSection?: CardTabSection;
   };
 
 /**

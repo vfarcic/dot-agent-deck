@@ -518,7 +518,13 @@ reason = "The open pane's close X: forwards `onClose`, which DeckSurface wires t
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
 code = "() => onTabChange(id)"
-reason = "Gap: switches the tile's tab (terminal, output, hand-offs). No row picks a tile tab."
+reason = "Gap: switches the tile's tab. The pane's Card and Terminal tabs are voice's `show_card_tab` and `show_terminal_tab` (VOICE_ACTIONS.showCardTab / showTerminalTab, through the shell's `choosePaneTab`, PR #2491 decision 2026-11-26), but no row picks the experimental Diff, Checks, Delegations or Artifacts tab."
+
+[[site]]
+file = "desktop/src/components/EndedCardPane.tsx"
+handler = "onClick"
+code = "() => onTabChange(id)"
+reason = "Switches the ended pane between its Terminal and Card tabs (PR #2491 decision 2026-11-26), the two tabs voice switches with `show_terminal_tab` and `show_card_tab` (VOICE_ACTIONS.showTerminalTab / showCardTab, through the shell's `choosePaneTab`, which serves the ended pane too)."
 
 [[site]]
 file = "desktop/src/components/AgentTile.tsx"

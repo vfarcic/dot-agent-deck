@@ -254,8 +254,8 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(within(cardOf(STUCK.key)).getByTestId("agent-card-details")).not.toHaveAccessibleName(/blocked/);
   });
 
-  /// Scenario: open the trees and read the cards. Each shows its name, its kind (dispatcher, orchestrator, role or agent), its status in the daemon's words and the needs-you marker, with no agent type; what the agent said, its progress and its next step are not on the card, and clicking the card body opens its agent with the Card panel, which still shows them and the agent type.
-  it("desktop/agent-cards/012: a compact card shows who and what, in the daemon's words, and the Card panel keeps what the agent said", () => {
+  /// Scenario: open the trees and read the cards. Each shows its name, its kind (dispatcher, orchestrator, role or agent), its status in the daemon's words and the needs-you marker, with no agent type; what the agent said, its progress and its next step are not on the card, and clicking the card body opens its agent with the Card tab, which still shows them and the agent type.
+  it("desktop/agent-cards/012: a compact card shows who and what, in the daemon's words, and the Card tab keeps what the agent said", () => {
     cardsView();
     fireEvent.click(toggle(QUEUE));
     fireEvent.click(toggle(LEAD));
@@ -333,8 +333,8 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(line.querySelector("button, a, [role='button'], [tabindex='0']")).toBeNull();
   });
 
-  /// Scenario: give the issue's label line room for two chips and the overflow count. Two labels remain visible and +3 accounts for the others, while opening the agent with its Card panel lists all five labels without an overflow cap.
-  it("desktop/agent-cards/013: labels that do not fit are counted by +N and the Card panel lists them all", () => {
+  /// Scenario: give the issue's label line room for two chips and the overflow count. Two labels remain visible and +3 accounts for the others, while opening the agent with its Card tab lists all five labels without an overflow cap.
+  it("desktop/agent-cards/013: labels that do not fit are counted by +N and the Card tab lists them all", () => {
     // jsdom has no layout: model a 200 px label line with 60 px chips and 6 px gaps.
     vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-labels" ? 200 : 0; });
     vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-label" ? 60 : 0; });
@@ -353,7 +353,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(within(section).queryByText(/^\+\d+$/)).toBeNull();
   });
 
-  /// Scenario: a malformed daemon sends too many issue labels or one overlong name. The helper accepts only 20 names of at most 50 characters, and both the compact card and the Card panel create chips only for those bounded labels, including hidden overflow chips.
+  /// Scenario: a malformed daemon sends too many issue labels or one overlong name. The helper accepts only 20 names of at most 50 characters, and both the compact card and the Card tab create chips only for those bounded labels, including hidden overflow chips.
   it.each([
     { surface: "helper", count: 100 }, { surface: "helper", count: 1 },
     { surface: "rendered card", count: 100 }, { surface: "rendered card", count: 1 },
@@ -400,7 +400,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
   });
 
   /// Scenario: read the unit's references the deck could not check, or has not yet. A pending one says it is being checked, a not-found one says "not found or private", one that is not a GitHub reference says so, each with the reason in its tooltip and no link; a stale one keeps its badge but is marked stale, with when it was last checked in its tooltip.
-  /// Scenario: click the text of a reference the deck has not checked yet, and of one it could not find, on a card whose daemon already gave both an address. Neither text opens a page; each click reaches the card and opens its agent with the Card panel, as a click anywhere else on the card does.
+  /// Scenario: click the text of a reference the deck has not checked yet, and of one it could not find, on a card whose daemon already gave both an address. Neither text opens a page; each click reaches the card and opens its agent with the Card tab, as a click anywhere else on the card does.
   it("desktop/agent-cards/014: a reference shown as text, with an address, lets a click through to the card", () => {
     const pendingWithUrl: AgentCardCheckedRef = { field: "pull-request", kind: "pull_request", claim: "o/r#9", repo: "o/r", number: 9, url: "https://github.com/o/r/pull/9", result: { status: "pending" } };
     const card = entry("5", "unit", { checked_refs: [pendingWithUrl, PR_NOT_FOUND] });
@@ -715,8 +715,8 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     }
   });
 
-  /// Scenario: open the unit's card, whose agent reported six pull requests and issues. Its agent's Card panel lists every one in the daemon's order with the deck's check (state, review and CI, or the issue's state, and the title), how fresh that check is or why there is none, and what the agent wrote; a checked badge there opens its page as the card's does, and one the deck could not check has no link.
-  it("desktop/agent-cards/025: the Card panel lists every checked reference with its state, its notes and the agent's claim, and opens them", () => {
+  /// Scenario: open the unit's card, whose agent reported six pull requests and issues. Its agent's Card tab lists every one in the daemon's order with the deck's check (state, review and CI, or the issue's state, and the title), how fresh that check is or why there is none, and what the agent wrote; a checked badge there opens its page as the card's does, and one the deck could not check has no link.
+  it("desktop/agent-cards/025: the Card tab lists every checked reference with its state, its notes and the agent's claim, and opens them", () => {
     cardsView();
     fireEvent.click(toggle(QUEUE));
     fireEvent.click(within(cardOf(UNIT.key)).getByTestId("agent-card-details"));
@@ -751,7 +751,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(stale.textContent).toContain("stale");
     expect(text(stale, "agent-card-panel-ref-note")).toMatch(/^Last checked .*may be out of date\.$/);
 
-    // A link the shell refuses says why in the Card panel.
+    // A link the shell refuses says why in the Card tab.
     openReference.mockReturnValueOnce("That card is no longer on its daemon, so its page was not opened.");
     act(() => { fireEvent.click(within(stale).getByTestId("agent-card-panel-pr")); });
     expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, cardKey: UNIT.key, kind: "pull_request", number: 9, url: PR_STALE.url });
@@ -777,8 +777,8 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(screen.queryByTestId("overview-card-notice")).toBeNull();
   });
 
-  /// Scenario: lay out the unit's card with a reference line that holds two of its six badges. The two show, the other four are hidden whole and a "+4" button says so; pressing it opens the unit's pane with its Card panel at its list of every reference.
-  it("desktop/agent-cards/025: references that do not fit are hidden whole and counted by a +N that opens the Card panel at them", () => {
+  /// Scenario: lay out the unit's card with a reference line that holds two of its six badges. The two show, the other four are hidden whole and a "+4" button says so; pressing it opens the unit's pane with its Card tab at its list of every reference.
+  it("desktop/agent-cards/025: references that do not fit are hidden whole and counted by a +N that opens the Card tab at them", () => {
     // jsdom lays nothing out: give the line 200 px and each badge 60 px with a 6 px gap.
     vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.classList.contains("agent-card-refs") ? 200 : 0; });
     vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.classList.contains("agent-card-ref") ? 60 : 0; });

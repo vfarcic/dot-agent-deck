@@ -9,9 +9,10 @@ export type RowMenuControls = Pick<VoiceActionContext, "toggleOverviewRowMenu" |
 
 /**
  * PRD #2374 — a dashboard table row's ⋯ menu while the cards are shown,
- * holding **Show card**, which opens the agent's pane with its Card panel
- * (PR #2491 decision 2026-11-25), and the card's primary action — which opens
- * that pane at the action's review, showing the exact text: nothing is sent
+ * holding **Show card**, which opens the agent's pane on its Terminal tab, as
+ * every way into an agent does (PR #2491 decision 2026-11-26), and the card's
+ * primary action — which opens that pane, on Terminal, under the action's
+ * review, showing the exact text: nothing is sent
  * from the label. The
  * row's own click still opens the agent; the menu's controls are buttons,
  * which the row's click handler leaves alone. The needs-you badge the daemon
@@ -29,7 +30,7 @@ export function OverviewRowCard({ card, name, rowKey, open, controls }: {
      agent's pane under a review showing exactly what the action does, and the
      user sends it from there (review B8, audit F2). */
   const items: MoreMenuItem[] = [
-    { key: "show-card", label: "Show card", testId: "overview-row-show-card", onSelect: () => VOICE_ACTIONS.showAgentCard.run(controls, cardRef(card)) },
+    { key: "show-card", label: "Show card", testId: "overview-row-show-card", onSelect: () => VOICE_ACTIONS.showAgentCard.run(controls, { ...cardRef(card), opensOn: "terminal" }) },
     ...(primary && primary.id !== "open"
       ? [{
         key: "primary",

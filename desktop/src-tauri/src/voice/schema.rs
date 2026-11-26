@@ -618,8 +618,8 @@ mod tests {
                 "previous_agent_card".to_string(),
                 "next_needs_you_card".to_string(),
                 "filter_needs_you_cards".to_string(),
-                "open_card_panel".to_string(),
-                "close_card_panel".to_string(),
+                "show_card_tab".to_string(),
+                "show_terminal_tab".to_string(),
                 "open_card_tree".to_string(),
                 "close_card_tree".to_string(),
                 "open_card_pull_request".to_string(),
@@ -641,7 +641,7 @@ mod tests {
                 "offer_card_action_on_every_card".to_string(),
                 "offer_card_action_when_agents_choose".to_string(),
                 "show_card_action_on_the_card".to_string(),
-                "show_card_action_only_in_the_card_panel".to_string(),
+                "show_card_action_only_in_the_card_tab".to_string(),
                 "none".to_string(),
             ]
         );
@@ -762,8 +762,8 @@ mod tests {
                 "previous_agent_card",
                 "next_needs_you_card",
                 "filter_needs_you_cards",
-                "open_card_panel",
-                "close_card_panel",
+                "show_card_tab",
+                "show_terminal_tab",
                 "open_card_tree",
                 "close_card_tree",
                 "open_card_pull_request",
@@ -785,7 +785,7 @@ mod tests {
                 "offer_card_action_on_every_card",
                 "offer_card_action_when_agents_choose",
                 "show_card_action_on_the_card",
-                "show_card_action_only_in_the_card_panel",
+                "show_card_action_only_in_the_card_tab",
                 "none"
             ]
         );
@@ -1028,8 +1028,8 @@ mod tests {
                 ("previous_agent_card".to_string(), false),
                 ("next_needs_you_card".to_string(), false),
                 ("filter_needs_you_cards".to_string(), false),
-                ("open_card_panel".to_string(), false),
-                ("close_card_panel".to_string(), false),
+                ("show_card_tab".to_string(), false),
+                ("show_terminal_tab".to_string(), false),
                 ("open_card_tree".to_string(), false),
                 ("close_card_tree".to_string(), false),
                 ("open_card_pull_request".to_string(), false),
@@ -1051,7 +1051,7 @@ mod tests {
                 ("offer_card_action_on_every_card".to_string(), false),
                 ("offer_card_action_when_agents_choose".to_string(), false),
                 ("show_card_action_on_the_card".to_string(), false),
-                ("show_card_action_only_in_the_card_panel".to_string(), false),
+                ("show_card_action_only_in_the_card_tab".to_string(), false),
             ]
         );
         assert_eq!(
@@ -1142,8 +1142,8 @@ mod tests {
                 ("previous_agent_card".to_string(), false),
                 ("next_needs_you_card".to_string(), true),
                 ("filter_needs_you_cards".to_string(), true),
-                ("open_card_panel".to_string(), false),
-                ("close_card_panel".to_string(), false),
+                ("show_card_tab".to_string(), false),
+                ("show_terminal_tab".to_string(), false),
                 ("open_card_tree".to_string(), true),
                 ("close_card_tree".to_string(), true),
                 ("open_card_pull_request".to_string(), true),
@@ -1165,7 +1165,7 @@ mod tests {
                 ("offer_card_action_on_every_card".to_string(), true),
                 ("offer_card_action_when_agents_choose".to_string(), true),
                 ("show_card_action_on_the_card".to_string(), true),
-                ("show_card_action_only_in_the_card_panel".to_string(), true),
+                ("show_card_action_only_in_the_card_tab".to_string(), true),
             ]
         );
         assert_eq!(
@@ -1249,8 +1249,8 @@ mod tests {
                 ("previous_agent_card".to_string(), true),
                 ("next_needs_you_card".to_string(), true),
                 ("filter_needs_you_cards".to_string(), false),
-                ("open_card_panel".to_string(), true),
-                ("close_card_panel".to_string(), true),
+                ("show_card_tab".to_string(), true),
+                ("show_terminal_tab".to_string(), true),
                 ("open_card_tree".to_string(), false),
                 ("close_card_tree".to_string(), false),
                 ("open_card_pull_request".to_string(), false),
@@ -1272,7 +1272,7 @@ mod tests {
                 ("offer_card_action_on_every_card".to_string(), true),
                 ("offer_card_action_when_agents_choose".to_string(), true),
                 ("show_card_action_on_the_card".to_string(), true),
-                ("show_card_action_only_in_the_card_panel".to_string(), true),
+                ("show_card_action_only_in_the_card_tab".to_string(), true),
             ]
         );
     }

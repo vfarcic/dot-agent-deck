@@ -7,23 +7,23 @@ import { agentTypeText, issueLabels, referenceDetail, referenceView } from "../l
 import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
 import type { PaneCardControls } from "../lib/paneCards";
-import type { AgentCardCheckedRef, EndedRole } from "../types";
+import type { AgentCardCheckedRef, CardTabSection, EndedRole } from "../types";
 import { CardActionIconRow, CardReference, cardRef, ExactText, ExactTextNote, IssueLabelChip, panelIconActions, SourceBadge, type ReferenceControls } from "./AgentCard";
 
 /**
- * PR #2491 decision 2026-11-25 — the agent pane's Card panel, which replaced
- * the card overlay: the agent's card beside its terminal. It shows, in two
- * labelled parts, what the deck checked (the status, the pull requests and
- * issues the agent reported as the deck checked them, what was sent from the
- * card) and what the agent says (its summary and its own status, why it needs
- * you, its fields, and its questions with their answer buttons), then the
- * agent's actions as the same grouped icon row a card draws, pressed the same
- * way. The deck's own actions are not repeated: Open is the pane itself, a
- * reply is typed into the terminal, and Close is the header's Close agent.
+ * PR #2491 decision 2026-11-26 — what the agent pane's Card tab shows (the
+ * tab's panel; it was a panel beside the terminal from 2026-11-25, and the
+ * card overlay before that). It shows, in two labelled parts, what the deck
+ * checked (the status, the pull requests and issues the agent reported as the
+ * deck checked them, what was sent from the card) and what the agent says
+ * (its summary and its own status, why it needs you, its fields, and its
+ * questions with their answer buttons), then the agent's actions as the same
+ * grouped icon row a card draws, pressed the same way. The deck's own actions
+ * are not repeated: Open is the pane itself, a reply is typed into the
+ * terminal, and Close is the header's Close agent.
  *
- * It never opens, closes or changes size by itself: its width changes the
- * terminal's, which the agent sees as a resize, so the pane shows it only on
- * the user's choice or when the pane opens.
+ * It is drawn over the terminal's box, which stays mounted under it, so
+ * switching tabs never changes the terminal's size.
  */
 export function AgentCardPanel({ card, name, results, tree, ended, notice, section, controls, readOnly = false, cardActions = false }: {
   /** The agent's card; `undefined` when the dashboard lists none for it (any more). */
@@ -37,8 +37,8 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
   ended?: EndedRole;
   /** Why the last thing pressed did not happen. */
   notice?: string;
-  /** The part of the panel the pane was opened at: a card's `+N` opens it at the references. */
-  section?: "references";
+  /** The part of the Card tab the pane was opened at: a card's references `+N` opens it at the references, its actions `+N` at the actions. */
+  section?: CardTabSection;
   controls: PaneCardControls;
   /**
    * PR #2491 audit M1 — the pane of an agent that has ended: the panel shows
@@ -55,27 +55,29 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
 }) {
   const entry = card?.entry;
   const shownName = entry ? displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id) : displayText(name, DISPLAY_LIMITS.name);
-  /* Opened from a card's `+N`: the references are scrolled into view and
-     take the keyboard, once per navigation that asked for them, so the next
-     Tab continues into the list and a screen reader lands there (PR #2491
-     review J6). `preventScroll` keeps the scroll just made; a card update
-     re-renders with the same section and key, so it never takes focus. */
+  /* Opened from a card's `+N`: the part it counted (the references, or the
+     actions) is scrolled into view and takes the keyboard, once per
+     navigation that asked for it, so the next Tab continues into it and a
+     screen reader lands there (PR #2491 review J6). `preventScroll` keeps the
+     scroll just made; a card update re-renders with the same section and key,
+     so it never takes focus. */
   const refsSection = useRef<HTMLElement>(null);
+  const actionsSection = useRef<HTMLElement>(null);
   const cardKey = card ? `${card.deckId}\u0000${card.entry.key}` : undefined;
-  const hasRefs = (tree ? entry?.checked_refs?.length ?? 0 : 0) > 0;
+  const checkedRefs = tree ? entry?.checked_refs ?? [] : [];
+  const icons = entry && !readOnly ? panelIconActions(entry) : [];
+  const hasSection = section === "references" ? checkedRefs.length > 0 : section === "actions" ? icons.length > 0 : false;
   const handedOff = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (section !== "references") handedOff.current = undefined;
-    if (section !== "references" || !hasRefs || cardKey === undefined || handedOff.current === cardKey) return;
-    const node = refsSection.current;
+    if (section === undefined) handedOff.current = undefined;
+    if (section === undefined || !hasSection || cardKey === undefined || handedOff.current === `${section}\u0000${cardKey}`) return;
+    const node = (section === "references" ? refsSection : actionsSection).current;
     if (!node) return;
-    handedOff.current = cardKey;
+    handedOff.current = `${section}\u0000${cardKey}`;
     node.scrollIntoView?.({ block: "start" });
     node.focus({ preventScroll: true });
-  }, [section, cardKey, hasRefs]);
-  const checkedRefs = tree ? entry?.checked_refs ?? [] : [];
+  }, [section, cardKey, hasSection]);
   const pullRequest = entry?.facts.pull_request as { number?: number; title?: string; state?: string } | null | undefined;
-  const icons = entry && !readOnly ? panelIconActions(entry) : [];
   /* PR #2491 (the maintainer, 2026-11-25) — the Edit beside Actions: the card's daemon's editor, as its ⋯ menu opens it. */
   const editActions = cardActions && !readOnly && controls.openCardActionsEditor
     ? { openCardActionsEditor: controls.openCardActionsEditor, reportRefused: controls.reportRefused }
@@ -84,8 +86,7 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
   /* What became of each press from this card, in the order the actions are listed. */
   const answered = entry ? entry.actions.flatMap((action) => (results[action.token] ? [{ action, result: results[action.token]! }] : [])) : [];
   return (
-    <aside className="agent-card-panel" aria-label={`${shownName}'s card`} data-testid="agent-card-panel" data-card-key={entry?.key}>
-      <h2 className="agent-card-panel-title">Card</h2>
+    <div className="agent-card-panel" aria-label={`${shownName}'s card`} data-testid="agent-card-panel" data-card-key={entry?.key}>
       {notice && <p className="agent-card-panel-notice" role="status" data-testid="agent-card-panel-notice">{displayText(notice, DISPLAY_LIMITS.message)}</p>}
       {/* PR #2491 review J2: the card is gone or its daemon is not answering; the panel keeps its place and offers none of its actions. */}
       {!entry && <p className="agent-card-gone" role="status" data-testid="agent-card-gone">This card is not available right now.</p>}
@@ -192,7 +193,7 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
 
           {readOnly && offersSomething && <p className="agent-card-hint agent-card-panel-read-only" role="note" data-testid="agent-card-panel-read-only">{`${shownName} has ended, so its actions and answers are not available.`}</p>}
           {icons.length > 0 && (
-            <section className="agent-card-section agent-card-panel-part agent-card-panel-actions" aria-label="Actions" data-testid="agent-card-panel-actions">
+            <section ref={actionsSection} tabIndex={-1} className="agent-card-section agent-card-panel-part agent-card-panel-actions" aria-label="Actions" data-testid="agent-card-panel-actions">
               <div className="agent-card-panel-actions-heading">
                 <h3>Actions</h3>
                 {editActions && (
@@ -220,7 +221,7 @@ export function AgentCardPanel({ card, name, results, tree, ended, notice, secti
           )}
         </>
       )}
-    </aside>
+    </div>
   );
 }
 

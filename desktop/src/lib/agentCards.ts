@@ -120,7 +120,7 @@ export function reportStatusLabel(status: string): string {
   return words ? `${words[0].toUpperCase()}${words.slice(1)}` : "Unknown";
 }
 
-/** Why a card needs the user, in words, for its marker's hover and the Card panel. */
+/** Why a card needs the user, in words, for its marker's hover and the Card tab. */
 const NEEDS_YOU_REASON: Record<string, string> = {
   stopped: "its agent stopped",
   native_question: "the agent is asking a question in its terminal",

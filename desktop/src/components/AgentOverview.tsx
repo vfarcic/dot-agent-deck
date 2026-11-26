@@ -2,7 +2,7 @@ import { Children, cloneElement, createContext, isValidElement, useCallback, use
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Ellipsis, Filter, LayoutList, Layers, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { worktreePreview } from "../lib/worktreeClose";
-import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
+import { type AgentSession, type AgentStatus, type CardTabSection, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
@@ -1231,7 +1231,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   agentPane?: { deckId: string; agentId: string; incarnation?: string };
   /**
    * PR #2491 decision 2026-11-25 — where this screen publishes the cards the
-   * agent pane's Card panel draws; absent where no pane is drawn beside it.
+   * agent pane's Card tab draws; absent where no pane is drawn beside it.
    */
   paneCards?: PaneCardsChannel;
   /**
@@ -1886,8 +1886,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
       : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
   }, [decks]);
-  const openCardAgent = useCallback((card: PlacedCard, options?: { cardPanel?: boolean; cardSection?: "references" }) => {
-    VOICE_ACTIONS.openAgent.run(voiceContext, { ...cardOpenTarget(card), ...(options?.cardPanel ? { cardPanel: true } : {}), ...(options?.cardSection ? { cardSection: options.cardSection } : {}) });
+  const openCardAgent = useCallback((card: PlacedCard, options?: { cardTab?: boolean; cardSection?: CardTabSection }) => {
+    VOICE_ACTIONS.openAgent.run(voiceContext, { ...cardOpenTarget(card), ...(options?.cardTab ? { cardTab: true } : {}), ...(options?.cardSection ? { cardSection: options.cardSection } : {}) });
   }, [cardOpenTarget, voiceContext]);
   /* PRD #2374 — in the Cards view, the cards of a deck whose daemon has them,
      after the dashboard filter; `undefined` for a deck that keeps its usual
@@ -2003,7 +2003,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
      the pane's daemon, never the selection's behind it. */
   const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons, preferredDeckId: selectionDaemons.length === 1 ? selectionDaemons[0].deckId : undefined, paneDeckId: agentPaneOpen ? agentPane?.deckId : undefined });
   /* The editor's opening, stable across renders, for the surfaces outside the
-     overview's own controls (the selection bar, the agent pane's Card panel):
+     overview's own controls (the selection bar, the agent pane's Card tab):
      it always reaches the editor as it stands now. */
   const latestEditor = useRef(cardActionsEditor);
   latestEditor.current = cardActionsEditor;
@@ -2029,13 +2029,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     }];
   };
   const needYouCountId = useId();
-  /* Issue #1965 — the exited role a card is for, from its own deck's reply: the Card panel says why in full. */
+  /* Issue #1965 — the exited role a card is for, from its own deck's reply: the Card tab says why in full. */
   const endedForCard = useCallback((card: PlacedCard) => endedRoleOfCard(decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.snapshot.endedRoles, card.entry), [decks]);
   /* Issue #2418 (D12) — a card's name opens its agent through `openAgent`
      with the same members a table row's click uses, so the two cannot open
      different things. */
   const cardControls = useMemo(() => ({ ...cards.clickControls, navigate: voiceContext.navigate, revealAgent: voiceContext.revealAgent }), [cards.clickControls, voiceContext]);
-  /* PR #2491 decision 2026-11-25 — what the agent pane's Card panel draws,
+  /* PR #2491 decision 2026-11-25 — what the agent pane's Card tab draws,
      published for the pane beside this screen; withdrawn on unmount. */
   const paneCardsView = useMemo<PaneCardsView | undefined>(() => (cards.shown
     ? {

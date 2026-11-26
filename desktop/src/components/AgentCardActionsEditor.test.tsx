@@ -419,7 +419,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(calls.editCardCatalog).not.toHaveBeenCalled();
   });
 
-  /// Scenario: Edit Ship it, set its Placement to the overlay only and tick Offer on every card, and save: the update carries both. Reopen it: the form shows that placement and the box ticked; untick it and save: the update carries `always: false` and keeps the placement. A new action added with a non-default placement carries it too. The two choices read Show on the card and Only in the Card panel, and an action whose file says `compact` shows as on the card and keeps `compact` when saved without choosing again.
+  /// Scenario: Edit Ship it, set its Placement to the overlay only and tick Offer on every card, and save: the update carries both. Reopen it: the form shows that placement and the box ticked; untick it and save: the update carries `always: false` and keeps the placement. A new action added with a non-default placement carries it too. The two choices read Show on the card and Only in the Card tab, and an action whose file says `compact` shows as on the card and keeps `compact` when saved without choosing again.
   it("desktop/agent-cards/066: the form round-trips Placement and Offer on every card", async () => {
     const calls = setup();
     let editor = await openEditor();
@@ -457,7 +457,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     editor = editorDialog();
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
     fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
-    expect([...placement().options].map((option) => [option.value, option.textContent])).toEqual([["card", "Show on the card"], ["detail", "Only in the Card panel"]]);
+    expect([...placement().options].map((option) => [option.value, option.textContent])).toEqual([["card", "Show on the card"], ["detail", "Only in the Card tab"]]);
     expect(placement().value).toBe("card");
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
     expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "compact" }), base: expect.objectContaining({ name: "ship" }) });

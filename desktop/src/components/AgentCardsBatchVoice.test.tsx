@@ -398,7 +398,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(screen.queryByRole("button", { name: "Ship it" })).toBeNull();
 
     // The registry and the command table agree, row by row: each voice entry has one row invoking it, on the dashboard and over an
-    // agent's pane (where the Card panel's Edit opens the editor, PR #2491 review T1), with its parameters.
+    // agent's pane (where the Card tab's Edit opens the editor, PR #2491 review T1), with its parameters.
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
     const rows: [string, string, { name: string; kind: string }[]][] = [
       ["openCardActionsEditor", "open_card_actions_editor", [{ name: "deck", kind: "deck_ref" }]],
@@ -416,7 +416,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     // Daemon picker's entry is gone.
     expect((VOICE_ACTIONS as unknown as Record<string, unknown>).chooseCardActionsDaemon, "the Daemon picker's entry is retired").toBeUndefined();
     expect(commandRows().some((candidate) => candidate.id === "choose_card_actions_daemon"), "and so is its row").toBe(false);
-    for (const id of ["confirmRemoveCardAction", "saveCardAction", "hideCardAction", "restoreCardAction", "chooseCardActionIcon", "showCardActionOnCard", "showCardActionOnlyInCardPanel", "askBeforeSendingCardAction", "sendCardActionWithoutAsking", "offerCardActionOnEveryCard", "offerCardActionWhenAgentsChoose", "refreshCardActions", "cancelCardActionForm", "closeCardActionsEditor"]) {
+    for (const id of ["confirmRemoveCardAction", "saveCardAction", "hideCardAction", "restoreCardAction", "chooseCardActionIcon", "showCardActionOnCard", "showCardActionOnlyInCardTab", "askBeforeSendingCardAction", "sendCardActionWithoutAsking", "offerCardActionOnEveryCard", "offerCardActionWhenAgentsChoose", "refreshCardActions", "cancelCardActionForm", "closeCardActionsEditor"]) {
       const entry = registry[id];
       expect(entry, `${id} is in the registry`).toBeDefined();
       if (entry?.voice) {
@@ -433,7 +433,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(registry.saveCardAction?.voice).not.toBe(true);
   });
 
-  /// Scenario: Open the editor and Ship it's form by voice, then say an icon's name ("icon git merge"), "ask before sending", "offer on every card", "only in the Card panel", their opposites, "refresh the card actions" and "open card actions" naming a daemon. The form's icon becomes git-merge and an unknown icon name is refused in words; each checkbox and the Placement choice follow what was said, whatever they were before; Refresh reads the list again and keeps the form; naming the daemon the editor is already on keeps it as it is, and a daemon not on the dashboard is refused in words. Nothing is written, and each of these entries is a voice entry with exactly one row (issue #2399 review 12, re-review N4; PR #2491 decision 2026-11-25).
+  /// Scenario: Open the editor and Ship it's form by voice, then say an icon's name ("icon git merge"), "ask before sending", "offer on every card", "only in the Card tab", their opposites, "refresh the card actions" and "open card actions" naming a daemon. The form's icon becomes git-merge and an unknown icon name is refused in words; each checkbox and the Placement choice follow what was said, whatever they were before; Refresh reads the list again and keeps the form; naming the daemon the editor is already on keeps it as it is, and a daemon not on the dashboard is refused in words. Nothing is written, and each of these entries is a voice entry with exactly one row (issue #2399 review 12, re-review N4; PR #2491 decision 2026-11-25).
   it("desktop/agent-cards/075: voice names the editor's daemon, reads it again and sets the form's icon and checkboxes, writing nothing", async () => {
     const ship = { name: "ship", label: "Ship it", description: "Offer when it is ready.", prompt: "Ship it.", icon: "rocket", placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false };
     const readCardCatalog = vi.fn(async () => ({ actions: [ship], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" }));
@@ -452,7 +452,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
         "send without asking": row("send_card_action_without_asking", "sendCardActionWithoutAsking"),
         "offer on every card": row("offer_card_action_on_every_card", "offerCardActionOnEveryCard"),
         "only when agents suggest it": row("offer_card_action_when_agents_choose", "offerCardActionWhenAgentsChoose"),
-        "only in the Card panel": row("show_card_action_only_in_the_card_panel", "showCardActionOnlyInCardPanel"),
+        "only in the Card tab": row("show_card_action_only_in_the_card_tab", "showCardActionOnlyInCardTab"),
         "show it on the card": row("show_card_action_on_the_card", "showCardActionOnCard"),
         "refresh the card actions": row("refresh_card_actions", "refreshCardActions"),
         "open card actions on the local daemon": row("open_card_actions_editor", "openCardActionsEditor", [deck(FIXTURE_DAEMON_ID, "Local daemon")]),
@@ -484,9 +484,9 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(box("Offer on every card")).not.toBeChecked();
     const placement = () => within(editor).getByLabelText("Placement") as HTMLSelectElement;
     expect(placement().value).toBe("card");
-    await speak(run.voice, "only in the Card panel");
+    await speak(run.voice, "only in the Card tab");
     expect(placement().value).toBe("detail");
-    await speak(run.voice, "only in the Card panel");
+    await speak(run.voice, "only in the Card tab");
     expect(placement().value, "saying it again keeps it").toBe("detail");
     await speak(run.voice, "show it on the card");
     expect(placement().value).toBe("card");
@@ -512,7 +512,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
       ["offerCardActionOnEveryCard", "offer_card_action_on_every_card", []],
       ["offerCardActionWhenAgentsChoose", "offer_card_action_when_agents_choose", []],
       ["showCardActionOnCard", "show_card_action_on_the_card", []],
-      ["showCardActionOnlyInCardPanel", "show_card_action_only_in_the_card_panel", []],
+      ["showCardActionOnlyInCardTab", "show_card_action_only_in_the_card_tab", []],
     ];
     for (const [id, name, params] of rows) {
       expect(registry[id]?.voice, id).toBe(true);
@@ -757,7 +757,9 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "Select far-coder" }));
     fireEvent.click(document.querySelector<HTMLElement>(`article[data-card-key="${run.cards[0].key}"]`)!);
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByTestId("agent-card-panel")).toBeInTheDocument();
+    // A card opens its agent's pane on Terminal, with the Card tab beside it (PR #2491 decision 2026-11-26).
+    expect(within(pane).getByRole("tab", { selected: true })).toHaveAccessibleName("Terminal");
+    expect(within(pane).getByRole("tab", { name: /^Card/ })).toBeInTheDocument();
 
     await speak(run.voice, "open card actions");
     expect(run.declareVoiceScreen.mock.calls.at(-1)?.[0], "voice declared the agent screen").toBe("agent");
@@ -823,7 +825,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     const run = setup((agents) => [cardFor(agents[0].id, "coder-card")], () => ({}), { extra: { readCardCatalog, editCardCatalog, resolveVoice, declareVoiceScreen }, remote: true });
     await turnOnVoice();
     fireEvent.click(document.querySelector<HTMLElement>(`article[data-card-key="${run.cards[0].key}"]`)!);
-    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-card-panel")).toBeInTheDocument();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("tab", { name: /^Card/ })).toBeInTheDocument();
     const firstPane = screen.getByTestId("agent-pane-overlay").getAttribute("aria-label");
 
     await speak(run.voice, said);

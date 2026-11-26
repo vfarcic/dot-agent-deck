@@ -409,8 +409,8 @@ mod tests {
                 "previous_agent_card",
                 "next_needs_you_card",
                 "filter_needs_you_cards",
-                "open_card_panel",
-                "close_card_panel",
+                "show_card_tab",
+                "show_terminal_tab",
                 "open_card_tree",
                 "close_card_tree",
                 "open_card_pull_request",
@@ -432,7 +432,7 @@ mod tests {
                 "offer_card_action_on_every_card",
                 "offer_card_action_when_agents_choose",
                 "show_card_action_on_the_card",
-                "show_card_action_only_in_the_card_panel",
+                "show_card_action_only_in_the_card_tab",
                 "none"
             ]
         );

@@ -8,7 +8,7 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  * - the selection bar's Edit card actions, after the batch actions and apart
  *   from them, opens the editor of the one daemon the selected cards are on
  *   (116), and with the selection across daemons opens a menu of them (117);
- * - the Card panel's Edit, beside its Actions heading, opens the editor of
+ * - the Card tab's Edit, beside its Actions heading, opens the editor of
  *   the agent's daemon over the pane (118).
  *
  * The fixture scene `/?fixture=1&state=docs-fleet&cards=fleet` shows two
@@ -118,11 +118,12 @@ for (const width of WIDTHS) {
       await expectInsideWindow(page, editor, width);
     });
 
-    /// Scenario: At this width, open Plan / architecture's pane from its card. The Card panel's Actions heading has a small Edit button beside it, named "Edit card actions"; Shift+Tab reaches it from the panel's first action icon and Enter opens the local daemon's Card actions editor over the pane, inside the window.
-    test(`desktop/agent-cards/118 — the Card panel's Edit opens its daemon's editor at ${width}px`, async ({ page }) => {
+    /// Scenario: At this width, open Plan / architecture's pane from its card. The Card tab's Actions heading has a small Edit button beside it, named "Edit card actions"; Shift+Tab reaches it from the panel's first action icon and Enter opens the local daemon's Card actions editor over the pane, inside the window.
+    test(`desktop/agent-cards/118 — the Card tab's Edit opens its daemon's editor at ${width}px`, async ({ page }) => {
       await openScene(page);
       const [local] = await daemonNames(page);
       await page.locator("article[data-card-key]").filter({ hasText: "Plan / architecture" }).getByTestId("agent-card-details").click();
+      await page.getByTestId("agent-pane-overlay").getByRole("tab", { name: /^Card/ }).click();
       const panel = page.getByTestId("agent-pane-overlay").getByTestId("agent-card-panel");
       await expect(panel).toBeVisible();
       const actions = panel.getByTestId("agent-card-panel-actions");

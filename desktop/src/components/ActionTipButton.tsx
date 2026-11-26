@@ -214,7 +214,7 @@ export function ActionTipButton({ tip, unavailable = false, onClick, onFocus, on
 
 /**
  * PR #2491 review — the box around a set of action icons: a card's own, the
- * selection bar's and the agent pane's Card panel all draw their icons
+ * selection bar's and the agent pane's Card tab all draw their icons
  * inside one, so a user who learns where a card's actions are finds them in
  * the same box in all three. A card's own Close stays outside its group; the
  * batch's Close, in the bar, is one of the

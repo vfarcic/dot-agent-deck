@@ -84,8 +84,9 @@ resolved_agent = "agent-gen-coder"
 resolved_card_action = "go ahead"
 
 # PR #2491 decision 2026-11-25: the card overlay is gone. A card opens its
-# agent's pane with the Card panel beside the terminal; the pane's header moves
-# between agents, and its Card panel opens and closes by voice too.
+# agent's pane; the pane's header moves between agents. Decision 2026-11-26:
+# the Card panel became the pane's Card tab, beside its Terminal tab, and
+# voice switches between the two.
 [[fixtures]]
 name = "card-panel-show-coders-card-from-dashboard"
 utterance = "show the coder's card"
@@ -105,24 +106,38 @@ outcome = "dispatch"
 resolved_agent = "agent-gen-coder"
 
 [[fixtures]]
-name = "card-panel-show-the-card"
+name = "card-tab-show-the-card"
 utterance = "show the card"
 screen = "agent"
-action = "open_card_panel"
+action = "show_card_tab"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "card-panel-close-the-card"
+name = "card-tab-close-the-card"
 utterance = "close the card"
 screen = "agent"
-action = "close_card_panel"
+action = "show_terminal_tab"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "card-panel-close-the-card-unavailable-on-dashboard"
-utterance = "hide the card panel"
+name = "card-tab-show-the-terminal"
+utterance = "show the terminal"
+screen = "agent"
+action = "show_terminal_tab"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-tab-back-to-the-terminal"
+utterance = "back to the terminal"
+screen = "agent"
+action = "show_terminal_tab"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-tab-close-the-card-unavailable-on-dashboard"
+utterance = "hide the card"
 screen = "overview"
-action = "close_card_panel"
+action = "show_terminal_tab"
 outcome = "unavailable"
 
 [[fixtures]]
@@ -419,13 +434,13 @@ action = "show_card_action_on_the_card"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "card-actions-editor-placement-only-in-the-card-panel"
-utterance = "only show it in the card panel"
+name = "card-actions-editor-placement-only-in-the-card-tab"
+utterance = "only show it in the card tab"
 screen = "overview"
-action = "show_card_action_only_in_the_card_panel"
+action = "show_card_action_only_in_the_card_tab"
 outcome = "dispatch"
 
-# PR #2491 review T1 (2026-11-25): the Card panel's Edit opens the editor over
+# PR #2491 review T1 (2026-11-25): the Card panel's (now Card tab's) Edit opens the editor over
 # an agent's pane, so its rows run on the agent screen too, where typing to
 # the agent (`dictate_to_agent`) competes for the same words. The same
 # phrases as on the dashboard, over a pane with typing mode off.
@@ -518,10 +533,10 @@ action = "show_card_action_on_the_card"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "card-actions-editor-placement-only-in-the-card-panel-over-pane"
-utterance = "only show it in the card panel"
+name = "card-actions-editor-placement-only-in-the-card-tab-over-pane"
+utterance = "only show it in the card tab"
 screen = "agent"
-action = "show_card_action_only_in_the_card_panel"
+action = "show_card_action_only_in_the_card_tab"
 outcome = "dispatch"
 
 [[fixtures]]

@@ -2787,12 +2787,13 @@ try_saying  = "show cards"
 
 [[commands]]
 id          = "show_agent_card"
-description = """Open one agent's CARD: that agent's pane with its Card panel open beside the
-terminal, showing what the agent reported, its questions and the actions it offers. Use only when
-the user says card — "show the coder's card", "open the tester's card", "card for the dispatcher".
-Opening an agent's terminal pane without naming its card ("open the coder", "show the tester") is
-`open_agent`, not this one; showing the card of the agent whose pane is already open, without
-naming another, is `open_card_panel`. Set `agent` to the user's own words for the agent."""
+description = """Open one agent's CARD: that agent's pane on its Card tab, showing what the agent
+reported, its questions and the actions it offers. Use only when the user says card — "show the
+coder's card", "open the tester's card", "card for the dispatcher". Opening an agent's terminal pane
+without naming its card ("open the coder", "show the tester") is `open_agent`, not this one. A card
+with NO agent named ("show the card", "open the card", "show its card") is the card of the agent whose
+pane is already open, which is `show_card_tab`, never this row. Set `agent` to the user's own words for
+the agent."""
 invoke      = "showAgentCard"
 screens     = ["overview", "agent"]
 unavailable_hint = "an agent's card opens from the agent dashboard"
@@ -2880,29 +2881,34 @@ try_saying  = "only the ones that need me"
   name = "needs_you"
   kind = "needs_you_filter"
 
+# PR #2491 decision 2026-11-26: the Card panel became the agent pane's Card
+# tab, beside its Terminal tab; these two rows switch between them.
 [[commands]]
-id          = "open_card_panel"
-description = """In an open agent's pane, show its Card panel beside the terminal: what the agent
-reported, its questions and its actions. Use for show the card, open the card, show its card, show
-the card panel. Showing ANOTHER agent's card, named, is `show_agent_card`."""
-invoke      = "openCardPanel"
+id          = "show_card_tab"
+description = """In an open agent's pane, switch to its Card tab: what the agent reported, its
+questions and its actions. Use for show the card, open the card, show its card, the card tab, switch
+to the card. Showing ANOTHER agent's card, named, is `show_agent_card`. Placing a card action "only in
+the card tab" ("only show it in the card tab") is the Card actions editor's Placement,
+`show_card_action_only_in_the_card_tab`, not this row."""
+invoke      = "showCardTab"
 screens     = ["agent"]
-unavailable_hint = "the Card panel opens in an agent's pane opened from the agent dashboard"
+unavailable_hint = "the Card tab is in an agent's pane opened from the agent dashboard"
 report      = "Showing the card."
-asks_to     = "show the card in this agent's pane"
+asks_to     = "show the Card tab in this agent's pane"
 try_saying  = "show the card"
 
 [[commands]]
-id          = "close_card_panel"
-description = """In an open agent's pane, hide its Card panel, giving the terminal the room. Use for
-close the card, hide the card, close the card panel, done with the card. It keeps the pane open: a
-bare "close", "back to dashboard" or "go back" leaves the pane and is `close`."""
-invoke      = "closeCardPanel"
+id          = "show_terminal_tab"
+description = """In an open agent's pane, leave its Card tab for its Terminal tab, showing the agent's
+terminal again. Use for close the card, hide the card, done with the card, show the terminal, back to
+the terminal, switch to the terminal, the terminal tab. It keeps the pane open: a bare "close", "back
+to dashboard" or "go back" leaves the pane and is `close`; typing to the agent is `dictate_to_agent`."""
+invoke      = "showTerminalTab"
 screens     = ["agent"]
-unavailable_hint = "the Card panel closes in an agent's pane opened from the agent dashboard"
-report      = "Hid the card."
-asks_to     = "hide the card in this agent's pane"
-try_saying  = "close the card"
+unavailable_hint = "the Terminal tab is in an agent's pane opened from the agent dashboard"
+report      = "Showing the terminal."
+asks_to     = "go back to the terminal in this agent's pane, leaving its Card tab"
+try_saying  = "show the terminal"
 
 # Issue #2418 — the Cards tree. Opening and closing the tree under a card
 # changes what the dashboard shows and sends nothing; opening a card's pull
@@ -2930,8 +2936,8 @@ try_saying  = "open {agent}'s tree"
 id          = "close_card_tree"
 description = """In the agent dashboard's cards, close the TREE under one agent's card, hiding the
 agents it started. Use for close the dispatcher's tree, collapse the queue, hide what is under the
-orchestrator. Set `agent` to the user's words for the agent whose tree to close. Hiding the Card
-panel in an open agent's pane is `close_card_panel`."""
+orchestrator. Set `agent` to the user's words for the agent whose tree to close. Leaving the Card
+tab in an open agent's pane is `show_terminal_tab`."""
 invoke      = "closeCardTree"
 screens     = ["overview"]
 unavailable_hint = "a card's tree closes on the agent dashboard's cards"
@@ -3113,7 +3119,7 @@ try_saying  = "{action} on the selected agents"
 # are presses by hand — so a misheard word never becomes text an agent is sent
 # or takes an action off the cards.
 #
-# PR #2491 review T1 (2026-11-25): the Card panel's Edit opens the editor over
+# PR #2491 review T1 (2026-11-25): the Card panel's Edit (since 2026-11-26 the Card tab's) opens the editor over
 # an agent's pane opened from the dashboard, so the editor's rows run on the
 # agent screen too. There an opening naming no daemon means the PANE's daemon,
 # never a selection behind the pane; a pane the Daemons screen opened, and one
@@ -3130,7 +3136,7 @@ id          = "open_card_actions_editor"
 description = """Open one daemon's Card actions editor on the agent dashboard: the list of actions
 agents can offer on their cards (such as Go ahead and Merge it), where the user adds, changes, hides
 and removes them. It is what Card actions in a daemon's ⋯ (More) menu opens, and what Edit beside Actions
-in an agent pane's Card panel opens: over an agent's pane, naming no daemon means that agent's. Use for open card
+in an agent pane's Card tab opens: over an agent's pane, naming no daemon means that agent's. Use for open card
 actions, open the card actions editor, edit card actions, manage card actions, show the card actions,
 and, naming the daemon (which a user may also call a deck; speech-to-text often writes daemon as
 demon), open card actions on the build box, the build box daemon's card actions, edit the local
@@ -3294,14 +3300,14 @@ asks_to     = "show the card action I am editing on the card"
 try_saying  = "show it on the card"
 
 [[commands]]
-id          = "show_card_action_only_in_the_card_panel"
-description = """In the Card actions editor's form, set Placement to Only in the Card panel, so the action
-draws no icon on the card and is offered only in the Card panel of the agent's pane. Use for only in
-the Card panel, only in the panel, not on the card, no icon on the card. It only sets the form's choice; nothing is saved until the user
+id          = "show_card_action_only_in_the_card_tab"
+description = """In the Card actions editor's form, set Placement to Only in the Card tab, so the action
+draws no icon on the card and is offered only in the Card tab of the agent's pane. Use for only in
+the Card tab, only in the card, not on the card, no icon on the card. It only sets the form's choice; nothing is saved until the user
 presses Save."""
-invoke      = "showCardActionOnlyInCardPanel"
+invoke      = "showCardActionOnlyInCardTab"
 screens     = ["overview", "agent"]
 unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
-report      = "Placement is Only in the Card panel. Press Save to keep it."
-asks_to     = "offer the card action I am editing only in the Card panel"
-try_saying  = "only in the Card panel"
+report      = "Placement is Only in the Card tab. Press Save to keep it."
+asks_to     = "offer the card action I am editing only in the Card tab"
+try_saying  = "only in the Card tab"

@@ -1541,8 +1541,8 @@ mod tests {
                     "toggleNeedsYouFilter",
                     vec!["overview"]
                 ),
-                ("open_card_panel", "openCardPanel", vec!["agent"]),
-                ("close_card_panel", "closeCardPanel", vec!["agent"]),
+                ("show_card_tab", "showCardTab", vec!["agent"]),
+                ("show_terminal_tab", "showTerminalTab", vec!["agent"]),
                 ("open_card_tree", "openCardTree", vec!["overview"]),
                 ("close_card_tree", "closeCardTree", vec!["overview"]),
                 (
@@ -1629,8 +1629,8 @@ mod tests {
                     vec!["overview", "agent"]
                 ),
                 (
-                    "show_card_action_only_in_the_card_panel",
-                    "showCardActionOnlyInCardPanel",
+                    "show_card_action_only_in_the_card_tab",
+                    "showCardActionOnlyInCardTab",
                     vec!["overview", "agent"]
                 ),
             ]
@@ -2645,7 +2645,7 @@ mod tests {
                 "offer_card_action_on_every_card",
                 "offer_card_action_when_agents_choose",
                 "show_card_action_on_the_card",
-                "show_card_action_only_in_the_card_panel"
+                "show_card_action_only_in_the_card_tab"
             ]
         );
         assert_eq!(
@@ -2683,14 +2683,14 @@ mod tests {
                 "stop_agent",
                 // PRD #2119: ask the pane's agent to generate the config.
                 "generate_config",
-                // PR #2491 decision 2026-11-25: the pane's Card panel, the
+                // PR #2491 decision 2026-11-25: the pane's Card tab (2026-11-26), the
                 // moves between agents, another agent's card and its actions.
                 "show_agent_card",
                 "next_agent_card",
                 "previous_agent_card",
                 "next_needs_you_card",
-                "open_card_panel",
-                "close_card_panel",
+                "show_card_tab",
+                "show_terminal_tab",
                 "run_card_action",
                 // PR #2491 review T1: the Card actions editor, which the Card
                 // panel's Edit opens over the pane, and its form's rows.
@@ -2705,7 +2705,7 @@ mod tests {
                 "offer_card_action_on_every_card",
                 "offer_card_action_when_agents_choose",
                 "show_card_action_on_the_card",
-                "show_card_action_only_in_the_card_panel"
+                "show_card_action_only_in_the_card_tab"
             ]
         );
         // PRD #1401 — over the pull request browser: the rows callable

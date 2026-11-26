@@ -5,8 +5,8 @@ import { boundOpenCards, cardTree, openableReference, pathTo, pruneOpenCards, re
 import { newCardRequestId } from "../lib/bridge";
 import type { CardReferenceTarget } from "../lib/prBrowser";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
-import type { AgentCardRef, CardOverlaySection, VoiceActionContext } from "../lib/voiceActions";
-import type { AgentCardAction, CardBatchOutcome, DeckRuntimeState } from "../types";
+import type { AgentCardRef, VoiceActionContext } from "../lib/voiceActions";
+import type { AgentCardAction, CardBatchOutcome, CardTabSection, DeckRuntimeState } from "../types";
 
 /** What a card member says when the cards are not shown (this connection offers no cards). */
 const CARDS_HIDDEN = "Agent cards are not available here.";
@@ -226,7 +226,7 @@ export interface AgentCardsView {
   review: CardReviewView | undefined;
   /**
    * Issue #2418 review (F2) — why the last thing pressed on a card or in its
-   * Card panel did not happen, until it is dismissed, the review closes, or a
+   * Card tab did not happen, until it is dismissed, the review closes, or a
    * reference opens: a press that did nothing says why.
    */
   notice: string | undefined;
@@ -235,7 +235,7 @@ export interface AgentCardsView {
   rowMenu: string | undefined;
   controls: AgentCardControls;
   /**
-   * {@link controls} for the cards' and the Card panel's own controls, which
+   * {@link controls} for the cards' and the Card tab's own controls, which
    * report a refusal in {@link notice}. Kept apart from `controls`, which is
    * also published to voice, where the voice panel reports refusals itself.
    */
@@ -280,8 +280,8 @@ function sameIncarnation(card: PlacedCard, incarnation: string | undefined): boo
 export function useAgentCardsView({ runtime, decks, openAgent, pane, openReference, hiddenByFilter }: {
   runtime: Pick<DeckRuntimeState, "agentCards" | "invokeCardAction" | "invokeCardActionBatch">;
   decks: readonly { deckId: string | undefined; connected: boolean }[];
-  /** Open a card's agent's pane — a card's `open` action, and with `cardPanel`, the card itself. */
-  openAgent: (card: PlacedCard, options?: { cardPanel?: boolean; cardSection?: CardOverlaySection }) => void;
+  /** Open a card's agent's pane — on Terminal, or with `cardTab` on its Card tab (where the user asked for the card itself). */
+  openAgent: (card: PlacedCard, options?: { cardTab?: boolean; cardSection?: CardTabSection }) => void;
   /** The agent whose pane is open over the dashboard, if any: where the header's previous and next move from. */
   pane?: { deckId: string; agentId: string; incarnation?: string };
   /** Issue #2418 — open a checked pull request or issue in the app's GitHub browser; absent where there is none. */
@@ -481,12 +481,15 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
       remember(next);
       return undefined;
     },
-    showAgentCard: (ref, section) => {
+    showAgentCard: (ref, opensOn) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       const card = find(ref);
       if (!card) return CARD_GONE;
       setRowMenu(undefined);
-      openAgent(card, { cardPanel: true, ...(section ? { cardSection: section } : {}) });
+      /* PR #2491 decision 2026-11-26 — on Terminal unless the user asked for
+         the card itself: a spoken "show its card", or a `+N` naming the part
+         of the Card tab it counted. */
+      openAgent(card, opensOn === "terminal" ? {} : { cardTab: true, ...(opensOn === "card" ? {} : { cardSection: opensOn }) });
       return undefined;
     },
     stepAgentCard: (step: CardStep) => {
@@ -494,8 +497,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
       const from = current ? order.findIndex((card) => card.deckId === current.deckId && card.entry.agent_id === current.agentId && sameIncarnation(card, current.incarnation)) : -1;
       const at = stepCard(order, from, step);
       if (at === undefined) return step === "needs-you" ? NO_CARD_NEEDS_YOU : NO_CARDS;
-      /* Moving keeps the Card panel as the user has it; the shell opens it
-         for an agent that needs them, as any pane opening does. */
+      /* A move is a way into an agent, so its pane opens on Terminal. */
       openAgent(order[at]);
       return undefined;
     },
@@ -530,11 +532,11 @@ export function useAgentCardsView({ runtime, decks, openAgent, pane, openReferen
       /* Open is the pane itself, and a reply is the user's own words, typed
          into the agent's terminal there (PR #2491 decision 2026-11-25). */
       if (action.kind === "open" || action.text_input) {
-        openAgent(card, action.text_input ? { cardPanel: true } : {});
+        openAgent(card);
         return undefined;
       }
       const reviewIt = (sentence?: string) => {
-        if (wanted.openPane) openAgent(card, { cardPanel: true });
+        if (wanted.openPane) openAgent(card);
         setReview({ key: placedCardKey(card), name: card.entry.name, actionId: action.id, token: action.token });
         return sentence;
       };
