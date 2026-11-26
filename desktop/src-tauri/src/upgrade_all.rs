@@ -125,11 +125,14 @@ pub(crate) struct UpgradeAllState {
 
 #[derive(Default)]
 struct Inner {
-    /// The last check, by its batch id. A newer check replaces it, so an
-    /// abandoned dialog leaves nothing behind.
-    checked: Mutex<Option<(String, Checked)>>,
+    /// The last check, by its batch id, with the flag Stop after this daemon
+    /// sets: it exists from the check, so a Stop pressed before the run has
+    /// registered is kept rather than refused. A newer check replaces it, so
+    /// an abandoned dialog leaves nothing behind.
+    checked: Mutex<Option<(String, Checked, Arc<AtomicBool>)>>,
     /// The runs in progress, by batch id, with their stop flag.
     running: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The number of the last check requested; only that check is kept.
     next_id: AtomicU64,
 }
 
@@ -159,20 +162,40 @@ impl Drop for Running {
 }
 
 impl UpgradeAllState {
-    /// Keep `checked` for a run and describe it for the webview.
-    pub(crate) fn insert(&self, checked: Checked) -> UpgradeAllPlanDto {
-        let n = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    /// Number a check as it is requested, so checks are ordered by when they
+    /// were asked for, not by when their remotes answered.
+    pub(crate) fn begin_check(&self) -> u64 {
+        self.inner.next_id.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Describe check `n` for the webview, and keep it for a run when it is
+    /// still the newest check requested. A slower, older check that finishes
+    /// after a newer one is described but not kept, so it cannot replace the
+    /// plan on screen; running it says it is no longer current.
+    pub(crate) fn insert(&self, n: u64, checked: Checked) -> UpgradeAllPlanDto {
         let batch_id = format!("batch-{n}");
         let dto = UpgradeAllPlanDto::new(&batch_id, &checked);
-        *lock(&self.inner.checked) = Some((batch_id, checked));
+        if self.inner.next_id.load(Ordering::SeqCst) == n {
+            *lock(&self.inner.checked) =
+                Some((batch_id, checked, Arc::new(AtomicBool::new(false))));
+        }
         dto
     }
 
-    /// Take the checked batch `batch_id` for its run. It runs once.
-    pub(crate) fn take(&self, batch_id: &str) -> Result<Checked, String> {
+    /// Take the checked batch `batch_id` for its run, registered at once so
+    /// it can be stopped, with any Stop already pressed. It runs once.
+    pub(crate) fn take(&self, batch_id: &str) -> Result<(Checked, Running), String> {
         let mut checked = lock(&self.inner.checked);
         match checked.take() {
-            Some((id, batch)) if id == batch_id => Ok(batch),
+            Some((id, batch, stop)) if id == batch_id => {
+                lock(&self.inner.running).insert(id.clone(), Arc::clone(&stop));
+                let running = Running {
+                    inner: Arc::clone(&self.inner),
+                    batch_id: id,
+                    stop,
+                };
+                Ok((batch, running))
+            }
             other => {
                 *checked = other;
                 Err(NOT_CHECKED.to_string())
@@ -180,19 +203,17 @@ impl UpgradeAllState {
         }
     }
 
-    /// Register the run of `batch_id`, so it can be stopped.
-    pub(crate) fn start(&self, batch_id: &str) -> Running {
-        let stop = Arc::new(AtomicBool::new(false));
-        lock(&self.inner.running).insert(batch_id.to_string(), Arc::clone(&stop));
-        Running {
-            inner: Arc::clone(&self.inner),
-            batch_id: batch_id.to_string(),
-            stop,
-        }
-    }
-
-    /// Start no deck of `batch_id` after the one being upgraded.
+    /// Start no deck of `batch_id` after the one being upgraded — or, when
+    /// its run has not registered yet, none at all after the first.
     pub(crate) fn stop(&self, batch_id: &str) -> Result<(), String> {
+        // The same lock order as `take`: checked, then running.
+        let checked = lock(&self.inner.checked);
+        if let Some((id, _, stop)) = checked.as_ref()
+            && id == batch_id
+        {
+            stop.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
         match lock(&self.inner.running).get(batch_id) {
             Some(stop) => {
                 stop.store(true, Ordering::SeqCst);
@@ -443,7 +464,7 @@ mod tests {
         }
     }
 
-    fn older() -> DeckCheck {
+    fn older_check() -> DeckCheck {
         DeckCheck::Upgrade {
             from: "0.51.0".into(),
             to: "0.52.0".into(),
@@ -451,37 +472,62 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_runs_once_and_only_the_last_check_runs() {
+    fn a_batch_runs_once_and_only_the_newest_check_requested_runs() {
         let state = UpgradeAllState::default();
-        let first = state.insert(checked(vec![("alpha", older(), Some("deck-a"))]));
-        let second = state.insert(checked(vec![("alpha", older(), Some("deck-a"))]));
+        let older = state.begin_check();
+        let newer = state.begin_check();
+        // The newer check's remotes answer first, then the older one's.
+        let shown = state.insert(
+            newer,
+            checked(vec![("alpha", older_check(), Some("deck-a"))]),
+        );
+        let late = state.insert(
+            older,
+            checked(vec![("alpha", older_check(), Some("deck-a"))]),
+        );
         assert_eq!(
-            state.take(&first.batch_id).err().as_deref(),
+            state.take(&late.batch_id).err().as_deref(),
             Some(NOT_CHECKED)
         );
-        assert!(state.take(&second.batch_id).is_ok());
+        assert!(
+            state.take(&shown.batch_id).is_ok(),
+            "the late older check did not replace it"
+        );
         assert_eq!(
-            state.take(&second.batch_id).err().as_deref(),
+            state.take(&shown.batch_id).err().as_deref(),
             Some(NOT_CHECKED),
             "a batch runs once"
         );
     }
 
     #[test]
+    fn a_stop_pressed_before_the_run_registers_is_kept() {
+        let state = UpgradeAllState::default();
+        let n = state.begin_check();
+        let plan = state.insert(n, checked(vec![("alpha", older_check(), Some("deck-a"))]));
+        assert!(state.stop(&plan.batch_id).is_ok());
+        let (_, running) = state.take(&plan.batch_id).unwrap();
+        assert!(running.stop_flag().load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn a_run_is_stopped_by_its_id_and_forgotten_when_it_ends() {
         let state = UpgradeAllState::default();
-        let running = state.start("batch-7");
-        assert!(state.stop("batch-7").is_ok());
+        let n = state.begin_check();
+        let plan = state.insert(n, checked(vec![("alpha", older_check(), Some("deck-a"))]));
+        let (_, running) = state.take(&plan.batch_id).unwrap();
+        assert!(!running.stop_flag().load(Ordering::SeqCst));
+        assert!(state.stop(&plan.batch_id).is_ok());
         assert!(running.stop_flag().load(Ordering::SeqCst));
         drop(running);
-        assert!(state.stop("batch-7").is_err());
+        assert!(state.stop(&plan.batch_id).is_err());
     }
 
     #[test]
     fn the_decks_to_upgrade_are_reserved_and_a_busy_one_refuses_the_batch() {
         let upgrades = UpgradeState::default();
         let batch = checked(vec![
-            ("alpha", older(), Some("deck-a")),
+            ("alpha", older_check(), Some("deck-a")),
             (
                 "beta",
                 DeckCheck::Skip {
@@ -505,7 +551,7 @@ mod tests {
 
     #[test]
     fn the_plan_and_report_carry_the_crates_words_in_camel_case() {
-        let batch = checked(vec![("alpha", older(), Some("deck-a"))]);
+        let batch = checked(vec![("alpha", older_check(), Some("deck-a"))]);
         let plan = UpgradeAllPlanDto::new("batch-1", &batch);
         let json = serde_json::to_value(&plan).unwrap();
         assert_eq!(json["batchId"], "batch-1");
@@ -559,8 +605,8 @@ mod tests {
     fn a_question_names_the_deck_that_asks() {
         let upgrades = UpgradeState::default();
         let batch = checked(vec![
-            ("alpha", older(), Some("deck-a")),
-            ("beta", older(), Some("deck-b")),
+            ("alpha", older_check(), Some("deck-a")),
+            ("beta", older_check(), Some("deck-b")),
         ]);
         let asked: Arc<Mutex<Vec<UpgradeDecisionEvent>>> = Arc::default();
         let seen = Arc::clone(&asked);

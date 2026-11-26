@@ -93,9 +93,11 @@ impl DeckCheck {
 
 /// Classify what probing a deck's daemon returned, against `client`.
 ///
-/// - A daemon answered: its reported version decides. A daemon so old that
-///   its `Hello` names no version is judged by the installed binary's version
-///   instead, since it is at least that old.
+/// - A daemon answered: its reported version decides. A daemon whose `Hello`
+///   names no version predates every release that reports one (PRD #161), so
+///   it is older than any client that knows its own version and is upgraded;
+///   the installed binary's version says nothing about it, since an earlier
+///   upgrade may have installed a newer binary and kept this daemon running.
 /// - No daemon is running: skipped.
 /// - The installed binary predates `daemon probe`: it is older than this
 ///   client's every release, so the binary's own `--version` decides.
@@ -112,7 +114,16 @@ pub fn check_from_probe(
     match probe {
         Ok(Some(hello)) => match hello.daemon_version.as_deref() {
             Some(version) => DeckCheck::from_version(client, Some(version)),
-            None => by_binary(),
+            None if crate::version::is_unknown_version(client) => DeckCheck::Skip {
+                reason: SkipReason::VersionUnknown,
+            },
+            None => DeckCheck::Upgrade {
+                from: hello
+                    .build_version
+                    .clone()
+                    .unwrap_or_else(|| "an older release".to_string()),
+                to: client.to_string(),
+            },
         },
         Ok(None) => DeckCheck::Skip {
             reason: SkipReason::NoDaemonRunning,
@@ -468,23 +479,28 @@ pub enum BatchEvent {
     Finished { index: usize, report: DeckReport },
 }
 
-/// Check every deck, all at the same time, and return what each check found
-/// in the order of `decks`.
+/// How many decks [`check_all`] checks at once. Each check is a thread and an
+/// ssh process, so a long deck list is checked this many at a time rather
+/// than all at once.
+pub const MAX_PARALLEL_CHECKS: usize = 16;
+
+/// Check every deck, up to [`MAX_PARALLEL_CHECKS`] at the same time, and
+/// return what each check found in the order of `decks`.
 pub fn check_all(decks: &[&dyn BatchDeck]) -> BatchPlan {
-    let checks: Vec<DeckCheck> = std::thread::scope(|scope| {
-        let handles: Vec<_> = decks
-            .iter()
-            .map(|deck| scope.spawn(move || deck.check()))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
+    let mut checks: Vec<DeckCheck> = Vec::with_capacity(decks.len());
+    for chunk in decks.chunks(MAX_PARALLEL_CHECKS) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|deck| scope.spawn(move || deck.check()))
+                .collect();
+            checks.extend(handles.into_iter().map(|handle| {
                 handle.join().unwrap_or_else(|_| DeckCheck::Unreachable {
                     reason: "checking it stopped unexpectedly".to_string(),
                 })
-            })
-            .collect()
-    });
+            }));
+        });
+    }
     BatchPlan {
         decks: decks
             .iter()
@@ -949,9 +965,17 @@ mod tests {
             &|| Err("dot-agent-deck is not installed there".to_string()),
         );
         assert!(matches!(gone, DeckCheck::Unreachable { .. }));
-        // A Hello so old it names no version is judged by the binary too.
-        let unnamed = check_from_probe(CLIENT, Ok(Some(hello(None))), &|| Ok("0.30.0".into()));
-        assert!(matches!(unnamed, DeckCheck::Upgrade { .. }));
+        // A Hello so old it names no version is older than any versioned
+        // client, whatever the installed binary says: an earlier upgrade may
+        // have installed a current binary and kept this daemon running.
+        let unnamed = check_from_probe(CLIENT, Ok(Some(hello(None))), &no_binary);
+        assert_eq!(
+            unnamed,
+            DeckCheck::Upgrade {
+                from: "an older release".into(),
+                to: CLIENT.into()
+            }
+        );
     }
 
     #[test]
@@ -1163,6 +1187,50 @@ mod tests {
         let plan = check_all(&decks);
         let names: Vec<_> = plan.decks.iter().map(|p| p.deck.as_str()).collect();
         assert_eq!(names, ["x", "y"], "the plan keeps deck-list order");
+    }
+
+    #[test]
+    fn a_long_deck_list_is_checked_a_bounded_number_at_a_time_in_order() {
+        struct Counting<'a> {
+            name: String,
+            running: &'a AtomicUsize,
+            most: &'a AtomicUsize,
+        }
+        impl BatchDeck for Counting<'_> {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn check(&self) -> DeckCheck {
+                let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                DeckCheck::Skip {
+                    reason: SkipReason::NoDaemonRunning,
+                }
+            }
+            fn upgrade(
+                &self,
+                _: &dyn RestartDecider,
+                _: &mut dyn FnMut(UpgradeProgress),
+            ) -> UpgradeOutcome {
+                unreachable!("a skipped deck is never upgraded")
+            }
+        }
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let decks: Vec<Counting> = (0..MAX_PARALLEL_CHECKS * 2 + 3)
+            .map(|i| Counting {
+                name: format!("deck-{i}"),
+                running: &running,
+                most: &most,
+            })
+            .collect();
+        let refs: Vec<&dyn BatchDeck> = decks.iter().map(|d| d as &dyn BatchDeck).collect();
+        let plan = check_all(&refs);
+        assert!(most.load(Ordering::SeqCst) <= MAX_PARALLEL_CHECKS);
+        let names: Vec<_> = plan.decks.iter().map(|p| p.deck.clone()).collect();
+        let wanted: Vec<_> = decks.iter().map(|d| d.name.clone()).collect();
+        assert_eq!(names, wanted);
     }
 
     #[test]

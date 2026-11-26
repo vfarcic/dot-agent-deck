@@ -7134,11 +7134,12 @@ async fn desktop_upgrade_all_check(
     batches: State<'_, upgrade_all::UpgradeAllState>,
 ) -> Result<upgrade_all::UpgradeAllPlanDto, String> {
     ensure_main_webview(&webview)?;
+    let n = batches.begin_check();
     let path = crate::decks::remotes_path();
     let checked = tauri::async_runtime::spawn_blocking(move || upgrade_all::Checked::check(&path))
         .await
         .map_err(|error| safe_message(error.to_string()))??;
-    Ok(batches.insert(checked))
+    Ok(batches.insert(n, checked))
 }
 
 /// Issue #1600: run the batch `batch_id` checked — the older decks upgraded
@@ -7165,10 +7166,14 @@ async fn desktop_upgrade_all_run(
 
     ensure_main_webview(&webview)?;
     let attempt_id = upgrade::validate_attempt_id(&attempt_id)?;
-    let checked = batches.take(&batch_id)?;
+    let (checked, running) = batches.take(&batch_id)?;
     let _slots = checked.reserve(&upgrades)?;
-    let running = batches.start(&batch_id);
     let stop = running.stop_flag();
+    // The deck being upgraded, so a run that stops without reporting it can
+    // still let go of what that deck may have lost.
+    let in_progress: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let in_progress_run = std::sync::Arc::clone(&in_progress);
+    let cleanup_app = app.clone();
     let upgrade_id = upgrades.next_upgrade_id();
     let handle = tokio::runtime::Handle::current();
     let decider_state = upgrades.inner().clone();
@@ -7191,6 +7196,17 @@ async fn desktop_upgrade_all_run(
             &decider,
             &|| stop.load(std::sync::atomic::Ordering::SeqCst),
             &mut |event| {
+                let mut current = in_progress_run
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match &event {
+                    BatchEvent::Started { index, .. } => {
+                        *current = checked.deck_ids().get(*index).cloned().flatten();
+                    }
+                    BatchEvent::Finished { .. } => *current = None,
+                    BatchEvent::Progress { .. } => {}
+                }
+                drop(current);
                 // The deck's own cleanup first, so the webview hears its
                 // result after the app has let go of its old daemon.
                 if let BatchEvent::Finished { index, report } = &event
@@ -7220,6 +7236,18 @@ async fn desktop_upgrade_all_run(
     // A question a panicked run left waiting is closed, as for a single Upgrade.
     upgrades.end_upgrade(&upgrade_id);
     drop(running);
+    if run.is_err() {
+        // A run that stopped mid-deck may have had that deck's restart
+        // accepted: treat it as a single Upgrade's interrupted run does, and
+        // end its sessions (PRD #1487, Qodo #15).
+        let deck = in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(deck_id) = deck {
+            after_batch_deck(&cleanup_app, &deck_id, true).await;
+        }
+    }
     run.map_err(|error| {
         safe_message(format!(
             "Upgrade all stopped unexpectedly, so it is not known how far it got: {error}. Reconnect shows what each daemon runs now."

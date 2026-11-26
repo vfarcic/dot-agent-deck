@@ -1236,6 +1236,9 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .upgrade-dialog [data-testid="upgrade-decision"] > div:last-child, .upgrade-dialog [data-testid="upgrade-outcome"] > div:last-child { display: flex; justify-content: center; gap: 7px; }
 /* The decision and outcome bodies are the dialog's last child, so `.confirm-dialog > div:last-child` (the button row rule) would lay their sentences, list and buttons out side by side. They stack; only their own last child is a button row. */
 .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-decision"], .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-outcome"] { display: block; }
+/* Upgrade all's question and results are its last child too (issue #1600): they stack the same way, and only their own last child is a button row. */
+.confirm-dialog.upgrade-dialog > div[data-testid="upgrade-all-decision"], .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-all-results"] { display: block; }
+.upgrade-dialog [data-testid="upgrade-all-decision"] > div:last-child, .upgrade-dialog [data-testid="upgrade-all-results"] > div:last-child { display: flex; justify-content: center; gap: 7px; }
 /* Issue #1635 — this machine's own copies: the rail's newer-release button, the dashboard banner, and the dialog's per-copy plans. */
 .rail-bottom .rail-update { color: var(--shell-teal); border-color: var(--shell-teal-edge); background: var(--shell-teal-surface); }
 .rail-bottom .rail-update:hover, .rail-bottom .rail-update:focus-visible { color: var(--shell-teal-text-strong); }

@@ -6407,7 +6407,13 @@ export class TauriDeckBridge implements DeckBridge {
     const attemptId = newUpgradeAttemptId();
     const registered = await Promise.allSettled([
       listen<{ attemptId: string } & UpgradeAllEvent>("desktop://upgrade-all", (event) => {
-        if (event.payload.attemptId === attemptId) onEvent(event.payload);
+        if (event.payload.attemptId !== attemptId) return;
+        // A restarted deck's sessions are forgotten as soon as its part is
+        // over, as after a single Upgrade, not when the whole batch ends:
+        // the crate has already detached them and re-sent its snapshot.
+        const payload = event.payload;
+        if (payload.type === "finished" && payload.report.endsSessions && payload.report.deckId !== undefined) this.forgetDeckSessions(payload.report.deckId);
+        onEvent(payload);
       }),
       listen<UpgradeDecisionEvent>("desktop://upgrade-decision", (event) => {
         if (event.payload.attemptId === attemptId) onEvent({ type: "decision", ...event.payload });
@@ -6420,13 +6426,7 @@ export class TauriDeckBridge implements DeckBridge {
       throw refused.reason;
     }
     try {
-      const report = await invoke<UpgradeAllReport>("desktop_upgrade_all_run", { batchId, attemptId });
-      // The crate ended these decks' terminal sessions with their old daemons;
-      // the bridge forgets them too, as after a single Upgrade.
-      for (const deck of report.decks) {
-        if (deck.endsSessions && deck.deckId !== undefined) this.forgetDeckSessions(deck.deckId);
-      }
-      return report;
+      return await invoke<UpgradeAllReport>("desktop_upgrade_all_run", { batchId, attemptId });
     } finally {
       stops.forEach((stop) => stop());
     }

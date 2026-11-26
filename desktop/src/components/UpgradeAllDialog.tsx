@@ -26,7 +26,7 @@ type Question = Pick<UpgradeDecisionEvent, "upgradeId" | "questionId" | "deckId"
 type Phase =
   | { phase: "checking" }
   | { phase: "plan"; plan: UpgradeAllPlan }
-  | { phase: "running"; plan: UpgradeAllPlan; current?: number; stage?: UpgradeStage; finished: (DeckReport | undefined)[]; question?: Question; answering: boolean; stopping: boolean }
+  | { phase: "running"; plan: UpgradeAllPlan; current?: number; stage?: UpgradeStage; finished: (DeckReport | undefined)[]; question?: Question; answering: boolean; undelivered?: boolean; stopping: boolean }
   | { phase: "done"; report: UpgradeAllReport }
   | { phase: "error"; message: string; started: boolean };
 
@@ -87,7 +87,7 @@ export function UpgradeAllDialog({ runtime, onClose }: {
       }
       if (event.type === "decision") {
         pending.current = event;
-        setState((current) => current.phase === "running" ? { ...current, question: event, answering: false } : current);
+        setState((current) => current.phase === "running" ? { ...current, question: event, answering: false, undelivered: false } : current);
         return;
       }
       setState((current) => {
@@ -119,22 +119,31 @@ export function UpgradeAllDialog({ runtime, onClose }: {
   const stop = () => {
     if (state.phase !== "running" || state.stopping || state.question) return;
     setState({ ...state, stopping: true });
-    if (batchId.current && runtime.upgradeAll) void runtime.upgradeAll.stop(batchId.current).catch(() => undefined);
+    // Refused (the batch had already ended): offer Stop again rather than
+    // claim the batch is stopping.
+    if (batchId.current && runtime.upgradeAll) {
+      runtime.upgradeAll.stop(batchId.current).catch(() => {
+        if (mounted.current) setState((current) => current.phase === "running" ? { ...current, stopping: false } : current);
+      });
+    }
   };
 
   const decide = (choice: UpgradeChoice) => {
     if (state.phase !== "running" || !state.question || state.answering) return;
     const question = state.question;
-    setState({ ...state, answering: true });
+    setState({ ...state, answering: true, undelivered: false });
     send(question, choice).then(
       () => {
         if (pending.current?.questionId === question.questionId) pending.current = undefined;
         setState((current) => current.phase === "running" && current.question?.questionId === question.questionId ? { ...current, question: undefined, answering: false } : current);
       },
       () => {
-        // The question already closed (it timed out, or was asked again); the
-        // deck's result says what happened.
-        setState((current) => current.phase === "running" && current.question?.questionId === question.questionId ? { ...current, question: undefined, answering: false } : current);
+        // Not delivered: the daemon may still be waiting, so the question
+        // stays up to be answered again, as in the single Upgrade's dialog.
+        // One that has since closed is replaced by the deck's result or a
+        // newer question when they arrive.
+        if (!mounted.current) return;
+        setState((current) => current.phase === "running" && current.question?.questionId === question.questionId ? { ...current, answering: false, undelivered: true } : current);
       },
     );
   };
@@ -266,6 +275,7 @@ function RunBody({ state, onStop, onDecide }: {
               {stopSetLines(state.question.atStake).map((line, index) => <li key={index}>{displayText(line, DISPLAY_LIMITS.message)}</li>)}
             </ul>
             <p className="upgrade-hint">Keep current daemon leaves them running on the old version; the new version stays installed for its next restart.</p>
+            {state.undelivered && <p role="alert" data-testid="upgrade-all-decision-error">Your answer did not reach Agent Deck, so nothing has been stopped or restarted yet. Choose again to retry.</p>}
             <div>
               <button className="button secondary" data-testid="upgrade-all-keep-current" autoFocus disabled={state.answering} onClick={() => onDecide("keep-current")}>Keep current daemon</button>
               <button className="button danger" data-testid="upgrade-all-restart-now" disabled={state.answering} onClick={() => onDecide("restart-now")}>Restart now</button>

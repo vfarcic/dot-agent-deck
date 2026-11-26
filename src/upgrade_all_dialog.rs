@@ -50,8 +50,10 @@ pub const CHECKING: &str = "Checking every remote deck on the deck list…";
 pub enum Phase {
     /// Every deck is being checked.
     Checking,
-    /// The deck list could not be read, or the check could not run.
-    Failed(String),
+    /// The deck list could not be read (`started: false`), or the check or
+    /// the run stopped before it reported (`started` says whether anything
+    /// may have been upgraded).
+    Failed { reason: String, started: bool },
     /// What the check found, waiting for Upgrade or Cancel.
     Plan(BatchPlan),
     /// The upgrades are running.
@@ -128,6 +130,12 @@ pub enum Update {
     /// A daemon asks; the answer goes back on the sender.
     Asked(Question, Sender<RestartChoice>),
     Finished(BatchReport),
+    /// The work stopped without its final report; `started` says whether the
+    /// upgrades had begun.
+    Stopped {
+        reason: String,
+        started: bool,
+    },
 }
 
 /// The dialog.
@@ -169,7 +177,7 @@ impl UpgradeAllDialog {
     pub fn buttons(&self) -> Vec<Choice> {
         match &self.phase {
             Phase::Checking => Vec::new(),
-            Phase::Failed(_) | Phase::Done(_) => vec![Choice::Close],
+            Phase::Failed { .. } | Phase::Done(_) => vec![Choice::Close],
             Phase::Plan(plan) if plan.to_upgrade() == 0 => vec![Choice::Close],
             Phase::Plan(_) => vec![Choice::Cancel, Choice::Upgrade],
             Phase::Running(run) if run.question.is_some() => {
@@ -281,7 +289,17 @@ impl UpgradeAllDialog {
                 self.reset_selection();
             }
             Update::Checked(Err(reason)) => {
-                self.phase = Phase::Failed(reason.clone());
+                self.phase = Phase::Failed {
+                    reason: reason.clone(),
+                    started: false,
+                };
+                self.reset_selection();
+            }
+            Update::Stopped { reason, started } => {
+                self.phase = Phase::Failed {
+                    reason: reason.clone(),
+                    started: *started,
+                };
                 self.reset_selection();
             }
             Update::Event(event) => {
@@ -323,16 +341,21 @@ impl UpgradeAllDialog {
         }
     }
 
-    /// The body: one line per deck, in deck-list order, then the question.
+    /// The body: one line per deck, in deck-list order. A daemon's question is
+    /// [`Self::question_lines`], drawn in the footer so it is always in view.
     pub fn body_lines(&self) -> Vec<(String, Style)> {
         let mut lines = Vec::new();
         let deck = |name: &str| display_line(name, crate::untrusted_text::REMOTE_NAME_MAX_BYTES);
         match &self.phase {
             Phase::Checking => lines.push((CHECKING.to_string(), plain())),
-            Phase::Failed(reason) => {
+            Phase::Failed { reason, started } => {
                 lines.push((
-                    "The deck list could not be read, so nothing was checked or upgraded."
-                        .to_string(),
+                    if *started {
+                        "Upgrade all stopped unexpectedly, so it is not known how far it got. `dot-agent-deck connect <name>` shows what a daemon runs now."
+                    } else {
+                        "Nothing was checked or upgraded."
+                    }
+                    .to_string(),
                     plain(),
                 ));
                 lines.push((
@@ -388,32 +411,6 @@ impl UpgradeAllDialog {
                     };
                     lines.push((format!("{}: {text}", deck(&planned.deck)), style));
                 }
-                if let Some(question) = &run.question {
-                    lines.push((String::new(), plain()));
-                    if question.stale {
-                        lines.push((
-                            "What is running changed since you were asked, so here is the list again."
-                                .to_string(),
-                            plain(),
-                        ));
-                    }
-                    lines.push((
-                        format!(
-                            "Restarting the daemon on {} stops {}:",
-                            deck(&question.deck),
-                            stop_set_count(&question.at_stake)
-                        ),
-                        bold(),
-                    ));
-                    for line in crate::daemon_upgrade_batch::stop_set_lines(&question.at_stake) {
-                        lines.push((format!("  {line}"), plain()));
-                    }
-                    lines.push((
-                        "Keep current daemon leaves them running on the old version; the new version stays installed for its next restart."
-                            .to_string(),
-                        plain(),
-                    ));
-                }
             }
             Phase::Done(report) => {
                 lines.push((report.headline(), bold()));
@@ -425,6 +422,43 @@ impl UpgradeAllDialog {
                 }
             }
         }
+        lines
+    }
+
+    /// The open question, with what it would stop, for the footer above its
+    /// buttons; empty when no daemon is asking.
+    pub fn question_lines(&self) -> Vec<(String, Style)> {
+        let Phase::Running(Run {
+            question: Some(question),
+            ..
+        }) = &self.phase
+        else {
+            return Vec::new();
+        };
+        let deck = display_line(&question.deck, crate::untrusted_text::REMOTE_NAME_MAX_BYTES);
+        let mut lines = Vec::new();
+        if question.stale {
+            lines.push((
+                "What is running changed since you were asked, so here is the list again."
+                    .to_string(),
+                plain(),
+            ));
+        }
+        lines.push((
+            format!(
+                "Restarting the daemon on {deck} stops {}:",
+                stop_set_count(&question.at_stake)
+            ),
+            bold(),
+        ));
+        for line in crate::daemon_upgrade_batch::stop_set_lines(&question.at_stake) {
+            lines.push((format!("  {line}"), plain()));
+        }
+        lines.push((
+            "Keep current daemon leaves them running on the old version; the new version stays installed for its next restart."
+                .to_string(),
+            plain(),
+        ));
         lines
     }
 }
@@ -491,7 +525,7 @@ fn hint(dialog: &UpgradeAllDialog) -> &'static str {
         Phase::Running(run) if run.stopping => "Wait for the daemon being upgraded to finish.",
         Phase::Running(_) => "Enter or Esc stops after this daemon",
         Phase::Plan(_) => "↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc closes",
-        Phase::Failed(_) | Phase::Done(_) => "PgUp/PgDn scroll · Enter or Esc closes",
+        Phase::Failed { .. } | Phase::Done(_) => "PgUp/PgDn scroll · Enter or Esc closes",
     }
 }
 
@@ -518,7 +552,19 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &mut UpgradeAllDialog) -> V
 
     let buttons = dialog.buttons();
     let selected = dialog.selected();
+    // The footer never scrolls: a daemon's question stays in view above the
+    // buttons that answer it, however long the deck list above is.
     let mut footer: Vec<Line<'static>> = vec![Line::from("")];
+    let question = dialog.question_lines();
+    for (text, style) in &question {
+        let clean = crate::untrusted_text::strip_control_and_bidi(text, false);
+        for row in crate::upgrade_dialog::wrap(&clean, text_width) {
+            footer.push(Line::styled(row, *style));
+        }
+    }
+    if !question.is_empty() {
+        footer.push(Line::from(""));
+    }
     let first_button_row = footer.len();
     for choice in &buttons {
         let (cursor, style) = if Some(*choice) == selected {
@@ -597,6 +643,18 @@ pub struct Job {
     stop: Arc<AtomicBool>,
     /// Where the answer to the open question goes.
     reply: Option<Sender<RestartChoice>>,
+    /// The check or the run in progress, and whether it is the run: one that
+    /// ends without its final update is reported rather than left spinning.
+    worker: Option<(tokio::task::JoinHandle<()>, bool)>,
+}
+
+impl Drop for Job {
+    /// The TUI closing, or the dialog going: no deck after the current one
+    /// starts, and a daemon waiting on an answer keeps its current daemon.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.answer(RestartChoice::KeepCurrent);
+    }
 }
 
 impl Job {
@@ -611,16 +669,18 @@ impl Job {
             plan: None,
             stop: Arc::new(AtomicBool::new(false)),
             reply: None,
+            worker: None,
         };
         match RemoteBatchDeck::from_deck_list(&path, no_report) {
             Ok(decks) => {
                 let decks = Arc::new(decks);
                 job.decks = Arc::clone(&decks);
-                handle.spawn_blocking(move || {
+                let worker = handle.spawn_blocking(move || {
                     let refs: Vec<&dyn BatchDeck> =
                         decks.iter().map(|d| d as &dyn BatchDeck).collect();
                     let _ = sender.send(Update::Checked(Ok(check_all(&refs))));
                 });
+                job.worker = Some((worker, false));
             }
             Err(reason) => {
                 let _ = sender.send(Update::Checked(Err(reason)));
@@ -637,7 +697,7 @@ impl Job {
         let decks = Arc::clone(&self.decks);
         let stop = Arc::clone(&self.stop);
         let sender = self.sender.clone();
-        handle.spawn_blocking(move || {
+        let worker = handle.spawn_blocking(move || {
             let refs: Vec<&dyn BatchDeck> = decks.iter().map(|d| d as &dyn BatchDeck).collect();
             let decider = ChannelDecider {
                 sender: sender.clone(),
@@ -653,6 +713,7 @@ impl Job {
             );
             let _ = sender.send(Update::Finished(report));
         });
+        self.worker = Some((worker, true));
     }
 
     /// Start no deck after the current one.
@@ -670,6 +731,12 @@ impl Job {
     /// Hand every update that arrived to `dialog`. A run whose work ended
     /// without a report is reported as stopped rather than left running.
     pub fn poll(&mut self, dialog: &mut UpgradeAllDialog) {
+        // Read before draining: a worker's last update is sent before it
+        // ends, so once it has ended everything it sent is in the channel.
+        let ended = self
+            .worker
+            .as_ref()
+            .is_some_and(|(worker, _)| worker.is_finished());
         loop {
             match self.updates.try_recv() {
                 Ok(update) => {
@@ -684,6 +751,15 @@ impl Job {
                 Err(TryRecvError::Empty) => break,
                 // The job holds its own sender, so this is never reached.
                 Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        if ended && let Some((_, started)) = self.worker.take() {
+            let waiting = matches!(dialog.phase(), Phase::Checking | Phase::Running(_));
+            if waiting {
+                dialog.apply(&Update::Stopped {
+                    reason: "the work behind the dialog ended without reporting".to_string(),
+                    started,
+                });
             }
         }
     }
@@ -886,6 +962,50 @@ mod tests {
             ]
         );
         assert_eq!(dialog.buttons(), [Choice::Close]);
+    }
+
+    fn idle_job(runtime: &tokio::runtime::Runtime, started: bool, work: fn()) -> Job {
+        let (sender, updates) = channel();
+        Job {
+            updates,
+            sender,
+            decks: Arc::new(Vec::new()),
+            plan: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            reply: None,
+            worker: Some((runtime.spawn_blocking(work), started)),
+        }
+    }
+
+    #[test]
+    fn a_run_that_ends_without_its_report_is_reported_not_left_running() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut dialog = UpgradeAllDialog::new();
+        dialog.apply(&Update::Checked(Ok(plan())));
+        dialog.choose(Choice::Upgrade);
+        let mut job = idle_job(&runtime, true, || panic!("the run's worker panicked"));
+        while !job.worker.as_ref().unwrap().0.is_finished() {
+            std::thread::yield_now();
+        }
+        job.poll(&mut dialog);
+        assert!(
+            matches!(dialog.phase(), Phase::Failed { started: true, .. }),
+            "{:?}",
+            dialog.phase()
+        );
+        assert_eq!(dialog.buttons(), [Choice::Close], "it can be closed");
+    }
+
+    #[test]
+    fn dropping_the_job_stops_the_batch_and_keeps_a_waiting_daemon() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut job = idle_job(&runtime, true, || {});
+        let (reply, answer) = channel();
+        job.reply = Some(reply);
+        let stop = Arc::clone(&job.stop);
+        drop(job);
+        assert!(stop.load(Ordering::SeqCst));
+        assert_eq!(answer.recv().unwrap(), RestartChoice::KeepCurrent);
     }
 
     #[test]

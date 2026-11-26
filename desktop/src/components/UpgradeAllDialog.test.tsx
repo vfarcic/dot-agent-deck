@@ -33,8 +33,8 @@ function controlledRuntime(plan: UpgradeAllPlan = PLAN) {
     onEvent = listener;
     return new Promise<UpgradeAllReport>((resolve) => { finish = resolve; });
   });
-  const stop = vi.fn(async () => undefined);
-  const decideUpgrade = vi.fn(async () => undefined);
+  const stop = vi.fn(async (_batchId: string) => undefined);
+  const decideUpgrade = vi.fn(async (_upgradeId: string, _questionId: number, _choice: string) => undefined);
   return {
     runtime: { upgradeAll: { check, run, stop }, decideUpgrade },
     check: async () => { await act(async () => checked(plan)); },
@@ -137,6 +137,34 @@ describe("UpgradeAllDialog", () => {
     emit({ type: "decision", deckId: "deck-c", attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 9, atStake: AT_STAKE, stale: false });
     unmount();
     expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 9, "keep-current");
+  });
+
+  /** Scenario: An answer that does not reach the app keeps the question on screen with a retry message, and answering again sends it. */
+  it("keeps the question up when an answer is not delivered", async () => {
+    const { runtime, check, emit } = controlledRuntime();
+    runtime.decideUpgrade.mockRejectedValueOnce(new Error("not delivered"));
+    render(<UpgradeAllDialog runtime={runtime} onClose={vi.fn()} />);
+    await check();
+    fireEvent.click(screen.getByTestId("upgrade-all-start"));
+    emit({ type: "decision", deckId: "deck-a", attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 3, atStake: AT_STAKE, stale: false });
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-all-keep-current")); });
+    expect(screen.getByTestId("upgrade-all-decision-error")).toHaveTextContent("Your answer did not reach Agent Deck");
+    expect(screen.getByTestId("upgrade-all-decision")).toBeInTheDocument();
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-all-keep-current")); });
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
+    expect(screen.queryByTestId("upgrade-all-decision")).toBeNull();
+  });
+
+  /** Scenario: A Stop the app refuses (the batch had already ended) offers Stop after this daemon again instead of claiming the batch is stopping. */
+  it("offers Stop again when the stop is refused", async () => {
+    const { runtime, check } = controlledRuntime();
+    runtime.upgradeAll.stop.mockRejectedValueOnce(new Error("That upgrade is no longer running."));
+    render(<UpgradeAllDialog runtime={runtime} onClose={vi.fn()} />);
+    await check();
+    fireEvent.click(screen.getByTestId("upgrade-all-start"));
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-all-stop")); });
+    expect(screen.getByTestId("upgrade-all-stop")).toBeInTheDocument();
+    expect(screen.getByTestId("upgrade-all-headline")).toHaveTextContent("Upgrading, one daemon at a time…");
   });
 
   /** Scenario: A plan with nothing older than this app says so and offers only Close. */
