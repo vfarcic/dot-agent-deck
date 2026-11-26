@@ -187,10 +187,13 @@ impl RestartingDeck {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dad-{tag}-{}-{unique}", std::process::id()));
+        // No tag in the path: macOS's temp folder is about 50 bytes long and a
+        // socket's path must stay under its 104, which a long tag overran.
+        let dir = std::env::temp_dir().join(format!("dad-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create the scratch dir");
         let socket = dir.join("s");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the deck");
+        let listener = tokio::net::UnixListener::bind(&socket)
+            .unwrap_or_else(|e| panic!("bind the deck {tag} at {}: {e}", socket.display()));
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .expect("restate 0o600 on the socket inode");
         let recorded = Arc::new(Mutex::new(Vec::new()));
