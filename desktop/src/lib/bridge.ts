@@ -3492,16 +3492,26 @@ class FixtureDeckBridge implements DeckBridge {
   private readonly cardCatalog = createFixtureCardCatalog();
   /** PR #2491 — the `cards=fleet` scene's second daemon keeps a catalog of its own. */
   private readonly remoteCardCatalog = createFixtureCardCatalog();
-  private cardCatalogFor(deckId: string) {
+  /*
+   * PR #2491 re-audit (F2): bound to a daemon process as the production
+   * bridge and backend bind it — a read or an edit naming none is refused in
+   * their words, and one naming a process other than the one whose cards the
+   * deck shows is refused as a replaced daemon is; an edit adds that nothing
+   * was saved.
+   */
+  private cardCatalogFor(deckId: string, instanceId: string | undefined, edits: boolean) {
+    const unsent = edits ? "; nothing was saved" : "";
+    if (!instanceId) throw new Error(`${CARD_CATALOG_DAEMON_UNNAMED}${unsent}`);
     const cards = this.sceneCardsFor(deckId);
     if (!cards || cards.deckId !== deckId || cards.catalogEdit !== true) throw new Error("this deck's daemon is from a release whose card actions cannot be edited from the app");
+    if (cards.instanceId !== instanceId) throw new Error(`${CARD_CATALOG_DAEMON_REPLACED}${unsent}`);
     return deckId === FIXTURE_REMOTE_DAEMON_ID ? this.remoteCardCatalog : this.cardCatalog;
   }
-  async readCardCatalog(deckId: string, _instanceId: string | undefined): Promise<EditableCardCatalog> {
-    return this.cardCatalogFor(deckId).read();
+  async readCardCatalog(deckId: string, instanceId: string | undefined): Promise<EditableCardCatalog> {
+    return this.cardCatalogFor(deckId, instanceId, false).read();
   }
-  async editCardCatalog(deckId: string, edit: CardCatalogEdit, _instanceId: string | undefined): Promise<EditableCardCatalog> {
-    return this.cardCatalogFor(deckId).edit(edit);
+  async editCardCatalog(deckId: string, edit: CardCatalogEdit, instanceId: string | undefined): Promise<EditableCardCatalog> {
+    return this.cardCatalogFor(deckId, instanceId, true).edit(edit);
   }
   /**
    * Issue #2399 — the preview answers a batch as a daemon would, from the
@@ -4643,6 +4653,14 @@ export const CARD_CATALOG_EDIT_MAY_HAVE_SAVED = "it may have been saved";
  * word, so the editor says the same whichever side refused.
  */
 export const CARD_CATALOG_DAEMON_UNNAMED = "the app did not say which of the deck's daemon processes its card actions were read from";
+
+/**
+ * PR #2491 re-audit (F2) — why a Card actions editor read or edit bound to a
+ * daemon process that another has replaced is refused: the backend's
+ * `CARD_CATALOG_DAEMON_REPLACED` (`desktop/src-tauri/src/lib.rs`), word for
+ * word, so the fixture refuses a wrong process as the backend does.
+ */
+export const CARD_CATALOG_DAEMON_REPLACED = "the deck's daemon was restarted since its cards were read";
 
 export class TauriDeckBridge implements DeckBridge {
   readonly mode = "live" as const;

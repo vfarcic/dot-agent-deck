@@ -18070,6 +18070,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** Refresh pressed, then Edit Ship it and a typed label while the read is out: a read answering Ship it unchanged puts nothing in the form; a later read answering it with another program's text keeps the typed label and says in the form that Ship it changed since the form was opened and that Save replaces it with what the form holds; Save then sends the action as just read as `base` (PR #2491 re-audit, F1; the base following a Refresh is `079`'s).
 - **Does not assert:** the form's own refusal after a Save (`057`, `079`).
 
+##### desktop/agent-cards/135 — The fixture bridge's Card actions editor refuses a read or edit naming no process or another process.
+- **Test:** vitest `desktop/agent-cards/135: …` in `desktop/src/lib/bridgeFixtureCardCatalog.test.ts`.
+- **Layer:** the fixture bridge on the `cards=tree` scene.
+- **Asserts:** a read, an add and a hide naming `undefined` or `""` are refused with `CARD_CATALOG_DAEMON_UNNAMED`, and naming a process other than the one whose cards the deck shows with `CARD_CATALOG_DAEMON_REPLACED` (held to the backend's text), each edit adding that nothing was saved; none changes the catalog, and the process shown reads it and adds an action (PR #2491 re-audit, F2).
+- **Does not assert:** the production bridge (`132`) or the backend's binding (Rust `a_card_catalog_edit_bound_to_a_replaced_daemon_is_refused`).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
