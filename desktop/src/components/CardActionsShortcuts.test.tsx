@@ -107,7 +107,7 @@ describe("Edit card actions in the selection bar (PR #2491, 2026-11-25)", () => 
     await act(async () => { fireEvent.click(edit); });
     const editor = screen.getByRole("dialog", { name: `Card actions: ${LOCAL_NAME}` });
     expect(within(editor).queryByTestId("agent-card-actions-editor-readonly")).toBeNull();
-    expect(live.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
+    expect(live.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, INSTANCE);
     fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close"));
 
     fireEvent.click(within(bar()).getByRole("button", { name: "Clear" }));
@@ -150,6 +150,6 @@ describe("Edit card actions in the selection bar (PR #2491, 2026-11-25)", () => 
     await act(async () => { fireEvent.click(within(reopened).getByRole("menuitem", { name: FAR_NAME })); });
     expect(within(bar()).queryByRole("menu")).toBeNull();
     expect(screen.getByRole("dialog", { name: `Card actions: ${FAR_NAME}` })).toBeInTheDocument();
-    expect(live.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    expect(live.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, REMOTE_INSTANCE);
   });
 });

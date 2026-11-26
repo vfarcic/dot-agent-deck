@@ -548,14 +548,14 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
   });
 
   /*
-   * PR #2491 review (Qodo 4) — the Card actions editor reads and writes the
-   * daemon process whose cards the app shows for the deck, so a save made
-   * from one process's list is never written to a daemon that replaced it:
-   * the bridge is handed that process with each read and edit, and the
-   * successor's once its cards are the ones shown.
+   * PR #2491 audit (A2) — the Card actions editor names the daemon process
+   * each read and edit is bound to, the one whose list the user saw; the
+   * runtime hands the bridge exactly that, never the process whose cards
+   * happen to be shown when Save is pressed, and passes a missing one on for
+   * the bridge to refuse (A1) rather than filling it in.
    */
-  it("binds the Card actions editor's reads and edits to the process whose cards are shown", async () => {
-    type CatalogBridge = { readCardCatalog?: (deckId: string, instanceId?: string) => Promise<unknown>; editCardCatalog?: (deckId: string, edit: unknown, instanceId?: string) => Promise<unknown> };
+  it("passes the Card actions editor's daemon process to the bridge as given", async () => {
+    type CatalogBridge = { readCardCatalog?: (deckId: string, instanceId: string | undefined) => Promise<unknown>; editCardCatalog?: (deckId: string, edit: unknown, instanceId: string | undefined) => Promise<unknown> };
     const catalogBridge = bridge as unknown as CatalogBridge;
     const catalog = { actions: [], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" };
     catalogBridge.readCardCatalog = vi.fn(async () => catalog);
@@ -578,18 +578,19 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
       await waitFor(() => expect(push).toBeDefined());
       act(() => push!(cards("docs-before", 1)));
       const removal = { kind: "remove" as const, name: "ship" };
-      await result.current.readCardCatalog!(FIXTURE_DAEMON_ID);
+      await result.current.readCardCatalog!(FIXTURE_DAEMON_ID, "docs-before");
       expect(catalogBridge.readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "docs-before");
-      await result.current.editCardCatalog!(FIXTURE_DAEMON_ID, removal);
-      expect(catalogBridge.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, removal, "docs-before");
 
+      /* The deck's daemon restarts: an edit made from the old process's list still names the old process. */
       act(() => push!(cards("docs-after", 1)));
       act(() => onFleet!([restartedFixtureSnapshot()]));
       expect(result.current.agentCards?.[FIXTURE_DAEMON_ID]).toMatchObject({ instanceId: "docs-after" });
-      await result.current.readCardCatalog!(FIXTURE_DAEMON_ID);
-      expect(catalogBridge.readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "docs-after");
-      await result.current.editCardCatalog!(FIXTURE_DAEMON_ID, removal);
-      expect(catalogBridge.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, removal, "docs-after");
+      await result.current.editCardCatalog!(FIXTURE_DAEMON_ID, removal, "docs-before");
+      expect(catalogBridge.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, removal, "docs-before");
+      await result.current.readCardCatalog!(FIXTURE_DAEMON_ID, undefined);
+      expect(catalogBridge.readCardCatalog, "a missing process is not filled in from the cards shown").toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, undefined);
+      await result.current.editCardCatalog!(FIXTURE_DAEMON_ID, removal, undefined);
+      expect(catalogBridge.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, removal, undefined);
     } finally {
       delete catalogBridge.readCardCatalog;
       delete catalogBridge.editCardCatalog;

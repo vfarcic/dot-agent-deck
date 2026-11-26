@@ -18034,6 +18034,30 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** the references' `+N` opens the agent's pane on Card with its pull requests and issues scrolled into view and focused, listing all five; the actions' `+N` opens it on Card with its Actions scrolled into view and focused; the same card's body afterwards opens on Terminal (PR #2491 decision 2026-11-26, review J6).
 - **Does not assert:** that a card update leaves the focus alone (`025` in the browser).
 
+##### desktop/agent-cards/129 — A spoken removal waiting for the list never confirms the old process's action under a restarted daemon.
+- **Test:** vitest `desktop/agent-cards/129: …` in `desktop/src/hooks/useCardActionsEditor.test.ts`.
+- **Layer:** hook (`renderHook`), a stand-in runtime whose reads are held until the test answers them.
+- **Asserts:** with "remove ship" waiting for process `process-a`'s list, `process-a`'s answer and the adoption of `process-b` land in one batch: no confirmation is shown and the request is not settled; once `process-b`'s list arrives the confirmation names its action, and confirming sends that action as the base, bound to `process-b` (PR #2491 audit, A2).
+- **Does not assert:** the backend's refusal of a replaced process (Rust `a_card_catalog_edit_bound_to_a_replaced_daemon_is_refused`).
+
+##### desktop/agent-cards/130 — A spoken edit waiting for the list never opens the old process's form under a restarted daemon.
+- **Test:** vitest `desktop/agent-cards/130: …` in `desktop/src/hooks/useCardActionsEditor.test.ts`.
+- **Layer:** hook (`renderHook`), as `129`.
+- **Asserts:** the same batched restart with "edit ship" waiting: no form is open until `process-b`'s list arrives, the form then holds `process-b`'s action, and Save sends it as the base, bound to `process-b` (PR #2491 audit, A2).
+- **Does not assert:** the form's rendering (`desktop/agent-cards/055`).
+
+##### desktop/agent-cards/131 — A Save or a removal is bound to the daemon process whose list the user saw.
+- **Test:** vitest `desktop/agent-cards/131: …` in `desktop/src/hooks/useCardActionsEditor.test.ts`.
+- **Layer:** hook (`renderHook`), as `129`.
+- **Asserts:** reads, a Save and a confirmed removal made from `process-a`'s list each name `process-a`; once the deck's daemon is `process-b`, the form and the list read from `process-a` are no longer offered, and nothing is sent bound to `process-b` (PR #2491 audit, A2).
+- **Does not assert:** the backend binding (Rust `a_card_catalog_edit_bound_to_a_replaced_daemon_is_refused`).
+
+##### desktop/agent-cards/132 — A card-actions read or edit naming no daemon process is refused unsent.
+- **Test:** vitest `desktop/agent-cards/132: …` in `desktop/src/lib/bridgeCardCatalog.test.ts`; Rust `a_card_catalog_edit_naming_no_daemon_process_is_refused_before_connecting` (`desktop/src-tauri/src/restart_binding_tests.rs`).
+- **Layer:** production Tauri bridge with a mocked `invoke`; the backend command against a scripted restarting deck.
+- **Asserts:** with no process id, or an empty one, the bridge invokes nothing and rejects with the backend's own words (a test holds the two to one text), an edit adding that nothing was saved; the backend refuses the same before opening any connection, so a daemon that replaced the one shown is sent nothing, and the same edit naming the process now answering reaches it (PR #2491 audit, A1).
+- **Does not assert:** the editor's display of the refusal (it is shown as any read's or form's error, `desktop/agent-cards/057`, `065`).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

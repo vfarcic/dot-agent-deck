@@ -214,7 +214,7 @@ describe("the Dashboard's ⋯ menus (PR #2491 decision 2026-11-25)", () => {
       expect(within(editor).queryByRole("combobox", { name: "Daemon" })).toBeNull();
       if (editable) {
         expect(within(editor).queryByTestId("agent-card-actions-editor-readonly")).toBeNull();
-        expect(live.readCardCatalog).toHaveBeenLastCalledWith(deckId);
+        expect(live.readCardCatalog).toHaveBeenLastCalledWith(deckId, deckId === FIXTURE_DAEMON_ID ? INSTANCE : REMOTE_INSTANCE);
       } else {
         expect(within(editor).getByTestId("agent-card-actions-editor-readonly")).toHaveTextContent(/earlier release, so its card actions cannot be edited from the app/);
       }

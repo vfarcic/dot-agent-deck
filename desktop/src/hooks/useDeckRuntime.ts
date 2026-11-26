@@ -679,19 +679,17 @@ export function useDeckRuntime(): DeckRuntimeState {
   const invokeCardActionBatch = useMemo(() => (typeof bridge.invokeCardActionBatch === "function"
     ? (deckId: string, actionId: string, options: CardBatchOptions) => bridge.invokeCardActionBatch!(deckId, actionId, options)
     : undefined), [bridge]);
-  /* PR #2491 review (Qodo 4) — the Card actions editor reads and writes the
-     daemon process whose cards the app shows for the deck: the one the editor
-     read its list from, since the editor reads again whenever that process
-     changes. A daemon that replaced it is sent nothing. */
-  const latestAgentCards = useRef(agentCards);
-  latestAgentCards.current = agentCards;
-  const listedInstance = useCallback((deckId: string) => latestAgentCards.current[deckId]?.instanceId, []);
+  /* PR #2491 audit (A2) — the Card actions editor names the daemon process
+     each read and edit is bound to: the one whose list the user saw, which
+     the editor holds with that list. It is passed on as given, never looked
+     up from whichever process is current when Save is pressed; a daemon that
+     replaced it, or no process named, is sent nothing (the bridge, A1). */
   const readCardCatalog = useMemo(() => (typeof bridge.readCardCatalog === "function"
-    ? (deckId: string) => bridge.readCardCatalog!(deckId, listedInstance(deckId))
-    : undefined), [bridge, listedInstance]);
+    ? (deckId: string, instanceId: string | undefined) => bridge.readCardCatalog!(deckId, instanceId)
+    : undefined), [bridge]);
   const editCardCatalog = useMemo(() => (typeof bridge.editCardCatalog === "function"
-    ? (deckId: string, edit: CardCatalogEdit) => bridge.editCardCatalog!(deckId, edit, listedInstance(deckId))
-    : undefined), [bridge, listedInstance]);
+    ? (deckId: string, edit: CardCatalogEdit, instanceId: string | undefined) => bridge.editCardCatalog!(deckId, edit, instanceId)
+    : undefined), [bridge]);
 
   return {
     appliedGeometry,

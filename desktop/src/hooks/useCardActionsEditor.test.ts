@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
+import type { CardCatalogEdit, EditableCardAction, EditableCardCatalog } from "../types";
 import { cardActionsWhich, useCardActionsEditor, type CardActionsDaemon } from "./useCardActionsEditor";
 
 /*
@@ -29,7 +30,7 @@ describe("opening the Card actions editor by voice (PR #2491 decision 2026-11-25
     await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...one.hook.result.current.controls, ...report }, {}); });
     expect(said).toEqual([]);
     expect(one.hook.result.current.view?.daemon.deckId).toBe(LOCAL.deckId);
-    expect(one.runtime.readCardCatalog).toHaveBeenCalledExactlyOnceWith(LOCAL.deckId);
+    expect(one.runtime.readCardCatalog).toHaveBeenCalledExactlyOnceWith(LOCAL.deckId, undefined);
     one.hook.unmount();
 
     const two = editorOver([LOCAL, BUILD]);
@@ -54,7 +55,7 @@ describe("opening the Card actions editor by voice (PR #2491 decision 2026-11-25
     await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...two.hook.result.current.controls, ...report }, { preselectDeckId: BUILD.deckId }); });
     expect(said).toHaveLength(1);
     expect(two.hook.result.current.view?.daemon.deckId).toBe(BUILD.deckId);
-    expect(two.runtime.readCardCatalog).toHaveBeenCalledExactlyOnceWith(BUILD.deckId);
+    expect(two.runtime.readCardCatalog).toHaveBeenCalledExactlyOnceWith(BUILD.deckId, undefined);
 
     await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...two.hook.result.current.controls, ...report }, { preselectDeckId: "deck-moon" }); });
     expect(said[1]).toBe("That daemon is not on the dashboard, or shows no cards, so its card actions cannot be shown.");
@@ -74,7 +75,7 @@ describe("open card actions with a selection on screen (PR #2491, 2026-11-25)", 
     await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...preferred.hook.result.current.controls, ...report }, {}); });
     expect(said).toEqual([]);
     expect(preferred.hook.result.current.view?.daemon.deckId).toBe(BUILD.deckId);
-    expect(preferred.runtime.readCardCatalog).toHaveBeenCalledExactlyOnceWith(BUILD.deckId);
+    expect(preferred.runtime.readCardCatalog).toHaveBeenCalledExactlyOnceWith(BUILD.deckId, undefined);
     await act(async () => { VOICE_ACTIONS.openCardActionsEditor.run({ ...preferred.hook.result.current.controls, ...report }, { preselectDeckId: LOCAL.deckId }); });
     expect(preferred.hook.result.current.view?.daemon.deckId, "a daemon named wins over the selection").toBe(LOCAL.deckId);
     preferred.hook.unmount();
@@ -123,5 +124,88 @@ describe("a daemon restarted under the same deck (PR #2491 review, Qodo 2)", () 
 
     hook.rerender({ list: at("process-c") });
     expect(runtime.readCardCatalog, "the same process is not read again").toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("a late answer batched with a daemon restart (PR #2491 audit, A2)", () => {
+  const action = (label: string): EditableCardAction => ({ name: "ship", label, description: "", prompt: "Ship it.", icon: null, placement: "card", confirm: false, always: false, source: "user", default: false, overridden: false, hidden: false });
+  const catalogOf = (label: string): EditableCardCatalog => ({ actions: [action(label)], errors: [], user_config: null });
+  const at = (instanceId: string): CardActionsDaemon[] => [{ ...LOCAL, instanceId }];
+
+  /* The editor opened on process `process-a`, its read under way, a spoken request waiting for it; then `process-a`'s answer and the adoption of `process-b` land in one batch. */
+  async function batchedRestart(asked: (controls: ReturnType<typeof useCardActionsEditor>["controls"]) => unknown) {
+    const reads: ((answer: EditableCardCatalog) => void)[] = [];
+    const runtime = {
+      readCardCatalog: vi.fn((_deckId: string, _instanceId?: string) => new Promise<EditableCardCatalog>((resolve) => { reads.push(resolve); })),
+      editCardCatalog: vi.fn(async (_deckId: string, _edit: CardCatalogEdit, _instanceId?: string) => catalogOf("Deploy production")),
+    };
+    const hook = renderHook(({ list }) => useCardActionsEditor({ runtime, daemons: list }), { initialProps: { list: at("process-a") } });
+    act(() => { hook.result.current.controls.openCardActionsEditor(LOCAL.deckId); });
+    let spoken: unknown;
+    act(() => { spoken = asked(hook.result.current.controls); });
+    let settled: { said: string | undefined } | undefined;
+    void Promise.resolve(spoken).then((said) => { settled = { said: said as string | undefined }; });
+    await act(async () => {
+      reads[0](catalogOf("Ship staging"));
+      await Promise.resolve();
+      hook.rerender({ list: at("process-b") });
+    });
+    return { hook, runtime, reads, settled: () => settled };
+  }
+
+  /// Scenario: With the Card actions editor open on a daemon whose list is still being read, say "remove Ship staging"; the old process's list ("Ship staging") arrives in the same moment the daemon restarts as a new process. No removal is asked from the old list under the new process; once the new process's list arrives ("Deploy production"), the confirmation names what it lists, and confirming sends the new process's action as the base, bound to the new process.
+  it("desktop/agent-cards/129: a pending spoken removal never confirms the old process's action under the new one", async () => {
+    const { hook, runtime, reads, settled } = await batchedRestart((controls) => controls.removeCardAction({ name: "ship" }));
+    expect(hook.result.current.view?.removing, "no confirmation made from the old process's list").toBeUndefined();
+    expect(settled(), "the spoken request waits for the new process's list").toBeUndefined();
+    expect(runtime.readCardCatalog).toHaveBeenLastCalledWith(LOCAL.deckId, "process-b");
+
+    await act(async () => { reads[1](catalogOf("Deploy production")); });
+    expect(hook.result.current.view?.removing?.label).toBe("Deploy production");
+    expect(settled()).toEqual({ said: undefined });
+    await act(async () => { hook.result.current.controls.confirmRemoveCardAction(); });
+    expect(runtime.editCardCatalog).toHaveBeenCalledExactlyOnceWith(LOCAL.deckId, { kind: "remove", name: "ship", base: action("Deploy production") }, "process-b");
+  });
+
+  /// Scenario: The same as the removal, with "edit Ship staging" said instead. The old process's form never opens under the new process; once the new process's list arrives, the form holds its action, and Save sends that action as the base, bound to the new process.
+  it("desktop/agent-cards/130: a pending spoken edit never opens the old process's form under the new one", async () => {
+    const { hook, runtime, reads, settled } = await batchedRestart((controls) => controls.editCardAction({ name: "ship" }));
+    expect(hook.result.current.view?.form, "no form made from the old process's list").toBeUndefined();
+    expect(settled()).toBeUndefined();
+
+    await act(async () => { reads[1](catalogOf("Deploy production")); });
+    expect(hook.result.current.view?.form?.values.label).toBe("Deploy production");
+    expect(settled()).toEqual({ said: undefined });
+    await act(async () => { hook.result.current.controls.saveCardAction(); });
+    expect(runtime.editCardCatalog).toHaveBeenCalledOnce();
+    const [deckId, edit, instanceId] = runtime.editCardCatalog.mock.calls[0];
+    expect([deckId, instanceId]).toEqual([LOCAL.deckId, "process-b"]);
+    expect(edit).toMatchObject({ kind: "update", base: action("Deploy production") });
+  });
+
+  /// Scenario: A form and a removal confirmation are open on the list one daemon process answered when the daemon restarts as another, and the old list is still what the editor holds when Save or Remove is pressed. Each edit is sent bound to the process whose list the user saw, never to the new one with the old list's base.
+  it("desktop/agent-cards/131: a save or a removal is bound to the process whose list the user saw", async () => {
+    const reads: ((answer: EditableCardCatalog) => void)[] = [];
+    const runtime = {
+      readCardCatalog: vi.fn((_deckId: string, _instanceId?: string) => new Promise<EditableCardCatalog>((resolve) => { reads.push(resolve); })),
+      editCardCatalog: vi.fn(async (_deckId: string, _edit: CardCatalogEdit, _instanceId?: string) => catalogOf("Ship staging")),
+    };
+    const hook = renderHook(({ list }) => useCardActionsEditor({ runtime, daemons: list }), { initialProps: { list: at("process-a") } });
+    act(() => { hook.result.current.controls.openCardActionsEditor(LOCAL.deckId); });
+    await act(async () => { reads[0](catalogOf("Ship staging")); });
+    expect(runtime.readCardCatalog).toHaveBeenLastCalledWith(LOCAL.deckId, "process-a");
+    act(() => { hook.result.current.controls.editCardAction({ name: "ship" }); });
+    await act(async () => { hook.result.current.controls.saveCardAction(); });
+    expect(runtime.editCardCatalog).toHaveBeenLastCalledWith(LOCAL.deckId, expect.objectContaining({ kind: "update", base: action("Ship staging") }), "process-a");
+    act(() => { hook.result.current.controls.removeCardAction({ name: "ship" }); });
+    await act(async () => { hook.result.current.controls.confirmRemoveCardAction(); });
+    expect(runtime.editCardCatalog).toHaveBeenLastCalledWith(LOCAL.deckId, { kind: "remove", name: "ship", base: action("Ship staging") }, "process-a");
+
+    /* The restart lands: what the old process listed is no longer offered to save or confirm. */
+    act(() => { hook.result.current.controls.editCardAction({ name: "ship" }); });
+    hook.rerender({ list: at("process-b") });
+    expect(hook.result.current.view?.form).toBeUndefined();
+    expect(hook.result.current.view?.catalog).toBeUndefined();
+    expect(runtime.editCardCatalog.mock.calls.filter(([, , instanceId]) => instanceId === "process-b")).toEqual([]);
   });
 });

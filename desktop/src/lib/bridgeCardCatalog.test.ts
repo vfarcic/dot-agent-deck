@@ -27,14 +27,14 @@ describe("desktop/agent-cards/062: the Card actions editor's production bridge",
     const { TauriDeckBridge } = await import("./bridge");
     invoke.mockResolvedValue(CATALOG);
     const bridge = new TauriDeckBridge();
-    expect(await bridge.readCardCatalog(DECK)).toEqual(CATALOG);
-    expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, edit: null });
+    expect(await bridge.readCardCatalog(DECK, "process-a")).toEqual(CATALOG);
+    expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, instanceId: "process-a", edit: null });
     const edit = { kind: "add" as const, action: { name: "ship", description: "Offer when it is ready.", prompt: "Ship it.\nThen update your card.", icon: "rocket", confirm: true, always: false } };
-    expect(await bridge.editCardCatalog(DECK, edit)).toEqual(CATALOG);
-    expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, edit });
+    expect(await bridge.editCardCatalog(DECK, edit, "process-a")).toEqual(CATALOG);
+    expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, instanceId: "process-a", edit });
     for (const removal of [{ kind: "remove" as const, name: "ship" }, { kind: "hide" as const, name: "merge" }, { kind: "restore" as const, name: "merge" }]) {
-      await bridge.editCardCatalog(DECK, removal);
-      expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, edit: removal });
+      await bridge.editCardCatalog(DECK, removal, "process-a");
+      expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, instanceId: "process-a", edit: removal });
     }
     expect(invoke).toHaveBeenCalledTimes(5);
   });
@@ -51,6 +51,23 @@ describe("desktop/agent-cards/062: the Card actions editor's production bridge",
     expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, instanceId: "process-a", edit: removal });
   });
 
+  /** Scenario: the editor asks to read, add and remove card actions naming no daemon process — `undefined`, or the empty id a cards snapshot without one carries (PR #2491 audit, A1). Each is refused before anything is invoked, in the backend's own words, the edits saying nothing was saved; nothing goes unbound to whichever process answers the deck. */
+  it("desktop/agent-cards/132: refuses a read or an edit naming no daemon process, invoking nothing", async () => {
+    const { TauriDeckBridge, CARD_CATALOG_DAEMON_UNNAMED } = await import("./bridge");
+    const backend = readFileSync(resolve("src-tauri/src/lib.rs"), "utf8");
+    expect(backend).toContain(`"${CARD_CATALOG_DAEMON_UNNAMED}";`);
+    invoke.mockResolvedValue(CATALOG);
+    const bridge = new TauriDeckBridge();
+    const caught = (promise: Promise<unknown>) => promise.then(() => undefined, (error: unknown) => error as Error);
+    for (const instanceId of [undefined, ""]) {
+      expect((await caught(bridge.readCardCatalog(DECK, instanceId)))?.message).toBe(CARD_CATALOG_DAEMON_UNNAMED);
+      const add = { kind: "add" as const, action: { name: "ship", description: "d", prompt: "p", confirm: false, always: false } };
+      expect((await caught(bridge.editCardCatalog(DECK, add, instanceId)))?.message).toBe(`${CARD_CATALOG_DAEMON_UNNAMED}; nothing was saved`);
+      expect((await caught(bridge.editCardCatalog(DECK, { kind: "remove", name: "ship" }, instanceId)))?.message).toBe(`${CARD_CATALOG_DAEMON_UNNAMED}; nothing was saved`);
+    }
+    expect(invoke).not.toHaveBeenCalledWith("agent_card_catalog_edit", expect.anything());
+  });
+
   /** Scenario: the backend refuses the edit with the daemon's reason, as a string, as Tauri rejects. The bridge rejects with an Error whose message is exactly that reason. */
   it("rejects with the daemon's reason unchanged", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -61,10 +78,10 @@ describe("desktop/agent-cards/062: the Card actions editor's production bridge",
       return undefined;
     });
     const bridge = new TauriDeckBridge();
-    const refused = await bridge.editCardCatalog(DECK, { kind: "remove", name: "Ship It" }).catch((error: unknown) => error);
+    const refused = await bridge.editCardCatalog(DECK, { kind: "remove", name: "Ship It" }, "process-a").catch((error: unknown) => error);
     expect(refused).toBeInstanceOf(Error);
     expect((refused as Error).message).toBe(reason);
-    expect(invoke).toHaveBeenCalledWith("agent_card_catalog_edit", { deckId: DECK, edit: { kind: "remove", name: "Ship It" } });
+    expect(invoke).toHaveBeenCalledWith("agent_card_catalog_edit", { deckId: DECK, instanceId: "process-a", edit: { kind: "remove", name: "Ship It" } });
   });
 
   /** Scenario: the backend pushes two decks' cards, one whose daemon advertised the editor and one whose daemon did not. The snapshot the dashboard reads says `catalogEdit` true for the first and false for the second, and false when the field is missing. */
@@ -90,12 +107,12 @@ describe("desktop/agent-cards/062: the Card actions editor's production bridge",
     });
     const bridge = new TauriDeckBridge();
     const caught = (promise: Promise<unknown>) => promise.then(() => undefined, (error: unknown) => error as Error & { outcome?: string });
-    const unsure = await caught(bridge.editCardCatalog(DECK, { kind: "hide", name: "merge" }));
+    const unsure = await caught(bridge.editCardCatalog(DECK, { kind: "hide", name: "merge" }, "process-a"));
     expect(unsure?.message).toBe(lost);
     expect(unsure?.outcome).toBe("unknown");
-    const refused = await caught(bridge.editCardCatalog(DECK, { kind: "add", action: { name: "ship", description: "d", prompt: "p", confirm: false, always: false } }));
+    const refused = await caught(bridge.editCardCatalog(DECK, { kind: "add", action: { name: "ship", description: "d", prompt: "p", confirm: false, always: false } }, "process-a"));
     expect(refused?.outcome).toBeUndefined();
-    const read = await caught(bridge.readCardCatalog(DECK));
+    const read = await caught(bridge.readCardCatalog(DECK, "process-a"));
     expect(read?.outcome, "a read writes nothing, so it is never of unknown outcome").toBeUndefined();
   });
 });

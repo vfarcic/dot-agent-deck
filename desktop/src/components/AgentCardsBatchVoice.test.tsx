@@ -379,7 +379,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     await turnOnVoice();
     await speak(run.voice, "open the card actions editor");
     const editor = screen.getByRole("dialog", { name: /^Card actions: / });
-    expect(readCardCatalog).toHaveBeenCalledWith(FIXTURE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, INSTANCE);
 
     await speak(run.voice, "add a card action");
     expect((within(editor).getByLabelText("Name") as HTMLInputElement).value).toBe("");
@@ -666,13 +666,13 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
     const editor = screen.getByRole("dialog", { name: `Card actions: ${farName}` });
     expect(editor).toBeInTheDocument();
-    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, REMOTE_INSTANCE);
     await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
 
     await speak(run.voice, "open card actions on the local daemon");
     expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
     expect(screen.getByRole("dialog", { name: `Card actions: ${localName}` })).toBeInTheDocument();
-    expect(readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, INSTANCE);
   });
 
   /// Scenario: With two daemons showing cards, say "open card actions and add a card action" without naming a daemon. The chain stops at its first step on a "Which daemon?" choice listing both daemons, and no editor opens and no form appears on a guessed daemon. Choosing the second daemon opens its Card actions editor and the chain goes on with its next step there, opening the empty form. Afterwards "open card actions on the local daemon" opens that editor at once, with no choice left over from the chain (PR #2491, Qodo 12).
@@ -704,14 +704,14 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
     expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
     const editor = screen.getByRole("dialog", { name: `Card actions: ${farName}` });
-    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, REMOTE_INSTANCE);
     expect((within(editor).getByLabelText("Name") as HTMLInputElement).value, "the chain went on with its next step in the chosen daemon's editor").toBe("");
     await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
 
     await speak(run.voice, "open card actions on the local daemon");
     expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
     expect(screen.getByRole("dialog", { name: `Card actions: ${localName}` })).toBeInTheDocument();
-    expect(readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, INSTANCE);
   });
 
   /// Scenario: With two daemons showing cards, tick a card on the second daemon only and say "open card actions" without naming a daemon: that daemon's Card actions editor opens with no question. Close it, add a card on the first daemon to the selection and say it again: the selection spans both daemons, so the app asks "Which daemon?" as it does with nothing selected (PR #2491, 2026-11-25).
@@ -728,7 +728,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     await speak(run.voice, "open card actions");
     expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
     const editor = screen.getByRole("dialog", { name: `Card actions: ${farName}` });
-    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, REMOTE_INSTANCE);
     await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
 
     fireEvent.click(cardNode(run.cards[0]).getByRole("checkbox", { name: "Select coder-card" }));
@@ -765,7 +765,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(run.declareVoiceScreen.mock.calls.at(-1)?.[0], "voice declared the agent screen").toBe("agent");
     expect(screen.queryByRole("dialog", { name: "Which daemon?" })).toBeNull();
     const editor = screen.getByRole("dialog", { name: `Card actions: ${localName}` });
-    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, INSTANCE);
     expect(screen.getByTestId("agent-pane-overlay"), "the pane stays open under the editor").toBeInTheDocument();
 
     await speak(run.voice, "add a card action");
@@ -878,7 +878,7 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     /* A daemon named in the utterance still wins over the pane it was said in. */
     await speak(run.voice, "open card actions on the far daemon");
     expect(screen.getByRole("dialog", { name: `Card actions: ${farName}` })).toBeInTheDocument();
-    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID);
+    expect(readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, REMOTE_INSTANCE);
   });
 
   /// Scenario: On the Table view with Needs you only off, say "only the ones that need me": the voice panel declares the dashboard's view and the filter as they stood (table, off), and the filter turns on. Say "show all cards": it declares table and on, and the filter turns off. Switch to the Cards view and say "only the ones that need me" again: it declares cards and off. That declaration is what tells the command model that "show all cards" turns the filter off while it is on (PR #2491, 2026-11-25).

@@ -48,6 +48,11 @@ export interface CardActionForm {
   original?: EditableCardAction;
   /** Why the daemon refused the last Save; the form keeps what was typed. */
   error?: string;
+  /**
+   * PR #2491 audit (A2) — the daemon process whose list the form was made
+   * from: a Save is bound to it, and the form is not offered under another.
+   */
+  instanceId?: string;
 }
 
 /** The editor on screen. */
@@ -159,6 +164,9 @@ function chooseDaemon(daemons: readonly CardActionsDaemon[], wanted: string | un
   return { daemon: daemons[0] };
 }
 
+/** PR #2491 audit (A2) — something read from one daemon process, with that process. */
+type Held<T> = { value: T; instanceId: string | undefined };
+
 /** A spoken edit or removal, by the action's name or label. */
 type VoiceAsk = { kind: "edit" | "remove"; wanted: { name?: string; label?: string } };
 
@@ -234,13 +242,15 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
   const shown = typeof read === "function" && typeof write === "function" && daemons.length > 0;
   const [open, setOpen] = useState(false);
   const [deckId, setDeckId] = useState<string | undefined>(undefined);
-  const [catalog, setCatalog] = useState<EditableCardCatalog | undefined>(undefined);
+  /* PR #2491 audit (A2): the list as read, with the daemon process it was
+     read from. It counts only while that process is the one shown. */
+  const [held, setHeld] = useState<Held<EditableCardCatalog> | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [rereadState, setReread] = useState<CardActionsReread | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
-  const [form, setForm] = useState<CardActionForm | undefined>(undefined);
-  const [removing, setRemoving] = useState<EditableCardAction | undefined>(undefined);
+  const [heldForm, setForm] = useState<CardActionForm | undefined>(undefined);
+  const [heldRemoving, setRemoving] = useState<Held<EditableCardAction> | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   /* Which daemon's answers count: an answer for an earlier one (another
      daemon, a closed editor) is dropped. */
@@ -266,10 +276,18 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
     asked?.settle(refused);
   }, []);
   const daemon = daemons.find((candidate) => candidate.deckId === deckId);
+  /* PR #2491 audit (A2): what was read, and what was made from it, is
+     offered only under the process it came from. An answer from the process
+     before a restart can land in the render that adopts its successor, before
+     the restart's reset runs; it is then simply not there. */
+  const instanceId = daemon?.instanceId;
+  const catalog = held !== undefined && held.instanceId === instanceId ? held.value : undefined;
+  const removing = heldRemoving !== undefined && heldRemoving.instanceId === instanceId ? heldRemoving.value : undefined;
+  const form = heldForm !== undefined && heldForm.instanceId === instanceId ? heldForm : undefined;
 
   const load = useCallback((target: CardActionsDaemon | undefined) => {
     const seq = ++readSeq.current;
-    setCatalog(undefined);
+    setHeld(undefined);
     setError(undefined);
     setForm(undefined);
     setRemoving(undefined);
@@ -282,9 +300,10 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       return;
     }
     setLoading(true);
-    read(target.deckId).then((answer) => {
+    const from = target.instanceId;
+    read(target.deckId, from).then((answer) => {
       if (seq !== readSeq.current) return;
-      setCatalog(answer);
+      setHeld({ value: answer, instanceId: from });
       setLoading(false);
     }, (failure: unknown) => {
       if (seq !== readSeq.current) return;
@@ -310,14 +329,15 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
     const epoch = writeEpoch.current;
     setRefreshing(true);
     setReread({ kind, status: "reading" });
-    read(target.deckId).then((answer) => {
+    const from = target.instanceId;
+    read(target.deckId, from).then((answer) => {
       if (seq !== readSeq.current || mine !== rereadSeq.current) return;
       setRefreshing(false);
       if (epoch !== writeEpoch.current) { setReread(undefined); return; }
-      setCatalog(answer);
+      setHeld({ value: answer, instanceId: from });
       if (kind === "refresh") setError(undefined);
       setReread(kind === "check" ? { kind, status: "read" } : undefined);
-      setForm((current) => (current?.mode === "edit"
+      setForm((current) => (current?.mode === "edit" && current.instanceId === from
         ? { ...current, original: answer.actions.find((action) => action.name === current.values.name) }
         : current));
     }, (failure: unknown) => {
@@ -344,39 +364,50 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
      the editor read, the form made from it and every answer still on its way
      from the old process are dropped (`load` moves `readSeq` on), and the new
      process's list is read. A spoken edit or removal still waiting for a list
-     waits for that one: the user never saw the old one. */
-  const instanceId = daemon?.instanceId;
+     waits for that one: the user never saw the old one. A process becoming
+     known for the first time is read the same way (PR #2491 audit, A2): a
+     list read naming none was refused, and one held from no process is not
+     offered under a named one. */
   const shownInstance = useRef({ deckId: daemon?.deckId, instanceId });
   useEffect(() => {
     const before = shownInstance.current;
     shownInstance.current = { deckId: daemon?.deckId, instanceId };
-    if (!open || !present || before.deckId !== daemon?.deckId || before.instanceId === undefined || before.instanceId === instanceId) return;
+    if (!open || !present || before.deckId !== daemon?.deckId || before.instanceId === instanceId) return;
     load(daemon);
   }, [daemon, instanceId, load, open, present]);
 
-  const latest = useRef({ open, daemon, catalog, form, removing, busy, shown, refreshing, loading });
-  latest.current = { open, daemon, catalog, form, removing, busy, shown, refreshing, loading };
+  /* The confirmation on screen, with the process its action was read from. */
+  const asking = removing !== undefined ? heldRemoving : undefined;
+  const latest = useRef({ open, daemon, catalog, form, removing: asking, busy, shown, refreshing, loading });
+  latest.current = { open, daemon, catalog, form, removing: asking, busy, shown, refreshing, loading };
 
-  /* The action of `name` as the editor last read it, the `base` an edit sends; `null`: none. */
-  const asRead = (name: string): EditableCardAction | null => latest.current.catalog?.actions.find((action) => action.name === name) ?? null;
+  /* The `base` a removal of `asked` sends: the action as process `from` —
+     the one the confirmation was made from — was last read (a Refresh may
+     have read it since), `null` once that read lists none; under another
+     process, the action as the confirmation showed it (PR #2491 audit, A2). */
+  const asRead = (asked: EditableCardAction, from: string | undefined): EditableCardAction | null => (latest.current.daemon?.instanceId === from
+    ? latest.current.catalog?.actions.find((action) => action.name === asked.name) ?? null
+    : asked);
 
   /*
-   * Send one edit to the daemon shown. `onDone` runs with its answer;
+   * Send one edit to the daemon shown, bound to process `from` — the one
+   * whose list the edit was made from (PR #2491 audit, A2): a process that
+   * replaced it is sent nothing. `onDone` runs with its answer;
    * `onFailed` with the reason and whether the edit may have been saved
    * anyway (its answer was lost after it was sent), in which case the list is
    * read once more and the editor says it "may have been" done.
    */
-  const send = useCallback((edit: CardCatalogEdit, onFailed: (why: string, unknown: boolean) => void, onDone?: () => void) => {
+  const send = useCallback((edit: CardCatalogEdit, from: string | undefined, onFailed: (why: string, unknown: boolean) => void, onDone?: () => void) => {
     const target = latest.current.daemon;
     if (!target || !write) return;
     const seq = readSeq.current;
     setBusy(true);
     setReread(undefined);
-    write(target.deckId, edit).then((answer) => {
+    write(target.deckId, edit, from).then((answer) => {
       setBusy(false);
       if (seq !== readSeq.current) return;
       writeEpoch.current += 1;
-      setCatalog(answer);
+      setHeld({ value: answer, instanceId: from });
       setError(undefined);
       onDone?.();
     }, (failure: unknown) => {
@@ -388,23 +419,28 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
     });
   }, [reread, write]);
 
-  const startForm = useCallback((action: EditableCardAction | undefined) => {
+  /* `from`: the process whose list the form is made from, which its Save is bound to. */
+  const startForm = useCallback((action: EditableCardAction | undefined, from: string | undefined) => {
     setRemoving(undefined);
     setError(undefined);
     const generation = ++formSeq.current;
+    const bound = from !== undefined ? { instanceId: from } : {};
     setForm(action
-      ? { generation, mode: "edit", original: action, values: { name: action.name, label: action.label, prompt: action.prompt, description: action.description, icon: action.icon, placement: formPlacement(action.placement), confirm: action.confirm, always: action.always } }
-      : { generation, mode: "add", values: { ...EMPTY_FORM } });
+      ? { generation, mode: "edit", original: action, values: { name: action.name, label: action.label, prompt: action.prompt, description: action.description, icon: action.icon, placement: formPlacement(action.placement), confirm: action.confirm, always: action.always }, ...bound }
+      : { generation, mode: "add", values: { ...EMPTY_FORM }, ...bound });
   }, []);
 
-  const askRemove = useCallback((action: EditableCardAction): string | undefined => {
+  /* `from`: the process whose list `action` was read from, which the removal is bound to. */
+  const askRemove = useCallback((action: EditableCardAction, from: string | undefined): string | undefined => {
     if (action.default) return `${displayText(action.label, DISPLAY_LIMITS.name)} is a deck default: hide it instead.`;
-    setRemoving(action);
+    setRemoving({ value: action, instanceId: from });
     return undefined;
   }, []);
 
   /* What voice asked for before the catalog was read: done now, or refused
-     in words (an action the list does not name, a save under way). */
+     in words (an action the list does not name, a save under way). Only a
+     list read from the process shown settles it (`catalog` is no other's,
+     PR #2491 audit A2), and what it opens is bound to that process. */
   useEffect(() => {
     const asked = pending.current;
     if (!asked || !catalog) return;
@@ -412,8 +448,8 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
     if (latest.current.busy) { asked.settle(asked.kind === "edit" ? SAVING_FORM : STILL_SAVING); return; }
     const action = findAction(catalog, asked.wanted);
     if (!action) { asked.settle(unknownAction(asked.wanted)); return; }
-    if (asked.kind === "edit") { startForm(action); asked.settle(undefined); } else asked.settle(askRemove(action));
-  }, [askRemove, catalog, startForm]);
+    if (asked.kind === "edit") { startForm(action, instanceId); asked.settle(undefined); } else asked.settle(askRemove(action, instanceId));
+  }, [askRemove, catalog, instanceId, startForm]);
 
   /* Wait for the list, then do `voiceAsk`: what it answers settles once the list is read, or the read fails. */
   const queue = (voiceAsk: VoiceAsk): Promise<string | undefined> => new Promise((settle) => {
@@ -494,7 +530,7 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       dropPending(CLOSED_BEFORE_READ);
       setReread(undefined);
       setOpen(false);
-      setCatalog(undefined);
+      setHeld(undefined);
       setForm(undefined);
       setError(undefined);
       setLoading(false);
@@ -521,28 +557,29 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
         openEditor(target.deckId);
       }
       if (!target?.editable) return readOnly(displayText(target?.name ?? "This", DISPLAY_LIMITS.name));
-      startForm(undefined);
+      startForm(undefined, target.instanceId);
       return undefined;
     },
     editCardAction: (wanted) => editing((listed) => {
       const action = findAction(listed, wanted);
       if (!action) return unknown(wanted);
       if (latest.current.busy) return SAVING_FORM;
-      startForm(action);
+      startForm(action, latest.current.daemon?.instanceId);
       return undefined;
     }, { kind: "edit", wanted }),
     removeCardAction: (wanted) => editing((listed) => {
       const action = findAction(listed, wanted);
       if (!action) return unknown(wanted);
       if (latest.current.busy) return STILL_SAVING;
-      return askRemove(action);
+      return askRemove(action, latest.current.daemon?.instanceId);
     }, { kind: "remove", wanted }),
     confirmRemoveCardAction: () => {
-      const action = latest.current.removing;
-      if (!action) return NOT_ASKING;
+      const asking = latest.current.removing;
+      if (!asking) return NOT_ASKING;
       if (latest.current.busy) return STILL_SAVING;
+      const { value: action, instanceId: from } = asking;
       setRemoving(undefined);
-      send({ kind: "remove", name: action.name, base: asRead(action.name) }, outcome(action.label, "removed"), () => {
+      send({ kind: "remove", name: action.name, base: asRead(action, from) }, from, outcome(action.label, "removed"), () => {
         setForm((current) => (current?.original?.name === action.name ? undefined : current));
       });
       return undefined;
@@ -551,14 +588,14 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       const action = listed.actions.find((candidate) => candidate.name === name);
       if (!action?.default) return unknown({ name });
       if (latest.current.busy) return STILL_SAVING;
-      send({ kind: "hide", name, base: action }, outcome(action.label, "hidden"));
+      send({ kind: "hide", name, base: action }, latest.current.daemon?.instanceId, outcome(action.label, "hidden"));
       return undefined;
     }),
     restoreCardAction: (name) => editing((listed) => {
       const action = listed.actions.find((candidate) => candidate.name === name);
       if (!action?.default) return unknown({ name });
       if (latest.current.busy) return STILL_SAVING;
-      send({ kind: "restore", name, base: action }, outcome(action.label, "restored"), () => {
+      send({ kind: "restore", name, base: action }, latest.current.daemon?.instanceId, outcome(action.label, "restored"), () => {
         setForm((current) => (current?.original?.name === name ? undefined : current));
       });
       return undefined;
@@ -574,7 +611,7 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       const sentFrom = current.generation;
       const ours = (now: CardActionForm | undefined) => now !== undefined && now.generation === sentFrom;
       setForm({ ...current, error: undefined });
-      send(edit, (why, unsure) => setForm((now) => (ours(now) ? { ...now!, error: unsure ? `This may have been saved: ${why}` : why } : now)), () => setForm((now) => (ours(now) ? undefined : now)));
+      send(edit, current.instanceId, (why, unsure) => setForm((now) => (ours(now) ? { ...now!, error: unsure ? `This may have been saved: ${why}` : why } : now)), () => setForm((now) => (ours(now) ? undefined : now)));
       return undefined;
     },
     cancelCardActionForm: () => {

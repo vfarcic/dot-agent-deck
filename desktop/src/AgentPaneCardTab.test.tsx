@@ -507,7 +507,7 @@ describe("the agent pane's Card tab (PR #2491 decision 2026-11-26)", () => {
     await act(async () => { fireEvent.click(edit); });
     const editor = screen.getByRole("dialog", { name: /^Card actions: / });
     expect(editor).toBeInTheDocument();
-    expect(shell.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
+    expect(shell.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, INSTANCE);
     await act(async () => { fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close")); });
     back();
 

@@ -2159,10 +2159,21 @@ export interface DeckRuntimeState {
   invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
   /** Issue #2399 — preview or execute one action on many cards of one deck; the daemon checks and performs each as a single press. */
   invokeCardActionBatch?: (deckId: string, actionId: string, options: CardBatchOptions) => Promise<CardBatchResult>;
-  /** PRD #2374 decision 2026-11-24 — read one daemon's card actions for the editor. Rejects with the reason it could not. */
-  readCardCatalog?: (deckId: string) => Promise<EditableCardCatalog>;
-  /** PRD #2374 decision 2026-11-24 — change one daemon's card actions; answers them after the change, or rejects with the daemon's reason (nothing written). */
-  editCardCatalog?: (deckId: string, edit: CardCatalogEdit) => Promise<EditableCardCatalog>;
+  /**
+   * PRD #2374 decision 2026-11-24 — read one daemon's card actions for the
+   * editor. Rejects with the reason it could not. Bound to daemon process
+   * `instanceId` (PR #2491 audit, A1/A2): a process that replaced it, or no
+   * process named, is sent nothing and the read rejects.
+   */
+  readCardCatalog?: (deckId: string, instanceId: string | undefined) => Promise<EditableCardCatalog>;
+  /**
+   * PRD #2374 decision 2026-11-24 — change one daemon's card actions; answers
+   * them after the change, or rejects with the daemon's reason (nothing
+   * written). Bound to daemon process `instanceId`, the one whose list the
+   * edit was made from (PR #2491 audit, A1/A2): a process that replaced it,
+   * or no process named, is sent nothing and the edit rejects.
+   */
+  editCardCatalog?: (deckId: string, edit: CardCatalogEdit, instanceId: string | undefined) => Promise<EditableCardCatalog>;
   /**
    * PRD #1790 stage 2 — each deck's interrupted work (what a restart of its
    * daemon left behind), the dialog that lists it, and the calls that act on

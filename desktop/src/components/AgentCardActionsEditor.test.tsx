@@ -202,7 +202,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(editor).toHaveAttribute("data-testid", "agent-card-actions-editor");
     expect(editor).toHaveAccessibleName(`Card actions: ${calls.localName}`);
     expect(within(editor).queryByRole("combobox", { name: "Daemon" })).toBeNull();
-    expect(calls.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
+    expect(calls.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, INSTANCE);
     expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge", "ship"]);
     expect(rows(editor).map((node) => node.getAttribute("data-source"))).toEqual(["deck", "deck", "user"]);
     for (const name of ["go-ahead", "merge"]) {
@@ -264,7 +264,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
         name: "deploy", label: "Deploy it", prompt: "Deploy it.\nThen update your card.",
         description: "Offer when the change can be deployed.", icon: "rocket", confirm: true, always: false,
       }),
-    });
+    }, INSTANCE);
     const listed = row(editorDialog(), "deploy");
     expect(listed).toHaveAttribute("data-source", "user");
     expect(within(listed).getByText("Deploy it", { exact: true })).toBeInTheDocument();
@@ -289,7 +289,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
       kind: "update",
       action: expect.objectContaining({ name: "ship", label: "Ship it now", prompt: "Ship it.\nThen update your card.", description: "Offer when it is ready.", icon: "rocket", confirm: true }),
       base: SHIP,
-    });
+    }, INSTANCE);
 
     editor = editorDialog();
     fireEvent.click(within(row(editor, "go-ahead")).getByRole("button", { name: "Edit Go ahead" }));
@@ -299,7 +299,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
       kind: "update",
       action: expect.objectContaining({ name: "go-ahead", label: "Go ahead", prompt: "Carry on, then update your card.", icon: "play" }),
       base: GO_AHEAD,
-    });
+    }, INSTANCE);
     const go = row(editorDialog(), "go-ahead");
     expect(go).toHaveAttribute("data-source", "user");
     // An overridden default says both: it is the deck's, in the user's version.
@@ -321,15 +321,15 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Remove Ship it" }));
     confirm = screen.getByRole("alertdialog", { name: "Remove Ship it?" });
     await act(async () => { fireEvent.click(within(confirm).getByRole("button", { name: "Remove" })); });
-    expect(calls.editCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, { kind: "remove", name: "ship", base: SHIP });
+    expect(calls.editCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, { kind: "remove", name: "ship", base: SHIP }, INSTANCE);
     editor = editorDialog();
     expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge"]);
 
     await act(async () => { fireEvent.click(within(row(editor, "go-ahead")).getByRole("button", { name: "Hide Go ahead" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "hide", name: "go-ahead", base: GO_AHEAD });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "hide", name: "go-ahead", base: GO_AHEAD }, INSTANCE);
     editor = editorDialog();
     await act(async () => { fireEvent.click(within(row(editor, "merge")).getByRole("button", { name: "Restore Merge it" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "restore", name: "merge", base: MERGE });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "restore", name: "merge", base: MERGE }, INSTANCE);
     expect(calls.editCardCatalog).toHaveBeenCalledTimes(3);
   });
 
@@ -357,7 +357,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     let editor = await openEditor(FIXTURE_DAEMON_ID);
     expect(editor).toHaveAccessibleName(`Card actions: ${calls.localName}`);
     expect(within(editor).queryByRole("combobox", { name: "Daemon" })).toBeNull();
-    expect(calls.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID);
+    expect(calls.readCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, INSTANCE);
     expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge", "ship"]);
     fireEvent.click(within(editor).getByTestId("agent-card-actions-editor-close"));
     expect(screen.queryByRole("dialog", { name: EDITOR_NAME })).toBeNull();
@@ -365,11 +365,11 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     editor = await openEditor(FIXTURE_REMOTE_DAEMON_ID);
     expect(editor).toHaveAccessibleName(`Card actions: ${calls.remoteName}`);
     expect(within(editor).queryByRole("combobox", { name: "Daemon" })).toBeNull();
-    expect(calls.readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID);
+    expect(calls.readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID, REMOTE_INSTANCE);
     expect(rows(editor).map((node) => node.getAttribute("data-action"))).toEqual(["go-ahead", "merge", "deploy"]);
     expect(within(editor).getByText("/srv/deck/config.toml", { exact: false })).toBeInTheDocument();
     await act(async () => { fireEvent.click(within(row(editor, "go-ahead")).getByRole("button", { name: "Hide Go ahead" })); });
-    expect(calls.editCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, { kind: "hide", name: "go-ahead", base: GO_AHEAD });
+    expect(calls.editCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, { kind: "hide", name: "go-ahead", base: GO_AHEAD }, REMOTE_INSTANCE);
   });
 
   /// Scenario: Open the editor for a daemon from an older release that does not offer it, alone and then beside one that does. The older daemon's ⋯ menu still offers Card actions; its editor says its release cannot be edited from the app, offers no Add, Edit, Remove, Hide or Restore, and sends that daemon nothing; the newer daemon's ⋯ menu opens an editor that edits it as usual.
@@ -431,7 +431,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(field(editor, "Offer on every card")).not.toBeChecked();
     fireEvent.click(field(editor, "Offer on every card"));
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "detail", always: true }), base: expect.objectContaining({ name: "ship" }) });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "detail", always: true }), base: expect.objectContaining({ name: "ship" }) }, INSTANCE);
 
     editor = editorDialog();
     fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
@@ -439,7 +439,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect(field(editor, "Offer on every card")).toBeChecked();
     fireEvent.click(field(editor, "Offer on every card"));
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "detail", always: false }), base: expect.objectContaining({ name: "ship" }) });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "detail", always: false }), base: expect.objectContaining({ name: "ship" }) }, INSTANCE);
 
     editor = editorDialog();
     fireEvent.click(within(editor).getByRole("button", { name: "Add action" }));
@@ -448,7 +448,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     fireEvent.change(field(editor, "Tell agents when to offer it"), { target: { value: "Offer when it can be deployed." } });
     fireEvent.change(placement(), { target: { value: "detail" } });
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "add", action: expect.objectContaining({ name: "deploy", placement: "detail", always: false }) });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "add", action: expect.objectContaining({ name: "deploy", placement: "detail", always: false }) }, INSTANCE);
     expect(calls.editCardCatalog).toHaveBeenCalledTimes(3);
 
     // Issue #2399 review 11: the two choices say what each does, and an action whose file says `compact`
@@ -460,7 +460,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     expect([...placement().options].map((option) => [option.value, option.textContent])).toEqual([["card", "Show on the card"], ["detail", "Only in the Card tab"]]);
     expect(placement().value).toBe("card");
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "compact" }), base: expect.objectContaining({ name: "ship" }) });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, { kind: "update", action: expect.objectContaining({ name: "ship", placement: "compact" }), base: expect.objectContaining({ name: "ship" }) }, INSTANCE);
   });
 
   /// Scenario: With a local and a remote daemon whose answers arrive late and out of order, open the local daemon's editor, close it and open the remote daemon's from its ⋯ menu before the local read answers: the remote catalog is shown, and the local answer arriving afterwards does not replace it. Save an edit on the local daemon and move to the remote one the same way before the save answers: the late answer changes nothing shown, and the next edit goes to the remote daemon only. A form open when the editor moves is gone — the read-only daemon's editor offers no Save — so nothing typed for one daemon is written to another.
@@ -502,14 +502,14 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
     fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({ kind: "update" }));
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({ kind: "update" }), INSTANCE);
     await choose(FIXTURE_REMOTE_DAEMON_ID);
     await settle(FIXTURE_REMOTE_DAEMON_ID, "read");
     await settle(FIXTURE_DAEMON_ID, "edit");
     expect(shownNames(), "the late local save changes nothing shown").toEqual(["go-ahead", "deploy"]);
     editor = editorDialog();
     await act(async () => { fireEvent.click(within(row(editor, "go-ahead")).getByRole("button", { name: "Hide Go ahead" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID, { kind: "hide", name: "go-ahead", base: GO_AHEAD });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID, { kind: "hide", name: "go-ahead", base: GO_AHEAD }, REMOTE_INSTANCE);
     expect(calls.editCardCatalog.mock.calls.map(([deckId]) => deckId)).toEqual([FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID]);
     cleanup();
 
@@ -719,7 +719,7 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
     fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
     fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
     await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
-    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({ kind: "update", base: SHIP }));
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({ kind: "update", base: SHIP }), INSTANCE);
     calls.catalogs[FIXTURE_DAEMON_ID].actions = calls.catalogs[FIXTURE_DAEMON_ID].actions.map((entry) => (entry.name === "ship" ? { ...entry, prompt: "THEIRS-2399: ship it." } : entry));
     await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.reject(staleReason));
     const form = within(editor).getByTestId("agent-card-actions-editor-form");
@@ -736,6 +736,6 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
       kind: "update",
       action: expect.objectContaining({ name: "ship", label: "Ship it now" }),
       base: expect.objectContaining({ name: "ship", prompt: "THEIRS-2399: ship it." }),
-    }));
+    }), INSTANCE);
   });
 });
