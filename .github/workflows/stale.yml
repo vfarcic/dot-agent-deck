@@ -28,5 +28,5 @@ jobs:
           days-before-pr-close: 7
           stale-issue-label: stale
           stale-pr-label: stale
-          exempt-issue-labels: 'pinned,security,PRD'
+          exempt-issue-labels: 'pinned,security,PRD,graduation'
           exempt-pr-labels: 'pinned,security,PRD'
