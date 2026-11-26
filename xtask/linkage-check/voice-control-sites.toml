@@ -1291,3 +1291,63 @@ file = "desktop/src/components/AgentCardOverlay.tsx"
 handler = "onChange"
 code = "(event) => setReply(event.target.value)"
 reason = "A keystroke into the card overlay's reply box (PRD #2374). Sending the reply is the Send reply button, which dispatches `replyToAgentCard` — a `voice: true` entry whose `reply_to_agent_card` row sends the spoken words directly."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "() => setUpgradeAllOpen(true)"
+reason = "The Dashboard's Upgrade all (issue #1600): opens the dialog that upgrades every remote daemon older than this app, restarting daemons and the agents under them. Kept off voice like each deck's own Upgrade: a misheard sentence must not start upgrades across machines."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onMouseDown"
+code = "dismiss"
+reason = "Upgrade all dialog backdrop: a dismissal (Keep current daemon at a question, nothing while the batch runs)."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Upgrade all dialog Close (after the results, an error, or a plan with nothing to upgrade): a dismissal."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = "onCancel"
+reason = "Upgrade all plan Cancel: a dismissal."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = "onStart"
+reason = "Upgrade all plan Upgrade: upgrades every listed daemon, each of which may restart and stop its agents. Kept off voice like the single Upgrade's confirmation — a misheard utterance must not start it."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = "onStop"
+reason = "Upgrade all Stop after this daemon: part of the click-only Upgrade all flow, which is kept off voice as a whole (see its Upgrade); it only ever does less."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = '() => onDecide("keep-current")'
+reason = "Upgrade all: Keep current daemon — the safe answer to one daemon's restart question; part of the click-only Upgrade all flow (see Restart now)."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = '() => onDecide("restart-now")'
+reason = "Upgrade all: Restart now — stops every agent and role the asking daemon named. Kept off voice for the same reason as the single Upgrade's Restart now."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = "onCancel"
+reason = "Upgrade all plan Close, when nothing needs upgrading: a dismissal."
+
+[[site]]
+file = "desktop/src/components/UpgradeAllDialog.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "Upgrade all results Close: a dismissal."

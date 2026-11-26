@@ -464,3 +464,32 @@ describe("the dashboard's Replace daemon (issue #1073)", () => {
     expect(screen.queryByTestId("overview-replace")).not.toBeInTheDocument();
   });
 });
+
+describe("the dashboard's Upgrade all action", () => {
+  const upgradeAll = () => ({
+    check: vi.fn(async () => ({ batchId: "batch-1", headline: "Checked 2 remote decks: 2 to upgrade.", toUpgrade: 2, decks: [] })),
+    run: vi.fn(),
+    stop: vi.fn(),
+  });
+
+  /** Scenario: Issue #1600 — the top bar shows Upgrade all while a remote deck runs an older daemon, and pressing it opens the dialog, which checks every deck. */
+  it("offers Upgrade all while a remote deck is older and opens the dialog", async () => {
+    const batch = upgradeAll();
+    render(<AgentOverview runtime={runtime(createFixtureFleet("upgrade"), { upgradeAll: batch })} onNavigate={vi.fn()} />);
+    const button = screen.getByTestId("overview-upgrade-all");
+    expect(button).toHaveAccessibleName("Upgrade all daemons");
+    fireEvent.click(button);
+    expect(screen.getByTestId("upgrade-all-dialog")).toBeVisible();
+    await waitFor(() => expect(screen.getByTestId("upgrade-all-headline")).toHaveTextContent("Checked 2 remote decks: 2 to upgrade."));
+    expect(batch.check).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: Issue #1600 — no Upgrade all when no remote deck is older, or when the bridge has no batch. */
+  it("offers no Upgrade all when nothing is older or the bridge has no batch", () => {
+    const { unmount } = render(<AgentOverview runtime={runtime(createFixtureFleet("fleet"), { upgradeAll: upgradeAll() })} onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("overview-upgrade-all")).not.toBeInTheDocument();
+    unmount();
+    render(<AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("overview-upgrade-all")).not.toBeInTheDocument();
+  });
+});

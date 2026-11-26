@@ -147,6 +147,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "upgrade-all",
+        description: "The desktop Upgrade all daemons dialog over the upgrade fleet, stopped at the busy remote daemon's own restart question, with the other remote waiting its turn below and Keep current daemon and Restart now.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "daemon-upgrade",
         description: "The desktop Upgrade dialog for a remote daemon on an older release, stopped at the restart question that names the agents a restart would stop, with Keep current daemon and Restart now.",
         clients: &[Client::Desktop],
