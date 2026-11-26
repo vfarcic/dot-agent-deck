@@ -4070,7 +4070,13 @@ mod tests {
     #[test]
     fn the_folder_check_refuses_a_link_loop_or_a_chain_past_its_cap() {
         let dir = crate::test_temp::tempdir().unwrap();
-        let home = dir.path();
+        // The check counts every link it follows, the temp root's own among
+        // them, and each link below is absolute, so it walks the root again
+        // at every hop: on macOS `/var` is a link to `private/var`, and a
+        // chain built under `/var/tmp` would count far more than its own 40.
+        // The canonical root holds no link, so the chains count only theirs.
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let home = canonical.as_path();
         std::os::unix::fs::symlink(home.join("loop-dir"), home.join("loop-dir")).unwrap();
         std::os::unix::fs::symlink(home.join("b.toml"), home.join("a.toml")).unwrap();
         std::os::unix::fs::symlink(home.join("a.toml"), home.join("b.toml")).unwrap();

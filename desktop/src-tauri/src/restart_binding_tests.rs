@@ -187,7 +187,11 @@ impl RestartingDeck {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dad-{tag}-{}-{unique}", std::process::id()));
+        // Under `/tmp`, not `std::env::temp_dir()`: a socket path must fit
+        // `sun_path` (104 bytes on macOS), and with macOS's per-user `$TMPDIR`
+        // under `/var/folders/…` the `batch-preview-refused` tag did not.
+        let dir =
+            std::path::Path::new("/tmp").join(format!("dad-{tag}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create the scratch dir");
         let socket = dir.join("s");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind the deck");
