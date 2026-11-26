@@ -318,12 +318,14 @@ Ask **which** PRDs too, unless the runner already named them. Relative priority 
 Check the name is free before dispatching:
 
 ```bash
-git show-ref --verify --quiet "refs/heads/agent/dispatch-prd-<n>" && echo TAKEN || echo FREE
+.claude/skills/issue-queue/unit-name-free.sh "prd-<n>" "$OWNER/$REPO"
 ```
+
+It prints `FREE`, `TAKEN: <why>` or `UNKNOWN: <why>`, and reads a name as taken when the branch exists locally or on `origin`, or when any pull request, merged and closed ones included, has had it as its head (issue #2509; `/issue-queue` step 6 says why the last one matters). Read `UNKNOWN` as taken.
 
 Check both spellings if step 4c turned up an `issue-<n>` branch for this PRD — that branch does not block `agent/dispatch-prd-<n>`, but knowing it exists is what tells you the PRD has been dispatched before.
 
-A name is single-use: removing a worktree keeps its branch, so a surviving `agent/dispatch-prd-<n>` refuses a re-dispatch. **If it is taken, pick a different name** — `prd-<n>-<MMDD>` disambiguates a second attempt. **Do not delete the branch to free the name.** It may hold committed work that was never pushed, and it is the only reference to it; the refusal is deliberate for exactly that reason. The mechanics, and the deliberate `git branch -D` route out of them, are in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) — that is the runner's call, with the branch's contents in front of them, not this skill's.
+A name is single-use: removing a worktree keeps its branch, so a surviving `agent/dispatch-prd-<n>` refuses a re-dispatch, and a branch deleted after its PR merged leaves that PR behind under the name. **If it is taken, pick a different name** — `prd-<n>-<MMDD>` disambiguates a second attempt. **Do not delete the branch to free the name.** It may hold committed work that was never pushed, and it is the only reference to it; the refusal is deliberate for exactly that reason. The mechanics, and the deliberate `git branch -D` route out of them, are in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) — that is the runner's call, with the branch's contents in front of them, not this skill's.
 
 ## Step 7 — Choose the shape with `dispatch-shape`, and default the provider
 

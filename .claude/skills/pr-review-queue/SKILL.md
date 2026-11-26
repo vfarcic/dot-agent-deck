@@ -535,8 +535,10 @@ Default the unit name to **`verify-pr-<number>-<MMDD>`** — e.g. `verify-pr-465
 Check the branch is free **before** dispatching:
 
 ```bash
-git show-ref --verify --quiet "refs/heads/agent/dispatch-<name>" && echo TAKEN || echo FREE
+.claude/skills/issue-queue/unit-name-free.sh "<name>" "$OWNER/$REPO"
 ```
+
+It prints `FREE`, `TAKEN: <why>` or `UNKNOWN: <why>` (read `UNKNOWN` as taken), and besides the local branch it checks `origin` and every pull request that has had the branch as its head, merged and closed ones included (issue #2509): a new branch under a used name picks up the old PR on its card and in `worktree list`.
 
 `dispatch` derives `agent/dispatch-<name>` for the branch and `../<repo>-dispatch-<name>` for the worktree, and refuses on either collision — `worktree ... is already claimed` when the directory is live, `branch ... already exists` when a previous unit's worktree was removed but its branch survived.
 
