@@ -9878,6 +9878,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** which colour the role holds (deliberately — `theme/palette/001-002` own the identity, and asserting identity here is what let an unreadable colour ship); contrast of the other status/accent roles (green 2.16:1 and cyan 1.98:1 on white have the same weakness and are a separate colour decision); how any specific terminal emulator actually resolves the slot.
 - **Platform coverage:** mac+linux+windows.
 
+##### theme/contrast/003 — The trust prompt's field labels and the values the user approves are legible on light and dark terminals, and the values stand out from their labels.
+- **Layer:** L1 (`trust_prompt::render_to_buffer`, colour read from the buffer's cells; `tests/palette_contrast.rs`).
+- **Agent:** none.
+- **Asserts:** in the `Review project commands` prompt for a never-approved orchestration, every cell of the `Project:`, `command:`, `description:` and `prompt:` labels and of the values beside them is `Color::Reset` or a named ANSI colour that clears the `theme/contrast/002` floors on white and on black; no value cell is `DIM`; each label's style differs from its value's (issue #2518). A paired non-spec unit guard proves the gate rejects `Color::White` and `Color::Gray`.
+- **Does not assert:** how much `Modifier::DIM` lowers a label's contrast, or that a terminal honours it; the prompt's Yellow title, border and change marks, or its Cyan footer; the desktop dialog.
+- **Platform coverage:** mac+linux+windows.
+
 #### theme/guard
 
 ##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the terminal's own foreground plus a thickened border, not an absolute fill.
