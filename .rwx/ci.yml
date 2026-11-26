@@ -451,19 +451,22 @@ tasks:
       test-results:
         - path: desktop/junit/playwright.xml
 
-  # The desktop app driven through WebKitWebDriver under Xvfb
-  # (`desktop-driver`).
-  - key: desktop-driver
+  # The Ubuntu packages `desktop-driver` needs, as their own task (issue
+  # #2519). Installed inside that task, they were downloaded on every run, the
+  # cron's included (its tool cache never carried them: "37 newly installed"
+  # on run 01a21602dc73), so each pull request depended on the mirror's speed
+  # that day; on PR #2491's run 01a213df8b08 three 3-minute attempts across
+  # both mirrors did not finish the download and the task went red. As its
+  # own task, filtered to the prefetch script, its cache key moves only with
+  # this definition, that script or `system-packages`, so runs reuse one
+  # install until then, as `playwright-browsers` does for `desktop-browser`.
+  # Content-keyed, not a tool cache, for the reason given there.
+  - key: desktop-driver-packages
     if: ${{ tasks.backend.values.rust == 'true' }}
-    use: [system-packages, code, rust, pnpm]
-    # v2: v1's cache held a deleted /etc/ssh/sshd_config, which fails openssh-server's postinst.
-    tool-cache: ci-desktop-driver-v2
+    use: [system-packages, code]
+    filter: [.github/scripts/apt-prefetch.sh]
+    # A cache miss pays the whole download, on whatever mirror speed it gets.
     timeout: 30m
-    env:
-      TAURI_DRIVER_VERSION: 2.0.6
-      CARGO_INCREMENTAL: "0"
-      # Issue #326: see the `backend` task.
-      DAD_VERSION: ${{ tasks.backend.values.dad_version }}
     run: |
       sudo apt-get update
       # The .debs first, with a time limit per attempt and a move to
@@ -473,12 +476,26 @@ tasks:
       # install's, so it finds every .deb already downloaded.
       .github/scripts/apt-prefetch.sh webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
-      # UCF_FORCE_CONFFMISS: a restored ci-desktop-driver-v1 tool cache can
-      # carry ucf's record of /etc/ssh/sshd_config without the file itself,
-      # and ucf then refuses to recreate the "deleted" file, which fails
-      # openssh-server's postinst (PR #1915's run 01a173dc7cf1, and three
-      # others on 2026-10-25). This makes ucf write it, as a clean install does.
-      sudo env UCF_FORCE_CONFFMISS=1 apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
+      sudo apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
+      sudo apt-get clean
+
+  # The desktop app driven through WebKitWebDriver under Xvfb
+  # (`desktop-driver`).
+  - key: desktop-driver
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [system-packages, desktop-driver-packages, code, rust, pnpm]
+    # v2: v1's cache held a deleted /etc/ssh/sshd_config, which failed
+    # openssh-server's postinst when this task installed it.
+    # v3: v2 was written by runs that installed the Ubuntu packages here, on
+    # a layer stack without `desktop-driver-packages` (issue #2519).
+    tool-cache: ci-desktop-driver-v3
+    timeout: 30m
+    env:
+      TAURI_DRIVER_VERSION: 2.0.6
+      CARGO_INCREMENTAL: "0"
+      # Issue #326: see the `backend` task.
+      DAD_VERSION: ${{ tasks.backend.values.dad_version }}
+    run: |
       cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
       # `cargo install` puts it in Cargo's bin dir, which is not on PATH here.
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
@@ -555,13 +572,21 @@ tasks:
       echo "$HOME/.nix-profile/bin" >> "$RWX_ENV/PATH"
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
+      # The `nix` and `devbox` tool-cache names carry this version too (issue
+      # #2529), and renovate.json's NixOS/nix manager bumps all three sites in
+      # one change; xtask/linkage-check's rwx_nix_cache_keys fails the build
+      # when they disagree.
       NIX_VERSION: 2.36.0
 
   # `nix flake check` (`nix`).
   - key: nix
     if: ${{ tasks.backend.values.nix == 'true' }}
     use: [code, nix-install]
-    tool-cache: ci-nix-v1
+    # Named for the Nix release `nix-install` installs (issue #2529): a tool
+    # cache is the store changes this task made on top of that layer, so one
+    # written over another Nix release's layer restores store paths and a
+    # database that do not match it. `devbox` below has the failure it caused.
+    tool-cache: ci-nix-2.36.0-v1
     # RWX's default task timeout is 10 minutes, as for `test` above. Run
     # 01a1faaa88ed7f05 (PR #2434) spent 6.5 minutes building the dependency
     # derivation and was killed at 10 minutes in the release build that
@@ -576,7 +601,14 @@ tasks:
   - key: devbox
     if: ${{ tasks.backend.values.active == 'true' }}
     use: [code, nix-install]
-    tool-cache: ci-devbox-v1
+    # Named for the Nix release `nix-install` installs (issue #2529). Under
+    # the old name `ci-devbox-v1`, after the 2026-11-26 cron rewrote it over
+    # Nix 2.36.0, PR #2491's head on a Nix 2.35.6 base restored it and
+    # `devbox run` exited 126: the profile's rustc named a bash store path
+    # that was not there (task 01a217a97449). Only the cron writes tool
+    # caches, so a Nix bump's own pull request finds no cache under the new
+    # name and installs cold (97s on the cron's cold run 01a21602dc73).
+    tool-cache: ci-devbox-nix-2.36.0-v1
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
       DEVBOX_USE_VERSION: 0.22.0
@@ -600,21 +632,35 @@ tasks:
       sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox
       devbox run -- bash scripts/devbox-smoke.sh
 
+  # `file`, for `aarch64-crossbuild`'s check of the binary, as its own task for
+  # the reason `desktop-driver-packages` gives (issue #2519).
+  - key: aarch64-packages
+    if: ${{ tasks.backend.values.aarch64 == 'true' }}
+    use: [code]
+    filter: [.github/scripts/apt-prefetch.sh]
+    # Above RWX's 10-minute default: the prefetch's three 3-minute attempts
+    # alone can take nine (Qodo on #2532).
+    timeout: 30m
+    run: |
+      sudo apt-get update
+      # The same regional mirror `desktop-driver-packages`' prefetch moves
+      # off: on 2026-11-19 its indexes answered 503 and this install found no
+      # `file` package (PR #2386's run 01a1f3b7c59d).
+      .github/scripts/apt-prefetch.sh file
+      sudo apt-get install -y file
+      sudo apt-get clean
+
   # The aarch64 release build through `cross` (aarch64-crossbuild-check.yml),
   # when the manifests or a CI definition changed.
   - key: aarch64-crossbuild
     if: ${{ tasks.backend.values.aarch64 == 'true' }}
-    use: [code, rustup]
+    use: [code, rustup, aarch64-packages]
     docker: true
-    tool-cache: ci-aarch64-v2
+    # v3: v2 was written by runs that installed `file` here, on a layer stack
+    # without `aarch64-packages` (issue #2519).
+    tool-cache: ci-aarch64-v3
     run: |
       set -euo pipefail
-      sudo apt-get update
-      # The same regional mirror `desktop-driver`'s prefetch moves off:
-      # on 2026-11-19 its indexes answered 503 and this install found no
-      # `file` package (PR #2386's run 01a1f3b7c59d).
-      .github/scripts/apt-prefetch.sh file
-      sudo apt-get install -y file
       cargo install cross --locked --version 0.2.5
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
       cross build --release --target aarch64-unknown-linux-gnu

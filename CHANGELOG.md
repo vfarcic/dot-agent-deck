@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.51.4] - 2026-11-26
+
+### Added
+
+- **Upgrade all remote daemons at once**
+  After a release, every remote daemon that runs an older version can now be upgraded in one go instead of one at a time, from the CLI, the TUI or the desktop app. `dot-agent-deck remote upgrade --all` checks every remote on the deck list at the same time, lists each one with what will happen to it (`Will be upgraded from 0.51.0 to 0.52.0.`, `Skipped: already runs 0.52.0.`, `Failed: it could not be checked: …`), then upgrades the older ones one after another, exactly as `remote upgrade <name>` would. A daemon with agents or orchestration roles running asks about its own, by name, before stopping any, so you answer once per daemon; an idle one restarts without asking. A remote that fails does not stop the others, and the run ends with one line per remote: upgraded, kept running, skipped or failed, each with the reason. The command exits non-zero when any remote failed or could not be checked, and `--json` prints the whole report.
+  In the TUI, press `U` (remappable as `upgrade_all_daemons`) to open the **Upgrade all daemons** dialog; in the desktop app, the Dashboard shows **Upgrade all** while a remote daemon is older than the app. Both show the same plan, the same question for each busy daemon (**Keep current daemon** or **Restart now**) and the same results, and both offer **Stop after this daemon**, which lets the daemon being upgraded finish and starts no other. The daemon on this machine is not part of it: the TUI and the desktop app already upgrade that one when they start.
+  See [Upgrade every remote at once](https://agent-deck.devopstoolkit.ai/docs/remote-environments#upgrade-every-remote-at-once) and [Upgrade all remote daemons](https://agent-deck.devopstoolkit.ai/docs/desktop/daemons#upgrade-all-remote-daemons).
+- **Schedule: issues for everyone**
+  The **schedule: issues** mode is now offered to everyone, with no experimental flag to turn on. It is in the TUI's New Agent form (`Ctrl+n`) and is a chip in the desktop app's **New agent** dialog, between **schedule** and **dispatcher**. Choosing it starts an agent that helps you write a schedule which dispatches an agent to each open issue in a GitHub repository. Before, both clients showed it only with `experimental = true`, and the desktop app showed it only when the daemon you were creating the agent on had the flag on. You can still create the same schedule with `dot-agent-deck schedule add --repo <owner/name>` or in `.dot-agent-deck.toml`, and that never needed the flag.
+  See [Schedules](https://agent-deck.devopstoolkit.ai/docs/scheduled-tasks) and [New agent](https://agent-deck.devopstoolkit.ai/docs/desktop/new-agent).
+
+### Fixed
+
+- **An approval the deck asks for no longer waits unseen while you are in an agent's pane**
+  When the deck refused to start an orchestration and asked for its approval (for example after an agent's `dispatch --orchestration`), the desktop app showed the review only when nothing else was open. While you were in an agent's pane, a dialog or Settings, the request waited and nothing on screen said so, so the refused work could sit unanswered.
+  The desktop app now shows a **1 approval waiting · Review** button at the top of the window, or the number waiting when there are several, without covering what you are in. Click it, or say "show the approval" with voice control on, to open the review over the pane or dialog. When you answer it, you are back where you were. If you leave it, the review opens by itself once you close what you are in. Voice's "approve" now also works on a review opened over an agent's pane. The TUI, which already opens the review over the pane you are typing in, now says `1 approval waiting` in its footer while another dialog holds the review back.
+  See [Answering the deck's request](https://agent-deck.devopstoolkit.ai/docs/project-trust#answering-the-decks-request) for how approvals work in both clients.
+
+
+
 ## [0.51.3] - 2026-11-25
 
 ### Added
