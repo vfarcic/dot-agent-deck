@@ -82,6 +82,31 @@ tasks:
     with:
       node-version: "26.13.1"
 
+  # pnpm, at devbox.json's pin, so desktop/'s commands (`pnpm install`,
+  # `pnpm test`, `pnpm test:browser`, the desktop half of
+  # `cargo docs-screenshots`) can leave the shared box like the cargo ones.
+  # `.rwx/ci.yml`'s `pnpm` task, and scripts/check-pin-lockstep.sh holds this
+  # copy to devbox.json too.
+  - key: pnpm
+    use: node
+    run: |
+      npm install -g pnpm@12.9.0
+      pnpm --version
+
+  # Chromium and WebKit with the Ubuntu packages they need, for the Playwright
+  # suite and the screenshot generator. `.rwx/ci.yml`'s `playwright-browsers`
+  # task, which says why it is a task of its own filtered to
+  # desktop/package.json: one install is reused until that file changes.
+  - key: playwright-browsers
+    use: [code, pnpm]
+    filter: [desktop/package.json]
+    timeout: 45m
+    run: |
+      version=$(node -p "require('./desktop/package.json').devDependencies['@playwright/test']")
+      [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "desktop/package.json must pin @playwright/test exactly, not '$version'" >&2; exit 1; }
+      npx --yes "playwright@$version" install --with-deps chromium webkit
+      sudo apt-get clean
+
   # cargo-mutants, for `/code-cleanup`'s tests mode
   # (`.claude/skills/code-cleanup/find-targets.sh tests`), so a mutation run,
   # one rebuild and test run per mutant, leaves the shared dev box too. The
@@ -122,7 +147,7 @@ tasks:
     run: printf '%s\n' "$RWX_WORKSPACE_DIR/scripts/rwx-sandbox-bin" > "$RWX_ENV/PATH"
 
   - key: sandbox
-    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node, opencode, cargo-build-id]
+    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node, pnpm, playwright-browsers, opencode, cargo-build-id]
     runner:
       cpus: 16
       memory: 64gb
