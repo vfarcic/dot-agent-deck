@@ -1361,16 +1361,12 @@ fn status_waiting_008_real_claude_task_notification_turn_keeps_waiting() {
         describe_events_since(&events, &agent_id, first_stop),
         deck.snapshot_grid()
     );
-    // Held, not a passing glimpse: past the sampling grace the card is still
-    // Waiting.
-    std::thread::sleep(Duration::from_secs(3));
-    assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| grid
-            .contains("Waiting")
-            && grid.contains("Background: 1 command")),
-        "the card left Waiting after the task-notification turn ended, while the long command \
-         still runs:\n{}",
-        deck.snapshot_grid()
+    // Held, not a passing glimpse: asserted on every redraw for three
+    // seconds, past the sampling grace after the turn's end.
+    deck.wait_until_grid_then_hold(
+        "Waiting held after the task-notification turn, while the long command still runs",
+        Duration::from_secs(3),
+        |grid| grid.contains("Waiting") && grid.contains("Background: 1 command"),
     );
     assert!(
         !long_path.exists(),
