@@ -2194,22 +2194,31 @@ async fn agent_card_invoke_batch(
 /// `edit`, read deck `deck_id`'s editable card actions; with one, ask its
 /// daemon to apply it to the daemon's own user config and answer the actions
 /// afterwards. The webview names no file: the daemon writes only its own user
-/// config. A refused edit is the daemon's reason; a daemon without the editor's
-/// capability is sent nothing. The wait is bounded
+/// config. `instance_id` is the daemon process whose card actions the user was
+/// shown; a daemon that replaced it is sent nothing. A refused edit is the
+/// daemon's reason; a daemon without the editor's capability is sent nothing.
+/// The wait is bounded
 /// ([`crate::daemon_bridge::DECK_REPLY_TIMEOUT`]).
 #[tauri::command]
 async fn agent_card_catalog_edit(
     webview: Webview,
     state: State<'_, DesktopState>,
     deck_id: String,
+    instance_id: Option<String>,
     edit: Option<dot_agent_deck::card_catalog::CatalogActionEdit>,
 ) -> Result<dot_agent_deck::card_catalog::EditableCardCatalog, String> {
     ensure_main_webview(&webview)?;
-    agent_card_catalog_edit_on(&state, &deck_id, edit).await
+    agent_card_catalog_edit_on(&state, &deck_id, instance_id.as_deref(), edit).await
 }
 
 /// What the editor says for a deck whose daemon cannot edit card actions.
 pub(crate) const CARD_CATALOG_EDIT_UNSUPPORTED: &str = "this deck's daemon is from a release whose card actions cannot be edited from the app; upgrade it, or edit its user config file";
+
+/// PR #2491 review (Qodo 4): why a read or an edit bound to the daemon process
+/// whose card actions the user was shown reached no daemon: another process
+/// answers at the deck now. An edit adds that nothing was saved.
+pub(crate) const CARD_CATALOG_DAEMON_REPLACED: &str =
+    "the deck's daemon was restarted since its cards were read";
 
 /// The words in an edit's failure that say it may have been saved: its answer
 /// was lost after it was sent. The webview's bridge looks for them
@@ -2226,10 +2235,13 @@ pub(crate) const CARD_CATALOG_EDIT_MAY_HAVE_SAVED: &str = "it may have been save
 /// may have been saved ([`CARD_CATALOG_EDIT_MAY_HAVE_SAVED`]); the editor then
 /// reads the catalog once more instead of repeating the edit. One that failed
 /// or ran out of time before that, connecting or on the `Hello`, says nothing
-/// was saved.
+/// was saved. With `instance_id`, the request is bound to that daemon process
+/// (PR #2491 review, Qodo 4), as a batch is: a daemon that replaced it is sent
+/// nothing, and the answer is [`CARD_CATALOG_DAEMON_REPLACED`].
 pub(crate) async fn agent_card_catalog_edit_on(
     state: &DesktopState,
     deck_id: &str,
+    instance_id: Option<&str>,
     edit: Option<dot_agent_deck::card_catalog::CatalogActionEdit>,
 ) -> Result<dot_agent_deck::card_catalog::EditableCardCatalog, String> {
     let deadline = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
@@ -2256,14 +2268,30 @@ pub(crate) async fn agent_card_catalog_edit_on(
     } else {
         (String::new(), String::new())
     };
+    // PR #2491 review (Qodo 4): bound, like a batch, to the daemon process
+    // whose card actions the user was shown, so the `Hello` that would carry
+    // the request refuses a daemon that replaced it and nothing is sent.
+    let bound;
+    let client: &DaemonClient = match instance_id {
+        Some(instance) => {
+            bound = daemon
+                .client
+                .bound_to(Incarnation::from(Some(instance.to_string())));
+            &bound
+        }
+        None => &daemon.client,
+    };
     // PR #2491 review (Qodo 10): the connection and its `Hello` first, with
     // nothing of the edit written, so a failure or the bound running out here
     // says plainly that nothing was saved; only once the edit is being
     // written may it have been saved whatever became of the answer.
     let connection =
-        match tokio::time::timeout_at(until, daemon.client.card_catalog_edit_connection()).await {
+        match tokio::time::timeout_at(until, client.card_catalog_edit_connection()).await {
             Ok(Ok(Some(connection))) => connection,
             Ok(Ok(None)) => return Err(CARD_CATALOG_EDIT_UNSUPPORTED.to_string()),
+            Ok(Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed)) => {
+                return Err(format!("{CARD_CATALOG_DAEMON_REPLACED}{unsent}"));
+            }
             Ok(Err(ClientError::Server(reason))) => return Err(safe_message(reason)),
             Ok(Err(error)) => return Err(safe_message(format!("{error}{unsent}"))),
             Err(_) => {

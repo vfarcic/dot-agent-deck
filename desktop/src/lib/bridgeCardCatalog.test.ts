@@ -39,6 +39,18 @@ describe("desktop/agent-cards/062: the Card actions editor's production bridge",
     expect(invoke).toHaveBeenCalledTimes(5);
   });
 
+  /** Scenario: the editor reads and saves card actions listed by daemon process `process-a` (PR #2491 review, Qodo 4). The bridge passes that process as `instanceId` beside the deck, for the read and for the edit, so the backend binds both to it. */
+  it("binds a read and an edit to the daemon process it names", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockResolvedValue(CATALOG);
+    const bridge = new TauriDeckBridge();
+    await bridge.readCardCatalog(DECK, "process-a");
+    expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, instanceId: "process-a", edit: null });
+    const removal = { kind: "remove" as const, name: "ship" };
+    await bridge.editCardCatalog(DECK, removal, "process-a");
+    expect(invoke).toHaveBeenLastCalledWith("agent_card_catalog_edit", { deckId: DECK, instanceId: "process-a", edit: removal });
+  });
+
   /** Scenario: the backend refuses the edit with the daemon's reason, as a string, as Tauri rejects. The bridge rejects with an Error whose message is exactly that reason. */
   it("rejects with the daemon's reason unchanged", async () => {
     const { TauriDeckBridge } = await import("./bridge");

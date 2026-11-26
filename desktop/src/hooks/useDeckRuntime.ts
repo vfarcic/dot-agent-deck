@@ -679,12 +679,19 @@ export function useDeckRuntime(): DeckRuntimeState {
   const invokeCardActionBatch = useMemo(() => (typeof bridge.invokeCardActionBatch === "function"
     ? (deckId: string, actionId: string, options: CardBatchOptions) => bridge.invokeCardActionBatch!(deckId, actionId, options)
     : undefined), [bridge]);
+  /* PR #2491 review (Qodo 4) — the Card actions editor reads and writes the
+     daemon process whose cards the app shows for the deck: the one the editor
+     read its list from, since the editor reads again whenever that process
+     changes. A daemon that replaced it is sent nothing. */
+  const latestAgentCards = useRef(agentCards);
+  latestAgentCards.current = agentCards;
+  const listedInstance = useCallback((deckId: string) => latestAgentCards.current[deckId]?.instanceId, []);
   const readCardCatalog = useMemo(() => (typeof bridge.readCardCatalog === "function"
-    ? (deckId: string) => bridge.readCardCatalog!(deckId)
-    : undefined), [bridge]);
+    ? (deckId: string) => bridge.readCardCatalog!(deckId, listedInstance(deckId))
+    : undefined), [bridge, listedInstance]);
   const editCardCatalog = useMemo(() => (typeof bridge.editCardCatalog === "function"
-    ? (deckId: string, edit: CardCatalogEdit) => bridge.editCardCatalog!(deckId, edit)
-    : undefined), [bridge]);
+    ? (deckId: string, edit: CardCatalogEdit) => bridge.editCardCatalog!(deckId, edit, listedInstance(deckId))
+    : undefined), [bridge, listedInstance]);
 
   return {
     appliedGeometry,

@@ -2543,14 +2543,19 @@ export interface DeckBridge {
    * `deckId`'s card actions with where each came from
    * (`agent_card_catalog_edit` with no edit). The daemon reads its own user
    * config; a daemon without the editor is sent nothing and the call rejects.
+   * With `instanceId`, only that daemon process is read (PR #2491 review,
+   * Qodo 4): a daemon that replaced it is sent nothing and the call rejects.
    */
-  readCardCatalog?(deckId: string): Promise<EditableCardCatalog>;
+  readCardCatalog?(deckId: string, instanceId?: string): Promise<EditableCardCatalog>;
   /**
    * PRD #2374 decision 2026-11-24 — ask deck `deckId`'s daemon to apply one
    * edit to its own user config's card actions; answers them after the edit.
-   * A refusal rejects with the daemon's reason, and nothing was written.
+   * A refusal rejects with the daemon's reason, and nothing was written. With
+   * `instanceId` — the daemon process whose card actions the user was shown —
+   * a daemon that replaced it is sent nothing and the call rejects (PR #2491
+   * review, Qodo 4).
    */
-  editCardCatalog?(deckId: string, edit: CardCatalogEdit): Promise<EditableCardCatalog>;
+  editCardCatalog?(deckId: string, edit: CardCatalogEdit, instanceId?: string): Promise<EditableCardCatalog>;
   /**
    * PRD #1790 stage 2 — one deck's interrupted work (`interrupted_work_list`):
    * what a restart of its daemon left behind, from daemon process
@@ -6453,12 +6458,12 @@ export class TauriDeckBridge implements DeckBridge {
     });
   }
 
-  async readCardCatalog(deckId: string): Promise<EditableCardCatalog> {
-    return this.cardCatalogEdit(deckId, null);
+  async readCardCatalog(deckId: string, instanceId?: string): Promise<EditableCardCatalog> {
+    return this.cardCatalogEdit(deckId, null, instanceId);
   }
 
-  async editCardCatalog(deckId: string, edit: CardCatalogEdit): Promise<EditableCardCatalog> {
-    return this.cardCatalogEdit(deckId, edit);
+  async editCardCatalog(deckId: string, edit: CardCatalogEdit, instanceId?: string): Promise<EditableCardCatalog> {
+    return this.cardCatalogEdit(deckId, edit, instanceId);
   }
 
   /**
@@ -6467,12 +6472,13 @@ export class TauriDeckBridge implements DeckBridge {
    * reason then says {@link CARD_CATALOG_EDIT_MAY_HAVE_SAVED} — is marked
    * `outcome: "unknown"`, so the editor says it may have been saved instead of
    * that it was not (issue #2399 review 8); every other failure is a refusal,
-   * with nothing written.
+   * with nothing written. `instanceId` binds the request to that daemon
+   * process (PR #2491 review, Qodo 4).
    */
-  private async cardCatalogEdit(deckId: string, edit: CardCatalogEdit | null): Promise<EditableCardCatalog> {
+  private async cardCatalogEdit(deckId: string, edit: CardCatalogEdit | null, instanceId?: string): Promise<EditableCardCatalog> {
     const invoke = await this.getInvoke();
     try {
-      return await invoke<EditableCardCatalog>("agent_card_catalog_edit", { deckId, edit });
+      return await invoke<EditableCardCatalog>("agent_card_catalog_edit", { deckId, ...(instanceId !== undefined ? { instanceId } : {}), edit });
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       if (edit !== null && failure.message.includes(CARD_CATALOG_EDIT_MAY_HAVE_SAVED)) Object.assign(failure, { outcome: "unknown" });
