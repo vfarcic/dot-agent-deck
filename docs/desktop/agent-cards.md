@@ -1,6 +1,6 @@
 # Agent Cards
 
-Agent cards are a view of the desktop app's Dashboard. Each agent the daemon runs gets a card that says what it is doing, whether it needs you, and which pull requests and issues it reported. Click a card to open its agent with the card beside its terminal, and act on it there, such as answering its question or telling it to go ahead. The cards are laid out as a tree: you see the agents you started, and you open one to see the agents it started. You read many agents at a glance and act on the one that needs you without opening its terminal.
+Agent cards are a view of the desktop app's Dashboard. Each agent the daemon runs gets a card that says what it is doing, whether it needs you, and which pull requests and issues it reported. Click a card to open its agent's pane on its **Terminal** tab; the agent's report, its questions and its actions are on the pane's **Card** tab, where you act on them, such as answering its question or telling it to go ahead. The cards are laid out as a tree: you see the agents you started, and you open one to see the agents it started. You read many agents at a glance and act on the one that needs you without opening its terminal.
 
 ## What a card shows
 
@@ -110,7 +110,7 @@ An agent's pane has a **Card** tab beside its **Terminal** tab, showing the agen
 The pane opens on **Terminal** however you open it: clicking a card or its name, a table row or **Show card** in its **⋯** menu, saying "open the coder", or moving with **Previous agent**, **Next agent** or **Next needing you**. The app does not remember that you last looked at the card: the next time you open any agent, the same one included, its pane starts on **Terminal** again. Two ways in open on **Card**, because they ask for the card itself:
 
 - A card's **+N**: the one after its pull requests and issues opens the Card tab at its list of every pull request and issue, and the one after its action icons opens it at its actions, in each case with the keyboard on that list, so `Tab` continues into it.
-- Saying "show the coder's card", from the Dashboard or from another agent's pane.
+- Saying "show the coder's card", from anywhere on the Dashboard: the Dashboard itself, or any agent's pane open over it, another agent's included.
 
 While the agent needs you, the **Card** tab shows a bell, and a screen reader reads it as "Card, needs you".
 
@@ -175,7 +175,7 @@ With voice control on, you can say:
 | Say | What happens |
 | --- | --- |
 | "show cards", "show the table" | Switches the Dashboard's view. |
-| "show the coder's card" | Opens that agent's pane on its **Card** tab, from the Dashboard or from another agent's pane. |
+| "show the coder's card" | Opens that agent's pane on its **Card** tab, from anywhere on the Dashboard: the Dashboard itself, or any agent's pane open over it, another agent's included. |
 | "open the dispatcher's tree", "close the dispatcher's tree" | Opens or closes the tree under that agent's card. Opening it also opens the way down to that card when it is inside a closed tree. |
 | "open the pull request on the coder's card", "open the issue on the coder's card" | Opens, inside the app, the pull request or issue that agent reported, as the deck checked it. |
 | "next agent", "previous agent" | In an agent's pane, opens the next or previous agent's pane. |
