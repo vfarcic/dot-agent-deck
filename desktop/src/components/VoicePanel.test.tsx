@@ -301,7 +301,7 @@ describe("VoicePanel", () => {
     expect(onSave.mock.calls[0][0].voice.transcription).toEqual({
       backend: "remote",
       endpoint: "https://api.openai.com/v1/audio/transcriptions",
-      model: "whisper-1",
+      model: "gpt-transcribe",
       language: "en",
     });
   });

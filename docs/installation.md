@@ -256,7 +256,7 @@ The deck works with OpenCode 1.18.29 and later 1.x releases, and with OpenCode 2
 
 If an OpenCode 2 agent runs on the shared service anyway, its card says `Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent` when the deck knows the agent runs OpenCode 2; when it does not, the card's not-reporting notice names `--standalone` as the first fix. [An OpenCode card says to add --standalone, to install the plugin, or to upgrade](troubleshooting.md#an-opencode-card-says-to-add---standalone-to-install-the-plugin-or-to-upgrade) lists each OpenCode card message and what to do.
 
-**Choosing the model on OpenCode 2.** OpenCode 2's full interface (`opencode`) refuses the `--model` flag, so a command such as `opencode --model gpt-4o` written for OpenCode 1.x does not start on OpenCode 2. Set the model in OpenCode's configuration instead, or start `opencode mini --model <provider/model>`.
+**Choosing the model on OpenCode 2.** OpenCode 2's full interface (`opencode`) refuses the `--model` flag, so a command such as `opencode --model gpt-6-luna` written for OpenCode 1.x does not start on OpenCode 2. Set the model in OpenCode's configuration instead, or start `opencode mini --model <provider/model>`.
 
 **Questions and forms.** When OpenCode 2 asks you something with a form, its card shows **Needs Input** in both clients. In OpenCode's full interface (`opencode`), the deck knows the form's questions and options, so in the desktop app you can [answer it by voice](desktop/voice.md#answering-an-agents-question), as you can on OpenCode 1.x; in the TUI, which has no voice control, you answer it in the pane. These forms are answered in OpenCode's pane in both clients:
 

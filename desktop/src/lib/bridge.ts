@@ -950,7 +950,7 @@ export const VOICE_STAGE_PRESETS: {
     remote: {
       backend: "remote",
       endpoint: "https://api.openai.com/v1/audio/transcriptions",
-      model: "whisper-1",
+      model: "gpt-transcribe",
     },
   },
   intent: {
@@ -963,7 +963,7 @@ export const VOICE_STAGE_PRESETS: {
     openai_compatible: {
       backend: "openai_compatible",
       endpoint: "https://api.openai.com/v1/chat/completions",
-      model: "gpt-5-mini",
+      model: "gpt-6-luna",
       max_tokens: DEFAULT_TOKEN_CEILING,
     },
   },

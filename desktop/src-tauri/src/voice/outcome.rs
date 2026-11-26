@@ -6527,6 +6527,16 @@ pub enum DirRefMatch {
 /// dialog closed, no deck chosen, no listing loaded — there is nothing to
 /// resolve against and the answer is [`DirRefMatch::None`], never the entries of
 /// a listing the user has since left.
+///
+/// **A reference that matches nothing is tried once more without its filler**
+/// (issue #1820): the articles and the words for a directory, so "the service
+/// directory" is read as "service" and "the billing folder" as "billing". It is
+/// a second attempt rather than the first, so a reference that already matches
+/// keeps the answer it had: "the billing folder" beside both `billing` and
+/// `billing-service` is still `billing`, which the whole reference names.
+/// `gpt-6-luna` handed the user's words back as the value for `open-dir-by-one-word`
+/// and `open-dir-by-its-last-word` (2026-11-26), two fixtures `gpt-5-mini`
+/// passed in both of its runs that day.
 pub fn resolve_dir_ref(spoken: &str, directories: Option<&VoiceDirectories>) -> DirRefMatch {
     let Some(directories) = directories else {
         return DirRefMatch::None;
@@ -6535,13 +6545,34 @@ pub fn resolve_dir_ref(spoken: &str, directories: Option<&VoiceDirectories>) -> 
     if reference.is_empty() {
         return DirRefMatch::None;
     }
-    let reference_words = words(&reference);
+    let found = match_dir_ref(&reference, directories);
+    if found != DirRefMatch::None {
+        return found;
+    }
+    let bare = reference
+        .split(' ')
+        .filter(|word| !DIR_REF_FILLER.contains(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if bare.is_empty() || bare == reference {
+        return found;
+    }
+    match_dir_ref(&bare, directories)
+}
+
+/// The words a directory reference may carry around the name without naming
+/// anything: an article, or the noun for a directory.
+const DIR_REF_FILLER: [&str; 6] = ["the", "a", "an", "dir", "directory", "folder"];
+
+/// [`resolve_dir_ref`]'s two passes for one normalized, non-empty reference.
+fn match_dir_ref(reference: &str, directories: &VoiceDirectories) -> DirRefMatch {
+    let reference_words = words(reference);
 
     let mut exact = Vec::new();
     let mut loose = Vec::new();
     for entry in &directories.entries {
         let names = dir_names(&entry.name);
-        if names.iter().any(|name| normalize(name) == reference) {
+        if names.iter().any(|name| normalize(name) == *reference) {
             exact.push(entry);
         } else if names.iter().any(|name| word_subset(&reference_words, name)) {
             // How many of the spoken words this child's best name shares.
@@ -9731,6 +9762,40 @@ mod tests {
                 "{said}"
             );
         }
+    }
+
+    /// Scenario (issue #1820): the command model hands back the user's own
+    /// words, "the service directory" or "the billing folder", for a listed
+    /// `billing-service`. With the filler words dropped they name it; a
+    /// reference the whole of which already matches keeps that answer.
+    #[test]
+    fn voice_outcome_dir_ref_drops_filler_only_when_nothing_matched() {
+        let level = listing(&["billing-service", "docs", "infra"], true);
+        for said in ["the service directory", "the billing folder", "dir billing"] {
+            assert_eq!(
+                resolve_dir_ref(said, Some(&level)),
+                DirRefMatch::One {
+                    path: "/home/dev/code/billing-service".to_string(),
+                    name: "billing-service".to_string(),
+                },
+                "{said}"
+            );
+        }
+        // Filler alone names nothing.
+        assert_eq!(
+            resolve_dir_ref("the folder", Some(&level)),
+            DirRefMatch::None
+        );
+        // `billing` is named by the whole reference, so the retry never runs
+        // and `billing-service` does not make it ambiguous.
+        let both = listing(&["billing", "billing-service"], true);
+        assert_eq!(
+            resolve_dir_ref("the billing folder", Some(&both)),
+            DirRefMatch::One {
+                path: "/home/dev/code/billing".to_string(),
+                name: "billing".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -1710,11 +1710,13 @@ mod tests {
     fn voice_transcribe_request_names_the_model_and_the_response_format() {
         let rendered = text_of(&body(&audio(8)));
         assert!(
-            rendered.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"),
+            rendered.contains("name=\"model\"\r\n\r\ngpt-transcribe\r\n"),
             "{rendered}"
         );
+        // The hosted default is a `gpt-*` transcription model, which refuses
+        // `verbose_json` (issue #1820's measurement), so it is asked for `json`.
         assert!(
-            rendered.contains("name=\"response_format\"\r\n\r\nverbose_json\r\n"),
+            rendered.contains("name=\"response_format\"\r\n\r\njson\r\n"),
             "{rendered}"
         );
     }
@@ -1724,22 +1726,30 @@ mod tests {
     /// carries no timing, does not.
     #[test]
     fn voice_transcribe_request_asks_for_timing_only_where_the_format_carries_it() {
-        let rendered = text_of(&body(&audio(8)));
-        for granularity in ["word", "segment"] {
-            assert!(
-                rendered.contains(&format!(
-                    "name=\"timestamp_granularities[]\"\r\n\r\n{granularity}\r\n"
-                )),
-                "{rendered}"
-            );
-        }
-        let gpt = text_of(&multipart_body(
+        let whisper = text_of(&multipart_body(
             &audio(8),
-            "gpt-4o-transcribe",
+            LOCAL_SPEECH_MODEL,
             SpeechLanguage::default(),
             "TESTBOUNDARY",
         ));
-        assert!(!gpt.contains("timestamp_granularities"), "{gpt}");
+        for granularity in ["word", "segment"] {
+            assert!(
+                whisper.contains(&format!(
+                    "name=\"timestamp_granularities[]\"\r\n\r\n{granularity}\r\n"
+                )),
+                "{whisper}"
+            );
+        }
+        // The hosted default (`gpt-transcribe`) and the other `gpt-*` models.
+        for model in [HOSTED_SPEECH_MODEL, "gpt-4o-transcribe"] {
+            let gpt = text_of(&multipart_body(
+                &audio(8),
+                model,
+                SpeechLanguage::default(),
+                "TESTBOUNDARY",
+            ));
+            assert!(!gpt.contains("timestamp_granularities"), "{gpt}");
+        }
     }
 
     /// Reported 2026-10-01 while testing PR #1451: "Select the directory
@@ -1801,10 +1811,11 @@ mod tests {
             "TESTBOUNDARY",
         ));
         assert!(!rendered.contains("name=\"language\""), "{rendered}");
-        // model, response_format, the two timestamp granularities, file.
+        // model, response_format, file: the hosted default is a `gpt-*` model,
+        // which is asked for `json` and so for no timestamp granularities.
         assert_eq!(
             rendered.matches("content-disposition: form-data").count(),
-            5
+            3
         );
         assert!(rendered.ends_with("\r\n--TESTBOUNDARY--\r\n"), "{rendered}");
     }
@@ -1834,11 +1845,11 @@ mod tests {
         let rendered = text_of(&raw);
         assert!(rendered.starts_with("--TESTBOUNDARY\r\n"), "{rendered}");
         assert!(rendered.ends_with("\r\n--TESTBOUNDARY--\r\n"), "{rendered}");
-        // Six parts: model, response_format, the two timestamp
-        // granularities, language, file.
+        // Four parts: model, response_format, language, file. The hosted
+        // default is a `gpt-*` model, so no timestamp granularities.
         assert_eq!(
             rendered.matches("content-disposition: form-data").count(),
-            6
+            4
         );
 
         // CRLF everywhere — a bare LF is the mistake a hand-written encoder
@@ -2119,6 +2130,7 @@ mod tests {
             ("tiny.en", "verbose_json"),
             ("gpt-4o-transcribe", "json"),
             ("gpt-4o-mini-transcribe", "json"),
+            ("gpt-transcribe", "json"),
         ] {
             let rendered = text_of(&multipart_body(
                 &audio(8),
