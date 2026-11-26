@@ -8261,6 +8261,20 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** the desktop dialog, which scrolls its own list in the browser.
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-all-dialog/006 — Rows scrolled past between two frames keep Restart now refused.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** ten PageDowns before one draw put the last agent on screen without the rows between ever being drawn, and Restart now does nothing; paging back up a frame at a time shows them and Restart now is answered.
+- **Does not assert:** the desktop dialog, which scrolls its own list in the browser.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/007 — On a short terminal, paging moves at most one screen, so no agent is skipped before Restart now.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** on a 13-row terminal, Restart now does nothing at every step until paging has reached the end; every one of the 30 agents was drawn on some frame before it becomes available.
+- **Does not assert:** the desktop dialog.
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.

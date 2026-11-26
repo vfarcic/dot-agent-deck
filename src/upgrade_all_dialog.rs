@@ -148,9 +148,16 @@ pub struct UpgradeAllDialog {
     scroll: usize,
     /// A question just arrived: the next draw scrolls to its first row.
     scroll_to_question: bool,
-    /// Every row of the open question has been on screen. Restart now is
-    /// refused until it has, so nothing is stopped that was not shown.
+    /// Every row of the open question has been drawn. Restart now is refused
+    /// until it has, so nothing is stopped that was not shown.
     question_seen: bool,
+    /// Which of the open question's rows some frame has drawn, by row. Rows
+    /// a PageDown jumped past, or that several keys scrolled past between two
+    /// frames, stay unmarked.
+    question_rows_drawn: Vec<bool>,
+    /// How many body rows the last frame showed: one PageUp or PageDown moves
+    /// at most this far, so paging never jumps past a row.
+    page: usize,
 }
 
 impl Default for UpgradeAllDialog {
@@ -167,6 +174,8 @@ impl UpgradeAllDialog {
             scroll: 0,
             scroll_to_question: false,
             question_seen: false,
+            question_rows_drawn: Vec::new(),
+            page: 5,
         }
     }
 
@@ -216,11 +225,11 @@ impl UpgradeAllDialog {
                 Effect::None
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(5);
+                self.scroll = self.scroll.saturating_sub(self.page.max(1));
                 Effect::None
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(5);
+                self.scroll = self.scroll.saturating_add(self.page.max(1));
                 Effect::None
             }
             KeyCode::Enter => match self.selected() {
@@ -349,6 +358,7 @@ impl UpgradeAllDialog {
             self.selected = 0;
             self.scroll_to_question = true;
             self.question_seen = false;
+            self.question_rows_drawn.clear();
         }
     }
 
@@ -600,6 +610,7 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &mut UpgradeAllDialog) -> V
     // the rest.
     let room = usize::from(max_height).saturating_sub(2 + 1 + footer.len() + 1);
     let max_scroll = body.len().saturating_sub(room);
+    dialog.page = room.clamp(1, 5);
     if let Some(start) = question_start
         && std::mem::take(&mut dialog.scroll_to_question)
     {
@@ -607,9 +618,19 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &mut UpgradeAllDialog) -> V
     }
     dialog.scroll = dialog.scroll.min(max_scroll);
     let scroll = dialog.scroll;
-    // The question's last row reached the screen: Restart now may be chosen.
-    if question_start.is_some() && room > 0 && scroll + room >= body.len() {
-        dialog.question_seen = true;
+    // Mark the question rows this frame draws; Restart now may be chosen
+    // once every one of them has been drawn by some frame. A question laid
+    // out to a different number of rows (the terminal was resized) starts
+    // over, since its rows are not the ones that were drawn.
+    if let Some(start) = question_start {
+        let total = body.len() - start;
+        if dialog.question_rows_drawn.len() != total {
+            dialog.question_rows_drawn = vec![false; total];
+        }
+        for row in scroll.max(start)..(scroll + room).min(body.len()) {
+            dialog.question_rows_drawn[row - start] = true;
+        }
+        dialog.question_seen = dialog.question_rows_drawn.iter().all(|drawn| *drawn);
     }
     // Chosen once this frame has said whether the question was seen.
     footer.push(Line::styled(

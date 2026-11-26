@@ -302,3 +302,85 @@ fn upgrade_all_dialog_005_restart_now_waits_until_every_agent_was_on_screen() {
         Effect::Answer(RestartChoice::RestartNow)
     );
 }
+
+/// A batch asking about 30 agents on mac-studio, the question just arrived.
+fn asking_thirty() -> UpgradeAllDialog {
+    let mut dialog = UpgradeAllDialog::new();
+    dialog.apply(&Update::Checked(Ok(plan())));
+    dialog.choose(Choice::Upgrade);
+    dialog.apply(&started(0, "mac-studio"));
+    dialog.ask(Question {
+        deck: "mac-studio".into(),
+        at_stake: RestartStopSet {
+            agents: (0..30)
+                .map(|i| RestartAgent {
+                    id: format!("a{i}"),
+                    label: format!("worker-{i:02}"),
+                    pane_id: Some(format!("{i}")),
+                    cwd: None,
+                })
+                .collect(),
+            roles: Vec::new(),
+        },
+        stale: false,
+    });
+    dialog
+}
+
+/// Scenario: Press PageDown several times before the dialog draws again. The one frame drawn shows the end of the list, but the agents scrolled past were never on screen, so Restart now still does nothing until they have been.
+#[spec("upgrade/upgrade-all-dialog/006")]
+#[test]
+fn upgrade_all_dialog_006_rows_scrolled_past_unseen_keep_restart_now_refused() {
+    let mut dialog = asking_thirty();
+    draw_at(&mut dialog, 100, 24);
+    for _ in 0..10 {
+        dialog.handle_key(key(KeyCode::PageDown));
+    }
+    let last = draw_at(&mut dialog, 100, 24);
+    assert!(
+        last.contains("worker-29"),
+        "the end of the list is on screen: {last}"
+    );
+    assert!(
+        !dialog.question_seen(),
+        "the agents between the first frame and this one were never drawn"
+    );
+    assert_eq!(dialog.choose(Choice::RestartNow), Effect::None);
+    // Paging back up through them, one frame at a time, shows every one.
+    for _ in 0..10 {
+        dialog.handle_key(key(KeyCode::PageUp));
+        draw_at(&mut dialog, 100, 24);
+    }
+    assert!(dialog.question_seen());
+    assert_eq!(
+        dialog.choose(Choice::RestartNow),
+        Effect::Answer(RestartChoice::RestartNow)
+    );
+}
+
+/// Scenario: On a terminal so short that only a few rows of the list fit, each PageDown moves at most one screen, so paging to the end draws every agent on the way and Restart now becomes available only then.
+#[spec("upgrade/upgrade-all-dialog/007")]
+#[test]
+fn upgrade_all_dialog_007_paging_on_a_short_terminal_skips_no_agent() {
+    let mut dialog = asking_thirty();
+    let mut drawn = draw_at(&mut dialog, 100, 13);
+    let mut pages = 0;
+    while !dialog.question_seen() {
+        assert_eq!(dialog.choose(Choice::RestartNow), Effect::None);
+        dialog.handle_key(key(KeyCode::PageDown));
+        drawn.push_str(&draw_at(&mut dialog, 100, 13));
+        pages += 1;
+        assert!(pages < 100, "paging must reach the end: {drawn}");
+    }
+    for i in 0..30 {
+        let name = format!("worker-{i:02}");
+        assert!(
+            drawn.contains(&name),
+            "{name} was on screen before Restart now: {drawn}"
+        );
+    }
+    assert_eq!(
+        dialog.choose(Choice::RestartNow),
+        Effect::Answer(RestartChoice::RestartNow)
+    );
+}
