@@ -638,6 +638,9 @@ tasks:
     if: ${{ tasks.backend.values.aarch64 == 'true' }}
     use: [code]
     filter: [.github/scripts/apt-prefetch.sh]
+    # Above RWX's 10-minute default: the prefetch's three 3-minute attempts
+    # alone can take nine (Qodo on #2532).
+    timeout: 30m
     run: |
       sudo apt-get update
       # The same regional mirror `desktop-driver-packages`' prefetch moves
