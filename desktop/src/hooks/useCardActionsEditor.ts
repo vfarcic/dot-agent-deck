@@ -10,6 +10,12 @@ export interface CardActionsDaemon {
   deckId: string;
   name: string;
   editable: boolean;
+  /**
+   * PR #2491 review (Qodo 2) — the daemon process whose cards the dashboard
+   * shows for the deck. Another process under the same deck id is a restarted
+   * daemon: the open editor drops what it read and reads its list again.
+   */
+  instanceId?: string;
 }
 
 /** Where the catalog places an action, as the form offers it. */
@@ -333,6 +339,20 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
     if (!open || !present || before) return;
     load(daemon);
   }, [daemon, load, open, present]);
+  /* PR #2491 review (Qodo 2) — the daemon restarted while its deck stayed on
+     the dashboard: another process now answers under the same deck id. What
+     the editor read, the form made from it and every answer still on its way
+     from the old process are dropped (`load` moves `readSeq` on), and the new
+     process's list is read. A spoken edit or removal still waiting for a list
+     waits for that one: the user never saw the old one. */
+  const instanceId = daemon?.instanceId;
+  const shownInstance = useRef({ deckId: daemon?.deckId, instanceId });
+  useEffect(() => {
+    const before = shownInstance.current;
+    shownInstance.current = { deckId: daemon?.deckId, instanceId };
+    if (!open || !present || before.deckId !== daemon?.deckId || before.instanceId === undefined || before.instanceId === instanceId) return;
+    load(daemon);
+  }, [daemon, instanceId, load, open, present]);
 
   const latest = useRef({ open, daemon, catalog, form, removing, busy, shown, refreshing, loading });
   latest.current = { open, daemon, catalog, form, removing, busy, shown, refreshing, loading };

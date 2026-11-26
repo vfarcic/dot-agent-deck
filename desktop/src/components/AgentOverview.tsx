@@ -1994,7 +1994,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const cardActionDaemons = useMemo<CardActionsDaemon[]>(() => decks.flatMap((deck) => {
     const deckId = deck.snapshot.connection.deckId;
     const snapshot = deckId !== undefined ? runtime.agentCards?.[deckId] : undefined;
-    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true }] : [];
+    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true, instanceId: snapshot.instanceId }] : [];
   }), [decks, runtime.agentCards]);
   /* PR #2491 (the maintainer, 2026-11-25) — the daemons the selected cards
      are on, in the dashboard's order: the selection bar's Edit card actions

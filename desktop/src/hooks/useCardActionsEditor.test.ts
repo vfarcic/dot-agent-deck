@@ -85,3 +85,43 @@ describe("open card actions with a selection on screen (PR #2491, 2026-11-25)", 
     expect(stale.hook.result.current.view).toBeUndefined();
   });
 });
+
+describe("a daemon restarted under the same deck (PR #2491 review, Qodo 2)", () => {
+  /// Scenario: The editor is open on a daemon whose read of the card actions is still under way when the daemon restarts as another process under the same deck. The editor reads the list again from the new process, and the old process's late answer never fills it. With the new list on screen and a form open, a save is under way when the daemon restarts once more: the form closes, the list is read again, and the save's late answer changes nothing.
+  it("reads again on a new daemon process, dropping the old process's reads and writes", async () => {
+    type Catalog = { actions: { name: string }[]; errors: string[]; user_config: string | null };
+    const catalog = (name: string): Catalog => ({ actions: [{ name, label: name, description: "", prompt: "p", icon: null, placement: "card", confirm: false, always: false, source: "user", default: false, overrides_default: false, hidden: false } as never], errors: [], user_config: null });
+    const reads: ((answer: Catalog) => void)[] = [];
+    const writes: ((answer: Catalog) => void)[] = [];
+    const runtime = {
+      readCardCatalog: vi.fn(() => new Promise<Catalog>((resolve) => { reads.push(resolve); })),
+      editCardCatalog: vi.fn(() => new Promise<Catalog>((resolve) => { writes.push(resolve); })),
+    };
+    const at = (instanceId: string): CardActionsDaemon[] => [{ ...LOCAL, instanceId }];
+    const hook = renderHook(({ list }) => useCardActionsEditor({ runtime: runtime as never, daemons: list }), { initialProps: { list: at("process-a") } });
+    act(() => { hook.result.current.controls.openCardActionsEditor(LOCAL.deckId); });
+    expect(runtime.readCardCatalog).toHaveBeenCalledTimes(1);
+
+    hook.rerender({ list: at("process-b") });
+    expect(runtime.readCardCatalog, "the new process's list is read").toHaveBeenCalledTimes(2);
+    await act(async () => { reads[0](catalog("from-a")); });
+    expect(hook.result.current.view?.catalog, "the old process's answer is dropped").toBeUndefined();
+    await act(async () => { reads[1](catalog("from-b")); });
+    expect(hook.result.current.view?.catalog?.actions.map((action) => action.name)).toEqual(["from-b"]);
+
+    act(() => { hook.result.current.controls.addCardAction(); });
+    act(() => { hook.result.current.setField("name", "ship"); });
+    act(() => { hook.result.current.controls.saveCardAction(); });
+    expect(runtime.editCardCatalog).toHaveBeenCalledTimes(1);
+    hook.rerender({ list: at("process-c") });
+    expect(hook.result.current.view?.form, "the form made from the old list closes").toBeUndefined();
+    expect(runtime.readCardCatalog).toHaveBeenCalledTimes(3);
+    await act(async () => { writes[0](catalog("saved-on-b")); });
+    expect(hook.result.current.view?.catalog, "the old process's save answer is dropped").toBeUndefined();
+    await act(async () => { reads[2](catalog("from-c")); });
+    expect(hook.result.current.view?.catalog?.actions.map((action) => action.name)).toEqual(["from-c"]);
+
+    hook.rerender({ list: at("process-c") });
+    expect(runtime.readCardCatalog, "the same process is not read again").toHaveBeenCalledTimes(3);
+  });
+});
