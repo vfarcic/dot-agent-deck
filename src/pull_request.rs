@@ -686,21 +686,28 @@ struct Selection {
     /// because `gh` listed none of its commits.
     unproven: bool,
     /// The merged or closed pull requests whose commits were listed and do
-    /// not include the tip. Their commits do not change while they stay
-    /// merged or closed, so at this tip they stay someone else's.
-    not_ours: HashSet<u64>,
+    /// not include the tip, each with the head commit it had then. A pull
+    /// request's commits change only with its head (reopened and pushed to,
+    /// for one), so while the head is the same, at this tip it stays someone
+    /// else's.
+    not_ours: NotOurs,
 }
 
+/// Merged or closed pull requests proven not a branch's at one tip, by number
+/// and the head commit they had when that was proven ([`Selection::not_ours`]).
+pub(crate) type NotOurs = HashSet<(u64, String)>;
+
 /// [`parse_pr_list`] in full ([`Selection`]). A merged or closed pull request
-/// whose number is in `not_ours`, as an earlier lookup at the same tip found
-/// it, is left out without its commits; that is what spares a branch on a
-/// reused name the second, heavier `gh pr list` on every poll.
+/// that is in `not_ours` with the same head commit, as an earlier lookup at
+/// the same tip found it, is left out without its commits; that is what
+/// spares a branch on a reused name the second, heavier `gh pr list` on every
+/// poll. One whose head has moved since is looked at again.
 fn select_pr(
     json: &str,
     branch: &str,
     push_repos: &[String],
     tip: Option<&str>,
-    not_ours: &HashSet<u64>,
+    not_ours: &NotOurs,
 ) -> Result<Selection, String> {
     let entries: Vec<GhPr> =
         serde_json::from_str(json).map_err(|e| format!("could not parse gh output: {e}"))?;
@@ -720,13 +727,20 @@ fn select_pr(
                     ))
         })
         .filter(|pr| {
-            if pr.state != "OPEN" && not_ours.contains(&pr.number) {
+            if pr.state != "OPEN"
+                && pr
+                    .head_ref_oid
+                    .as_ref()
+                    .is_some_and(|head| not_ours.contains(&(pr.number, head.clone())))
+            {
                 return false;
             }
             match pr.history(tip) {
                 BranchHistory::Ours => true,
                 BranchHistory::NotOurs => {
-                    proven_not_ours.insert(pr.number);
+                    if let Some(head) = &pr.head_ref_oid {
+                        proven_not_ours.insert((pr.number, head.clone()));
+                    }
                     false
                 }
                 BranchHistory::Unknown => {
@@ -779,8 +793,8 @@ pub fn parse_pr_view(json: &str) -> Result<Option<PullRequestInfo>, String> {
 async fn query_gh(
     cwd: PathBuf,
     key: PrKey,
-    not_ours: HashSet<u64>,
-) -> Result<(Option<PullRequestInfo>, HashSet<u64>), GhFailure> {
+    not_ours: NotOurs,
+) -> Result<(Option<PullRequestInfo>, NotOurs), GhFailure> {
     let first = list_prs(&cwd, &key, &not_ours, GH_PR_FIELDS).await?;
     if !first.unproven {
         return Ok((first.pr, first.not_ours));
@@ -793,7 +807,7 @@ async fn query_gh(
 async fn list_prs(
     cwd: &Path,
     key: &PrKey,
-    not_ours: &HashSet<u64>,
+    not_ours: &NotOurs,
     fields: &str,
 ) -> Result<Selection, GhFailure> {
     let stdout = run_gh(
@@ -1359,10 +1373,8 @@ pub async fn run_pull_request_monitor(
     let mut events = event_tx.subscribe();
     let mut probes: JobPool<PathBuf, Option<BranchProbe>> = JobPool::new(permits.clone());
     #[allow(clippy::type_complexity)]
-    let mut lookups: JobPool<
-        PrKey,
-        Result<(Option<PullRequestInfo>, HashSet<u64>), GhFailure>,
-    > = JobPool::new(permits);
+    let mut lookups: JobPool<PrKey, Result<(Option<PullRequestInfo>, NotOurs), GhFailure>> =
+        JobPool::new(permits);
     // One timer for the monitor's life: a sleep rebuilt on every pass would
     // start over at each broadcast message, so steady unrelated traffic could
     // keep it from ever firing. A tick missed while a pass runs is delayed,
@@ -1374,7 +1386,7 @@ pub async fn run_pull_request_monitor(
     // Issue #2510: per key (and so per tip), the merged or closed pull
     // requests a lookup proved are not the branch's, so the next poll need
     // not fetch their commits again.
-    let mut not_ours: HashMap<PrKey, HashSet<u64>> = HashMap::new();
+    let mut not_ours: HashMap<PrKey, NotOurs> = HashMap::new();
     let mut kicked_sessions: HashSet<String> = HashSet::new();
     // The key each session's current value was resolved under (`None`: no
     // key), so a session that moved to another branch drops the old branch's
@@ -1686,7 +1698,7 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap();
-        assert_eq!(seen.not_ours, HashSet::from([1972]));
+        assert_eq!(seen.not_ours, HashSet::from([(1972, earlier.to_string())]));
         let next = select_pr(
             &gh(json!([unlisted])),
             "feat/x",
@@ -1706,6 +1718,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.pr.map(|pr| pr.number), Some(1972));
+        // Reopened, given this branch's commits and closed again: its head
+        // moved, so the memory no longer applies and its commits are read.
+        let reclosed = pr(1972, "CLOSED", TIP, serde_json::Value::Null);
+        let reclosed = select_pr(
+            &gh(json!([reclosed])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert_eq!(reclosed.pr.map(|pr| pr.number), Some(1972));
+        let reclosed = pr(1972, "CLOSED", "m", serde_json::Value::Null);
+        let reclosed = select_pr(
+            &gh(json!([reclosed])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert!(reclosed.unproven, "a moved head asks for the commits again");
         assert!(
             GH_PR_FIELDS.split(',').any(|field| field == "headRefOid")
                 && !GH_PR_FIELDS.split(',').any(|field| field == "commits"),
