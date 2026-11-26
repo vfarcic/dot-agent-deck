@@ -199,6 +199,8 @@ With voice control on, you can say:
 | "offer on every card" / "only when agents suggest it" | In the editor's form, ticks or unticks **Offer on every card**. |
 | "show it on the card" / "only in the Card tab" | In the editor's form, sets **Placement** to **Show on the card** or **Only in the Card tab**. |
 
+In an agent's pane opened from the Daemons screen, the commands that move between agents, show an agent's card, press a card's action or open the **Card actions** editor do nothing: the app says they work in a pane opened from the Dashboard.
+
 When the agent reported more than one pull request, or more than one issue, voice opens the first one the deck could check; click a badge to open another. If the dashboard's filter hides the card whose tree you asked to open, the app opens it anyway and tells you to clear the filter to see it.
 
 With **All daemons** selected, you can name an agent on any daemon the Dashboard shows. When the name fits agents on more than one daemon, the app asks which; add the daemon's name, as in "show the coder's card on build box", to pick it straight away (see [Naming an agent](voice.md#naming-an-agent)).

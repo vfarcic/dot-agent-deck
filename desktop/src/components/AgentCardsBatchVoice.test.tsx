@@ -806,6 +806,38 @@ describe("batch card actions by voice (issue 2399 review)", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent("The Card actions editor opens over an agent's pane opened from the agent dashboard, not from the Daemons screen.");
   });
 
+  /// Scenario: Open an agent's pane from the Daemons screen, where no dashboard is behind it, and say one of the dashboard's card commands: "next agent", "previous agent", "next one that needs me", "show coder-card's card" or "go ahead on coder-card". The app says in words that the command works over a pane opened from the agent dashboard, instead of saying the command is not wired, and the pane stays where it is with nothing sent (PR #2491 review, Qodo 6).
+  it.each([
+    ["next agent", "next_agent_card", "nextAgentCard", () => [], "Moving between agents works over an agent's pane opened from the agent dashboard, not from the Daemons screen."],
+    ["previous agent", "previous_agent_card", "previousAgentCard", () => [], "Moving between agents works over an agent's pane opened from the agent dashboard, not from the Daemons screen."],
+    ["next one that needs me", "next_needs_you_card", "nextNeedsYouCard", () => [], "Moving between agents works over an agent's pane opened from the agent dashboard, not from the Daemons screen."],
+    ["show coder-card's card", "show_agent_card", "showAgentCard", (id: string) => [agentParam(id, "coder-card")], "An agent's card opens over a pane opened from the agent dashboard, not from the Daemons screen."],
+    ["go ahead on coder-card", "run_card_action", "runCardAction", (id: string) => [agentParam(id, "coder-card"), actionParam("Go ahead")], "A card's actions are pressed over a pane opened from the agent dashboard, not from the Daemons screen."],
+  ] as const)("a dashboard card command said over a Daemons-screen pane is refused in words: %s", async (said, action, invoke, params, sentence) => {
+    const local = createFixtureSnapshot("connected").agents[0];
+    const run = setup((agents) => [cardFor(agents[0].id, "coder-card")], (agents) => ({ [said]: { action, invoke, params: params(agents[0].id) } }), {
+      gateScreens: true,
+      initialView: { kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: local.id, from: "deck" },
+    });
+    const pane = screen.getByTestId("agent-pane-overlay").getAttribute("aria-label");
+    await turnOnVoice();
+    await speak(run.voice, said);
+    expect(run.declareVoiceScreen.mock.calls.at(-1)?.[0]).toBe("agent");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(sentence);
+    expect(screen.getByTestId("agent-pane-overlay").getAttribute("aria-label")).toBe(pane);
+    expect(run.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: On the agent dashboard, with no daemon on it showing cards, say "next one that needs me". The app says in words that no daemon on the dashboard shows cards, instead of saying the command is not wired (PR #2491 review, Qodo 6).
+  it("a dashboard card command said where no daemon shows cards is refused in words", async () => {
+    const run = setup(() => [], () => ({ "next one that needs me": { action: "next_needs_you_card", invoke: "nextNeedsYouCard", params: [] } }), { gateScreens: true, extra: { agentCards: undefined } });
+    await turnOnVoice();
+    await speak(run.voice, "next one that needs me");
+    expect(run.declareVoiceScreen.mock.calls.at(-1)?.[0]).toBe("overview");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("No daemon on the agent dashboard shows cards.");
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+
   /// Scenario: With two daemons showing cards, open the first daemon's agent's pane and say an editor command that names no daemon ("open card actions", "add a card action", "edit the go ahead action" or "remove the go ahead action"). While it is still being worked out, go back to the dashboard and open the second daemon's agent's pane, leaving the selected daemon as it was. When the answer arrives, nothing opens: the app says the pane on screen changed, reads neither daemon's card actions and shows no form or confirmation over the second pane. Saying "open card actions on" the second daemon over that pane still opens its editor (PR #2491 review V1).
   it.each([
     ["open card actions", "open_card_actions_editor", "openCardActionsEditor", []],

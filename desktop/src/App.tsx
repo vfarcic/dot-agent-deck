@@ -274,6 +274,22 @@ const CARD_ACTIONS_EDITOR_ROW_INVOKES: readonly (keyof typeof VOICE_ACTIONS)[] =
 ];
 /** PR #2491 review T1 — a Card actions editor row said over a pane the Daemons screen opened. */
 const CARD_ACTIONS_NOT_ON_DECK_PANE = "The Card actions editor opens over an agent's pane opened from the agent dashboard, not from the Daemons screen.";
+/*
+ * PR #2491 review (Qodo 6) — the dashboard's card rows that run over an
+ * agent's pane too, and what each says over a pane the Daemons screen opened,
+ * where no dashboard publishes their members: in words, as the editor's rows
+ * above, never "not wired".
+ */
+const STEP_NOT_ON_DECK_PANE = "Moving between agents works over an agent's pane opened from the agent dashboard, not from the Daemons screen.";
+const DASHBOARD_CARD_ROW_REFUSALS: Partial<Record<keyof typeof VOICE_ACTIONS, string>> = {
+  nextAgentCard: STEP_NOT_ON_DECK_PANE,
+  previousAgentCard: STEP_NOT_ON_DECK_PANE,
+  nextNeedsYouCard: STEP_NOT_ON_DECK_PANE,
+  showAgentCard: "An agent's card opens over a pane opened from the agent dashboard, not from the Daemons screen.",
+  runCardAction: "A card's actions are pressed over a pane opened from the agent dashboard, not from the Daemons screen.",
+};
+/** The same rows said where the dashboard is on screen but no daemon on it shows cards. */
+const DASHBOARD_CARDS_NOT_SHOWN = "No daemon on the agent dashboard shows cards.";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
 
@@ -1690,6 +1706,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     }
     if (CARD_ACTIONS_EDITOR_ROW_INVOKES.includes(outcome.invoke as keyof typeof VOICE_ACTIONS) && typeof context.openCardActionsEditor !== "function") {
       panelVoiceContext.current?.reportRefused?.(agentView && base !== "overview" ? CARD_ACTIONS_NOT_ON_DECK_PANE : CARD_ACTIONS_NOT_AVAILABLE);
+      return {};
+    }
+    const cardRowRefusal = DASHBOARD_CARD_ROW_REFUSALS[outcome.invoke as keyof typeof VOICE_ACTIONS];
+    if (cardRowRefusal !== undefined && VOICE_ACTIONS[outcome.invoke as keyof typeof VOICE_ACTIONS].needs.some((member) => typeof context[member] !== "function")) {
+      panelVoiceContext.current?.reportRefused?.(agentView && base !== "overview" ? cardRowRefusal : DASHBOARD_CARDS_NOT_SHOWN);
       return {};
     }
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
