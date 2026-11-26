@@ -2,7 +2,7 @@ import { Children, cloneElement, createContext, isValidElement, useCallback, use
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Ellipsis, Filter, LayoutList, Layers, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { worktreePreview } from "../lib/worktreeClose";
-import { type AgentSession, type AgentStatus, type CardTabSection, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
+import { type AgentCardEntry, type AgentSession, type AgentStatus, type CardTabSection, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
@@ -1881,9 +1881,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   */
   const cardDeckList = useMemo(() => decks.map((deck) => ({ deckId: deck.snapshot.connection.deckId, connected: deck.connected })), [decks]);
   /* A card opens its agent's pane through the target the agent's table row
-     opens (issue #2418, D12), so the two cannot open different things. */
+     opens (issue #2418, D12), so the two cannot open different things. The
+     listed agent is the card's only when the daemon process that listed it is
+     the card's too (PR #2491 review, Qodo 5): agent ids are per-process, so
+     after a restart an older card keeps its own identity instead of opening
+     the newer agent that took its id. */
   const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
-    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => candidate.id === card.entry.agent_id);
+    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => cardIsAgent(card.entry, candidate));
     return agent
       ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
       : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
@@ -2709,8 +2713,17 @@ interface FleetDeck {
  * their order or what they say (PRD #2374 review).
  */
 function cardMatchesFilter(card: PlacedCard, matching: readonly OverviewAgent[]): boolean {
-  return matching.some((agent) => agent.id === card.entry.agent_id
-    && (agent.incarnation === undefined || card.entry.instance_id === "" || card.entry.instance_id === agent.incarnation));
+  return matching.some((agent) => cardIsAgent(card.entry, agent));
+}
+
+/**
+ * Whether `entry` is the card of `agent`: the same id, listed by the same
+ * daemon process when both name one. Agent ids are per-process, so a card from
+ * before a restart is not the card of the newer agent that took its id.
+ */
+function cardIsAgent(entry: Pick<AgentCardEntry, "agent_id" | "instance_id">, agent: Pick<OverviewAgent, "id" | "incarnation">): boolean {
+  return agent.id === entry.agent_id
+    && (agent.incarnation === undefined || entry.instance_id === "" || entry.instance_id === agent.incarnation);
 }
 
 /** One group as the filter leaves it: its matching agents, or a line saying none match. */

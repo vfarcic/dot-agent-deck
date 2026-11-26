@@ -384,3 +384,22 @@ describe("a dashboard row's Needs you and controls (issue #2454)", () => {
     expect([...row("7").querySelector(".overview-row-actions")!.children].map((child) => child.className)).toEqual(before);
   });
 });
+
+describe("a card whose agent id was reused (PR #2491 review, Qodo 5)", () => {
+  /// Scenario: the daemon restarted and numbered a new agent 7, while coder's card from the earlier daemon process is still on screen. Clicking that card opens the agent it was read from, under that process, not the newer agent that took the same id; once the cards and the agent are from one process, the click opens the listed agent as before.
+  it("opens the card's own agent, not a newer one with the same id", () => {
+    const navigate = vi.fn();
+    const live = runtime();
+    const restarted = live.fleet!.map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "daemon-instance-2" })) }));
+    const view = render(<AgentOverview runtime={{ ...live, fleet: restarted, snapshot: restarted[0] }} onNavigate={navigate} />);
+    fireEvent.click(screen.getByTestId("overview-mode-cards"));
+    const coder = () => document.querySelector(`article[data-card-key="${CODER.key}"]`) as HTMLElement;
+    fireEvent.click(coder());
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "7", incarnation: INSTANCE }));
+    navigate.mockClear();
+    const current = { [FIXTURE_DAEMON_ID]: { ...snapshot([{ ...CODER, instance_id: "daemon-instance-2" }, TESTER, LONE]), instanceId: "daemon-instance-2" } };
+    view.rerender(<AgentOverview runtime={{ ...live, fleet: restarted, snapshot: restarted[0], agentCards: current }} onNavigate={navigate} />);
+    fireEvent.click(coder());
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "7", incarnation: "daemon-instance-2" }));
+  });
+});
