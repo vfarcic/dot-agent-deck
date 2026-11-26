@@ -46,7 +46,11 @@ export interface CardActionForm {
    * one (issue #2399 re-review N5). `undefined` once a read no longer lists it.
    */
   original?: EditableCardAction;
-  /** Why the daemon refused the last Save; the form keeps what was typed. */
+  /**
+   * Why the daemon refused the last Save, or that a read since the form
+   * opened lists its action changed (PR #2491 re-audit, F1); the form keeps
+   * what was typed.
+   */
   error?: string;
   /**
    * PR #2491 audit (A2) — the daemon process whose list the form was made
@@ -122,6 +126,21 @@ const SAVING_FORM = "The form is being saved; wait for it before opening another
 const CLOSED_BEFORE_READ = "The Card actions editor was closed before its list was read.";
 const OTHER_DAEMON = "Another daemon's card actions were shown before the list was read.";
 const SUPERSEDED = "A later request replaced this one.";
+
+/* PR #2491 re-audit (F1): a Refresh read the action a confirmation or a form was made from, and it is not what the user saw any more. */
+const changedBeforeRemoval = (seen: EditableCardAction, listed: boolean) => (listed
+  ? `${displayText(seen.label, DISPLAY_LIMITS.name)} changed since you asked to remove it, so it was not removed: the list shows it as just read; press Remove again to remove it.`
+  : `${displayText(seen.label, DISPLAY_LIMITS.name)} is no longer listed, so it was not removed.`);
+const changedUnderForm = (seen: EditableCardAction, listed: boolean) => (listed
+  ? `${displayText(seen.label, DISPLAY_LIMITS.name)} changed since this form was opened: the list shows it as just read. Save replaces it with what this form holds.`
+  : `${displayText(seen.label, DISPLAY_LIMITS.name)} is no longer listed, so this form cannot save it.`);
+
+/** Whether two reads of an action list it the same: every field the daemon compares against an edit's `base`. */
+function sameAction(a: EditableCardAction, b: EditableCardAction): boolean {
+  return a.name === b.name && a.label === b.label && a.description === b.description && a.prompt === b.prompt && a.icon === b.icon
+    && a.placement === b.placement && a.confirm === b.confirm && a.always === b.always && a.source === b.source
+    && a.default === b.default && a.overridden === b.overridden && a.hidden === b.hidden;
+}
 
 const unknownAction = (wanted: { name?: string; label?: string }) => `No single card action is called "${displayText(wanted.label ?? wanted.name ?? "", DISPLAY_LIMITS.name)}" in the editor.`;
 
@@ -321,7 +340,9 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
      supersedes it, and a write answered since it began makes its answer
      older than the list shown, so it is dropped (N1). An open form's base
      becomes the action as read, so a Save after Refresh is checked against
-     what the user now sees (N5). */
+     what the user now sees (N5), and the form says so when that changed it;
+     a removal confirmation whose action it changed closes (PR #2491
+     re-audit, F1). */
   const reread = useCallback((target: CardActionsDaemon, kind: CardActionsReread["kind"]) => {
     if (!read || !target.editable) return;
     const seq = readSeq.current;
@@ -337,9 +358,29 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       setHeld({ value: answer, instanceId: from });
       if (kind === "refresh") setError(undefined);
       setReread(kind === "check" ? { kind, status: "read" } : undefined);
-      setForm((current) => (current?.mode === "edit" && current.instanceId === from
-        ? { ...current, original: answer.actions.find((action) => action.name === current.values.name) }
-        : current));
+      /* PR #2491 re-audit (F1): a removal asking about an action this read
+         lists changed, or no longer lists, is not confirmed under the old
+         words: it closes, and the editor says why. */
+      const asked = latest.current.removing;
+      if (asked !== undefined && asked.instanceId === from) {
+        const fresh = answer.actions.find((action) => action.name === asked.value.name);
+        if (fresh === undefined || !sameAction(asked.value, fresh)) {
+          setRemoving((current) => (current === asked ? undefined : current));
+          setError(changedBeforeRemoval(asked.value, fresh !== undefined));
+        }
+      }
+      /* ...and an open form whose action this read lists changed is told so,
+         in the form, before its Save sends the action as just read. After an
+         edit whose outcome is unknown (`check`), the form's own message stays:
+         the change may be its Save's, and the list says to check it. */
+      setForm((current) => {
+        if (current?.mode !== "edit" || current.instanceId !== from) return current;
+        const fresh = answer.actions.find((action) => action.name === current.values.name);
+        const seen = current.original;
+        if (seen === undefined ? fresh === undefined : fresh !== undefined && sameAction(seen, fresh)) return current;
+        const keep = kind === "check" && current.error !== undefined;
+        return { ...current, original: fresh, ...(keep ? {} : { error: changedUnderForm((seen ?? fresh)!, fresh !== undefined) }) };
+      });
     }, (failure: unknown) => {
       if (seq !== readSeq.current || mine !== rereadSeq.current) return;
       setRefreshing(false);
@@ -380,14 +421,6 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
   const asking = removing !== undefined ? heldRemoving : undefined;
   const latest = useRef({ open, daemon, catalog, form, removing: asking, busy, shown, refreshing, loading });
   latest.current = { open, daemon, catalog, form, removing: asking, busy, shown, refreshing, loading };
-
-  /* The `base` a removal of `asked` sends: the action as process `from` —
-     the one the confirmation was made from — was last read (a Refresh may
-     have read it since), `null` once that read lists none; under another
-     process, the action as the confirmation showed it (PR #2491 audit, A2). */
-  const asRead = (asked: EditableCardAction, from: string | undefined): EditableCardAction | null => (latest.current.daemon?.instanceId === from
-    ? latest.current.catalog?.actions.find((action) => action.name === asked.name) ?? null
-    : asked);
 
   /*
    * Send one edit to the daemon shown, bound to process `from` — the one
@@ -579,7 +612,10 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       if (latest.current.busy) return STILL_SAVING;
       const { value: action, instanceId: from } = asking;
       setRemoving(undefined);
-      send({ kind: "remove", name: action.name, base: asRead(action, from) }, from, outcome(action.label, "removed"), () => {
+      /* PR #2491 re-audit (F1): the base is the action the confirmation
+         showed, never a newer read of it; a read that changed it closed the
+         confirmation, and a file changed since is refused by the daemon. */
+      send({ kind: "remove", name: action.name, base: action }, from, outcome(action.label, "removed"), () => {
         setForm((current) => (current?.original?.name === action.name ? undefined : current));
       });
       return undefined;

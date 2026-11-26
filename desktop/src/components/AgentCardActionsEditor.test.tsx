@@ -738,4 +738,70 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
       base: expect.objectContaining({ name: "ship", prompt: "THEIRS-2399: ship it." }),
     }), INSTANCE);
   });
+
+  /** Another program changes Ship it in the daemon's file: the next read lists it changed. */
+  const changeShip = (calls: ReturnType<typeof setup>, change: Partial<EditableAction>) => {
+    calls.catalogs[FIXTURE_DAEMON_ID].actions = calls.catalogs[FIXTURE_DAEMON_ID].actions.map((entry) => (entry.name === "ship" ? { ...entry, ...change } : entry));
+  };
+
+  /// Scenario: Press Refresh and, while that read is still out, press Remove on Ship it; the Refresh answers with Ship it unchanged, so the confirmation stays open, and Cancel closes it. Press Refresh again and Remove Ship it again; this time another program has relabelled it "Deploy production" and the Refresh answers with that. The confirmation asking "Remove Ship it?" closes, nothing is sent, and the editor says Ship it changed and was not removed. Pressing Remove on the relabelled row asks "Remove Deploy production?", and confirming sends that version as the base.
+  it("desktop/agent-cards/133: a Refresh that changes the action a removal is asking about closes the confirmation and says so", async () => {
+    const calls = setup({ deferred: true });
+    await openEditor();
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = editorDialog();
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Remove Ship it" }));
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const unchanged = screen.getByRole("alertdialog", { name: "Remove Ship it?" });
+    expect(within(editor).queryByRole("alert"), "a Refresh that read Ship it unchanged says nothing").toBeNull();
+    fireEvent.click(within(unchanged).getByRole("button", { name: "Cancel" }));
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Remove Ship it" }));
+    expect(screen.getByRole("alertdialog", { name: "Remove Ship it?" })).toBeInTheDocument();
+    changeShip(calls, { label: "Deploy production" });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const asking = screen.queryByRole("alertdialog", { name: "Remove Ship it?" });
+    /* Were it still asking, confirming is what the user would press. */
+    if (asking) await act(async () => { fireEvent.click(within(asking).getByRole("button", { name: "Remove" })); });
+    expect(calls.editCardCatalog, "an action the confirmation did not show is never removed").not.toHaveBeenCalled();
+    expect(asking, "the confirmation of Ship it closes").toBeNull();
+    expect(within(editor).getByRole("alert")).toHaveTextContent(/Ship it changed .*not removed/);
+    expect(within(row(editor, "ship")).getByText("Deploy production", { exact: true })).toBeInTheDocument();
+
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Remove Deploy production" }));
+    await act(async () => { fireEvent.click(within(screen.getByRole("alertdialog", { name: "Remove Deploy production?" })).getByRole("button", { name: "Remove" })); });
+    expect(calls.editCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, { kind: "remove", name: "ship", base: { ...SHIP, label: "Deploy production" } }, INSTANCE);
+  });
+
+  /// Scenario: Press Refresh and, while that read is still out, press Edit on Ship it and type a new label; the Refresh answers with Ship it unchanged, and the form says nothing. Press Refresh again; another program has changed Ship it's text meanwhile, and the Refresh answers with it. The form keeps the typed label and says Ship it changed since the form was opened and that Save replaces it with what the form holds; Save then sends the action as just read, so the daemon checks it against the file.
+  it("desktop/agent-cards/134: a Refresh that changes the action an open form edits says so in the form", async () => {
+    const calls = setup({ deferred: true });
+    await openEditor();
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = editorDialog();
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const form = within(editor).getByTestId("agent-card-actions-editor-form");
+    expect(within(form).queryByRole("alert"), "a Refresh that read Ship it unchanged says nothing").toBeNull();
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    changeShip(calls, { prompt: "THEIRS-2491: ship it." });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(within(row(editor, "ship")).getByText("THEIRS-2491: ship it.", { exact: false })).toBeInTheDocument();
+    expect(field(editor, "Label").value, "the draft is kept").toBe("Ship it now");
+    expect(within(form).getByRole("alert"), "the user is told before a Save replaces the change").toHaveTextContent(/Ship it changed since this form was opened.*Save replaces it/);
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, expect.objectContaining({
+      kind: "update",
+      action: expect.objectContaining({ name: "ship", label: "Ship it now" }),
+      base: { ...SHIP, prompt: "THEIRS-2491: ship it." },
+    }), INSTANCE);
+  });
 });

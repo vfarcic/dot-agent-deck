@@ -18058,6 +18058,18 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** with no process id, or an empty one, the bridge invokes nothing and rejects with the backend's own words (a test holds the two to one text), an edit adding that nothing was saved; the backend refuses the same before opening any connection, so a daemon that replaced the one shown is sent nothing, and the same edit naming the process now answering reaches it (PR #2491 audit, A1).
 - **Does not assert:** the editor's display of the refusal (it is shown as any read's or form's error, `desktop/agent-cards/057`, `065`).
 
+##### desktop/agent-cards/133 — A Refresh that changes the action a removal is asking about closes the confirmation and says so.
+- **Test:** vitest `desktop/agent-cards/133: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** desktop overview (jsdom), a catalog bridge that answers when the test says, driven by DOM presses.
+- **Asserts:** Refresh pressed, then Remove Ship it while the read is out: a read answering Ship it unchanged leaves "Remove Ship it?" open and the editor silent; a read answering it relabelled "Deploy production" closes the confirmation, sends nothing, and the editor says Ship it changed and was not removed. Remove pressed on the relabelled row asks "Remove Deploy production?", and confirming sends exactly that action as `base`: a removal's base is the action its confirmation showed (PR #2491 re-audit, F1).
+- **Does not assert:** the daemon's refusal of a stale base (`agent-report/catalog-edit/005`).
+
+##### desktop/agent-cards/134 — A Refresh that changes the action an open form edits says so in the form.
+- **Test:** vitest `desktop/agent-cards/134: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** Refresh pressed, then Edit Ship it and a typed label while the read is out: a read answering Ship it unchanged puts nothing in the form; a later read answering it with another program's text keeps the typed label and says in the form that Ship it changed since the form was opened and that Save replaces it with what the form holds; Save then sends the action as just read as `base` (PR #2491 re-audit, F1; the base following a Refresh is `079`'s).
+- **Does not assert:** the form's own refusal after a Save (`057`, `079`).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
