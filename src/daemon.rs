@@ -447,6 +447,15 @@ pub struct Daemon {
     /// environment, so the env-var fallback in `lock_root` continues
     /// to serve them.
     pub lock_dir_override: Option<PathBuf>,
+    /// Issue #2531: the state directory this daemon keeps its deck id, inbox
+    /// spool, retained reports, work journal and launch records under, in
+    /// place of [`crate::config::state_dir`]. Production leaves it `None`; an
+    /// in-process test daemon sets it through
+    /// [`Self::with_state_dir_override`], because the test process's own
+    /// resolution is deliberately unusable (the test constructors point it
+    /// beneath `/dev/null`) and was the developer's real state directory
+    /// before that.
+    pub state_dir_override: Option<PathBuf>,
     /// PRD #127 M1.3/M1.4: the daemon-hosted scheduler. `run_daemon_with`
     /// loads the global `schedules.toml`, registers each enabled task on this
     /// scheduler, spawns its firing loop, and shares it with the attach server
@@ -494,6 +503,7 @@ impl Daemon {
             // that want it can opt in via [`with_idle_shutdown`].
             idle_shutdown: None,
             lock_dir_override: None,
+            state_dir_override: None,
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
@@ -520,6 +530,7 @@ impl Daemon {
             client_count: Arc::new(AtomicUsize::new(0)),
             idle_shutdown: idle_shutdown_from_env(),
             lock_dir_override: None,
+            state_dir_override: None,
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
@@ -544,6 +555,14 @@ impl Daemon {
     /// clear a previously-set override.
     pub fn with_lock_dir_override(mut self, dir: Option<PathBuf>) -> Self {
         self.lock_dir_override = dir;
+        self
+    }
+
+    /// Issue #2531 fluent override: keep this daemon's state under `dir`
+    /// instead of [`crate::config::state_dir`]. For in-process test daemons;
+    /// production never calls it. `None` clears a previous override.
+    pub fn with_state_dir_override(mut self, dir: Option<PathBuf>) -> Self {
+        self.state_dir_override = dir;
         self
     }
 
@@ -668,6 +687,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // local foreign uid can't pre-create the lock entry to DoS startup
     // for the target user. See `lock_path_for` for the resolution rules.
     let lock_path = lock_path_for(socket_path, daemon.lock_dir_override.as_deref());
+    // Issue #2531: every state store this run opens lives here.
+    let daemon_state_dir = daemon
+        .state_dir_override
+        .clone()
+        .unwrap_or_else(crate::config::state_dir);
     if let Some(parent) = lock_path.parent() {
         crate::platform::fsperm::ensure_owner_only_dir(parent)?;
     }
@@ -729,7 +753,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // PRD #1666: the inbox, addressed by this deck's persisted id. A state
     // directory that cannot hold the id costs it persistence, not the inbox.
     {
-        let state_dir = crate::config::state_dir();
+        let state_dir = daemon_state_dir.clone();
         let deck = crate::inbox::DeckId::load_or_create(&state_dir).unwrap_or_else(|error| {
             warn!(%error, "could not load or create the deck id; using one for this run only");
             crate::inbox::DeckId::generate()
@@ -1045,7 +1069,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         );
         Some(tokio::spawn(crate::attach_recovery::supervise(
             path,
-            crate::config::state_dir(),
+            daemon_state_dir.clone(),
             listener,
             move |listener| {
                 crate::daemon_protocol::serve_attach_with_restart(
@@ -1273,12 +1297,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             // (Qodo 4201540974).
             let control = restart_control.clone();
             let spawning = target.clone();
+            let successor_state_dir = daemon_state_dir.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 let check = control.recheck_successor(&spawning)?;
-                let spawned = crate::daemon_attach::spawn_restart_successor(
-                    &crate::config::state_dir(),
-                    &spawning,
-                );
+                let spawned =
+                    crate::daemon_attach::spawn_restart_successor(&successor_state_dir, &spawning);
                 Ok::<_, String>((check, spawned))
             })
             .await
