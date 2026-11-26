@@ -715,6 +715,20 @@ desktopScenario("daemon-upgrade", async (page) => {
   await expect(page.getByTestId("upgrade-at-stake").getByRole("listitem").first()).toBeVisible();
 });
 
+// Issue #1600 — Upgrade all from the Dashboard's top bar over the `upgrade`
+// fleet, stopped at dev@build-box's own question while ci@runner-7 waits.
+// Nothing is installed; the fixture bridge plays the crate's batch.
+desktopScenario("upgrade-all", async (page) => {
+  await page.goto("/?fixture=1&state=upgrade");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByTestId("overview-upgrade-all").click();
+  await expect(page.getByTestId("upgrade-all-start")).toBeVisible();
+  await page.getByTestId("upgrade-all-start").click();
+  await expect(page.getByTestId("upgrade-all-decision")).toBeVisible();
+  await expect(page.getByTestId("upgrade-all-at-stake").getByRole("listitem").first()).toBeVisible();
+});
+
 // Issue #1635 — upgrading the app: the `docs` dashboard behind the
 // newer-release banner and the rail's upgrade button, and the dialog the
 // banner opens, stopped at its question. The fixture's stand-in plays a

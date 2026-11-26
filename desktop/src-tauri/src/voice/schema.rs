@@ -602,6 +602,7 @@ mod tests {
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
                 "approve_project_commands".to_string(),
+                "show_approval_request".to_string(),
                 "star_repo".to_string(),
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),
@@ -746,6 +747,7 @@ mod tests {
                 "start_new_agent",
                 "discard_new_agent",
                 "approve_project_commands",
+                "show_approval_request",
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
@@ -1009,6 +1011,9 @@ mod tests {
                 // PRD #1885: callable where its dialog opens; the app answers
                 // that nothing is waiting when no review is open.
                 ("approve_project_commands".to_string(), true),
+                // Issue #2511: the "approval waiting" marker's click; the app
+                // answers that none is waiting when none is.
+                ("show_approval_request".to_string(), true),
                 // PRD #2174: the star reminder's buttons, on every screen the
                 // app opens on; the app answers that it is not showing.
                 ("star_repo".to_string(), true),
@@ -1120,6 +1125,9 @@ mod tests {
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
                 ("approve_project_commands".to_string(), true),
+                // Issue #2511: the "approval waiting" marker's click; the app
+                // answers that none is waiting when none is.
+                ("show_approval_request".to_string(), true),
                 // PRD #2174: the star reminder's buttons, on every screen the
                 // app opens on; the app answers that it is not showing.
                 ("star_repo".to_string(), true),
@@ -1231,7 +1239,10 @@ mod tests {
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
-                ("approve_project_commands".to_string(), false),
+                // PRD #1885 / issue #2511: a review the deck asked for opens
+                // over the pane once the user asks for it from the marker.
+                ("approve_project_commands".to_string(), true),
+                ("show_approval_request".to_string(), true),
                 ("star_repo".to_string(), true),
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),

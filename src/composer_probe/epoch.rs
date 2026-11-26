@@ -23,7 +23,9 @@
 //! ([`Writer::UnnamedDeck`], which only tests write) counts as foreign. Exempt reports
 //! don't move it: a whole focus or SGR mouse report while the agent has that
 //! report mode on (D3), and a whole DA1 or OSC 10/11 reply to a query the
-//! ledger keeps (D3′). A CPR reply is never exempt (OQ3). Whether an op is
+//! ledger keeps (D3′), and a whole CPR reply to one too unless it has a
+//! modified F3's shape (`CSI 1 ; m R`, `m` ≥ 2), which OQ3 refused for every
+//! CPR reply until issue #2467 ([`QueryKind::exempt_reply`]). Whether an op is
 //! one whole report is read from the input framing at the op's start, kept
 //! in enqueue order: a withdrawn job leaves that framing ahead of what the
 //! PTY took, which Q35-15/16's physical tracker corrects.
@@ -1029,7 +1031,7 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
     };
     let exempt = whole.filter(|&report| {
         state.modes.enabled(report)
-            || QueryKind::answered_by(report).is_some_and(|k| state.ledger.exempts(k))
+            || QueryKind::exempt_reply(report).is_some_and(|k| state.ledger.exempts(k))
     });
     // A person's keys and a voice answer's are the planner's; the deck's own
     // bytes open no segment and are never native.
@@ -1361,7 +1363,7 @@ impl GenerationInput {
         // A retired generation's ledger is empty, so nothing passes.
         let mut guard = self.state.lock_recovering();
         let passes = whole_report(&guard.framing, bytes)
-            .and_then(QueryKind::answered_by)
+            .and_then(QueryKind::exempt_reply)
             .is_some_and(|kind| guard.ledger.passes_ahead(kind, trigger));
         if passes {
             let accepted = enqueue_locked(&mut guard, writer, bytes);

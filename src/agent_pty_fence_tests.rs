@@ -608,7 +608,7 @@ async fn probe_011_a_reply_passes_ahead_of_a_closed_fence() {
     rig.taken_becomes(&[DA1_REPLY, b"key|"].concat()).await;
 }
 
-/// Scenario: With a CPR query and a DA1 query asked before the fence closed, the DA1 one in the very push the fence closes after, and a DA1 query after, hold a key and hand the gate a DA1 reply, a CPR reply and another DA1 reply; then two replies in one frame, a reply to nothing and half a reply, each against a fresh query asked after the trigger. Both DA1 replies are exempt, but only the second, answering the later query, passes ahead: the first answers the earlier query and is held; the CPR reply is never exempt; two replies in one frame, a reply to no query and a split reply are held. After release the PTY has the passing reply, then everything else in acceptance order.
+/// Scenario: With a CPR query and a DA1 query asked before the fence closed, the DA1 one in the very push the fence closes after, and a DA1 query after, hold a key and hand the gate a DA1 reply, a CPR reply and another DA1 reply; then two replies in one frame, a reply to nothing and half a reply, each against a fresh query asked after the trigger. Both DA1 replies are exempt, but only the second, answering the later query, passes ahead: the first answers the earlier query and is held, and so is the CPR reply, which answers a query asked before the trigger; two replies in one frame, a reply to no query and a split reply are held. After release the PTY has the passing reply, then everything else in acceptance order.
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_011_only_a_reply_to_a_query_after_the_trigger_passes_ahead() {

@@ -542,6 +542,15 @@ export type VoiceActionContext = {
    */
   cancelProjectCommands: () => void;
   /**
+   * Issue #2511 — the "approval waiting" marker: open the review a deck asked
+   * for over whatever holds it back (an agent's pane, a dialog). Answers
+   * `undefined` when it did, or the sentence saying no approval is waiting.
+   *
+   * **Served by the SHELL** (`showHeldTrustRequest` in `lib/trustRequests.ts`),
+   * whose `TrustRequestGate` shows the marker over every screen.
+   */
+  showApprovalRequest: () => string | undefined;
+  /**
    * PRD #2174 — the star reminder's three buttons: Star (open the repository
    * page and stop asking), Later (ask again after another ten launches) and
    * Don't ask again. Each answers `undefined` when it chose, or the sentence
@@ -2210,6 +2219,22 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* Issue #2511 — the marker saying an approval is waiting while something the
+     user is in holds its review back. It opens the review and nothing else:
+     approving or denying is still the review's own, so voice may press it for
+     the reason it may open any dialog. */
+  showApprovalRequest: {
+    label: "Open the approval review a deck is waiting on, over whatever is open",
+    voice: true,
+    needs: ["showApprovalRequest"],
+    /* `reportRefused` is read through `?.`, as `approveProjectCommands` does:
+       the marker's click always has a review to open. */
+    run: (context: Pick<VoiceActionContext, "showApprovalRequest"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.showApprovalRequest();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   cancelProjectCommands: {
     label: "Close the project commands review without starting anything",
     no_voice: "the review dialog's Cancel and its `Escape`; the dialog is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\") closes it as the thing on top, through `closeTopmost` — a row of its own would be a second reading of words `close` already answers. It is voice-reachable through that entry",
@@ -2704,7 +2729,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * on the overview and over the Runs screen on the deck. Its Cancel is reached
  * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "choosePaneTab" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "choosePaneTab" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "showApprovalRequest" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the

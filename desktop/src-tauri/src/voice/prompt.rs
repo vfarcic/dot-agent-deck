@@ -803,6 +803,7 @@ pub(crate) mod tests {
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
                 "approve_project_commands".to_string(),
+                "show_approval_request".to_string(),
                 "star_repo".to_string(),
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),

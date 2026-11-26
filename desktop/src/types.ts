@@ -2117,6 +2117,17 @@ export interface DeckRuntimeState {
   upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
   /** Answer question `questionId` of the upgrade `upgradeId`. */
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
+  /**
+   * Issue #1600: Upgrade all — `check` every remote deck, `run` the batch it
+   * returned (each daemon's question answered with `decideUpgrade`), and
+   * `stop` starting decks after the current one. Absent where the bridge has
+   * no batch, and the Dashboard then offers no Upgrade all.
+   */
+  upgradeAll?: {
+    check: () => Promise<import("./lib/upgradeAll").UpgradeAllPlan>;
+    run: (batchId: string, onEvent: (event: import("./lib/upgradeAll").UpgradeAllEvent) => void) => Promise<import("./lib/upgradeAll").UpgradeAllReport>;
+    stop: (batchId: string) => Promise<void>;
+  };
   /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
   inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
   /**

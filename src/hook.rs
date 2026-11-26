@@ -2807,7 +2807,7 @@ const CLAUDE_TRANSCRIPT_RETRY_GAP: std::time::Duration = std::time::Duration::fr
 /// Issue #714: classify a Claude Code `StopFailure`, reading the transcript
 /// only when the `error` kind needs it
 /// ([`crate::quota_signals::claude_stop_failure_needs_transcript`]).
-fn claude_stop_failure_outcome(
+pub(crate) fn claude_stop_failure_outcome(
     error: Option<&str>,
     transcript_path: Option<&str>,
 ) -> crate::quota_signals::FailureOutcome {

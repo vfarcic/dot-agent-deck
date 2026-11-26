@@ -2,13 +2,13 @@
 
 > **Developer / maintainer reference.** This page documents an internal development mechanism and is intentionally excluded from the published documentation site.
 
-`dot-agent-deck` can hide in-flight, work-in-progress surfaces behind a single boolean feature flag named `experimental`. It is **off by default**, so a normal install never shows half-finished features. Enable it only when you want to test a surface that a PRD has explicitly marked as experimental.
+`dot-agent-deck` can hide in-flight, work-in-progress surfaces behind a single boolean feature flag named `experimental`. It is **off by default**, so a normal install does not show the surfaces gated behind it. Enable it only when you want to test a surface that is gated behind it.
 
 ## What the flag does
 
 The flag is a **presentation switch**, not a behaviour switch. It controls only whether certain *new, user-visible surfaces* (a pane, field, command, tab, footer, or keybinding) are shown. The underlying code paths run regardless — the flag just decides whether you can see and reach the new surface.
 
-A feature is gated by the flag only when its PRD says so. Surfaces that are not marked experimental are always visible and are unaffected by this flag.
+A feature is gated by the flag only when a person has explicitly instructed it for that feature, and that instruction is recorded in its PRD, its issue or its PR ([CLAUDE.md rule 9](../../CLAUDE.md)). Without one, a new surface ships visible: an agent does not choose to gate a surface, and does not ask the flag question as a routine step. Surfaces that are not gated are always visible and are unaffected by this flag.
 
 ## How to enable it
 

@@ -393,6 +393,7 @@ mod tests {
                 "start_new_agent",
                 "discard_new_agent",
                 "approve_project_commands",
+                "show_approval_request",
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",

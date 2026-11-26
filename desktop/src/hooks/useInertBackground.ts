@@ -100,17 +100,19 @@
  * Read the count going from two to one as the exemption NARROWING rather than
  * moving: it is one marked sibling containing the same two controls, so what the
  * walk skips is the same subtree it skipped before. The trigger and the Undo
- * inside the report are still the complete set of controls reachable outside an
- * open pane, which `AgentPaneDeckIdentity.test.tsx` asserts by equality rather
- * than by a filter.
+ * inside the report are the complete set of controls reachable outside an
+ * open pane while no approval is waiting, which `AgentPaneDeckIdentity.test.tsx`
+ * asserts by equality rather than by a filter.
  *
- * So elements carrying {@link VOICE_PEER_PROPS} are skipped, and nothing else
- * is. It is an allow-list of one marker rather than a rule about roles or
- * dialogs: a second peer added later has to be exempted here deliberately,
+ * So elements carrying {@link VOICE_PEER_PROPS} are skipped, and so, since
+ * issue #2511, is the one element carrying {@link APPROVAL_PEER_PROPS}: the
+ * marker saying an approval is waiting, whose only control opens that review.
+ * It is an allow-list of two markers rather than a rule about roles or
+ * dialogs: a third peer added later has to be exempted here deliberately,
  * which is the review this hook's audit asked for.
  *
  * **What the hook still guarantees is unchanged for everything else.** Every
- * element that is not an ancestor of the pane and does not carry that marker is
+ * element that is not an ancestor of the pane and does not carry one of those markers is
  * still inerted on every commit, the `DeckSelector` above all — so the
  * retargeting attack the audit found stays unreachable, and the exemption
  * cannot widen by accident: it is matched on the sibling itself, so a marked
@@ -148,6 +150,21 @@ export const VOICE_PEER_PROPS = { "data-modal-peer": "voice" } as const;
 
 /** The same marker, as the selector the walk tests each sibling against. */
 const VOICE_PEER_SELECTOR = `[data-modal-peer="${VOICE_PEER_PROPS["data-modal-peer"]}"]`;
+
+/**
+ * Issue #2511 — the second peer: the marker saying an approval is waiting,
+ * which `TrustRequestGate` shows while something the user is in holds the
+ * review back. It is a peer for the voice row's reason: it is a control the
+ * user is meant to reach over the agent's pane, and an inert marker would be a
+ * picture of one. Clicking it does one thing — opens the review a deck asked
+ * for, which then goes on the stack itself and fences everything, the marker
+ * included, since the marker is gone while the review is up — so exempting it
+ * reaches nothing else behind the pane, the `DeckSelector` above all.
+ */
+export const APPROVAL_PEER_PROPS = { "data-modal-peer": "approval" } as const;
+
+/** The same marker, as the selector the walk tests each sibling against. */
+const APPROVAL_PEER_SELECTOR = `[data-modal-peer="${APPROVAL_PEER_PROPS["data-modal-peer"]}"]`;
 
 /**
  * Whether `element` is inside the voice surface ({@link VOICE_PEER_PROPS}).
@@ -327,8 +344,9 @@ function fence() {
     while (parent) {
       for (const sibling of Array.from(parent.children)) {
         if (sibling === child) continue;
-        // The one exemption, and the only one. See the note above.
-        if (sibling.matches(VOICE_PEER_SELECTOR)) continue;
+        // The two exemptions, and the only ones: the voice surface (see the
+        // note above) and the approval marker ({@link APPROVAL_PEER_PROPS}).
+        if (sibling.matches(VOICE_PEER_SELECTOR) || sibling.matches(APPROVAL_PEER_SELECTOR)) continue;
         // Inert for a reason of its own, which is not ours to undo later.
         if (sibling.hasAttribute("inert") && !marked.has(sibling)) continue;
         next.add(sibling);
@@ -458,8 +476,10 @@ function useOverlay<T extends HTMLElement>(open: boolean, layer: number, fences:
     // Focus on a voice peer is left where it is: the numbered choice's dialog
     // takes focus while it is open (PRD #1261), and this walk runs on every
     // commit, so pulling focus back here would take it from the dialog mid-answer.
+    // The approval marker (issue #2511) is a peer for the same reason, so a
+    // keyboard user who tabbed to it keeps it through the pane's next commit.
     const active = document.activeElement;
-    if (!node.contains(active) && !active?.closest(VOICE_PEER_SELECTOR)) node.focus();
+    if (!node.contains(active) && !active?.closest(VOICE_PEER_SELECTOR) && !active?.closest(APPROVAL_PEER_SELECTOR)) node.focus();
   });
 
   /**

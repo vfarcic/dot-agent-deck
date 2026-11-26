@@ -87,6 +87,17 @@ pub const ASKED_BY_LABEL: &str = "Asked by";
 /// reminder's guard (`STAR_KEYS_ARM_MS` in `desktop/src/lib/starPrompt.ts`).
 pub const REQUEST_KEYS_ARM: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// Issue #2511: the footer badge saying how many requests wait while a dialog
+/// holds their review back, the desktop app's marker's words
+/// (`approvalsWaitingLabel` in `desktop/src/lib/projectTrust.ts`).
+pub fn approvals_waiting_label(count: usize) -> String {
+    if count == 1 {
+        "1 approval waiting".to_string()
+    } else {
+        format!("{count} approvals waiting")
+    }
+}
+
 /// Issue #2330: the status line after approving a request.
 pub fn request_approved_message(orchestration: &str, asked_by: &str) -> String {
     escape_control_and_bidi(&format!(

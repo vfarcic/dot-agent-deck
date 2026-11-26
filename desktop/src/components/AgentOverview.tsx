@@ -10,6 +10,8 @@ import { VOICE_ACTIONS, type AgentViewTarget, type DashboardScroll, type NewAgen
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
+import { UpgradeAllDialog } from "./UpgradeAllDialog";
+import { upgradeAllOffered } from "../lib/upgradeAll";
 import { appFirst, LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
@@ -2075,6 +2077,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [confirm]);
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
+  /** Issue #1600 — the Upgrade all dialog, opened from the top bar. */
+  const [upgradeAllOpen, setUpgradeAllOpen] = useState(false); // voice-registry-exempt: the Upgrade all dialog (issue #1600) — opened only by its top-bar button, kept off voice like Upgrade, and it asks before stopping anything
   /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */
   const [localUpgrade, setLocalUpgrade] = useState<LocalUpgradeRequest>();
   /* The CLI's plan while it is behind and this app can upgrade it. */
@@ -2124,7 +2128,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   ), [numberedAgents, voiceOn]);
   /* The Upgrade dialog counts as a confirmation for voice and for the
      dashboard's own keys: it asks whether to stop agents (PRD #1487 review). */
-  const confirmationOpen = confirm !== undefined || upgrade !== undefined || localUpgrade !== undefined;
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined || localUpgrade !== undefined || upgradeAllOpen;
   /**
    * What a deck's Upgrade does, and what its button says. A remote deck's
    * covers its daemon, which runs that host's CLI. The local deck's covers the
@@ -2470,6 +2474,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               </OverviewInstrument>
             </DashboardCounters>
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
+            {/* Issue #1600: shown while a remote deck runs an older daemon than this app, as each deck's own Upgrade is. */}
+            {runtime.upgradeAll && runtime.decideUpgrade && upgradeAllOffered(decks.map((deck) => deck.snapshot.connection)) && <button type="button" className="button secondary compact" data-testid="overview-upgrade-all" aria-label="Upgrade all daemons" title="Upgrade every remote daemon older than this app" onClick={() => setUpgradeAllOpen(true)}><CircleArrowUp size={14} /><span>Upgrade all</span></button>}
             {/* Icon-only (issue #1308): with its label the top bar ran past 1440px on CI's font. The rail's Daemons entry is the labelled door. */}
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" aria-label="Open daemons" title="Open daemons" onClick={openDeck}><SquareTerminal size={14} /></button>}
             {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} consumeCards={runtime.consumeAgentCards} />}
@@ -2643,6 +2649,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
+      {upgradeAllOpen && <UpgradeAllDialog runtime={runtime} onClose={() => setUpgradeAllOpen(false)} />}
       {localUpgrade && <LocalUpgradeFlow {...localUpgrade} runtime={runtime} onClose={() => { setLocalUpgrade(undefined); selfUpgrade?.onClosed?.(); }} />}
       {newAgent && newAgentRuntime && (
         <NewAgentDialog
