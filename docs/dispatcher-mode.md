@@ -194,7 +194,7 @@ dot-agent-deck worktree list        # every linked worktree, its PR state, clean
 dot-agent-deck worktree reclaim     # remove the worktrees marked "remove": deck-created, PR merged, no uncommitted changes
 ```
 
-`worktree list` is read-only. `worktree reclaim` never deletes a branch, keeps every worktree with uncommitted changes, an unmerged PR, or other worktrees or Git checkouts inside it, and asks for `--yes` before removing a worktree the deck cannot prove it created.
+`worktree list` is read-only. `worktree reclaim` never deletes a branch, keeps every worktree with uncommitted changes, an unmerged PR, or other worktrees or Git checkouts inside it, and asks for `--yes` before removing a worktree the deck cannot prove it created. A merged pull request counts only when the branch's latest commit is one of its commits, so a worktree on a branch that reuses an earlier branch's name, or one with commits added after its pull request merged, is kept.
 
 ## When something goes wrong
 

@@ -1271,6 +1271,122 @@ fn status_waiting_008_real_claude_background_command_reads_waiting_until_it_exit
     settle_after_exit(&deck, &events, &agent_id, "status-waiting-008", running_at);
 }
 
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded and ask for two Bash run_in_background commands in one turn: a short ping that touches one uniquely named sentinel and a long one that touches another, ending the turn without waiting. After its native Stop the card reads Waiting with `Background: 2 commands`; when the short one finishes, Claude Code opens a turn of its own with a `<task-notification>` prompt and ends it, and the card still reads Waiting with `Background: 1 command` while the long command runs; once the long one exits the card settles on Idle (issue #2505).
+#[spec("status/waiting/008")]
+#[test]
+fn status_waiting_008_real_claude_task_notification_turn_keeps_waiting() {
+    skip_unless!(common::check_claude_available());
+    const SHORT: &str = "waiting-008-short-3e9a51d4.txt";
+    const LONG: &str = "waiting-008-long-a07c6b2e.txt";
+    let (deck, events, agent_id) = background_live_fixture("waiting-008-wake");
+    let workdir = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory");
+    let (short_path, long_path) = (workdir.join(SHORT), workdir.join(LONG));
+    // Twenty pings leave the Stop and the first Waiting check room before
+    // the short command ends; 150 leave the wake turn room before the long
+    // one does.
+    let prompt = format!(
+        "Use Bash exactly twice, as your first two actions, each with run_in_background=true. First execute exactly: ping -c 20 127.0.0.1 > /dev/null && touch {SHORT} . Then execute exactly: ping -c 150 127.0.0.1 > /dev/null && touch {LONG} . Do not use timeout. Do not call TaskOutput, wait, inspect or stop either command. Immediately finish your turn with the single word STARTED after both background task ids are returned. Later, when you are told a background command completed, reply only with the word NOTED and use no tools."
+    );
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, LONG);
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(120),
+    );
+    let first_stop = chrono::Utc::now();
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid
+            .contains("Waiting")
+            && grid.contains("Background: 2 commands")),
+        "the turn that started both commands ended while they run, so the card must read \
+         Waiting with both counted; events: {:#?}\n{}",
+        describe_events_since(&events, &agent_id, submitted.timestamp),
+        deck.snapshot_grid()
+    );
+    assert!(
+        !short_path.exists(),
+        "the short command finished before the first Waiting check; the run proves nothing"
+    );
+
+    // The short command ends; Claude Code opens a turn to report it.
+    assert!(
+        common::wait_for_path(&short_path, Duration::from_secs(90)),
+        "the short background command never finished:\n{}",
+        deck.snapshot_grid()
+    );
+    let wake = events
+        .try_wait_for(
+            |event| {
+                event.agent_id.as_deref() == Some(&agent_id)
+                    && event.event_type == EventType::Thinking
+                    && event.timestamp >= first_stop
+                    && event
+                        .user_prompt
+                        .as_deref()
+                        .is_some_and(|p| p.trim_start().starts_with("<task-notification>"))
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "PRECONDITION NOT MET: Claude Code opened no <task-notification> turn after the \
+                 short command finished; events: {:#?}\n{}",
+                describe_events_since(&events, &agent_id, first_stop),
+                deck.snapshot_grid()
+            )
+        });
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= wake.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    let wake_ended = chrono::Utc::now();
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid
+            .contains("Waiting")
+            && grid.contains("Background: 1 command")),
+        "the task-notification turn ended while the long command started earlier in its chain \
+         still runs, so the card must still read Waiting; events: {:#?}\n{}",
+        describe_events_since(&events, &agent_id, first_stop),
+        deck.snapshot_grid()
+    );
+    // Held, not a passing glimpse: asserted on every redraw for three
+    // seconds, past the sampling grace after the turn's end.
+    deck.wait_until_grid_then_hold(
+        "Waiting held after the task-notification turn, while the long command still runs",
+        Duration::from_secs(3),
+        |grid| grid.contains("Waiting") && grid.contains("Background: 1 command"),
+    );
+    assert!(
+        !long_path.exists(),
+        "the long command finished before the post-wake Waiting check; the run proves nothing"
+    );
+
+    assert!(
+        common::wait_for_path(&long_path, Duration::from_secs(240)),
+        "the long background command never finished:\n{}",
+        deck.snapshot_grid()
+    );
+    settle_after_exit(
+        &deck,
+        &events,
+        &agent_id,
+        "status-waiting-008-wake",
+        wake_ended,
+    );
+}
+
 /// Scenario: Start real interactive OpenCode on the harness's cheap test model through Ctrl+N and ask it to run one shell command with the shell tool's background option — a minute of pings, then touching a uniquely named sentinel — and to end its turn at once. After OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn OpenCode starts to report the finished command). On OpenCode 2.3 or later the command must have run under OpenCode's process daemon (`opencode-pty daemon`), which is still running when the card settles on Idle.
 #[spec("status/waiting/009")]
 #[test]

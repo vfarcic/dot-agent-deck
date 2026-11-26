@@ -1,43 +1,264 @@
-import { BellRing } from "lucide-react";
-import { useLayoutEffect, useMemo, useState } from "react";
+import { SlidersHorizontal, X } from "lucide-react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
 import { cardKinds, cardTree, needsYouPath, type CardNode } from "../lib/agentCardsTree";
 import { DISPLAY_LIMITS, displayText, domIdentity } from "../lib/displayText";
 import { endedRoleOfCard } from "../lib/endedRoles";
-import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
+import type { CardSelection } from "../hooks/useAgentCardsView";
 import type { EndedRole } from "../types";
-import { AgentCard, type CardControls, type CardPlace } from "./AgentCard";
+import { CardActionIcon, cardIconName } from "../lib/cardIcons";
+import { ActionIconGroup, ActionTipButton } from "./ActionTipButton";
+import { AgentCard, batchChoiceHover, type CardControls, type CardPlace } from "./AgentCard";
+import { MoreMenu } from "./MoreMenu";
 
 /**
- * PRD #2374 — the Cards view's line above every daemon's section: how many
- * agents the cards show and how many need the user, the Needs you filter, and
- * what to say when there is nothing to show. `cards` is every card on screen,
- * across the daemons, in the daemons' order.
+ * Issue #2399, decision 2026-11-24 — a batch button's icon: the action's
+ * catalog icon, or for a close the cross the card's own Close draws.
  */
-export function AgentCardsToolbar({ cards, needsYouOnly, controls }: {
+export function BatchChoiceIcon({ choice }: { choice: { icon?: string | null; kind?: string } }) {
+  if (batchIconName(choice) === "close") return <X size={15} aria-hidden="true" focusable="false" />;
+  return <CardActionIcon name={choice.icon} size={15} />;
+}
+
+/** The icon {@link BatchChoiceIcon} draws, by name (`data-icon`). */
+export function batchIconName(choice: { icon?: string | null; kind?: string }): string {
+  return choice.kind === "close" || choice.kind === "close_keep_worktree" ? "close" : cardIconName(choice.icon);
+}
+
+/**
+ * PR #2491 review S1 — the daemons on screen whose agents the cards do not
+ * account for, by name: connected daemons that report no cards (their rows
+ * stay as they are under Needs you only) and daemons that are not answering.
+ * Needs you only and the top bar's count read only cards, so neither may say
+ * nothing needs the user while one of these is on screen.
+ */
+export interface UncountedDaemons {
+  notReporting: readonly string[];
+  notAnswering: readonly string[];
+}
+
+export const NO_UNCOUNTED: UncountedDaemons = { notReporting: [], notAnswering: [] };
+
+const hasUncounted = (uncounted: UncountedDaemons) => uncounted.notReporting.length > 0 || uncounted.notAnswering.length > 0;
+
+/** "A", "A and B", "A, B and C". */
+function nameList(names: readonly string[]): string {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/**
+ * What the dashboard says about the daemons the cards do not count: their
+ * agents are "shown as usual" (the note above the daemons) or "not counted"
+ * (the top bar's ⋯). Empty when every daemon on screen reports cards.
+ */
+export function uncountedDaemonsText(uncounted: UncountedDaemons, agents: "shown as usual" | "not counted"): string {
+  const { notReporting, notAnswering } = uncounted;
+  const parts: string[] = [];
+  if (notReporting.length > 0) {
+    parts.push(`Agents on ${nameList(notReporting)} are ${agents}: ${notReporting.length === 1 ? "that daemon does" : "those daemons do"} not report cards.`);
+  }
+  if (notAnswering.length > 0) {
+    const one = notAnswering.length === 1;
+    parts.push(`${nameList(notAnswering)} ${one ? "is" : "are"} not answering, so ${one ? "its" : "their"} agents are not counted.`);
+  }
+  return parts.join(" ");
+}
+
+/**
+ * The top bar's ⋯ description: how many agents' cards need the user, and,
+ * while a daemon on screen is not counted, which. `undefined` when there is
+ * nothing to say (no card needs the user and every daemon is counted).
+ */
+export function needsYouCountDescription(count: number, uncounted: UncountedDaemons): string | undefined {
+  const counted = count > 0 ? `${count} ${count === 1 ? "agent needs" : "agents need"} you` : undefined;
+  if (!hasUncounted(uncounted)) return counted;
+  return `${counted ? `${counted}.` : "No card needs you."} ${uncountedDaemonsText(uncounted, "not counted")}`;
+}
+
+/**
+ * PRD #2374 — what the dashboard says above the daemons' sections when the
+ * cards have nothing to show: no agent has a card yet (the Cards view), or,
+ * with Needs you only on, no card needs the user (either view). The line that
+ * counted the cards and held the Needs you only and Card actions buttons is
+ * gone (PR #2491 decision 2026-11-25): each daemon's header counts its
+ * agents, the top bar's ⋯ counts what needs the user and holds Needs you
+ * only, and each daemon's ⋯ opens its Card actions. `cards` is every card on
+ * screen, across the daemons.
+ *
+ * "Nothing needs you right now" is said only while no daemon is in
+ * `uncounted`: a daemon that does not report cards and has agents on screen,
+ * or one that is not answering. Otherwise the note says no card needs the
+ * user and names those daemons (PR #2491 review S1). The empty Cards view's
+ * "Every agent the daemon runs gets one" is held to the same condition, and
+ * names the same daemons otherwise (PR #2491 review).
+ */
+export function AgentCardsNotes({ cards, needsYouOnly, cardsView, uncounted = NO_UNCOUNTED }: {
   cards: readonly PlacedCard[];
   needsYouOnly: boolean;
-  controls: Pick<VoiceActionContext, "setNeedsYouFilter">;
+  /** Whether the Cards view is on screen (the Table says nothing about cards it does not draw). */
+  cardsView: boolean;
+  /** The daemons on screen whose agents have no cards to count. */
+  uncounted?: UncountedDaemons;
 }) {
   const total = cards.length;
   const needYou = cards.filter((card) => card.entry.needs_you).length;
+  const empty = cardsView && total === 0;
+  const noneNeedYou = !empty && needsYouOnly && needYou === 0;
+  if (!empty && !noneNeedYou) return null;
+  const scoped = hasUncounted(uncounted);
   return (
-    <section className="agent-cards" aria-label="Agent cards" data-testid="agent-cards">
-      <div className="agent-cards-toolbar">
-        <span className="agent-cards-count">{total} {total === 1 ? "agent" : "agents"} · {needYou} {needYou === 1 ? "needs" : "need"} you</span>
+    <div className="agent-cards-notes">
+      {empty && !scoped && <p className="agent-cards-empty" data-testid="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
+      {empty && scoped && <p className="agent-cards-empty" data-testid="agent-cards-empty-scoped">No agent has a card yet. {uncountedDaemonsText(uncounted, "shown as usual")}</p>}
+      {noneNeedYou && !scoped && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">Nothing needs you right now. Needs you only is on: turn it off from the top bar to see every agent.</p>}
+      {noneNeedYou && scoped && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you-scoped">No card needs you. {uncountedDaemonsText(uncounted, "shown as usual")}</p>}
+    </div>
+  );
+}
+
+/**
+ * PR #2491 review — the selection bar: shown at the foot of the Dashboard as
+ * soon as a card is selected, and gone when the selection is emptied. It says
+ * how many cards are selected, offers each action the selected cards offer as
+ * an icon (pressing one opens the batch's confirmation; nothing is sent
+ * before it), and Clear. It floats over the end of the dashboard's scroll
+ * region, which leaves room for it below the last card.
+ */
+export function AgentCardsSelectionBar({ selection, controls, editor }: SelectionBarProps) {
+  if (selection.selected.size === 0) return null;
+  return <SelectionBar selection={selection} controls={controls} editor={editor} />;
+}
+
+/**
+ * PR #2491 (the maintainer, 2026-11-25) — the selection bar's shortcut to the
+ * Card actions editor: the daemons of the selected cards whose ⋯ menu offers
+ * it, in the dashboard's order, and the editor's members its presses go through.
+ */
+export interface SelectionBarEditor {
+  daemons: readonly { deckId: string; name: string }[];
+  controls: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused" | "askVoiceChoice">>;
+}
+
+interface SelectionBarProps {
+  selection: CardSelection;
+  controls: Pick<VoiceActionContext, "clearCardSelection" | "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
+  editor?: SelectionBarEditor;
+}
+
+const EDIT_CARD_ACTIONS = "Edit card actions";
+
+/**
+ * PR #2491 (the maintainer, 2026-11-25) — Edit card actions in the selection
+ * bar, after the batch actions and set apart from them so it does not read as
+ * one more action to send: with every selected card on one daemon, a button
+ * that opens that daemon's editor (read-only on a release that cannot edit
+ * them, as from its ⋯ menu); with the selection across daemons, a menu of
+ * those daemons, each opening its own. The daemon's ⋯ menu stays the main way in.
+ */
+function SelectionEditButton({ editor }: { editor: SelectionBarEditor }) {
+  const { daemons, controls } = editor;
+  if (daemons.length === 0) return null;
+  const icon = <SlidersHorizontal size={15} aria-hidden="true" focusable="false" />;
+  if (daemons.length === 1) {
+    const [daemon] = daemons;
+    return (
+      <span className="agent-cards-selection-edit">
         <button
           type="button"
-          className={`button secondary compact agent-cards-filter${needsYouOnly ? " is-on" : ""}`}
-          data-testid="agent-cards-needs-you-filter"
-          aria-pressed={needsYouOnly}
-          title={needsYouOnly ? "Show every card as bright" : "Open the way to every card that needs you, and fade the rest"}
-          onClick={() => VOICE_ACTIONS.toggleNeedsYouFilter.run(controls, { needsYouOnly: !needsYouOnly })}
-        ><BellRing size={13} aria-hidden="true" /><span>Needs you only</span></button>
-      </div>
-      {total === 0 && <p className="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
-      {total > 0 && needsYouOnly && needYou === 0 && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">No card needs you right now.</p>}
-    </section>
+          className="icon-button agent-cards-selection-edit-button"
+          data-testid="agent-cards-selection-edit"
+          data-icon="sliders-horizontal"
+          aria-label={EDIT_CARD_ACTIONS}
+          title={EDIT_CARD_ACTIONS}
+          onClick={() => VOICE_ACTIONS.openCardActionsEditor.run(controls, daemon.deckId)}
+        >{icon}</button>
+      </span>
+    );
+  }
+  return (
+    <span className="agent-cards-selection-edit" data-icon="sliders-horizontal">
+      <MoreMenu
+        label={EDIT_CARD_ACTIONS}
+        menuLabel={EDIT_CARD_ACTIONS}
+        testId="agent-cards-selection-edit"
+        menuTestId="agent-cards-selection-edit-menu"
+        className="agent-cards-selection-edit-menu"
+        buttonClassName="icon-button agent-cards-selection-edit-button"
+        icon={icon}
+        items={daemons.map((daemon) => ({
+          key: daemon.deckId,
+          label: displayText(daemon.name, DISPLAY_LIMITS.name),
+          testId: `agent-cards-selection-edit-${domIdentity(daemon.deckId)}`,
+          title: `Add, change, hide or remove the actions ${displayText(daemon.name, DISPLAY_LIMITS.name)}'s agents offer on their cards`,
+          onSelect: () => VOICE_ACTIONS.openCardActionsEditor.run(controls, daemon.deckId),
+        }))}
+      />
+    </span>
+  );
+}
+
+/**
+ * PR #2491 review H1 — where focus goes when the bar goes while it has it
+ * (Clear pressed from the keyboard, or the selection emptied by voice or by
+ * its cards leaving): the checkbox of the card ticked or unticked last, if it
+ * is still drawn, else the dashboard's scroll region. Left on the removed
+ * button, focus falls to the document, and WebKit's next Tab then starts from
+ * the page's header with the dashboard scrolled back to the top.
+ */
+function focusTargetAfterBar(bar: HTMLElement, last: string | undefined): HTMLElement | null {
+  const region = bar.closest<HTMLElement>(".overview-body") ?? bar.parentElement;
+  if (!region) return null;
+  const card = last === undefined ? undefined : `agent-card-${domIdentity(last)}`;
+  const checkbox = card === undefined ? undefined : [...region.querySelectorAll<HTMLElement>("[data-testid='agent-card-select']")]
+    .find((box) => box.closest("article")?.getAttribute("data-testid") === card);
+  return checkbox ?? region;
+}
+
+function SelectionBar({ selection, controls, editor }: SelectionBarProps) {
+  const count = selection.selected.size;
+  const bar = useRef<HTMLDivElement>(null);
+  const last = useRef(selection.last);
+  useLayoutEffect(() => { last.current = selection.last; }, [selection.last]);
+  /* A layout effect's cleanup runs while the bar is still in the document, so focus can be moved before the button holding it is removed. */
+  useLayoutEffect(() => {
+    const node = bar.current;
+    return () => {
+      if (!node || !node.contains(document.activeElement)) return;
+      focusTargetAfterBar(node, last.current)?.focus({ preventScroll: true });
+    };
+  }, []);
+  return (
+    <div ref={bar} className="agent-cards-selection-bar" role="region" aria-label="Selected cards" data-testid="agent-cards-selection-bar">
+      <span className="agent-cards-selection-count" data-testid="agent-cards-selection-count">{count} selected</span>
+      {selection.choices.length === 0
+        ? <span className="agent-cards-selection-hint">No action is offered by the selected cards.</span>
+        : (
+          <ActionIconGroup className="agent-cards-selection-actions" label={`Send to the ${count} selected ${count === 1 ? "card" : "cards"}`}>
+            {selection.choices.map((choice) => (
+              <ActionTipButton
+                key={choice.id}
+                className="icon-button agent-cards-batch-icon"
+                data-testid={`agent-cards-batch-action-${domIdentity(choice.id)}`}
+                data-icon={batchIconName(choice)}
+                aria-label={displayText(choice.label, DISPLAY_LIMITS.name)}
+                tip={batchChoiceHover(choice, `the ${count} selected ${count === 1 ? "agent" : "agents"}`)}
+                onClick={() => VOICE_ACTIONS.runSelectionBatch.run(controls, { cardActionId: choice.id })}
+              ><BatchChoiceIcon choice={choice} /></ActionTipButton>
+            ))}
+          </ActionIconGroup>
+        )}
+      {editor && <SelectionEditButton editor={editor} />}
+      <button
+        type="button"
+        className="button secondary compact agent-cards-selection-clear"
+        data-testid="agent-cards-selection-clear"
+        title="Unselect every card"
+        onClick={() => VOICE_ACTIONS.clearCardSelection.run(controls)}
+      >Clear</button>
+    </div>
   );
 }
 
@@ -64,7 +285,7 @@ function TreeLevel({ nodes, depth, top, view, above }: { nodes: readonly CardNod
         const open = node.children.length > 0 && view.openCards.has(key);
         return (
           <li key={key}>
-            <AgentCard card={node.card} controls={view.controls} results={view.results?.(node.card)} place={view.place(node, depth, open)} openTarget={view.openTarget} ended={endedRoleOfCard(view.endedRoles, node.card.entry)} />
+            <AgentCard card={node.card} controls={view.controls} results={view.results?.(node.card)} place={view.place(node, depth, open)} ended={endedRoleOfCard(view.endedRoles, node.card.entry)} />
             {open && <TreeLevel nodes={node.children} depth={depth + 1} view={view} above={new Set([...above, key])} />}
           </li>
         );
@@ -79,7 +300,6 @@ interface TreeView {
   controls: CardControls;
   results?: (card: PlacedCard) => CardResults;
   place: (node: CardNode, depth: number, open: boolean) => CardPlace;
-  openTarget?: (card: PlacedCard) => AgentViewTarget;
   /** Issue #1965 — this deck's exited orchestration roles, whose cards say why. */
   endedRoles?: readonly EndedRole[];
 }
@@ -170,7 +390,7 @@ function layoutRow(row: HTMLElement) {
  * user nor lead to one. A daemon older than the tree has its cards drawn as
  * roots, with a note saying why.
  */
-export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO_OPEN_CARDS, needsYouOnly, controls, results, openTarget, endedRoles }: {
+export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO_OPEN_CARDS, needsYouOnly, controls, results, endedRoles, selection }: {
   deckId: string;
   cards: readonly PlacedCard[];
   /** Whether this deck's daemon builds the card tree; without it, its cards are drawn side by side, as an older daemon's are. */
@@ -181,10 +401,10 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
   controls: CardControls;
   /** The last answer to each action pressed on a card, for its Close control's tooltip. */
   results?: (card: PlacedCard) => CardResults;
-  /** What a card's name opens: the dashboard's own target for that agent, so it is the one its table row opens (issue #2418, D12). */
-  openTarget?: (card: PlacedCard) => AgentViewTarget;
   /** Issue #1965 — this deck's exited orchestration roles, whose cards say why. */
   endedRoles?: readonly EndedRole[];
+  /** Issue #2399 — the selection, when this deck's daemon does batch actions: each card then carries its checkbox, always (PR #2491 review). */
+  selection?: CardSelection;
 }) {
   /* The frame as a state, set by its ref: it is not mounted while there are
      no cards to show, so measuring follows it in and out — a deck that starts
@@ -216,7 +436,6 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
     openCards,
     controls,
     results,
-    openTarget,
     endedRoles,
     place: (node, depth, open) => ({
       depth,
@@ -225,6 +444,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
       open,
       faded: path !== undefined && !path.has(placedCardKey(node.card)),
       tree,
+      ...(selection ? { selected: selection.selected.has(placedCardKey(node.card)) } : {}),
     }),
   };
   return (
@@ -239,7 +459,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
               <div className="agent-cards-roots" data-testid="agent-cards-roots" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, ${CARD_WIDTH}px))` }}>
                 {row.map((node) => {
                   const open = node.children.length > 0 && openCards.has(placedCardKey(node.card));
-                  return <AgentCard key={placedCardKey(node.card)} card={node.card} controls={controls} results={results?.(node.card)} place={view.place(node, 0, open)} openTarget={openTarget} ended={endedRoleOfCard(endedRoles, node.card.entry)} />;
+                  return <AgentCard key={placedCardKey(node.card)} card={node.card} controls={controls} results={results?.(node.card)} place={view.place(node, 0, open)} ended={endedRoleOfCard(endedRoles, node.card.entry)} />;
                 })}
               </div>
               {opened.map(({ node, col }) => (

@@ -481,7 +481,7 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
     );
 }
 
-/// Scenario: A Claude-shaped stand-in reports a turn that starts a real detached command and ends while the command runs: the attached card reads Waiting with `Background: 1 command`, and when the command exits it reads Idle with no background line. A command started in one turn and still running when a later turn ends leaves the card Idle with its background line.
+/// Scenario: A Claude-shaped stand-in reports a turn that starts a real detached command and ends while the command runs: the attached card reads Waiting with `Background: 1 command`, still reads Waiting after a turn Claude Code opens with a `<task-notification>` prompt ends, and when the command exits it reads Idle with no background line. A command started in one turn and still running when a later turn ends leaves the card Idle with its background line.
 #[spec("status/waiting/007")]
 #[test]
 fn status_waiting_007_card_waits_on_this_turns_command() {
@@ -527,6 +527,29 @@ fn status_waiting_007_card_waits_on_this_turns_command() {
     grid_within("the card reads Waiting with its Background line", &|grid| {
         grid.contains("● Waiting") && grid.contains("Background: 1 command")
     });
+
+    // Issue #2505: Claude Code opens a turn of its own to report another
+    // background job that finished, and ends it while the command still runs.
+    // That turn continues the chain that started the command: still Waiting.
+    f.hook(
+        "claude-code",
+        "UserPromptSubmit",
+        json!({"prompt": "<task-notification>\n<task-id>b7x2k</task-id>\n\
+            <status>completed</status>\n<summary>Background command completed</summary>\n\
+            </task-notification>"}),
+    );
+    let ended = f.hook("claude-code", "Stop", json!({}));
+    let live = f.live();
+    assert_eq!(
+        live["status"],
+        json!("Waiting"),
+        "a task-notification turn keeps the chain's command awaited: {live} (Stop broadcast {ended})"
+    );
+    assert_eq!(live["background"]["awaited"], json!(1), "{live}");
+    grid_within(
+        "the card still reads Waiting after a task-notification turn",
+        &|grid| grid.contains("● Waiting") && grid.contains("Background: 1 command"),
+    );
 
     // The command exits: Idle, and the Background line goes.
     f.command("one", false);
