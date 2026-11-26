@@ -1345,7 +1345,16 @@ fn a_removal_that_finishes_after_the_reply_bound_is_still_recorded() {
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, child) = unit(&registry, "agent/dispatch-x", Some(&wt));
         mark_naming(&wt, &root);
-        seams::arm_after_removal(&wt, || std::thread::sleep(Duration::from_millis(1500)));
+        // The hook runs inside the reclaim's tokio task. A bare
+        // `std::thread::sleep` there blocks that worker, which can keep the
+        // 300 ms bound's timer from firing until the sleep ends when that
+        // worker is the one driving timers, and the reply then reads Removed
+        // (RWX release-lib on PR #2524, 2026-11-26, not reproduced in 25,584
+        // runs since). `block_in_place` hands the worker's duties to another
+        // thread for the sleep's length.
+        seams::arm_after_removal(&wt, || {
+            tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(1500)))
+        });
 
         let outcome = reclaim_within(
             &registry,
