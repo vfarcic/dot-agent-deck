@@ -73,6 +73,7 @@ Other `remote` subcommands:
 |---|---|
 | `dot-agent-deck remote list` | Prints the registry as a table. Offline. |
 | `dot-agent-deck remote upgrade <NAME> [--version <V>] [--no-install] [--json]` | Installs a new release on the host and restarts its daemon onto it, asking first when agents are running (see [Upgrade a remote](#upgrade-a-remote)). |
+| `dot-agent-deck remote upgrade --all [--json]` | Upgrades every remote whose daemon runs an older release than this binary, one after another (see [Upgrade every remote at once](#upgrade-every-remote-at-once)). |
 | `dot-agent-deck remote doctor <NAME>` | Read-only diagnosis of ssh, the install and reverse tunnels (see [Check a remote's health](#check-a-remotes-health)). |
 | `dot-agent-deck remote remove <NAME>` | Removes the entry from the registry. The binary, hooks, daemon and agents on the host are left as they are. |
 | `dot-agent-deck connect [NAME]` | Opens the TUI on the host (see [Connect](#connect)). |
@@ -195,6 +196,41 @@ What happens to the running daemon depends on what it is running:
 Once the daemon has agreed to restart, it starts no new agents: starting one, from any terminal or the desktop app, fails with `the daemon is restarting; start the agent again once it is back`. Start it again once the upgrade has finished. An agent that starts while you are still deciding is added to the list, and you are asked again.
 
 The command exits non-zero only when a step fails. Keeping the current daemon, by your choice or because nobody could answer, is not a failure.
+
+### Upgrade every remote at once
+
+```bash
+dot-agent-deck remote upgrade --all
+```
+
+`--all`, in place of a name, upgrades every remote on the deck list whose daemon runs an older release than this binary. It first checks all of them at the same time and prints what it found, one line per remote:
+
+```
+Checking 3 remote decks…
+Checked 3 remote decks: 2 to upgrade.
+  my-vm: Will be upgraded from 0.43.0 to 0.44.0.
+  build-box: Skipped: already runs 0.44.0.
+  laptop: Failed: it could not be checked: Could not reach laptop:22. …
+```
+
+A remote is skipped when its daemon already runs this release, runs a newer one, is not running at all, or reports no version it can be compared by. One that cannot be reached is reported as failed and not upgraded.
+
+Then it upgrades the older remotes **one after another**, each exactly as `remote upgrade <name>` would, printing its steps and its result. A remote whose daemon is idle restarts without a question. A remote with agents or orchestration roles running asks the [same question](#upgrade-a-remote), naming its own agents and roles, so you answer once per remote: `r` restarts that one, anything else keeps it, and the next remote starts either way. With no terminal to ask on, a busy remote is installed and keeps its current daemon. A remote that fails does not stop the others.
+
+It ends with one line per remote:
+
+```
+Upgrade all: 1 upgraded, 1 skipped, 1 failed of 3 remote decks.
+  my-vm: Upgraded: now runs 0.44.0 (was 0.43.0).
+  build-box: Skipped: already runs 0.44.0.
+  laptop: Failed: it could not be checked: Could not reach laptop:22. …
+```
+
+Every remote gets one of four results: **Upgraded**, **Kept running** (the new release is installed and the old daemon keeps running, by your choice or because nobody could answer), **Skipped**, or **Failed**. The command exits non-zero when any remote failed or could not be checked; upgraded, kept and skipped remotes are not failures. With `--json`, stdout holds one JSON object with a `decks` list, each entry carrying the remote's name, its `status` (`upgraded`, `kept`, `skipped` or `failed`), the `line` above and the full result. `--all` always installs this binary's release, so `--version` and `--no-install` cannot be combined with it. The daemon on this machine is not part of it: the TUI and the desktop app upgrade that one when they start.
+
+**In the TUI**, press `U` (remappable as `upgrade_all_daemons`, see [Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings)) to open the **Upgrade all daemons** dialog. It shows the same check, one line per remote, and asks `Upgrade 2 daemons? Each daemon with agents or orchestration roles running asks before it stops any.` with **Cancel** selected, so `Enter` alone upgrades nothing. Choose **Upgrade** to start. While it runs, each remote's line shows its progress (`Upgrading: installing the new version…`) or `Waiting to be upgraded.`, and **Stop after this daemon** (or `Esc`) lets the remote being upgraded finish and starts no other; the rest read `Not started: you stopped the upgrade before it reached this deck.` A busy remote's question appears in the dialog, scrolled into view, with **Keep current daemon** selected and **Restart now** below it; `Esc` keeps. When it names more agents than the terminal shows, **Restart now** does nothing until every one of them has been on screen: page through the list with `PageDown`, which moves at most one screen at a time. When it is done, the dialog shows the same one-line-per-remote result, and **Close**. If you leave the dialog while it runs (`Ctrl+C`), press `U` again to return to it. A question that arrives meanwhile brings the dialog back when the TUI is in command mode, and otherwise the status bar says `Upgrade all daemons is waiting for your answer. Press U to see it.`
+
+**In the desktop app**, the Dashboard's **Upgrade all** button does the same; see [Daemons → Upgrade all remote daemons](desktop/daemons.md#upgrade-all-remote-daemons).
 
 ### When the upgrade cannot restart the daemon
 

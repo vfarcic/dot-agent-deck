@@ -8064,6 +8064,20 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** real SSH authentication, release-download compatibility, desktop behavior, or survival of a role map (covered synthetically by /006).
 - **Platform coverage:** mac+linux (Unix); credentials required locally, never run in CI.
 
+##### remote/upgrade/009 — Upgrade all restarts the idle older daemon, asks the busy one about its own work, and skips the current one.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, three sandboxed SSH installers and real daemons behind one host-routing SSH shim).
+- **Agent:** three synthetic cat stand-ins on the busy daemon, including two orchestration roles.
+- **Asserts:** the check reports three decks and two to upgrade; the idle older daemon restarts without a question before the next deck; the busy one asks once, naming its deck, agents, panes and orchestration; Enter keeps its daemon, agents and role map; the current deck is neither installed nor restarted; the run ends with the counts and one line per deck.
+- **Does not assert:** real SSH, independently compiled releases, real-agent work, the TUI or desktop dialogs.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/010 — A deck that fails does not stop Upgrade all, and the batch exits non-zero.
+- **Layer:** L2 (lane 1, real CLI with piped stdout, sandboxed SSH installers and daemons, one deck the SSH shim refuses).
+- **Agent:** none.
+- **Asserts:** with `--json`, stdout is one report naming every deck in deck-list order; an install failure is `failed` at the installing stage and its daemon keeps running; an unreachable deck is `failed` as not checked; the older idle deck after both is still upgraded and restarted; the exit status is non-zero.
+- **Does not assert:** real SSH, TTY rendering or release compatibility.
+- **Platform coverage:** linux+mac.
+
 #### remote/connect
 
 ##### remote/connect/001 — Upgrade-and-connect choices render the attached daemon without repeated consent.
@@ -8208,6 +8222,57 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** the floor is one hour and `focus_recheck_floor()` is it; a focus-in is due with no check started yet, not due within the hour, due at the hour and after five hours, and due when the wall clock moved backwards (issue #2450).
 - **Does not assert:** the checker loop reacting to a real focus-in (`upgrade/tui-upgrade/005`), the desktop app's focus re-check (`desktop/src/hooks/useSelfUpgradeCheck.test.ts`, `self_upgrade_check_006`–`007`).
+- **Platform coverage:** mac+linux+windows.
+
+#### upgrade/upgrade-all-dialog
+
+##### upgrade/upgrade-all-dialog/001 — Upgrade all daemons shows the plan for every remote deck and starts on Cancel.
+- **Layer:** L1 (`upgrade_all_dialog::UpgradeAllDialog` + ratatui `TestBackend` + `insta`), fed a `daemon_upgrade_batch::BatchPlan`.
+- **Agent:** none.
+- **Asserts:** the checking line; the plan's headline and one line per deck in the shared words (to upgrade, already current, could not be checked); the question naming how many daemons; `> Cancel` selected, and Enter alone closes.
+- **Does not assert:** the check itself (`daemon_upgrade_batch` unit tests, `remote/upgrade/009`), the spawned TUI.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/002 — A busy daemon's question names its own agents and roles and defaults to Keep current daemon.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** the deck being upgraded and its stage; the question naming that deck, its agents (pane, directory) and its orchestration role; `> Keep current daemon` selected; Esc answers Keep.
+- **Does not assert:** a real daemon's stop set (`remote/upgrade/009`), the answer reaching the daemon (`upgrade_all_dialog` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/003 — Stop after this daemon waits for the daemon being upgraded and offers nothing else.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** Stop after this daemon is the running batch's only button; after it, the dialog says it is stopping and shows no button; a finished deck's line reads as kept running.
+- **Does not assert:** the batch starting no further deck (`daemon_upgrade_batch::tests::stopping_finishes_the_current_deck_and_starts_no_other`).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/004 — The results show the counts and one line per deck.
+- **Layer:** L1 (dialog state machine + `TestBackend` + `insta`).
+- **Agent:** none.
+- **Asserts:** the headline counts; upgraded, skipped, not started and failed lines in the shared words; only Close, and Enter closes.
+- **Does not assert:** the CLI's summary (`remote/upgrade/009`), the desktop's (`desktop/src/components/UpgradeAllDialog.test.tsx`).
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/005 — Restart now waits until every agent a busy daemon names has been on screen.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** with 30 agents on a 24-row terminal the dialog scrolls to the question, the last agent is off screen, the hint says to read the whole list, and Restart now does nothing; after PageDown brings the last agent on screen Restart now is answered.
+- **Does not assert:** the desktop dialog, which scrolls its own list in the browser.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/006 — Rows scrolled past between two frames keep Restart now refused.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** ten PageDowns before one draw put the last agent on screen without the rows between ever being drawn, and Restart now does nothing; paging back up a frame at a time shows them and Restart now is answered.
+- **Does not assert:** the desktop dialog, which scrolls its own list in the browser.
+- **Platform coverage:** mac+linux+windows.
+
+##### upgrade/upgrade-all-dialog/007 — On a short terminal, paging moves at most one screen, so no agent is skipped before Restart now.
+- **Layer:** L1 (dialog state machine + `TestBackend`).
+- **Agent:** none.
+- **Asserts:** on a 13-row terminal, Restart now does nothing at every step until paging has reached the end; every one of the 30 agents was drawn on some frame before it becomes available.
+- **Does not assert:** the desktop dialog.
 - **Platform coverage:** mac+linux+windows.
 
 #### upgrade/tui-upgrade

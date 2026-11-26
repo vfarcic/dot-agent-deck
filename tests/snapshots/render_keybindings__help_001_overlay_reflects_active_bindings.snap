@@ -36,6 +36,7 @@ expression: text
         │  i                  Deck messages: Retry or Cancel                                                  │         
         │  o                  Open pull request                                                               │         
         │  u / Ctrl+u         Upgrade (update badge)                                                          │         
+        │  U                  Upgrade all daemons                                                             │         
         │  a / c              Restart notice: list / dismiss                                                  │         
         │  I / X              Interrupted work: list / hide                                                   │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
