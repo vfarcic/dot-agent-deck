@@ -1348,10 +1348,9 @@ fn a_removal_that_finishes_after_the_reply_bound_is_still_recorded() {
         // The hook runs inside the reclaim's tokio task. A bare
         // `std::thread::sleep` there blocks that worker, which can keep the
         // 300 ms bound's timer from firing until the sleep ends when that
-        // worker is the one driving timers, and the reply then reads Removed
-        // (RWX release-lib on PR #2524, 2026-11-26, not reproduced in 25,584
-        // runs since). `block_in_place` hands the worker's duties to another
-        // thread for the sleep's length.
+        // worker is the one driving timers, and the reply then reads Removed.
+        // `block_in_place` hands the worker's duties to another thread for
+        // the sleep's length.
         seams::arm_after_removal(&wt, || {
             tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(1500)))
         });
