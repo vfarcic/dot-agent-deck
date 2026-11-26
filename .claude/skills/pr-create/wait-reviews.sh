@@ -151,6 +151,22 @@ fetch() {
   echo '[]' >"$tmp/$name.json"
 }
 
+# Inline comments are read only from the head commit's committer date on, so a
+# poll reads what changed since the head was made rather than the PR's whole
+# review history (Qodo's finding on PR #2544). A finding on the head is written
+# after the commit, so it falls inside that window unless the committer's
+# clock ran ahead; then the settle period still ends the wait. When the date
+# cannot be read, every page is read.
+since_head=
+since_for=
+# Sets $since_head for the current head, reading it once per head.
+read_since_head() {
+  [ "$since_for" = "$head" ] && return
+  since_for="$head"
+  since_head=$(gh api "repos/{owner}/{repo}/commits/$head" --jq .commit.committer.date 2>/dev/null) || since_head=
+  printf '%s\n' "$since_head" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$' || since_head=
+}
+
 read_pr || die "cannot read pull request #$pr"
 head="$new_head"
 created="$new_created"
@@ -168,7 +184,10 @@ while :; do
   echo '[]' >"$tmp/reviews.json"
   echo '[]' >"$tmp/inline.json"
   case "$kinds" in *comment*) fetch comments 'add // []' api "repos/{owner}/{repo}/issues/$pr/comments" --paginate ;; esac
-  case "$kinds" in *inline*) fetch inline 'add // []' api "repos/{owner}/{repo}/pulls/$pr/comments" --paginate ;; esac
+  case "$kinds" in *inline*)
+    read_since_head
+    fetch inline 'add // []' api "repos/{owner}/{repo}/pulls/$pr/comments?per_page=100${since_head:+&since=$since_head}" --paginate ;;
+  esac
   case "$kinds" in *check_run*) fetch checks '[.[].check_runs[]]' api "repos/{owner}/{repo}/commits/$head/check-runs?per_page=100" --paginate ;; esac
   case "$kinds" in *review*) fetch reviews 'add // []' api "repos/{owner}/{repo}/pulls/$pr/reviews" --paginate ;; esac
 

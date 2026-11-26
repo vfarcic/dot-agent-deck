@@ -71,12 +71,14 @@ answer() {
   else echo "HTTP 502" >&2; exit 1
   fi
 }
+echo "$*" >>"$REVIEW_STUB/calls.log"
 case "$*" in
   "pr view "*) answer pr ;;
   "api repos/{owner}/{repo}/issues/"*"/comments --paginate") answer comments ;;
   "api repos/{owner}/{repo}/commits/"*"/check-runs?per_page=100 --paginate") answer checks ;;
   "api repos/{owner}/{repo}/pulls/"*"/reviews --paginate") answer reviews ;;
-  "api repos/{owner}/{repo}/pulls/"*"/comments --paginate") answer inline ;;
+  "api repos/{owner}/{repo}/pulls/"*"/comments?per_page=100"*" --paginate") answer inline ;;
+  "api repos/{owner}/{repo}/commits/"*" --jq .commit.committer.date") answer commit ;;
   *) echo "gh stand-in: unhandled invocation: $*" >&2; exit 1 ;;
 esac
 "#;
@@ -129,8 +131,9 @@ impl Sandbox {
             .unwrap_or(0)
     }
 
-    /// What `gh` answers for a surface: `pr`, `comments`, `checks`, `reviews`
-    /// or `inline` (the pull request's review comments).
+    /// What `gh` answers for a surface: `pr`, `comments`, `checks`, `reviews`,
+    /// `inline` (the pull request's review comments) or `commit` (the head
+    /// commit's committer date, which `--jq` prints as bare text).
     fn answer(&self, surface: &str, body: &Value) {
         fs::write(self.stub.join(format!("{surface}.json")), body.to_string()).unwrap();
     }
@@ -142,6 +145,16 @@ impl Sandbox {
             body.to_string(),
         )
         .unwrap();
+    }
+
+    /// Every `gh` invocation the script made, one per line.
+    fn calls(&self) -> String {
+        fs::read_to_string(self.stub.join("calls.log")).unwrap_or_default()
+    }
+
+    /// What `gh` prints, verbatim, for a surface.
+    fn answer_text(&self, surface: &str, text: &str) {
+        fs::write(self.stub.join(format!("{surface}.json")), text).unwrap();
     }
 
     fn with_registry(mut self, registry: &Value) -> Self {
@@ -759,5 +772,74 @@ fn review_wait_017_it_waits_past_the_early_edit_for_the_findings() {
         sb.reads("inline"),
         3,
         "the comment naming the head must not end the wait before the findings land"
+    );
+}
+
+/// Qodo's finding on PR #2544: reading every page of a busy PR's review
+/// comments on each poll can spend the API quota. Only comments updated since
+/// the head commit's date can be a finding on it.
+#[test]
+fn review_wait_018_inline_comments_are_read_from_the_head_commits_date_on() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer_text("commit", "2026-11-26T11:32:26Z\n");
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    let calls = sb.calls();
+    assert!(
+        calls.contains("pulls/42/comments?per_page=100&since=2026-11-26T11:32:26Z --paginate"),
+        "{calls}"
+    );
+
+    // The date is read once per head, not on every poll.
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer_text("commit", "2026-11-26T11:32:26Z\n");
+    sb.answer_on("inline", 1, &json!([]));
+    sb.answer_on("inline", 2, &json!([]));
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    assert_eq!(
+        (sb.reads("inline"), sb.reads("commit")),
+        (3, 1),
+        "{}",
+        sb.calls()
+    );
+
+    // A date that cannot be read falls back to every page.
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer_text("commit", "not a date\n");
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    assert!(
+        sb.calls()
+            .contains("pulls/42/comments?per_page=100 --paginate"),
+        "{}",
+        sb.calls()
     );
 }
