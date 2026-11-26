@@ -309,12 +309,12 @@ What stays specific to this queue:
 Check the name is free before dispatching:
 
 ```bash
-git show-ref --verify --quiet "refs/heads/agent/dispatch-<name>" && echo TAKEN || echo FREE
+.claude/skills/issue-queue/unit-name-free.sh "<name>" "$OWNER/$REPO"
 ```
 
-`<name>` is the unit name you just chose, so the ref is `agent/dispatch-issue-<n>` — or `agent/dispatch-issue-<n>-<slug>` when you added one. Check the name you are actually about to dispatch, not the bare number.
+`<name>` is the unit name you just chose, so the branch is `agent/dispatch-issue-<n>` — or `agent/dispatch-issue-<n>-<slug>` when you added one. Check the name you are actually about to dispatch, not the bare number. The script prints `FREE`, `TAKEN: <why>` or `UNKNOWN: <why>`; read `UNKNOWN` (a `git ls-remote` or `gh` that failed) as taken.
 
-A name is single-use: removing a worktree keeps its branch, so `agent/dispatch-<name>` surviving from earlier work refuses a re-dispatch. **If it is taken, pick a different name** — `issue-<n>-<MMDD>` disambiguates a second attempt. **Do not delete the branch to free the name.** It may hold committed work that was never pushed, and it is the only reference to it; the refusal is deliberate for exactly that reason. The mechanics and the deliberate `git branch -D` route out of it are documented in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) — that is the runner's call to make, with the branch's contents in front of them, not this skill's.
+A name is single-use, and the script checks the three ways it gets used up: the branch exists locally (removing a worktree keeps its branch), the branch exists on `origin`, or **any pull request, open, merged or closed, has had it as its head** (issue #2509). The last is the one a local check misses: a unit's branch is usually deleted locally and on the remote once its PR merges, and a new branch under the same name then picks up the old merged PR on its card and in `worktree list` (issue #2510 covers the deck's side). **If it is taken, pick a different name** — `issue-<n>-<MMDD>` disambiguates a second attempt. **Do not delete the branch to free the name.** It may hold committed work that was never pushed, and it is the only reference to it; the refusal is deliberate for exactly that reason. The mechanics and the deliberate `git branch -D` route out of it are documented in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) — that is the runner's call to make, with the branch's contents in front of them, not this skill's.
 
 ## Step 7 — Choose the shape, by criteria
 
