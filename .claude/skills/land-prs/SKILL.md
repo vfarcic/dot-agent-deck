@@ -157,14 +157,14 @@ Several PRs can share one worktree: switch between detached heads, but finish (c
 The approving actor is the agent reviewer, `pr-review-batch.yml` (CLAUDE.md rule 8). Its mechanics decide how to call it:
 
 - **It only votes on a PR whose required checks have all concluded.** Dispatching it right after a push produces `skip #<n>: required context '…' has not concluded` and no vote. Wait for CI first.
-- **Its concurrency group holds one running and one pending run.** A second dispatch replaces the pending one, so dispatching once per PR in a burst cancels all but the last. After CI is green on every PR you need reviewed, dispatch **one sweep** instead:
+- **Its runs go one at a time, and every dispatch queues** (`queue: max`, issue #2506), so dispatching once per PR in a burst no longer cancels any of them; they run in order. One sweep is still the cheaper way to cover many PRs, because each queued run pays its own selection and setup jobs. After CI is green on every PR you need reviewed, dispatch **one sweep**:
 
   ```bash
   gh workflow run pr-review-batch.yml -f dry_run=false
   ```
 
-  `dry_run` defaults to `true` on a manual dispatch, which produces verdicts and casts no vote. With `pr_number` set it reviews one PR; dispatch those one at a time, each after the previous run finishes.
-- **It reviews three PRs in parallel** (`max-parallel: 3`), so a sweep over many PRs takes several rounds.
+  `dry_run` defaults to `true` on a manual dispatch, which produces verdicts and casts no vote. With `pr_number` set it reviews one PR.
+- **Its agent reviews run one after another**, even within a sweep: the matrix starts three legs at a time (`max-parallel: 3`), but each leg's `agent` job waits on one repository-wide group in `pr-review.lock.yml`. A sweep over many PRs takes a few minutes per PR.
 - A sweep also covers PRs you are not landing. That is its normal job — an approval is not a merge, and the exclusions are still yours to hold.
 - **For a stack, review bottom-up one PR at a time** (`pr_number=<n>`), each after the previous review has finished and the previous PR has merged: an upper PR's review is wasted if its base draws a change request. A small loop that waits for CI, dispatches the review, waits for it, and merges only when the PR reads `MERGEABLE APPROVED` with no unresolved thread, a clean `merge-tree` against `main` and an overlap check (Step 3) that lists nothing — stopping at the first PR that does not — keeps this unattended without ever merging past a problem.
 - **Wait for CI on the PR's current head SHA, not for `gh pr checks` to read green.** Right after a push `gh pr checks` can still report the previous head's results, and a review dispatched then skips the PR (`required context 'build' has not concluded`). Read the head with `gh pr view <n> --json headRefOid` and wait for `gh run list --commit <sha> --workflow ci.yml` to report `completed` first.

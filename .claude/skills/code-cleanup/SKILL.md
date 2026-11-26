@@ -219,7 +219,7 @@ FINISH:
   "The overlap check before a merge" and then watches main's CI run for the merge commit, a red
   one being this unit's to fix. Never `--auto`, never `--admin`.
 - tests: request the agent review (`gh workflow run pr-review-batch.yml -f pr_number=<n>
-  -f dry_run=false`; request again if the run ends `cancelled`), address what it raises (at most
+  -f dry_run=false`; it may wait behind other runs; request again once if it ends `cancelled`), address what it raises (at most
   three rounds), then STOP at the PR for a person, approved or not. Do not merge, do not arm
   auto-merge.
 - instructions: if the PR changes CLAUDE.md, finish as tests mode does. Otherwise finish as code
