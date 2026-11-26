@@ -52,6 +52,25 @@ pub fn is_harness_turn(prompt: &str) -> bool {
     })
 }
 
+/// Issue #2505: whether `event` opens a turn the agent's harness submitted
+/// itself — Claude Code's `<task-notification>` wake about a background
+/// command or subagent that finished — rather than one a person typed or the
+/// deck delivered.
+///
+/// Such a turn continues the chain of turns that started the background work
+/// it reports on, so it neither starts a new turn for the Waiting
+/// classification (a command started earlier in the chain is still awaited)
+/// nor counts as the agent moving on from its card report's "Needs you". A
+/// deck message, which Claude Code also wakes with a `<task-notification>`, is
+/// labelled `✉ …` by the daemon before this is read
+/// ([`crate::inbox_prompt::stamp_deck_message_prompt`]), so it matches none of
+/// the openers and starts a new chain like a typed prompt.
+pub fn opens_harness_turn(event: &crate::event::AgentEvent) -> bool {
+    event.event_type == crate::event::EventType::Thinking
+        && !crate::inbox_prompt::is_deck_message(event)
+        && event.user_prompt.as_deref().is_some_and(is_harness_turn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
