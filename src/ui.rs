@@ -22180,16 +22180,36 @@ fn render_bottom_bar_below_notice(
     }
     // Issue #2511: drawn after every mode's footer (Filter, Rename and Copy
     // mode draw their own), so a held request is said whatever the bar shows.
-    render_trust_waiting_badge(frame, ui, full_area);
+    // The two text inputs keep their text and cursor clear of it (Qodo, PR
+    // #2525): the badge goes right of what is typed, or not at all.
+    let typed_end = match ui.mode {
+        UiMode::Filter => Some(area.x + 2 + text_cells(&ui.filter_text) + 1),
+        UiMode::Rename => Some(area.x + 8 + text_cells(&ui.rename_text) + 1),
+        _ => None,
+    };
+    render_trust_waiting_badge(frame, ui, full_area, typed_end);
+}
+
+/// The terminal cells `text` takes, saturated to `u16`.
+fn text_cells(text: &str) -> u16 {
+    u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
 }
 
 /// Issue #2511: the desktop app's "approval waiting" marker, in its words, at
 /// the right end of the bar's LAST row, which a tall dialog does not reach:
 /// left of whatever is pressable at that end (the update badge, Rename's
 /// Save/Cancel), or, with no room beside them, over the rightmost of them,
-/// whose click targets it then drops. Nothing to press: the review opens on
-/// its own once the dialog holding it back closes.
-fn render_trust_waiting_badge(frame: &mut Frame, ui: &mut UiState, area: Rect) {
+/// whose click targets it then drops. With `typed_end` (a text input's end,
+/// cursor included) it starts no further left than that and covers no
+/// button, and is left out when there is no such room, so typing is never
+/// hidden. Nothing to press: the review opens on its own once the dialog
+/// holding it back closes.
+fn render_trust_waiting_badge(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    area: Rect,
+    typed_end: Option<u16>,
+) {
     if ui.trust_requests_held == 0 || area.height == 0 || area.width == 0 {
         return;
     }
@@ -22217,6 +22237,7 @@ fn render_trust_waiting_badge(frame: &mut Frame, ui: &mut UiState, area: Rect) {
             .min();
         match blocking {
             Some(x) if x >= area.x + bw => end = x,
+            Some(_) if typed_end.is_some() => return,
             Some(_) => {
                 // No room beside them: over the rightmost, as the bar's own
                 // status message does.
@@ -22225,6 +22246,9 @@ fn render_trust_waiting_badge(frame: &mut Frame, ui: &mut UiState, area: Rect) {
             }
             None => break,
         }
+    }
+    if typed_end.is_some_and(|typed| end - bw < typed) {
+        return;
     }
     let badge_area = Rect {
         x: end - bw,
@@ -46589,6 +46613,18 @@ mod tests {
                     .is_some_and(|row| row.contains("1 approval waiting")),
                 "{mode:?}'s footer says a request is waiting: {rows:#?}"
             );
+            if mode == UiMode::Filter {
+                // A filter long enough to reach the badge keeps its end
+                // visible: no badge rather than one over the typing.
+                ui.filter_text = "x".repeat(47) + "END";
+                let rows = draw_sized(&mut ui, 80, 24);
+                let last = rows.last().expect("a footer");
+                assert!(
+                    last.contains("END"),
+                    "the filter's end stays visible: {last:?}"
+                );
+                assert!(!last.contains("approval waiting"), "{last:?}");
+            }
             if mode == UiMode::Rename {
                 for action in [Action::SaveRename, Action::CancelRename] {
                     assert!(
