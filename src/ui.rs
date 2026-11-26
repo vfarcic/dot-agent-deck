@@ -2018,6 +2018,11 @@ struct UiState {
     /// to the daemon, with the orchestration's name for the status line.
     /// [`poll_trust_requests`] sends them.
     trust_request_denials: Vec<(u64, String, String)>,
+    /// Issue #2511: how many requests wait unshown because another dialog
+    /// (or a held restore) holds their review back, for the footer's
+    /// "approval waiting" badge. `0` when none waits, when the deck is free
+    /// for them, and while a review is open.
+    trust_requests_held: usize,
     /// PRD #1666 part 2 (G-fix7e): where this frame drew the restart notice's
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
@@ -2769,6 +2774,7 @@ impl UiState {
             trust_requests_seen: std::collections::BTreeSet::new(),
             trust_request_retry_at: None,
             trust_request_denials: Vec::new(),
+            trust_requests_held: 0,
             restart_notice_area: None,
             confirm_choices_drawn: None,
             confirm_drawing: None,
@@ -14508,6 +14514,8 @@ fn open_next_trust_restore(ui: &mut UiState) {
 /// daemon as the New Agent form's is. A request whose orchestration reads as
 /// approved by then opens nothing.
 fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneController) {
+    // Issue #2511: recounted below when a dialog holds a request back.
+    ui.trust_requests_held = 0;
     for (id, digest, orchestration) in std::mem::take(&mut ui.trust_request_denials) {
         let message = match pane.deny_trust_request(id, &digest) {
             Ok(_) => crate::trust_prompt::request_denied_message(&orchestration),
@@ -14554,6 +14562,23 @@ fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneCon
             .iter()
             .any(|request| request.id == *id && request.digest == *digest)
     });
+    // Issue #2511: a request held back by another dialog or a held restore
+    // is said in the footer ("1 approval waiting") rather than waiting
+    // silently; it opens on its own once that closes. Not while a review is
+    // open: that is what is on screen.
+    if ui.trust_prompt.is_none()
+        && (!ui.pending_trust_restores.is_empty()
+            || !matches!(ui.mode, UiMode::Normal | UiMode::PaneInput))
+    {
+        ui.trust_requests_held = list
+            .requests
+            .iter()
+            .filter(|request| {
+                !ui.trust_requests_seen
+                    .contains(&(request.id, request.digest.clone()))
+            })
+            .count();
+    }
     if ui.trust_prompt.is_some()
         || !ui.pending_trust_restores.is_empty()
         || !matches!(ui.mode, UiMode::Normal | UiMode::PaneInput)
@@ -22316,6 +22341,98 @@ fn render_bottom_bar_below_notice(
             }
         }
     }
+    // Issue #2511: drawn after every mode's footer (Filter, Rename and Copy
+    // mode draw their own), so a held request is said whatever the bar shows.
+    // The two text inputs keep their text and cursor clear of it (Qodo, PR
+    // #2525): the badge goes right of what is typed, or not at all.
+    let typed_end = match ui.mode {
+        UiMode::Filter => Some(area.x + 2 + text_cells(&ui.filter_text) + 1),
+        UiMode::Rename => Some(area.x + 8 + text_cells(&ui.rename_text) + 1),
+        _ => None,
+    };
+    render_trust_waiting_badge(frame, ui, full_area, typed_end);
+}
+
+/// The terminal cells `text` takes, saturated to `u16`.
+fn text_cells(text: &str) -> u16 {
+    u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+}
+
+/// Issue #2511: the desktop app's "approval waiting" marker, in its words, at
+/// the right end of the bar's LAST row, which a tall dialog does not reach:
+/// left of whatever is pressable at that end (the update badge, Rename's
+/// Save/Cancel), or, with no room beside them, over the rightmost of them,
+/// whose click targets it then drops. With `typed_end` (a text input's end,
+/// cursor included) it starts no further left than that and covers no
+/// button, and is left out when there is no such room, so typing is never
+/// hidden. Nothing to press: the review opens on its own once the dialog
+/// holding it back closes.
+fn render_trust_waiting_badge(
+    frame: &mut Frame,
+    ui: &mut UiState,
+    area: Rect,
+    typed_end: Option<u16>,
+) {
+    if ui.trust_requests_held == 0 || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text = format!(
+        " {} ",
+        crate::trust_prompt::approvals_waiting_label(ui.trust_requests_held)
+    );
+    let bw =
+        u16::try_from(unicode_width::UnicodeWidthStr::width(text.as_str())).unwrap_or(u16::MAX);
+    if bw > area.width {
+        return;
+    }
+    let row = area.y + area.height - 1;
+    let right = area.x + area.width;
+    // Step left past the pressable rects at the row's right end.
+    let mut end = right;
+    loop {
+        let start = end.saturating_sub(bw);
+        let blocking = ui
+            .button_rects
+            .iter()
+            .filter(|(_, rect)| rect.y <= row && row < rect.y + rect.height)
+            .filter(|(_, rect)| rect.x < end && start < rect.x + rect.width)
+            .map(|(_, rect)| rect.x)
+            .min();
+        match blocking {
+            Some(x) if x >= area.x + bw => end = x,
+            Some(_) if typed_end.is_some() => return,
+            Some(_) => {
+                // No room beside them: over the rightmost, as the bar's own
+                // status message does.
+                end = right;
+                break;
+            }
+            None => break,
+        }
+    }
+    if typed_end.is_some_and(|typed| end - bw < typed) {
+        return;
+    }
+    let badge_area = Rect {
+        x: end - bw,
+        y: row,
+        width: bw,
+        height: 1,
+    };
+    frame.render_widget(Clear, badge_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        badge_area,
+    );
+    // A click on it presses nothing hidden beneath it.
+    ui.button_rects
+        .retain(|(_, rect)| rect.intersection(badge_area).is_empty());
 }
 
 /// PRD #80 M5: render a left-aligned row of modal buttons into `row` and
@@ -46663,9 +46780,11 @@ mod tests {
         assert!(pc.denials.lock().unwrap().is_empty());
     }
 
-    /// Scenario: A request waits while another dialog is open, while a held
-    /// restore still waits for its own review, and while the daemon reads the
-    /// orchestration as approved it opens nothing at all.
+    /// Scenario: A request waits while another dialog is open, and the footer
+    /// says "1 approval waiting" (issue #2511) until it opens on its own once
+    /// the dialog closes; it waits while a held restore still waits for its
+    /// own review, and while the daemon reads the orchestration as approved it
+    /// opens nothing at all.
     #[test]
     fn request_tui_004_a_request_waits_for_the_deck_to_be_free() {
         let tmp = tempdir().expect("tempdir");
@@ -46673,14 +46792,62 @@ mod tests {
         let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
         let snapshot = requesting(&pc.view, 9, 1);
 
+        // Every footer says it, the modes that draw their own bar too
+        // (Greptile, PR #2525); Rename keeps its Save/Cancel clickable.
+        for mode in [UiMode::Filter, UiMode::Rename] {
+            let mut ui = default_ui();
+            ui.mode = mode;
+            poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
+            assert!(ui.trust_prompt.is_none(), "waits behind {mode:?}");
+            let rows = draw_sized(&mut ui, 120, 40);
+            assert!(
+                rows.last()
+                    .is_some_and(|row| row.contains("1 approval waiting")),
+                "{mode:?}'s footer says a request is waiting: {rows:#?}"
+            );
+            if mode == UiMode::Filter {
+                // A filter long enough to reach the badge keeps its end
+                // visible: no badge rather than one over the typing.
+                ui.filter_text = "x".repeat(47) + "END";
+                let rows = draw_sized(&mut ui, 80, 24);
+                let last = rows.last().expect("a footer");
+                assert!(
+                    last.contains("END"),
+                    "the filter's end stays visible: {last:?}"
+                );
+                assert!(!last.contains("approval waiting"), "{last:?}");
+            }
+            if mode == UiMode::Rename {
+                for action in [Action::SaveRename, Action::CancelRename] {
+                    assert!(
+                        ui.button_rects.iter().any(|(a, _)| {
+                            std::mem::discriminant(a) == std::mem::discriminant(&action)
+                        }),
+                        "Rename's {action:?} is still clickable beside the badge"
+                    );
+                }
+            }
+        }
+
         let mut ui = default_ui();
         ui.mode = UiMode::Help;
         poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
         assert!(ui.trust_prompt.is_none(), "waits behind another dialog");
         assert_eq!(ui.mode, UiMode::Help);
+        let rows = draw_sized(&mut ui, 120, 40);
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.contains("1 approval waiting")),
+            "the footer says a request is waiting: {rows:#?}"
+        );
         ui.mode = UiMode::Normal;
         poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
         assert_eq!(ui.mode, UiMode::TrustPrompt, "opens once the deck is free");
+        let rows = draw_sized(&mut ui, 120, 40);
+        assert!(
+            !rows.join("\n").contains("approval waiting"),
+            "no badge while the review is open"
+        );
 
         let mut ui = default_ui();
         *pc.approved.lock().unwrap() = true;

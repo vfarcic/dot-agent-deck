@@ -504,6 +504,13 @@ The deck asks for the approval itself when it refuses to start an unapproved orc
 - **Does not assert:** the desktop app's own UI (its vitest and Playwright specs); `delegate`, `pane restart` and `pane spawn` callers (`trust_requests` unit tests record them the same way).
 - **Platform coverage:** mac+linux.
 
+##### config-trust/request/006 — A request held behind a dialog is said in the TUI's footer, and opens when the dialog closes.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, with a PTY-attached TUI already showing Help, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** with Help open when the refused run-now raises the request, the review does not cover Help and the footer says `1 approval waiting` (issue #2511); `Esc` closes Help, the review opens on its own with `Asked by: scheduled task 'held-sched'` and its footer, and the badge is gone.
+- **Does not assert:** the badge's placement beside Rename's buttons or in Filter mode (`ui.rs` `request_tui_004`); the desktop app's marker (its vitest and Playwright specs).
+- **Platform coverage:** mac+linux.
+
 #### config-trust/rearm
 
 ##### config-trust/rearm/001 — A warm reattach never re-arms the orchestrator with changed, unapproved instructions.

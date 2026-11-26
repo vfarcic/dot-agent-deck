@@ -10,6 +10,7 @@ import {
   APPROVE_AND_START,
   ASKED_BY_LABEL,
   DENY,
+  NO_APPROVAL_WAITING,
   REQUEST_INTRO,
   REQUEST_KEYS_ARM_MS,
   requestAnsweredElsewhereNotice,
@@ -20,7 +21,8 @@ import {
   type ProjectTrust,
   type ProjectTrustTarget,
 } from "./lib/projectTrust";
-import { pendingTrustRequests, TRUST_REQUEST_RETRY_MS, type TrustRequestRuntime } from "./lib/trustRequests";
+import { pendingTrustRequests, showHeldTrustRequest, TRUST_REQUEST_RETRY_MS, type TrustRequestRuntime } from "./lib/trustRequests";
+import { VOICE_ACTIONS } from "./lib/voiceActions";
 import { TrustRequestGate } from "./components/TrustRequestGate";
 import type { DeckFleet, DeckRuntimeState, DeckSnapshot, TrustRequest } from "./types";
 
@@ -81,10 +83,10 @@ function Other() {
   return <div ref={ref} data-testid="other">other</div>;
 }
 
-function Gate({ runtime, fleet, other = false, onNotice }: { runtime: TrustRequestRuntime; fleet: DeckFleet; other?: boolean; onNotice: (notice: { message: string }) => void }) {
+function Gate({ runtime, fleet, other = false, ready = true, summonable = true, onNotice }: { runtime: TrustRequestRuntime; fleet: DeckFleet; other?: boolean; ready?: boolean; summonable?: boolean; onNotice: (notice: { message: string }) => void }) {
   return <>
     {other && <Other />}
-    <TrustRequestGate runtime={runtime} fleet={fleet} ready onNotice={onNotice} />
+    <TrustRequestGate runtime={runtime} fleet={fleet} ready={ready} summonable={summonable} onNotice={onNotice} />
   </>;
 }
 
@@ -110,16 +112,95 @@ describe("an in-deck approval request", () => {
     expect(within(dialog).queryByRole("button", { name: "Cancel" })).toBeNull();
   });
 
-  /** Scenario: a request arrives while another dialog is open. No review opens over it; once that dialog closes, the review opens. */
-  it("waits while another overlay is open", async () => {
+  /** Scenario: a request arrives while another dialog is open. No review opens over it, and a marker says "1 approval waiting"; once that dialog closes, the review opens by itself and the marker goes. */
+  it("waits while another overlay is open, saying so", async () => {
     const runtime = runtimeOf();
     const fleet = [deck(LOCAL, [request(1)])];
     const { rerender } = render(<Gate runtime={runtime} fleet={fleet} other onNotice={vi.fn()} />);
     await act(async () => { await Promise.resolve(); });
     expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
     expect(runtime.projectTrustState).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /^1 approval waiting/ })).toBeVisible();
     rerender(<Gate runtime={runtime} fleet={fleet} onNotice={vi.fn()} />);
     expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+    expect(screen.queryByTestId("trust-waiting-marker")).toBeNull();
+  });
+
+  /** Scenario: two decks each ask for an approval while a dialog is open. The marker says "2 approvals waiting"; clicking it opens the first review over the dialog, and once that is answered the marker says "1 approval waiting" for the other. */
+  it("counts the waiting requests, and opens them over the dialog one at a time", async () => {
+    const runtime = runtimeOf();
+    render(<Gate runtime={runtime} fleet={[deck(LOCAL, [request(1)]), deck(REMOTE, [request(2, { orchestration: "other", digest: "cd34" })])]} other onNotice={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^2 approvals waiting/ }));
+    const dialog = await screen.findByTestId("project-trust-dialog");
+    expect(screen.getByTestId("other")).toBeInTheDocument();
+    expect(screen.queryByTestId("trust-waiting-marker")).toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: DENY }));
+    await waitFor(() => expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(LOCAL, 1, "ab12"));
+    expect(await screen.findByRole("button", { name: /^1 approval waiting/ })).toBeVisible();
+    expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+  });
+
+  /** Scenario: a request arrives while the shell is not ready for a review (the connection banner is up, say) and nothing is open. The marker says so, and clicking it opens the review. */
+  it("says an approval is waiting while the shell holds the review back", async () => {
+    const runtime = runtimeOf();
+    render(<Gate runtime={runtime} fleet={[deck(LOCAL, [request(1)])]} ready={false} onNotice={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^1 approval waiting/ }));
+    expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+  });
+
+  /** Scenario: the user clicks the marker while voice's numbered choice is drawn over everything. No review opens beneath the choice and the marker stays; once the choice closes, the review opens. */
+  it("waits for voice's numbered choice before opening a review asked for", async () => {
+    const runtime = runtimeOf();
+    const fleet = [deck(LOCAL, [request(1)])];
+    const { rerender } = render(<Gate runtime={runtime} fleet={fleet} other summonable={false} onNotice={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /^1 approval waiting/ }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+    expect(runtime.projectTrustState).not.toHaveBeenCalled();
+    expect(screen.getByTestId("trust-waiting-marker")).toBeVisible();
+    rerender(<Gate runtime={runtime} fleet={fleet} other onNotice={vi.fn()} />);
+    expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+  });
+
+  /** Scenario: the user clicks the marker, but the deck does not answer when the app reads the review. The app says why, the marker comes back, and the retry after the back-off does not open the review over the dialog unasked. */
+  it("asks once per click: a review that could not be read brings the marker back", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let fail = true;
+      const runtime = runtimeOf({
+        projectTrustState: vi.fn(async (target: ProjectTrustTarget) => {
+          if (fail) throw new Error("timed out");
+          return review(target);
+        }),
+      });
+      const onNotice = vi.fn();
+      render(<Gate runtime={runtime} fleet={[deck(LOCAL, [request(1)])]} other onNotice={onNotice} />);
+      fireEvent.click(await screen.findByRole("button", { name: /^1 approval waiting/ }));
+      await waitFor(() => expect(onNotice).toHaveBeenCalledOnce());
+      expect(await screen.findByRole("button", { name: /^1 approval waiting/ })).toBeVisible();
+      fail = false;
+      await act(async () => { vi.advanceTimersByTime(TRUST_REQUEST_RETRY_MS * 2); });
+      await act(async () => { await Promise.resolve(); });
+      expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+      expect(runtime.projectTrustState).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole("button", { name: /^1 approval waiting/ }));
+      expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** Scenario: with a request held behind a dialog, the user says "show the approval": the review opens over the dialog. With none waiting, it answers that no approval is waiting. */
+  it("is reachable by voice while held: show the approval opens it", async () => {
+    expect(showHeldTrustRequest()).toBe(NO_APPROVAL_WAITING);
+    const runtime = runtimeOf();
+    render(<Gate runtime={runtime} fleet={[deck(LOCAL, [request(1)])]} other onNotice={vi.fn()} />);
+    await screen.findByTestId("trust-waiting-marker");
+    const reportRefused = vi.fn();
+    act(() => { VOICE_ACTIONS.showApprovalRequest.run({ showApprovalRequest: showHeldTrustRequest, reportRefused }); });
+    expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+    expect(reportRefused).not.toHaveBeenCalled();
+    expect(VOICE_ACTIONS.showApprovalRequest.voice).toBe(true);
   });
 
   /** Scenario: the user approves a request. The approval carries the digest of the text shown, nothing is started, the review closes with the TUI's sentence, and a later snapshot still listing the request opens no second review. */
@@ -342,5 +423,71 @@ describe("an in-deck approval request in the app", () => {
     fireEvent.click(within(await screen.findByTestId("project-trust-dialog")).getByRole("button", { name: DENY }));
     expect(await screen.findByTestId("trust-request-toast")).toHaveTextContent(requestDeniedNotice("team"));
     expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(REMOTE, 7, "ab12");
+  });
+});
+
+describe("an in-deck approval request while the user is in something", () => {
+  function paneRuntime(): DeckRuntimeState {
+    const listed = deck(LOCAL, []);
+    /* The fixture's agents, as this deck's own, so the pane can open on one. */
+    const local = { ...listed, agents: listed.agents.map((agent) => ({ ...agent, daemonId: LOCAL })) };
+    const settings: DesktopSettingsDto = { ...structuredClone(DEFAULT_DESKTOP_SETTINGS), endpoints: { remote: [], selection: LOCAL_ENDPOINT_SELECTION } };
+    return {
+      mode: "live",
+      desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
+      terminalData: {},
+      clearError: vi.fn(),
+      runAction: vi.fn(async () => ({ ok: true })),
+      sendTerminalInput: vi.fn(async () => undefined),
+      resizeTerminal: vi.fn(async () => undefined),
+      setShownTerminals: vi.fn(async () => undefined),
+      reconnect: vi.fn(async () => undefined),
+      listProjects: vi.fn(async () => ({ projects: [] })),
+      resolveProject: vi.fn(async () => { throw new Error("unresolved"); }),
+      setZoom: vi.fn(async (level: number) => level),
+      getSettings: vi.fn(async () => ({ settings: structuredClone(settings), path: "/tmp/desktop.toml" })),
+      saveSettings: vi.fn(async (next: DesktopSettingsDto) => structuredClone(next)),
+      snapshot: local,
+      fleet: [local, deck(REMOTE, [request(7, { askedBy: "dispatch" })])],
+      ...runtimeOf(),
+    } as unknown as DeckRuntimeState;
+  }
+  const PANE = { kind: "agent", deckId: LOCAL, agentId: "planner", from: "deck" } as const;
+
+  /** Scenario: the user is in an agent's pane when a deck asks for an approval. The pane stays as it is, and a marker saying "1 approval waiting" is on screen; clicking it opens the review over the pane, naming the deck that asked. */
+  it("says an approval is waiting while an agent's pane is open, and opens the review when clicked", async () => {
+    render(<DeckShell runtime={paneRuntime()} initialView={PANE} />);
+    expect(await screen.findByTestId("agent-pane-overlay")).toBeVisible();
+    const marker = await screen.findByRole("button", { name: /1 approval waiting/ });
+    expect(marker).toBeVisible();
+    expect(marker).not.toHaveAttribute("inert");
+    expect(marker.closest("[inert]")).toBeNull();
+    expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+    fireEvent.click(marker);
+    const dialog = await screen.findByTestId("project-trust-dialog");
+    expect(within(dialog).getByTestId("project-trust-deck")).toHaveTextContent("deploy@build-box");
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /approval waiting/ })).toBeNull();
+  });
+
+  /** Scenario: a keyboard user moves focus to the marker over an agent's pane, and the app renders again (a new snapshot). Focus stays on the marker rather than being pulled back into the pane. */
+  it("keeps focus on the marker when the pane renders again", async () => {
+    const rt = paneRuntime();
+    const { rerender } = render(<DeckShell runtime={rt} initialView={PANE} />);
+    const marker = await screen.findByRole("button", { name: /1 approval waiting/ });
+    act(() => { marker.focus(); });
+    expect(document.activeElement).toBe(marker);
+    rerender(<DeckShell runtime={{ ...rt, fleet: [...rt.fleet] }} initialView={PANE} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /1 approval waiting/ }));
+  });
+
+  /** Scenario: a deck asks for an approval while the user is in an agent's pane, and the user goes back to the dashboard without touching the marker. The review opens by itself. */
+  it("opens the held review by itself once the pane closes", async () => {
+    render(<DeckShell runtime={paneRuntime()} initialView={PANE} />);
+    await screen.findByRole("button", { name: /1 approval waiting/ });
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" }));
+    expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /approval waiting/ })).toBeNull();
   });
 });

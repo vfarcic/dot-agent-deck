@@ -472,6 +472,22 @@ screen = "deck"
 action = "approve_project_commands"
 outcome = "dispatch"
 
+# Issue #2511 — the "approval waiting" marker, and approving the review it
+# opens over an agent's pane.
+[[fixtures]]
+name = "show-approval-request-over-a-pane"
+utterance = "show the approval"
+screen = "agent"
+action = "show_approval_request"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "approve-project-commands-over-a-pane"
+utterance = "approve it"
+screen = "agent"
+action = "approve_project_commands"
+outcome = "dispatch"
+
 # PRD #2174 — the star reminder's three buttons, by the words the docs give and
 # by the buttons' own labels, on the screens the app opens on.
 [[fixtures]]
