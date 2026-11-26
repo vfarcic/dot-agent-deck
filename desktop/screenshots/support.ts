@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test, type Page } from "@playwright/test";
 
+import { imageName, parseNaming, parseThemes, type Naming, type Theme } from "./themes";
+
 /**
  * Shared settings for the docs-screenshot generator (issue #1322). Read by
  * `desktop.shot.ts` and `tui.shot.ts`; `playwright.screenshots.config.ts`
@@ -25,9 +27,53 @@ export const TUI_HTML_DIR = process.env.DAD_DOCS_SCREENSHOTS_TUI_HTML;
  */
 export const FROZEN_NOW = new Date("2026-09-01T12:00:00Z");
 
-/** The PNG path for one scenario and client — `<scenario>-<client>.png`. */
-export function imagePath(scenario: string, client: "tui" | "desktop"): string {
-  return path.join(OUT_DIR, `${scenario}-${client}.png`);
+/**
+ * The themes this run shoots each scenario in, from `DAD_DOCS_SCREENSHOTS_THEMES`
+ * (`THEMES_ENV` in `xtask/screenshots/src/lib.rs`): `light,dark`, `light` or
+ * `dark`. Unset — a hand-run of the config — is both.
+ */
+export const THEMES: readonly Theme[] = parseThemes(process.env.DAD_DOCS_SCREENSHOTS_THEMES);
+
+/**
+ * How the PNGs are named, from `DAD_DOCS_SCREENSHOTS_NAMING` (`NAMING_ENV`):
+ * `paired` or `single`. Unset is `paired`.
+ */
+const NAMING: Naming = parseNaming(process.env.DAD_DOCS_SCREENSHOTS_NAMING, THEMES);
+
+/** The PNG path for one scenario, client and theme (`imageName`). */
+export function imagePath(scenario: string, client: "tui" | "desktop", theme: Theme): string {
+  return path.join(OUT_DIR, imageName(scenario, client, theme, NAMING));
+}
+
+/** `FIXTURE_SETTINGS_KEY` in `desktop/src/lib/bridge.ts`: where the fixture bridge keeps the app's settings. */
+const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
+
+/**
+ * Put the page in `theme` the way a user would: the OS preference
+ * (`prefers-color-scheme`) AND the app's own Appearance choice, which the app
+ * writes to the root as `data-theme`. The choice lives in the fixture's
+ * settings document, so the init script makes every write of that document
+ * carry `theme` — a scenario seeding its own settings included, since its init
+ * script runs after this one — and seeds one when there is none.
+ */
+async function useTheme(page: Page, theme: Theme): Promise<void> {
+  await page.emulateMedia({ colorScheme: theme });
+  await page.addInitScript(([key, mode]) => {
+    const setItem = Storage.prototype.setItem;
+    const withMode = (raw: string): string => {
+      try {
+        const document = JSON.parse(raw) as { appearance?: { mode?: string } };
+        return JSON.stringify({ ...document, appearance: { ...(document.appearance ?? {}), mode } });
+      } catch {
+        return raw;
+      }
+    };
+    Storage.prototype.setItem = function (this: Storage, name: string, value: string) {
+      return Reflect.apply(setItem, this, [name, name === key ? withMode(value) : value]);
+    };
+    const stored = window.localStorage.getItem(key);
+    window.localStorage.setItem(key, stored ?? JSON.stringify({ version: 1, appearance: { mode }, zoom: { level: 1 } }));
+  }, [SETTINGS_KEY, theme] as const);
 }
 
 /**
@@ -51,26 +97,44 @@ export async function fontsSettled(page: Page): Promise<void> {
 }
 
 /**
- * Register one desktop scenario. The test title is `desktop <name>`, which is
- * what `cargo docs-screenshots --scenario` selects by, and the name must be
- * listed in `xtask/screenshots/src/scenarios.rs` — a unit test there fails when
- * the two disagree. `prepare` puts the screen in the state the image shows and
- * waits for it; it must wait on state, never on a timer.
+ * Register one desktop scenario, once per theme of the run. The test title is
+ * `desktop <name> <theme>`, which is what `cargo docs-screenshots --scenario`
+ * and `--theme` select by, and the name must be listed in
+ * `xtask/screenshots/src/scenarios.rs` — a unit test there fails when the two
+ * disagree. `prepare` puts the screen in the state the image shows and waits
+ * for it; it must wait on state, never on a timer. The page is in the theme
+ * before `prepare` loads it, and the shot is refused unless the app's root
+ * says that theme.
  */
-export function desktopScenario(name: string, prepare: (page: Page) => Promise<void>): void {
-  test(`desktop ${name}`, async ({ page }) => {
+export function desktopScenario(name: string, prepare: (page: Page) => Promise<void>, { tooltip = false, hover = false }: { tooltip?: boolean; hover?: boolean } = {}): void {
+  for (const theme of THEMES) desktopScenarioIn(name, theme, prepare, tooltip, hover);
+}
+
+function desktopScenarioIn(name: string, theme: Theme, prepare: (page: Page) => Promise<void>, tooltip: boolean, hover: boolean): void {
+  test(`desktop ${name} ${theme}`, async ({ page }) => {
     // A run told it needs no web build starts no server, so a desktop scenario
     // selected anyway would only fail on a refused connection; say why instead.
     if (process.env.DAD_DOCS_SCREENSHOTS_WEB === "0") {
       throw new Error("DAD_DOCS_SCREENSHOTS_WEB=0 skips the web build, so no desktop scenario can run");
     }
     await page.clock.setFixedTime(FROZEN_NOW);
+    await useTheme(page, theme);
     await prepare(page);
+    await expect(page.locator("html"), `the app is in the ${theme} theme`).toHaveAttribute("data-theme", theme);
     // Park the pointer where nothing reacts to it, so a hover tooltip from the
-    // last click is not in the picture.
-    await page.mouse.move(0, page.viewportSize()!.height - 1);
-    await expect(page.locator("[role=tooltip]:visible")).toHaveCount(0);
+    // last click is not in the picture — unless the picture is of a tooltip
+    // (`tooltip: true`), which `prepare` left shown and which must still be,
+    // or of a control under the pointer (`hover: true`, PR #2491), which
+    // `prepare` left hovered and which has no drawn tooltip to wait for.
+    if (tooltip) {
+      await expect(page.locator("[role=tooltip]:visible")).toHaveCount(1);
+    } else if (hover) {
+      await expect(page.locator("[role=tooltip]:visible")).toHaveCount(0);
+    } else {
+      await page.mouse.move(0, page.viewportSize()!.height - 1);
+      await expect(page.locator("[role=tooltip]:visible")).toHaveCount(0);
+    }
     await fontsSettled(page);
-    await page.screenshot({ ...SHOT_OPTIONS, path: imagePath(name, "desktop") });
+    await page.screenshot({ ...SHOT_OPTIONS, path: imagePath(name, "desktop", theme) });
   });
 }

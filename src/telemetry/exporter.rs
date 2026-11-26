@@ -893,7 +893,14 @@ impl Drop for DispatchNaming {
 /// Where the daemon writes per-run agent configuration files: under its state
 /// directory.
 pub fn default_config_dir() -> PathBuf {
-    crate::config::state_dir().join("telemetry")
+    config_dir_under(&crate::config::state_dir())
+}
+
+/// The telemetry configuration directory under the state directory
+/// `state_dir`: [`default_config_dir`] for a daemon whose state directory is
+/// not the process's (issue #2531).
+pub fn config_dir_under(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("telemetry")
 }
 
 /// How [`Telemetry`] runs, apart from the environment. Tests change it.

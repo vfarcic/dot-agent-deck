@@ -276,7 +276,21 @@ pub async fn pr_state(repo_dir: &Path, branch: &str, gh: &OsStr, deadline: Deadl
         }
         None => Vec::new(),
     };
-    match parse_pr_state(&String::from_utf8_lossy(&listed), branch, &push_repos) {
+    // A tip that cannot be read leaves a merged or closed pull request
+    // unknown in `parse_pr_state`, which reads it as unresolvable.
+    let tip_args = crate::pull_request::branch_tip_args(branch);
+    let tip_args: Vec<&str> = tip_args.iter().map(String::as_str).collect();
+    let tip = git(repo_dir, &tip_args, deadline)
+        .await
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|tip| !tip.is_empty());
+    match parse_pr_state(
+        &String::from_utf8_lossy(&listed),
+        branch,
+        &push_repos,
+        tip.as_deref(),
+    ) {
         PrState::Open => PrFact::Open,
         PrState::Merged => PrFact::Merged,
         PrState::ClosedUnmerged => PrFact::Closed,
