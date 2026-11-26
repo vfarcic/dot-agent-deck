@@ -27,6 +27,10 @@ pub struct TestEntry {
     pub fn_name: String,
     /// Path relative to the repo root, e.g. `tests/e2e_hook_delivery.rs`.
     pub file: String,
+    /// The inline modules the function sits in within `file`, joined with
+    /// `::` (e.g. `tests::deeper`); empty at the file's top level. Two
+    /// sibling modules can each hold a function of the same name.
+    pub module_path: String,
     /// `/// Scenario:` doc comment with paragraph breaks preserved.
     /// Empty string when the test has no Scenario comment (linkage-check
     /// rule 7 catches this separately).
@@ -113,34 +117,53 @@ pub fn run(workspace_root: &Path) -> Result<String, String> {
 
 /// Every `#[spec]` test found at one ref, grouped by catalog id. An id
 /// can carry more than one test (issue #2496), so each id maps to all of
-/// them, sorted by `(file, fn_name)`.
+/// them, sorted by `(file, module_path, fn_name)`.
 pub type Inventory = BTreeMap<String, Vec<TestEntry>>;
 
 /// The tests under one id at the base and at HEAD, paired with each other.
-/// A base test and a HEAD test pair when they have the same file and
-/// function name. When that leaves exactly one test unpaired on each side,
-/// those two pair as well, so a test that moved file or was renamed is
-/// compared rather than reported as new.
+/// A base test and a HEAD test pair when they have the same file, module
+/// path and function name; each base test pairs at most once. When that
+/// leaves exactly one test unpaired on each side, those two pair as well,
+/// but only if the id has a single test at each ref (as before issue
+/// #2496), or the two share a file or a function name. That keeps a test
+/// that moved file or was renamed compared rather than reported as new,
+/// without pairing a deleted test with an unrelated new one under an id
+/// several tests share.
 fn pair_tests<'a>(
     base: &'a [TestEntry],
     head: &'a [TestEntry],
 ) -> (Vec<(&'a TestEntry, &'a TestEntry)>, Vec<&'a TestEntry>) {
-    let same_test = |b: &TestEntry, h: &TestEntry| b.file == h.file && b.fn_name == h.fn_name;
+    let same_test = |b: &TestEntry, h: &TestEntry| {
+        b.file == h.file && b.module_path == h.module_path && b.fn_name == h.fn_name
+    };
+    let mut base_used = vec![false; base.len()];
     let mut pairs = Vec::new();
     let mut unpaired_head = Vec::new();
     for h in head {
-        match base.iter().find(|b| same_test(b, h)) {
-            Some(b) => pairs.push((b, h)),
+        let found = base
+            .iter()
+            .enumerate()
+            .find(|(i, b)| !base_used[*i] && same_test(b, h));
+        match found {
+            Some((i, b)) => {
+                base_used[i] = true;
+                pairs.push((b, h));
+            }
             None => unpaired_head.push(h),
         }
     }
     let unpaired_base: Vec<&TestEntry> = base
         .iter()
-        .filter(|b| !head.iter().any(|h| same_test(b, h)))
+        .zip(&base_used)
+        .filter(|(_, used)| !**used)
+        .map(|(b, _)| b)
         .collect();
     if let ([b], [h]) = (unpaired_base.as_slice(), unpaired_head.as_slice()) {
-        pairs.push((b, h));
-        unpaired_head.clear();
+        let lone_on_both_sides = base.len() == 1 && head.len() == 1;
+        if lone_on_both_sides || b.file == h.file || b.fn_name == h.fn_name {
+            pairs.push((b, h));
+            unpaired_head.clear();
+        }
     }
     (pairs, unpaired_head)
 }
@@ -335,13 +358,15 @@ pub fn collect_tests_from_sources(sources: &[(String, String)]) -> Result<Invent
         // `tabs/selection/*` unit tests in `src/tab.rs`) are found, not
         // just top-level test fns in `tests/`. Mirrors the docs
         // generator's `collect_spec_tests_from_items` walk.
-        collect_entries_from_items(&parsed.items, path, &mut out);
+        collect_entries_from_items(&parsed.items, path, "", &mut out);
     }
     // The two refs read their files in different orders (`git ls-tree` at
     // the base, `read_dir` at HEAD), so sort each id's tests to make the
     // inventory independent of that order.
     for tests in out.values_mut() {
-        tests.sort_by(|a, b| (&a.file, &a.fn_name).cmp(&(&b.file, &b.fn_name)));
+        tests.sort_by(|a, b| {
+            (&a.file, &a.module_path, &a.fn_name).cmp(&(&b.file, &b.module_path, &b.fn_name))
+        });
     }
     Ok(out)
 }
@@ -350,7 +375,12 @@ pub fn collect_tests_from_sources(sources: &[(String, String)]) -> Result<Invent
 /// `out`. Items inside inline `Item::Mod { content: Some(_) }` are
 /// walked the same way; external `mod foo;` declarations (no inline
 /// body) are skipped — resolving them would need a separate file read.
-fn collect_entries_from_items(items: &[syn::Item], path: &str, out: &mut Inventory) {
+fn collect_entries_from_items(
+    items: &[syn::Item],
+    path: &str,
+    module_path: &str,
+    out: &mut Inventory,
+) {
     for item in items {
         match item {
             syn::Item::Fn(item_fn) => {
@@ -362,6 +392,7 @@ fn collect_entries_from_items(items: &[syn::Item], path: &str, out: &mut Invento
                         spec_id,
                         fn_name,
                         file: path.to_string(),
+                        module_path: module_path.to_string(),
                         scenario,
                         body_fingerprint,
                     });
@@ -369,7 +400,13 @@ fn collect_entries_from_items(items: &[syn::Item], path: &str, out: &mut Invento
             }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, nested_items)) = &item_mod.content {
-                    collect_entries_from_items(nested_items, path, out);
+                    let name = item_mod.ident.to_string();
+                    let nested_path = if module_path.is_empty() {
+                        name
+                    } else {
+                        format!("{module_path}::{name}")
+                    };
+                    collect_entries_from_items(nested_items, path, &nested_path, out);
                 }
             }
             _ => {}
@@ -851,6 +888,7 @@ mod tests {
             spec_id: spec_id.to_string(),
             fn_name: fn_name.to_string(),
             file: format!("tests/e2e_{}.rs", spec_id.replace('/', "_")),
+            module_path: String::new(),
             scenario: scenario.to_string(),
             body_fingerprint: body.to_string(),
         }
@@ -1050,6 +1088,7 @@ mod tests {
             spec_id: "dashboard/pane/004".into(),
             fn_name: "pane_004_card_title_row".into(),
             file: "tests/render_dashboard.rs".into(),
+            module_path: String::new(),
             scenario: "Render a single dashboard card. Pin it.".into(),
             body_fingerprint: "fp".into(),
         }];
@@ -1151,6 +1190,74 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_and_an_unrelated_added_test_under_a_shared_id_are_not_paired() {
+        // A review finding on issue #2496's fix: with siblings under the id,
+        // one test deleted and another added in a different file with a
+        // different name are two changes, not one test that moved. The new
+        // test is Created, and nothing is Modified.
+        let base_sources = shared_id_sources();
+        let mut head_sources = vec![base_sources[0].clone()];
+        head_sources.push((
+            "tests/e2e_doorbell_c.rs".to_string(),
+            r#"
+                #[spec("inbox/doorbell/035")]
+                #[test]
+                /// Scenario: an unrelated new test under the shared id.
+                fn doorbell_035_third() { let _ = 4; }
+            "#
+            .to_string(),
+        ));
+        let base = collect_tests_from_sources(&base_sources).expect("parses");
+        let head = collect_tests_from_sources(&head_sources).expect("parses");
+
+        assert_eq!(compute_modified(&base, &head), Vec::<ModifiedRow>::new());
+        let created = compute_created(&base, &head);
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(created[0].fn_name, "doorbell_035_third");
+    }
+
+    #[test]
+    fn same_named_tests_in_sibling_inline_modules_are_told_apart() {
+        // A review finding on issue #2496's fix: two inline modules in one
+        // file can each hold a function of the same name under the same id.
+        // An untouched one is not Modified, and one added beside them is
+        // Created.
+        let one = r#"
+            mod a {
+                #[spec("tabs/selection/009")]
+                #[test]
+                /// Scenario: the copy in module a.
+                fn selection_009_x() { let _ = 1; }
+            }
+            mod b {
+                #[spec("tabs/selection/009")]
+                #[test]
+                /// Scenario: the copy in module b.
+                fn selection_009_x() { let _ = 2; }
+            }
+        "#;
+        let two = format!(
+            "{one}{}",
+            r#"
+            mod c {
+                #[spec("tabs/selection/009")]
+                #[test]
+                /// Scenario: the copy in module c.
+                fn selection_009_x() { let _ = 3; }
+            }
+        "#
+        );
+        let base = collect_tests_from_sources(&[("src/tab.rs".to_string(), one.to_string())])
+            .expect("parses");
+        let head = collect_tests_from_sources(&[("src/tab.rs".to_string(), two)]).expect("parses");
+
+        assert_eq!(compute_modified(&base, &head), Vec::<ModifiedRow>::new());
+        let created = compute_created(&base, &head);
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(created[0].module_path, "c");
+    }
+
+    #[test]
     fn collect_tests_from_sources_extracts_spec_id_and_scenario() {
         let src = r#"
             #[spec("hooks/delivery/001")]
@@ -1203,6 +1310,9 @@ mod tests {
         assert_eq!(map["dashboard/pane/004"][0].fn_name, "pane_004_top");
         assert_eq!(map["tabs/selection/001"][0].fn_name, "selection_001_nested");
         assert_eq!(map["tabs/selection/001"][0].file, "src/tab.rs");
+        assert_eq!(map["tabs/selection/001"][0].module_path, "tests");
+        assert_eq!(map["tabs/selection/002"][0].module_path, "tests::deeper");
+        assert_eq!(map["dashboard/pane/004"][0].module_path, "");
         assert_eq!(map["tabs/selection/002"][0].fn_name, "selection_002_deep");
     }
 
