@@ -4070,7 +4070,10 @@ mod tests {
     #[test]
     fn the_folder_check_refuses_a_link_loop_or_a_chain_past_its_cap() {
         let dir = crate::test_temp::tempdir().unwrap();
-        let home = dir.path();
+        // The scratch folder's own path may pass through a link (macOS's
+        // `/var` is one to `/private/var`), which the check counts too, so
+        // the chains below start from the path with its links resolved.
+        let home = &std::fs::canonicalize(dir.path()).unwrap();
         std::os::unix::fs::symlink(home.join("loop-dir"), home.join("loop-dir")).unwrap();
         std::os::unix::fs::symlink(home.join("b.toml"), home.join("a.toml")).unwrap();
         std::os::unix::fs::symlink(home.join("a.toml"), home.join("b.toml")).unwrap();
