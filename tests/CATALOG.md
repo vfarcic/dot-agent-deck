@@ -18049,7 +18049,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 ##### desktop/agent-cards/131 — A Save or a removal is bound to the daemon process whose list the user saw.
 - **Test:** vitest `desktop/agent-cards/131: …` in `desktop/src/hooks/useCardActionsEditor.test.ts`.
 - **Layer:** hook (`renderHook`), as `129`.
-- **Asserts:** reads, a Save and a confirmed removal made from `process-a`'s list each name `process-a`; once the deck's daemon is `process-b`, the form and the list read from `process-a` are no longer offered, and nothing is sent bound to `process-b` (PR #2491 audit, A2).
+- **Asserts:** reads, a Save and a confirmed removal made from `process-a`'s list each name `process-a`. An edit form from `process-a`'s list open when the deck's daemon becomes `process-b` closes with the list, and Save pressed then answers "No card action form is open." and sends nothing; a removal confirmation from `process-b`'s list open when the daemon becomes `process-c` closes, and Confirm Remove pressed then answers "The editor is not asking to remove anything." and sends nothing. The only two edits sent are both bound to `process-a` (PR #2491 audit, A2). Unlike `129` and `130`, the form and the confirmation were made before the restart, from a list the user saw.
 - **Does not assert:** the backend binding (Rust `a_card_catalog_edit_bound_to_a_replaced_daemon_is_refused`).
 
 ##### desktop/agent-cards/132 — A card-actions read or edit naming no daemon process is refused unsent.

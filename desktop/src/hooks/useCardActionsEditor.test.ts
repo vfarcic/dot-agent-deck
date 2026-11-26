@@ -183,7 +183,7 @@ describe("a late answer batched with a daemon restart (PR #2491 audit, A2)", () 
     expect(edit).toMatchObject({ kind: "update", base: action("Deploy production") });
   });
 
-  /// Scenario: A form and a removal confirmation are open on the list one daemon process answered when the daemon restarts as another, and the old list is still what the editor holds when Save or Remove is pressed. Each edit is sent bound to the process whose list the user saw, never to the new one with the old list's base.
+  /// Scenario: A Save and a confirmed removal made from one daemon process's list are each sent bound to that process. Then an edit form is open when the daemon restarts as another process, and Save is pressed; once the new process's list is read, a removal confirmation is open when the daemon restarts once more, and Confirm Remove is pressed. Neither press sends anything, so no edit made from an old list reaches the new process.
   it("desktop/agent-cards/131: a save or a removal is bound to the process whose list the user saw", async () => {
     const reads: ((answer: EditableCardCatalog) => void)[] = [];
     const runtime = {
@@ -201,11 +201,28 @@ describe("a late answer batched with a daemon restart (PR #2491 audit, A2)", () 
     await act(async () => { hook.result.current.controls.confirmRemoveCardAction(); });
     expect(runtime.editCardCatalog).toHaveBeenLastCalledWith(LOCAL.deckId, { kind: "remove", name: "ship", base: action("Ship staging") }, "process-a");
 
-    /* The restart lands: what the old process listed is no longer offered to save or confirm. */
+    /* A form from `process-a`'s list is open when the daemon restarts: Save is pressed and sends nothing. */
     act(() => { hook.result.current.controls.editCardAction({ name: "ship" }); });
+    expect(hook.result.current.view?.form?.values.label).toBe("Ship staging");
     hook.rerender({ list: at("process-b") });
     expect(hook.result.current.view?.form).toBeUndefined();
     expect(hook.result.current.view?.catalog).toBeUndefined();
-    expect(runtime.editCardCatalog.mock.calls.filter(([, , instanceId]) => instanceId === "process-b")).toEqual([]);
+    let saved: string | undefined;
+    await act(async () => { saved = hook.result.current.controls.saveCardAction(); });
+    expect(saved, "Save answers in words that no form is open").toBe("No card action form is open.");
+    expect(runtime.editCardCatalog, "Save sent nothing after the restart").toHaveBeenCalledTimes(2);
+
+    /* A removal confirmation from `process-b`'s list is open when the daemon restarts again: Confirm Remove sends nothing. */
+    await act(async () => { reads[1](catalogOf("Deploy production")); });
+    expect(runtime.readCardCatalog).toHaveBeenLastCalledWith(LOCAL.deckId, "process-b");
+    act(() => { hook.result.current.controls.removeCardAction({ name: "ship" }); });
+    expect(hook.result.current.view?.removing?.label).toBe("Deploy production");
+    hook.rerender({ list: at("process-c") });
+    expect(hook.result.current.view?.removing).toBeUndefined();
+    let confirmed: string | undefined;
+    await act(async () => { confirmed = hook.result.current.controls.confirmRemoveCardAction(); });
+    expect(confirmed, "Confirm Remove answers in words that nothing is being removed").toBe("The editor is not asking to remove anything.");
+    expect(runtime.editCardCatalog, "Confirm Remove sent nothing after the restart").toHaveBeenCalledTimes(2);
+    expect(runtime.editCardCatalog.mock.calls.map(([, , instanceId]) => instanceId)).toEqual(["process-a", "process-a"]);
   });
 });
