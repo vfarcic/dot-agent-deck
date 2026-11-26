@@ -93,18 +93,35 @@ tasks:
       npm install -g pnpm@12.9.0
       pnpm --version
 
-  # Chromium and WebKit with the Ubuntu packages they need, for the Playwright
-  # suite and the screenshot generator. `.rwx/ci.yml`'s `playwright-browsers`
-  # task, which says why it is a task of its own filtered to
-  # desktop/package.json: one install is reused until that file changes.
-  - key: playwright-browsers
-    use: [code, pnpm]
+  # The @playwright/test pin from desktop/package.json, as a value, so that
+  # `playwright-browsers` is keyed on the version alone. A task's cache key
+  # covers its env but not the value's source file, so a dependency bump that
+  # moves another line of package.json (3 of its 5 changes in the month to
+  # 2026-11-26) reuses the cached browsers instead of reinstalling them. The
+  # `sandbox` task uses `playwright-browsers`, so a reinstall delays every
+  # sandbox, a Rust-only one included.
+  - key: playwright-version
+    use: [code, node]
     filter: [desktop/package.json]
-    timeout: 45m
     run: |
       version=$(node -p "require('./desktop/package.json').devDependencies['@playwright/test']")
+      # A range would let `pnpm install` resolve a Playwright whose browsers
+      # are not the ones installed below.
       [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "desktop/package.json must pin @playwright/test exactly, not '$version'" >&2; exit 1; }
-      npx --yes "playwright@$version" install --with-deps chromium webkit
+      printf '%s' "$version" > "$RWX_VALUES/version"
+
+  # Chromium and WebKit with the Ubuntu packages they need, for the Playwright
+  # suite and the screenshot generator: `.rwx/ci.yml`'s `playwright-browsers`
+  # task, keyed on the pin rather than on package.json (`playwright-version`).
+  # A cache miss downloads about 195 MB of packages from the Ubuntu mirror (14
+  # minutes on 2026-11-26).
+  - key: playwright-browsers
+    use: pnpm
+    timeout: 45m
+    env:
+      PLAYWRIGHT_VERSION: ${{ tasks.playwright-version.values.version }}
+    run: |
+      npx --yes "playwright@$PLAYWRIGHT_VERSION" install --with-deps chromium webkit
       sudo apt-get clean
 
   # cargo-mutants, for `/code-cleanup`'s tests mode
