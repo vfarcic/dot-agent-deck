@@ -71,11 +71,14 @@ answer() {
   else echo "HTTP 502" >&2; exit 1
   fi
 }
+echo "$*" >>"$REVIEW_STUB/calls.log"
 case "$*" in
   "pr view "*) answer pr ;;
   "api repos/{owner}/{repo}/issues/"*"/comments --paginate") answer comments ;;
   "api repos/{owner}/{repo}/commits/"*"/check-runs?per_page=100 --paginate") answer checks ;;
   "api repos/{owner}/{repo}/pulls/"*"/reviews --paginate") answer reviews ;;
+  "api repos/{owner}/{repo}/pulls/"*"/comments?per_page=100"*" --paginate") answer inline ;;
+  "api repos/{owner}/{repo}/commits/"*" --jq .commit.committer.date") answer commit ;;
   *) echo "gh stand-in: unhandled invocation: $*" >&2; exit 1 ;;
 esac
 "#;
@@ -128,7 +131,9 @@ impl Sandbox {
             .unwrap_or(0)
     }
 
-    /// What `gh` answers for a surface: `pr`, `comments`, `checks` or `reviews`.
+    /// What `gh` answers for a surface: `pr`, `comments`, `checks`, `reviews`,
+    /// `inline` (the pull request's review comments) or `commit` (the head
+    /// commit's committer date, which `--jq` prints as bare text).
     fn answer(&self, surface: &str, body: &Value) {
         fs::write(self.stub.join(format!("{surface}.json")), body.to_string()).unwrap();
     }
@@ -140,6 +145,16 @@ impl Sandbox {
             body.to_string(),
         )
         .unwrap();
+    }
+
+    /// Every `gh` invocation the script made, one per line.
+    fn calls(&self) -> String {
+        fs::read_to_string(self.stub.join("calls.log")).unwrap_or_default()
+    }
+
+    /// What `gh` prints, verbatim, for a surface.
+    fn answer_text(&self, surface: &str, text: &str) {
+        fs::write(self.stub.join(format!("{surface}.json")), text).unwrap();
     }
 
     fn with_registry(mut self, registry: &Value) -> Self {
@@ -170,12 +185,16 @@ impl Sandbox {
 }
 
 fn iso_minutes_ago(minutes: i64) -> String {
+    iso_seconds_ago(minutes * 60)
+}
+
+fn iso_seconds_ago(seconds: i64) -> String {
     let out = Command::new("date")
         .args(["-u", "+%s"])
         .output()
         .expect("date");
     let now: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-    let t = now - minutes * 60;
+    let t = now - seconds;
     let out = Command::new("jq")
         .args(["-nr", &format!("{t} | todate")])
         .output()
@@ -187,11 +206,41 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Qodo's review comment naming `sha`, created five minutes ago and never
+/// edited since: a PR's first review, which Qodo posts in one step.
 fn qodo_comment(sha: &str) -> Value {
+    let at = iso_minutes_ago(5);
+    qodo_comment_at(sha, &at, &at)
+}
+
+/// Qodo's review comment naming `sha`, created at `created` and last edited at
+/// `updated`.
+fn qodo_comment_at(sha: &str, created: &str, updated: &str) -> Value {
     json!({
         "user": {"login": "qodo-code-review[bot]"},
         "html_url": "https://example.test/qodo",
+        "created_at": created,
+        "updated_at": updated,
         "body": format!("<h3>Code Review by Qodo</h3>\n...\n<!-- https://github.com/o/r/commit/{sha} -->"),
+    })
+}
+
+/// The comment as Qodo leaves it moments after a push to `sha` (issue #2507):
+/// created on an earlier review an hour ago, edited `edited_secs_ago` seconds
+/// ago to name `sha`, while that head's review is still running.
+fn qodo_comment_edited(sha: &str, edited_secs_ago: i64) -> Value {
+    qodo_comment_at(sha, &iso_minutes_ago(60), &iso_seconds_ago(edited_secs_ago))
+}
+
+/// An inline review comment by `login` written on `sha`; `reply_to` makes it a
+/// reply in an existing thread.
+fn inline_comment(login: &str, sha: &str, reply_to: Option<u64>) -> Value {
+    json!({
+        "user": {"login": login},
+        "original_commit_id": sha,
+        "commit_id": HEAD,
+        "in_reply_to_id": reply_to,
+        "html_url": "https://example.test/finding",
     })
 }
 
@@ -480,6 +529,24 @@ fn review_wait_008_a_malformed_registry_is_an_error_not_a_verdict() {
             json!({"name": "Anyone", "login": "anyone[bot]", "timeout_minutes": 5,
                    "signal": {"kind": "check_run", "name": "Review"}}),
         ),
+        (
+            "a settle period on a comment that does not name the head",
+            json!({"name": "Once", "login": "once[bot]", "timeout_minutes": 5,
+                   "signal": {"kind": "comment", "contains": "x", "settle_minutes": 5,
+                              "first_review_settle_minutes": 1}}),
+        ),
+        (
+            "a settle period with no first-review grace",
+            json!({"name": "Half", "login": "half[bot]", "timeout_minutes": 5,
+                   "signal": {"kind": "comment", "contains": "x", "names_head": true,
+                              "settle_minutes": 5}}),
+        ),
+        (
+            "a first-review grace with no settle period",
+            json!({"name": "Grace", "login": "grace[bot]", "timeout_minutes": 5,
+                   "signal": {"kind": "comment", "contains": "x", "names_head": true,
+                              "first_review_settle_minutes": 1}}),
+        ),
     ] {
         let sb = Sandbox::new(1).with_registry(&json!({ "reviewers": [entry] }));
         let out = sb.run(&["42"]);
@@ -506,6 +573,29 @@ fn review_wait_009_the_real_registry_names_qodo_and_greptile_with_their_signals(
         qodo["signal"]["names_head"], true,
         "Qodo reviews every push, so only a comment naming the head counts"
     );
+    // Issue #2507's measurements, in reviewers.json's note: the longest quiet
+    // gap between the comment's edits before a head's findings was 664 s, a
+    // first review's findings came up to 4 s after the comment, and the
+    // findings of a later push up to 714 s after the comment named its head.
+    let settle = qodo["signal"]["settle_minutes"]
+        .as_f64()
+        .expect("Qodo names the head before it has finished, so it needs settle_minutes");
+    assert!(
+        settle * 60.0 > 664.0,
+        "settle_minutes must outlast the longest quiet gap measured before Qodo's findings"
+    );
+    let grace = qodo["signal"]["first_review_settle_minutes"]
+        .as_f64()
+        .expect("Qodo needs first_review_settle_minutes");
+    assert!(
+        grace * 60.0 > 4.0,
+        "the first-review grace must outlast the gap between the comment and its findings"
+    );
+    let bound = qodo["timeout_minutes"].as_f64().expect("a bound");
+    assert!(
+        bound * 60.0 > settle * 60.0 + 714.0,
+        "a bound shorter than the settle period after Qodo's slowest review times out a finished review"
+    );
     let greptile = find("greptile-apps[bot]");
     assert_eq!(greptile["signal"]["kind"], "comment");
     assert_ne!(
@@ -519,4 +609,237 @@ fn review_wait_009_the_real_registry_names_qodo_and_greptile_with_their_signals(
             r["name"]
         );
     }
+}
+
+/// Issue #2507: a push moves the head named in Qodo's comment within a minute,
+/// minutes before that head's review has finished. That comment alone is not a
+/// finished review.
+#[test]
+fn review_wait_012_a_comment_just_edited_to_name_the_head_is_not_a_finished_review() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer("inline", &json!([]));
+    let text = stdout(&sb.run(&["--no-wait", "42"]));
+    assert!(text.contains("PENDING=Qodo"), "{text}");
+    assert!(!text.contains("DONE=Qodo"), "{text}");
+    assert!(text.ends_with("REVIEWS=incomplete\n"), "{text}");
+
+    let sb = Sandbox::new(60).with_registry(&real_registry_without_bounds());
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer("inline", &json!([]));
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("TIMED_OUT=Qodo"), "{text}");
+}
+
+/// Qodo posts a head's inline findings in one batch, seconds after the edit
+/// that finishes its review, so one of them on the head ends the wait.
+#[test]
+fn review_wait_013_a_qodo_finding_written_on_the_head_finishes_the_review() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let text = stdout(&sb.run(&["--no-wait", "42"]));
+    assert!(
+        text.contains("DONE=Qodo https://example.test/qodo"),
+        "{text}"
+    );
+    assert!(text.ends_with("REVIEWS=complete\n"), "{text}");
+}
+
+#[test]
+fn review_wait_014_replies_older_findings_and_other_accounts_do_not_finish_it() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(60).with_registry(&real_registry_without_bounds());
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer(
+        "inline",
+        &json!([
+            // Qodo answering a thread ("Dismissed — deferred") is not a review.
+            inline_comment("qodo-code-review[bot]", HEAD, Some(7)),
+            // A finding written on an earlier push, re-anchored to the head.
+            inline_comment("qodo-code-review[bot]", OLD, None),
+            inline_comment("greptile-apps[bot]", HEAD, None),
+        ]),
+    );
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("TIMED_OUT=Qodo"), "{text}");
+    assert!(text.contains("DONE=Greptile"), "{text}");
+}
+
+/// A push that brings no finding gets no inline comment at all, so the
+/// comment counts once it has sat unedited for the settle period.
+#[test]
+fn review_wait_015_a_comment_unedited_for_the_settle_period_is_finished() {
+    if !tools_present() {
+        return;
+    }
+    let settle = real_registry()["reviewers"][0]["signal"]["settle_minutes"]
+        .as_i64()
+        .expect("Qodo's settle_minutes is whole minutes");
+    for (edited_secs_ago, finished) in [((settle + 1) * 60, true), ((settle - 1) * 60, false)] {
+        let sb = Sandbox::new(120);
+        sb.answer(
+            "comments",
+            &json!([
+                qodo_comment_edited(HEAD, edited_secs_ago),
+                greptile_comment()
+            ]),
+        );
+        sb.answer("inline", &json!([]));
+        let text = stdout(&sb.run(&["--no-wait", "42"]));
+        assert_eq!(
+            text.contains("DONE=Qodo"),
+            finished,
+            "last edited {edited_secs_ago} s ago, settle {settle} min:\n{text}"
+        );
+    }
+}
+
+/// A PR's first review creates the comment and its findings follow within
+/// seconds, so a comment never edited still waits out a short grace.
+#[test]
+fn review_wait_016_a_first_review_counts_once_its_grace_has_passed() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(1);
+    let just_now = iso_seconds_ago(5);
+    sb.answer(
+        "comments",
+        &json!([
+            qodo_comment_at(HEAD, &just_now, &just_now),
+            greptile_comment()
+        ]),
+    );
+    sb.answer("inline", &json!([]));
+    let text = stdout(&sb.run(&["--no-wait", "42"]));
+    assert!(text.contains("PENDING=Qodo"), "{text}");
+
+    let sb = Sandbox::new(10);
+    sb.answer("comments", &json!([qodo_comment(HEAD), greptile_comment()]));
+    sb.answer("inline", &json!([]));
+    let text = stdout(&sb.run(&["--no-wait", "42"]));
+    assert!(text.contains("DONE=Qodo"), "{text}");
+}
+
+/// The wait keeps polling past the edit that names the head, and ends when the
+/// findings land.
+#[test]
+fn review_wait_017_it_waits_past_the_early_edit_for_the_findings() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer_on("inline", 1, &json!([]));
+    sb.answer_on("inline", 2, &json!([]));
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let out = sb.run(&["42"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    assert!(text.ends_with("REVIEWS=complete\n"), "{text}");
+    assert_eq!(
+        sb.reads("inline"),
+        3,
+        "the comment naming the head must not end the wait before the findings land"
+    );
+}
+
+/// Qodo's finding on PR #2544: reading every page of a busy PR's review
+/// comments on each poll can spend the API quota. Only comments updated since
+/// the head commit's date can be a finding on it.
+#[test]
+fn review_wait_018_inline_comments_are_read_from_the_head_commits_date_on() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer_text("commit", "2026-11-26T11:32:26Z\n");
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    let calls = sb.calls();
+    assert!(
+        calls.contains("pulls/42/comments?per_page=100&since=2026-11-26T11:32:26Z --paginate"),
+        "{calls}"
+    );
+
+    // The date is read once per head, not on every poll.
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer_text("commit", "2026-11-26T11:32:26Z\n");
+    sb.answer_on("inline", 1, &json!([]));
+    sb.answer_on("inline", 2, &json!([]));
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    assert_eq!(
+        (sb.reads("inline"), sb.reads("commit")),
+        (3, 1),
+        "{}",
+        sb.calls()
+    );
+
+    // A date that cannot be read falls back to every page.
+    let sb = Sandbox::new(60);
+    sb.answer(
+        "comments",
+        &json!([qodo_comment_edited(HEAD, 30), greptile_comment()]),
+    );
+    sb.answer_text("commit", "not a date\n");
+    sb.answer(
+        "inline",
+        &json!([inline_comment("qodo-code-review[bot]", HEAD, None)]),
+    );
+    let text = stdout(&sb.run(&["42"]));
+    assert!(text.contains("DONE=Qodo"), "{text}");
+    assert!(
+        sb.calls()
+            .contains("pulls/42/comments?per_page=100 --paginate"),
+        "{}",
+        sb.calls()
+    );
 }
