@@ -18100,6 +18100,24 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** two Refreshes in a row, each reading another program's new text for Ship it under an open Edit form: each shows the changed-since alert, the second as a new element (the first is gone from the document), so assistive technology announces it again; Save sends the second change as `base` (PR #2491 re-audit, F1, Edit).
 - **Does not assert:** what a particular screen reader speaks.
 
+##### desktop/agent-cards/140 — An uncertain Save whose reading-again shows the action hidden is not treated as saved.
+- **Test:** vitest `desktop/agent-cards/140: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** Merge it starts as the user's override of the deck default; a Save typing the deck's own text back, whose answer is lost, when another program hides Merge it and the check read lists the deck's own values with `hidden: true`, `source: default`, `overridden: false`: the form stays open with the draft, its message is the changed-since alert saying Merge it is now hidden, the editor does not say it was saved, and Save sends the hidden action as `base` (PR #2491 re-audit, hidden default: "landed" means the state a successful Update leaves, `src/card_catalog.rs`).
+- **Does not assert:** the daemon's answer to that Save (`agent-report/catalog-edit/005`).
+
+##### desktop/agent-cards/141 — A draft typed into after an uncertain Save is told its action is now hidden, not that it was saved.
+- **Test:** vitest `desktop/agent-cards/141: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** as `140`, with a newer text typed after the answer is lost and before the check read: the form keeps the newer text and shows the changed-since alert saying Merge it is now hidden, not "was saved as this form sent it earlier", and the editor does not say it was saved (PR #2491 re-audit, hidden default).
+- **Does not assert:** a draft typed into after a Save that did land (`138`'s note).
+
+##### desktop/agent-cards/142 — An uncertain Save of a deck default whose reading-again shows the user's version in effect is treated as saved.
+- **Test:** vitest `desktop/agent-cards/142: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** the control for `140`: when the check read lists Merge it as the form sent it with `hidden: false`, `source: user`, `overridden: true` — the state an Update of a deck default leaves — the form closes, the editor says "Merge it was saved" and nothing is sent again (PR #2491 re-audit, hidden default).
+- **Does not assert:** a user's own action saved the same way (`138`).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

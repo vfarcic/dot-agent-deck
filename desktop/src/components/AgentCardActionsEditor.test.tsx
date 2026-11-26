@@ -911,4 +911,66 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
       base: { ...SHIP, prompt: "THEIRS-TWO-2491." },
     }), INSTANCE);
   });
+
+  /* PR #2491 re-audit (hidden default): Merge it starts as the user's override of the deck default, whose text differs from the shipped one. */
+  const MERGE_OVERRIDE: EditableAction = { ...MERGE, prompt: "AUDIT-2491: the user's own merge text.", source: "user", overridden: true, hidden: false };
+  /** Open the editor on a catalog whose Merge it is `MERGE_OVERRIDE`, Edit Merge it, type the shipped text back and Save, and lose the answer. */
+  const saveMergeBackToShipped = async () => {
+    const calls = setup({ deferred: true });
+    calls.catalogs[FIXTURE_DAEMON_ID].actions = calls.catalogs[FIXTURE_DAEMON_ID].actions.map((entry) => (entry.name === "merge" ? { ...MERGE_OVERRIDE } : entry));
+    await openEditor();
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = editorDialog();
+    fireEvent.click(within(row(editor, "merge")).getByRole("button", { name: "Edit Merge it" }));
+    fireEvent.change(field(editor, "Text it sends"), { target: { value: MERGE.prompt } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.fail(lost()));
+    expect(formAlert(editor)).toHaveTextContent("may have been saved");
+    return { calls, editor };
+  };
+  /** Another program hides Merge it: the daemon drops the user's override and lists the deck's own values, hidden. */
+  const hideMergeElsewhere = (calls: ReturnType<typeof setup>) => {
+    calls.catalogs[FIXTURE_DAEMON_ID].actions = calls.catalogs[FIXTURE_DAEMON_ID].actions.map((entry) => (entry.name === "merge" ? { ...MERGE } : entry));
+  };
+  const MERGE_NOW_HIDDEN = /Merge it changed since this form was opened: it is now hidden.*Save replaces it/;
+
+  /// Scenario: Merge it is the user's own version of the deck default. Edit Merge it, type the deck's own text back and Save, and lose the answer. Another program hides Merge it, so the list read once more shows the deck's own values, hidden. The form stays open with the alert that Merge it changed since it was opened and is now hidden, and the editor does not say Merge it was saved.
+  it("desktop/agent-cards/140: an uncertain Save whose reading-again shows the action hidden is not treated as saved", async () => {
+    const { calls, editor } = await saveMergeBackToShipped();
+    hideMergeElsewhere(calls);
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(within(editor).queryByTestId("agent-card-actions-editor-form"), "a hidden action is not the Save landing").not.toBeNull();
+    expect(formAlert(editor)).toHaveTextContent(MERGE_NOW_HIDDEN);
+    expect(within(editor).getByTestId("agent-card-actions-editor-reread")).not.toHaveTextContent("was saved");
+    expect(field(editor, "Text it sends").value, "the draft is kept").toBe(MERGE.prompt);
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({
+      kind: "update",
+      action: expect.objectContaining({ name: "merge", prompt: MERGE.prompt }),
+      base: MERGE,
+    }), INSTANCE);
+  });
+
+  /// Scenario: as 140, but after the answer is lost the user types a newer text before the list is read once more, which shows Merge it hidden by another program. The form keeps the newer text and shows the alert that Merge it changed and is now hidden, not the message that it was saved as the form sent it earlier.
+  it("desktop/agent-cards/141: a draft typed into after an uncertain Save is told its action is now hidden, not that it was saved", async () => {
+    const { calls, editor } = await saveMergeBackToShipped();
+    fireEvent.change(field(editor, "Text it sends"), { target: { value: "NEWER-2491: merge it." } });
+    hideMergeElsewhere(calls);
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(field(editor, "Text it sends").value, "the draft is kept").toBe("NEWER-2491: merge it.");
+    expect(formAlert(editor)).toHaveTextContent(MERGE_NOW_HIDDEN);
+    expect(formAlert(editor)).not.toHaveTextContent("was saved as this form sent it earlier");
+    expect(within(editor).getByTestId("agent-card-actions-editor-reread")).not.toHaveTextContent("was saved");
+  });
+
+  /// Scenario: as 140, but the daemon did save the form: the list read once more shows Merge it with the deck's own text as the user's version, in effect. The Save is treated as done: the form closes, the editor says Merge it was saved, and nothing is sent again.
+  it("desktop/agent-cards/142: an uncertain Save of a deck default whose reading-again shows the user's version in effect is treated as saved", async () => {
+    const { calls, editor } = await saveMergeBackToShipped();
+    calls.catalogs[FIXTURE_DAEMON_ID].actions = calls.catalogs[FIXTURE_DAEMON_ID].actions.map((entry) => (entry.name === "merge" ? { ...MERGE, source: "user", overridden: true, hidden: false } : entry));
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(within(editor).queryByTestId("agent-card-actions-editor-form"), "a Save the list shows landed closes its form").toBeNull();
+    expect(within(editor).getByTestId("agent-card-actions-editor-reread")).toHaveTextContent("Merge it was saved");
+    expect(calls.editCardCatalog).toHaveBeenCalledTimes(1);
+  });
 });

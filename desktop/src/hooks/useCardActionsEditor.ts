@@ -144,9 +144,13 @@ const SUPERSEDED = "A later request replaced this one.";
 const changedBeforeRemoval = (seen: EditableCardAction, listed: boolean) => (listed
   ? `${displayText(seen.label, DISPLAY_LIMITS.name)} changed since you asked to remove it, so it was not removed: the list shows it as just read; press Remove again to remove it.`
   : `${displayText(seen.label, DISPLAY_LIMITS.name)} is no longer listed, so it was not removed.`);
-const changedUnderForm = (seen: EditableCardAction, listed: boolean) => (listed
-  ? `${displayText(seen.label, DISPLAY_LIMITS.name)} changed since this form was opened: the list shows it as just read. Save replaces it with what this form holds.`
-  : `${displayText(seen.label, DISPLAY_LIMITS.name)} is no longer listed, so this form cannot save it.`);
+/* PR #2491 re-audit (hidden default): an action hidden since is said to be hidden; a Save un-hides a deck default (`src/card_catalog.rs:1318-1320`). */
+const changedUnderForm = (seen: EditableCardAction, fresh: EditableCardAction | undefined) => {
+  const label = displayText(seen.label, DISPLAY_LIMITS.name);
+  if (fresh === undefined) return `${label} is no longer listed, so this form cannot save it.`;
+  if (fresh.hidden && !seen.hidden) return `${label} changed since this form was opened: it is now hidden. Save replaces it with what this form holds and shows it again.`;
+  return `${label} changed since this form was opened: the list shows it as just read. Save replaces it with what this form holds.`;
+};
 
 /** The label the daemon gives an action that names none (`default_label` in `src/card_catalog.rs`). */
 function defaultLabel(name: string): string {
@@ -154,11 +158,26 @@ function defaultLabel(name: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
-/** Whether `listed` is the action `sent` asked for: every field a form's Save sends, as the daemon lists it. */
+/**
+ * Whether `listed` is the action `sent` asked for, in the state a successful
+ * Save leaves it in: every field a form's Save sends, as the daemon lists it,
+ * and the action in effect as the user's own entry. PR #2491 re-audit (hidden
+ * default): a hidden deck default is listed with the deck's own values
+ * (`editable_catalog`, `src/card_catalog.rs:1032-1037`), which can equal the
+ * draft while the Save is not in effect. What a Save writes, per
+ * `src/card_catalog.rs`: an Update of a deck default's name un-hides it
+ * (`:1318-1320`) and writes a user entry, which parses as `source: user`
+ * (`parse_action`, `:536`), so it is listed `default: true`,
+ * `overridden: true`, `hidden: false` (`:1026-1030`); an Update or Add of any
+ * other name writes a user entry, listed `default: false`,
+ * `overridden: false`, `hidden: false` (`:1046-1049`). `listed.default` says
+ * which kind of name it is, so `overridden` must equal it.
+ */
 function listedAsSent(listed: EditableCardAction, sent: CardActionInput): boolean {
   return listed.name === sent.name && listed.label === (sent.label ?? defaultLabel(sent.name)) && listed.description === sent.description
     && listed.prompt === sent.prompt && (listed.icon ?? null) === (sent.icon ?? null) && (listed.placement || "card") === (sent.placement ?? "card")
-    && listed.confirm === sent.confirm && listed.always === sent.always;
+    && listed.confirm === sent.confirm && listed.always === sent.always
+    && !listed.hidden && listed.source === "user" && listed.overridden === listed.default;
 }
 
 /** Whether two drafts send the same edit. */
@@ -281,7 +300,7 @@ function formAfterRead(current: CardActionForm | undefined, answer: EditableCard
   const fresh = answer.actions.find((action) => action.name === current.values.name);
   const seen = current.original;
   if (seen === undefined ? fresh === undefined : fresh !== undefined && sameAction(seen, fresh)) return { form: current };
-  return { form: { ...withoutSent(current), original: fresh, error: changedUnderForm((seen ?? fresh)!, fresh !== undefined), alertKey } };
+  return { form: { ...withoutSent(current), original: fresh, error: changedUnderForm((seen ?? fresh)!, fresh), alertKey } };
 }
 
 const reason = (error: unknown) => displayText(error instanceof Error ? error.message : String(error), DISPLAY_LIMITS.detail);
