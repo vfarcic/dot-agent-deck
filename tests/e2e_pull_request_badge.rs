@@ -44,14 +44,18 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\n' "$all_args" >> "$PR_STUB_DIR/calls"
 [ "$repo" = test-org/test-repo ] && [ "$state" = all ] && [ -n "$head" ] || exit 93
-for field in number state isDraft reviewDecision url headRefName statusCheckRollup; do
+for field in number state isDraft reviewDecision url headRefName headRefOid statusCheckRollup; do
     case ",$fields," in
         *",$field,"*) ;;
         *) printf 'missing JSON field: %s\n' "$field" >&2; exit 94 ;;
     esac
 done
 [ ! -f "$PR_STUB_DIR/fail" ] || exit 1
-cat "$PR_STUB_DIR/reply.json"
+# Like gh, list each pull request's commits only when they are asked for.
+case ",$fields," in
+    *,commits,*) cat "$PR_STUB_DIR/reply-commits.json" ;;
+    *) cat "$PR_STUB_DIR/reply.json" ;;
+esac
 "#;
 
 struct Fixture {
@@ -139,9 +143,17 @@ impl Fixture {
                 entry["headRefOid"] = json!(tip);
             }
         }
-        let pending = self.scratch.path().join("reply.pending");
-        std::fs::write(&pending, serde_json::to_vec(&reply).unwrap()).unwrap();
-        std::fs::rename(pending, self.scratch.path().join("reply.json")).unwrap();
+        // The reply with commits goes first, so a lookup that reads the
+        // reply without them and then asks again finds both in place.
+        let mut without = reply.clone();
+        for entry in without.as_array_mut().into_iter().flatten() {
+            entry.as_object_mut().map(|entry| entry.remove("commits"));
+        }
+        for (name, reply) in [("reply-commits.json", &reply), ("reply.json", &without)] {
+            let pending = self.scratch.path().join("reply.pending");
+            std::fs::write(&pending, serde_json::to_vec(reply).unwrap()).unwrap();
+            std::fs::rename(pending, self.scratch.path().join(name)).unwrap();
+        }
     }
 
     fn path_env(&self) -> String {
@@ -378,6 +390,13 @@ fn pr_001_daemon_resolves_branch_pull_request() {
     // the name, but its commits are not this branch's, so the card shows no
     // pull request — until the branch's own one opens.
     let fixture = Fixture::new("feat/x");
+    let calls = |fields: &str| {
+        std::fs::read_to_string(fixture.scratch.path().join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(fields))
+            .count()
+    };
     let earlier = "1111111111111111111111111111111111111111";
     let mut earlier_pr = pr_json(1972, "feat/x", "MERGED", false, json!("APPROVED"));
     earlier_pr["headRefOid"] = json!(earlier);
@@ -404,6 +423,13 @@ fn pr_001_daemon_resolves_branch_pull_request() {
         "an earlier branch's merged pull request must not be this branch's badge: {:?}",
         daemon.agent_records()
     );
+    // Telling it apart took one lookup that asked for its commits; the
+    // polls after it remember the answer and ask for them no more.
+    assert!(
+        common::wait_until(WAIT, || calls("--json") >= 4),
+        "the branch with no pull request of its own is polled every interval"
+    );
+    assert_eq!(calls(",commits"), 1, "commits are asked for once at a tip");
     // Control: once the branch's own pull request has merged too, with its
     // tip as the head, it is the badge, although the earlier one has the
     // higher number that would otherwise win.
@@ -411,16 +437,44 @@ fn pr_001_daemon_resolves_branch_pull_request() {
         earlier_pr,
         pr_json(1234, "feat/x", "MERGED", false, json!("APPROVED"))
     ]));
-    expect_pr(
-        &daemon,
-        &PullRequestInfo {
-            number: 1234,
-            url: PR_URL.into(),
-            state: PullRequestState::Merged,
-            review: Some(PullRequestReview::Approved),
-            checks: None,
-        },
+    let merged = PullRequestInfo {
+        number: 1234,
+        url: PR_URL.into(),
+        state: PullRequestState::Merged,
+        review: Some(PullRequestReview::Approved),
+        checks: None,
+    };
+    expect_pr(&daemon, &merged);
+
+    // A commit after the merge is in no pull request, so the badge goes, on
+    // the same daemon: the commit is a new tip, and the lookup runs again.
+    fixture.git(&["commit", "--allow-empty", "-m", "after the merge"]);
+    assert!(
+        daemon
+            .wait_for_agent_where(
+                |record| record
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| l.pull_request.is_none()),
+                WAIT
+            )
+            .is_some(),
+        "a commit after the merge must take the merged badge away: {:?}",
+        daemon.agent_records()
     );
+    drop(daemon);
+
+    // A merged pull request whose head moved on GitHub after the branch's
+    // last push (`gh pr update-branch`, for one) has the tip among its
+    // commits, and only the second lookup, which asks for them, can see it.
+    let fixture = Fixture::new("feat/x");
+    let mut moved = pr_json(1234, "feat/x", "MERGED", false, json!("APPROVED"));
+    moved["headRefOid"] = json!(earlier);
+    moved["commits"] = json!([{"oid": fixture.tip()}, {"oid": earlier}]);
+    fixture.set_reply(json!([moved]));
+    let daemon = fixture.daemon();
+    fixture.start(&daemon);
+    expect_pr(&daemon, &merged);
 }
 
 /// Scenario: Start agents on the remote default branch and on branches with

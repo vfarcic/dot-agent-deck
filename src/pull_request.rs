@@ -283,33 +283,52 @@ pub(crate) struct PrKey {
     /// `owner/name` of each GitHub repository the branch is pushed to: the
     /// forks whose pull request is the branch's. Empty without a push remote.
     pub push: Vec<String>,
+    /// The commit the branch points at, `None` when it has none (an unborn
+    /// branch). Part of the key (issue #2510) because whether a merged or
+    /// closed pull request is the branch's depends on it ([`branch_history`]),
+    /// so a commit on a branch whose pull request merged looks it up again,
+    /// and two checkouts of one branch at different commits are two lookups.
+    pub tip: Option<String>,
+}
+
+impl PrKey {
+    /// Whether `other` names the same branch of the same repository, pushed to
+    /// the same places, whatever commit either points at.
+    pub(crate) fn same_branch(&self, other: &Self) -> bool {
+        self.slug == other.slug && self.branch == other.branch && self.push == other.push
+    }
 }
 
 /// What reading a directory's branch found: its key, and whether the push
-/// remote could be read at all. A `git` that could not run or outlived
-/// [`GIT_TIMEOUT`] leaves `push_known` false, and the monitor then keeps the
-/// push repositories it last read for the same branch ([`BranchProbe::resolve`])
-/// rather than let a slow `git` change the key, which would drop the badge and
-/// look the pull request up again.
+/// remote and the branch's tip could be read at all. A `git` that could not
+/// run or outlived [`GIT_TIMEOUT`] leaves `push_known` (or `tip_known`) false,
+/// and the monitor then keeps the push repositories (or the tip) it last read
+/// for the same branch ([`BranchProbe::resolve`]) rather than let a slow `git`
+/// change the key, which would look the pull request up again, and with no
+/// tip read would leave a merged one unproven.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchProbe {
     pub key: PrKey,
     pub push_known: bool,
+    pub tip_known: bool,
 }
 
 impl BranchProbe {
     /// The key a directory has after this probe, given the one it had.
     pub(crate) fn resolve(probe: Option<Self>, previous: Option<PrKey>) -> Option<PrKey> {
-        match (probe?, previous) {
-            (
-                Self {
-                    key,
-                    push_known: false,
-                },
-                Some(previous),
-            ) if previous.slug == key.slug && previous.branch == key.branch => Some(previous),
-            (probe, _) => Some(probe.key),
+        let mut probe = probe?;
+        if let Some(previous) = previous
+            && previous.slug == probe.key.slug
+            && previous.branch == probe.key.branch
+        {
+            if !probe.push_known {
+                probe.key.push = previous.push;
+            }
+            if !probe.tip_known {
+                probe.key.tip = previous.tip;
+            }
         }
+        Some(probe.key)
     }
 }
 
@@ -379,12 +398,17 @@ pub(crate) async fn branch_key(cwd: &Path) -> Option<BranchProbe> {
     }
     let slug = origin_repo(cwd).await?;
     let push = push_repos(cwd, &branch).await;
+    let tip_args = branch_tip_args(&branch);
+    let tip_args: Vec<&str> = tip_args.iter().map(String::as_str).collect();
+    let tip = git_run(cwd, &tip_args).await;
     Some(BranchProbe {
         push_known: push.is_ok(),
+        tip_known: tip.is_ok(),
         key: PrKey {
             slug,
             branch,
             push: push.unwrap_or_default(),
+            tip: tip.unwrap_or_default(),
         },
     })
 }
@@ -649,21 +673,39 @@ pub fn parse_pr_list(
     push_repos: &[String],
     tip: Option<&str>,
 ) -> Result<Option<PullRequestInfo>, String> {
-    select_pr(json, branch, push_repos, tip).map(|(pr, _)| pr)
+    select_pr(json, branch, push_repos, tip, &HashSet::new()).map(|selection| selection.pr)
 }
 
-/// [`parse_pr_list`], and whether the answer could change once `gh` lists
-/// the pull requests' commits: no open pull request won, and a merged or
-/// closed one was left out only because `gh` listed none of its commits.
+/// What [`select_pr`] read from one `gh pr list` reply.
+#[derive(Debug, Default, PartialEq)]
+struct Selection {
+    /// The branch's pull request, as [`parse_pr_list`] picks it.
+    pr: Option<PullRequestInfo>,
+    /// The answer could change once `gh` lists the pull requests' commits: no
+    /// open pull request won, and a merged or closed one was left out only
+    /// because `gh` listed none of its commits.
+    unproven: bool,
+    /// The merged or closed pull requests whose commits were listed and do
+    /// not include the tip. Their commits do not change while they stay
+    /// merged or closed, so at this tip they stay someone else's.
+    not_ours: HashSet<u64>,
+}
+
+/// [`parse_pr_list`] in full ([`Selection`]). A merged or closed pull request
+/// whose number is in `not_ours`, as an earlier lookup at the same tip found
+/// it, is left out without its commits; that is what spares a branch on a
+/// reused name the second, heavier `gh pr list` on every poll.
 fn select_pr(
     json: &str,
     branch: &str,
     push_repos: &[String],
     tip: Option<&str>,
-) -> Result<(Option<PullRequestInfo>, bool), String> {
+    not_ours: &HashSet<u64>,
+) -> Result<Selection, String> {
     let entries: Vec<GhPr> =
         serde_json::from_str(json).map_err(|e| format!("could not parse gh output: {e}"))?;
     let mut unproven = false;
+    let mut proven_not_ours = HashSet::new();
     let best = entries
         .into_iter()
         .filter(|pr| {
@@ -677,12 +719,20 @@ fn select_pr(
                         push_repos,
                     ))
         })
-        .filter(|pr| match pr.history(tip) {
-            BranchHistory::Ours => true,
-            BranchHistory::NotOurs => false,
-            BranchHistory::Unknown => {
-                unproven |= pr.commits.is_none();
-                false
+        .filter(|pr| {
+            if pr.state != "OPEN" && not_ours.contains(&pr.number) {
+                return false;
+            }
+            match pr.history(tip) {
+                BranchHistory::Ours => true,
+                BranchHistory::NotOurs => {
+                    proven_not_ours.insert(pr.number);
+                    false
+                }
+                BranchHistory::Unknown => {
+                    unproven |= pr.commits.is_none();
+                    false
+                }
             }
         })
         .filter_map(GhPr::into_info)
@@ -693,7 +743,11 @@ fn select_pr(
     let open = best
         .as_ref()
         .is_some_and(|pr| matches!(pr.state, PullRequestState::Open | PullRequestState::Draft));
-    Ok((best, unproven && !open && tip.is_some()))
+    Ok(Selection {
+        pr: best,
+        unproven: unproven && !open && tip.is_some(),
+        not_ours: proven_not_ours,
+    })
 }
 
 /// The arguments of `gh pr view` for pull request `number` of `repo_slug`,
@@ -720,25 +774,28 @@ pub fn parse_pr_view(json: &str) -> Result<Option<PullRequestInfo>, String> {
 /// branch's tip, which happens once a pull request was updated on GitHub (a
 /// merge of its base, for one) and also for an earlier branch's with the same
 /// name, a second `gh pr list` asks for the commits too ([`select_pr`]).
-async fn query_gh(cwd: PathBuf, key: PrKey) -> Result<Option<PullRequestInfo>, GhFailure> {
-    let tip_args = branch_tip_args(&key.branch);
-    let tip_args: Vec<&str> = tip_args.iter().map(String::as_str).collect();
-    let tip = git_line(&cwd, &tip_args).await;
-    let (pr, unproven) = list_prs(&cwd, &key, tip.as_deref(), GH_PR_FIELDS).await?;
-    if !unproven {
-        return Ok(pr);
+/// `not_ours` are the pull requests an earlier lookup of `key` proved
+/// someone else's; the answer carries those this one proved.
+async fn query_gh(
+    cwd: PathBuf,
+    key: PrKey,
+    not_ours: HashSet<u64>,
+) -> Result<(Option<PullRequestInfo>, HashSet<u64>), GhFailure> {
+    let first = list_prs(&cwd, &key, &not_ours, GH_PR_FIELDS).await?;
+    if !first.unproven {
+        return Ok((first.pr, first.not_ours));
     }
-    let (pr, _) = list_prs(&cwd, &key, tip.as_deref(), GH_PR_FIELDS_WITH_COMMITS).await?;
-    Ok(pr)
+    let second = list_prs(&cwd, &key, &not_ours, GH_PR_FIELDS_WITH_COMMITS).await?;
+    Ok((second.pr, second.not_ours))
 }
 
 /// One `gh pr list` for `key` asking for `fields`, read by [`select_pr`].
 async fn list_prs(
     cwd: &Path,
     key: &PrKey,
-    tip: Option<&str>,
+    not_ours: &HashSet<u64>,
     fields: &str,
-) -> Result<(Option<PullRequestInfo>, bool), GhFailure> {
+) -> Result<Selection, GhFailure> {
     let stdout = run_gh(
         "gh pr list",
         Some(cwd),
@@ -749,7 +806,8 @@ async fn list_prs(
         &String::from_utf8_lossy(&stdout),
         &key.branch,
         &key.push,
-        tip,
+        key.tip.as_deref(),
+        not_ours,
     )
     .map_err(GhFailure::error)
 }
@@ -1300,8 +1358,11 @@ pub async fn run_pull_request_monitor(
 ) {
     let mut events = event_tx.subscribe();
     let mut probes: JobPool<PathBuf, Option<BranchProbe>> = JobPool::new(permits.clone());
-    let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, GhFailure>> =
-        JobPool::new(permits);
+    #[allow(clippy::type_complexity)]
+    let mut lookups: JobPool<
+        PrKey,
+        Result<(Option<PullRequestInfo>, HashSet<u64>), GhFailure>,
+    > = JobPool::new(permits);
     // One timer for the monitor's life: a sleep rebuilt on every pass would
     // start over at each broadcast message, so steady unrelated traffic could
     // keep it from ever firing. A tick missed while a pass runs is delayed,
@@ -1310,6 +1371,10 @@ pub async fn run_pull_request_monitor(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cwds: HashMap<PathBuf, CwdEntry> = HashMap::new();
     let mut keys: HashMap<PrKey, KeyEntry> = HashMap::new();
+    // Issue #2510: per key (and so per tip), the merged or closed pull
+    // requests a lookup proved are not the branch's, so the next poll need
+    // not fetch their commits again.
+    let mut not_ours: HashMap<PrKey, HashSet<u64>> = HashMap::new();
     let mut kicked_sessions: HashSet<String> = HashSet::new();
     // The key each session's current value was resolved under (`None`: no
     // key), so a session that moved to another branch drops the old branch's
@@ -1343,7 +1408,10 @@ pub async fn run_pull_request_monitor(
                 entry.in_flight = false;
                 entry.fetched_at = Some(Instant::now());
                 match result {
-                    Ok(value) => entry.record(value, Instant::now()),
+                    Ok((value, proven)) => {
+                        entry.record(value, Instant::now());
+                        not_ours.entry(key.clone()).or_default().extend(proven);
+                    }
                     Err(error) => {
                         let detail = error.detail.clone();
                         if entry.record_failure(error) {
@@ -1430,6 +1498,7 @@ pub async fn run_pull_request_monitor(
             }
         }
         keys.retain(|key, _| key_cwd.contains_key(key));
+        not_ours.retain(|key, _| key_cwd.contains_key(key));
         lookups.retain(|key| key_cwd.contains_key(key));
         for (key, cwd) in &key_cwd {
             let entry = keys.entry(key.clone()).or_default();
@@ -1445,14 +1514,20 @@ pub async fn run_pull_request_monitor(
                 "looking up the branch's pull request"
             );
             let (job_key, cwd) = (key.clone(), cwd.clone());
-            lookups.spawn(key.clone(), async move { query_gh(cwd, job_key).await });
+            let known = not_ours.get(key).cloned().unwrap_or_default();
+            lookups.spawn(
+                key.clone(),
+                async move { query_gh(cwd, job_key, known).await },
+            );
         }
 
         // What each session should show now. A session whose directory has no
         // answer yet keeps what it has, and so does one whose key has none yet
         // while that key is the one its value came from — a failed re-read
-        // keeps the last answer. A session whose key changed drops the old
-        // key's PR at once and shows the new key's when that resolves.
+        // keeps the last answer, as does one whose branch moved to a new tip
+        // (a key that differs only in its tip). A session that moved to
+        // another branch drops the old key's PR at once and shows the new
+        // key's when that resolves.
         let live_sessions: HashSet<&String> = sessions.iter().map(|(id, _)| id).collect();
         shown_keys.retain(|id, _| live_sessions.contains(id));
         let mut want: HashMap<String, Option<PullRequestInfo>> = HashMap::new();
@@ -1467,7 +1542,15 @@ pub async fn run_pull_request_monitor(
                 None => None,
                 Some(key) => match keys.get(key).and_then(|k| k.value.clone()) {
                     Some(value) => value,
-                    None if shown_keys.get(session_id) == Some(&entry.key) => continue,
+                    // The same branch at a new tip keeps what it shows until
+                    // the new tip's lookup answers, so a commit does not
+                    // blink the badge.
+                    None if shown_keys.get(session_id).is_some_and(|shown| {
+                        shown.as_ref().is_some_and(|shown| shown.same_branch(key))
+                    }) =>
+                    {
+                        continue;
+                    }
                     None => None,
                 },
             };
@@ -1580,14 +1663,49 @@ mod tests {
         // Only that last case asks `gh` again, for the commits, and only
         // while no open pull request already won.
         let unproven = |entries: serde_json::Value, tip: Option<&str>| {
-            select_pr(&gh(entries), "feat/x", &[], tip).unwrap().1
+            select_pr(&gh(entries), "feat/x", &[], tip, &HashSet::new())
+                .unwrap()
+                .unproven
         };
         assert!(unproven(json!([unlisted.clone()]), Some(TIP)));
         assert!(!unproven(json!([unlisted.clone()]), None));
         let listed = pr(1972, "MERGED", earlier, json!([{"oid": earlier}]));
         assert!(!unproven(json!([listed]), Some(TIP)));
         let open = pr(1234, "OPEN", TIP, serde_json::Value::Null);
-        assert!(!unproven(json!([unlisted, open]), Some(TIP)));
+        assert!(!unproven(json!([unlisted.clone(), open]), Some(TIP)));
+
+        // A lookup that saw the commits remembers which pull requests they
+        // ruled out, and the next lookup at the same tip leaves those out
+        // without asking for commits again; reopened, one counts by name.
+        let listed = pr(1972, "MERGED", earlier, json!([{"oid": earlier}]));
+        let seen = select_pr(
+            &gh(json!([listed])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(seen.not_ours, HashSet::from([1972]));
+        let next = select_pr(
+            &gh(json!([unlisted])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert_eq!(next, Selection::default());
+        let reopened = pr(1972, "OPEN", earlier, serde_json::Value::Null);
+        let reopened = select_pr(
+            &gh(json!([reopened])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert_eq!(reopened.pr.map(|pr| pr.number), Some(1972));
         assert!(
             GH_PR_FIELDS.split(',').any(|field| field == "headRefOid")
                 && !GH_PR_FIELDS.split(',').any(|field| field == "commits"),
@@ -1815,8 +1933,15 @@ mod tests {
             slug: "o/r".into(),
             branch: branch.into(),
             push: push.iter().map(|p| p.to_string()).collect(),
+            tip: Some("t".into()),
         };
-        let probe = |key, push_known| Some(BranchProbe { key, push_known });
+        let probe = |key, push_known| {
+            Some(BranchProbe {
+                key,
+                push_known,
+                tip_known: true,
+            })
+        };
         let previous = Some(key("feat/x", &["me/r"]));
         assert_eq!(
             BranchProbe::resolve(probe(key("feat/x", &[]), false), previous.clone()),
@@ -1837,7 +1962,28 @@ mod tests {
             BranchProbe::resolve(probe(key("feat/x", &[]), false), None),
             Some(key("feat/x", &[]))
         );
-        assert_eq!(BranchProbe::resolve(None, previous), None);
+        assert_eq!(BranchProbe::resolve(None, previous.clone()), None);
+
+        // Issue #2510: a tip that could not be read keeps the last one read
+        // for the same branch, and one that was read replaces it.
+        let at = |tip: Option<&str>| PrKey {
+            tip: tip.map(str::to_string),
+            ..key("feat/x", &["me/r"])
+        };
+        let unread_tip = Some(BranchProbe {
+            key: at(None),
+            push_known: true,
+            tip_known: false,
+        });
+        assert_eq!(BranchProbe::resolve(unread_tip, previous.clone()), previous);
+        let moved = Some(BranchProbe {
+            key: at(Some("u")),
+            push_known: true,
+            tip_known: true,
+        });
+        assert_eq!(BranchProbe::resolve(moved, previous), Some(at(Some("u"))));
+        assert!(at(Some("u")).same_branch(&at(Some("t"))));
+        assert!(!at(Some("u")).same_branch(&key("feat/y", &["me/r"])));
     }
 
     #[test]
@@ -2596,6 +2742,13 @@ mod tests {
         ]);
         assert_eq!(branch_key(&repo).await, None, "the default branch");
         git(&["checkout", "-q", "-b", "feat/x"]);
+        let tip = {
+            let out = crate::git_env::fixture_git(&repo, sandbox.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
         assert_eq!(
             branch_key(&repo).await,
             Some(BranchProbe {
@@ -2603,8 +2756,10 @@ mod tests {
                     slug: "o/r".into(),
                     branch: "feat/x".into(),
                     push: Vec::new(),
+                    tip: Some(tip),
                 },
                 push_known: true,
+                tip_known: true,
             }),
             "a branch with no push remote"
         );
