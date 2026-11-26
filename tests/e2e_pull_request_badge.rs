@@ -113,13 +113,32 @@ impl Fixture {
         );
     }
 
+    /// The commit the checked-out branch points at.
+    fn tip(&self) -> String {
+        let output = common::fixture_git(&self.repo, self.scratch.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("fixture git rev-parse");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn executable(&self, name: &str, content: &str) {
         let path = self.bin.join(name);
         std::fs::write(&path, content).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    fn set_reply(&self, reply: Value) {
+    /// Every entry of `reply` that names no `headRefOid` gets the branch's
+    /// tip as its head, so a canned pull request reads as the branch's own
+    /// unless a case says otherwise (issue #2510: a merged or closed pull
+    /// request counts only when the branch's tip is one of its commits).
+    fn set_reply(&self, mut reply: Value) {
+        let tip = self.tip();
+        for entry in reply.as_array_mut().into_iter().flatten() {
+            if entry.get("headRefOid").is_none() {
+                entry["headRefOid"] = json!(tip);
+            }
+        }
         let pending = self.scratch.path().join("reply.pending");
         std::fs::write(&pending, serde_json::to_vec(&reply).unwrap()).unwrap();
         std::fs::rename(pending, self.scratch.path().join("reply.json")).unwrap();
@@ -276,7 +295,9 @@ fn expect_pr(daemon: &DaemonProc, expected: &PullRequestInfo) {
 
 /// Scenario: Start a synthetic agent on a GitHub PR branch and inspect its live
 /// daemon listing. Exact branch matching, open-PR preference, lifecycle/review
-/// mapping, and the highest-number fallback are reflected in the served PR.
+/// mapping, and the highest-number fallback are reflected in the served PR; a
+/// merged PR of an earlier branch with the same name is not served, and the
+/// branch's own PR is once it exists.
 #[spec("session/pr/001")]
 #[test]
 fn pr_001_daemon_resolves_branch_pull_request() {
@@ -351,6 +372,55 @@ fn pr_001_daemon_resolves_branch_pull_request() {
             },
         );
     }
+
+    // Issue #2510: the branch name was used before, by a branch whose pull
+    // request merged and was deleted. `gh` lists that merged pull request for
+    // the name, but its commits are not this branch's, so the card shows no
+    // pull request — until the branch's own one opens.
+    let fixture = Fixture::new("feat/x");
+    let earlier = "1111111111111111111111111111111111111111";
+    let mut earlier_pr = pr_json(1972, "feat/x", "MERGED", false, json!("APPROVED"));
+    earlier_pr["headRefOid"] = json!(earlier);
+    earlier_pr["commits"] = json!([{"oid": earlier}]);
+    fixture.set_reply(json!([earlier_pr.clone()]));
+    let daemon = fixture.daemon();
+    fixture.start(&daemon);
+    // The stub answers at once, so the two seconds below follow the
+    // lookup's answer, not race it.
+    assert!(
+        common::wait_until(WAIT, || fixture.scratch.path().join("calls").exists()),
+        "the branch's pull request must be looked up"
+    );
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || {
+            daemon.agent_records().iter().any(|record| {
+                record
+                    .live
+                    .as_ref()
+                    .and_then(|live| live.pull_request.as_ref())
+                    .is_some()
+            })
+        }),
+        "an earlier branch's merged pull request must not be this branch's badge: {:?}",
+        daemon.agent_records()
+    );
+    // Control: once the branch's own pull request has merged too, with its
+    // tip as the head, it is the badge, although the earlier one has the
+    // higher number that would otherwise win.
+    fixture.set_reply(json!([
+        earlier_pr,
+        pr_json(1234, "feat/x", "MERGED", false, json!("APPROVED"))
+    ]));
+    expect_pr(
+        &daemon,
+        &PullRequestInfo {
+            number: 1234,
+            url: PR_URL.into(),
+            state: PullRequestState::Merged,
+            review: Some(PullRequestReview::Approved),
+            checks: None,
+        },
+    );
 }
 
 /// Scenario: Start agents on the remote default branch and on branches with

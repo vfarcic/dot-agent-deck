@@ -1247,7 +1247,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### session/pr/001 — The daemon resolves the exact branch PR and serves its state, review and CI checks.
 - **Layer:** L2 headless, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, strict offline gh stub).
-- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly; the winning PR's `statusCheckRollup` (check runs and a commit status) is served as its CI summary, failing first, with per-bucket counts (issue #1781). The stub requires explicit repository, all states and all required JSON fields, `statusCheckRollup` included.
+- **Asserts:** ListAgents live.pull_request carries the exact branch's open PR in preference to terminal PRs; draft, merged, closed, review decisions, absent review and highest-number fallback are mapped correctly; the winning PR's `statusCheckRollup` (check runs and a commit status) is served as its CI summary, failing first, with per-bucket counts (issue #1781). A branch whose name an earlier branch used gets no PR from that branch's merged PR (its `headRefOid` and commits are not the branch's tip), and gets its own merged PR once one is listed, although the earlier one has the higher number (issue #2510). The stub requires explicit repository, all states and all required JSON fields, `statusCheckRollup` included.
 - **Does not assert:** periodic refresh (`session/pr/003`) or TUI rendering.
 - **Platform coverage:** mac+linux.
 
@@ -3224,6 +3224,13 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Agent:** none (a deck-owned, clean worktree whose stub `gh` reply is `MERGED`, so it would be removed; under its git-ignored `.worktrees/` lies a linked worktree of a second, independent repository holding an unsaved file).
 - **Asserts:** `worktree list --json` reads the holder `keep`; after `worktree reclaim --yes` the holder is still on disk, the nested worktree's unsaved file is unchanged, and the output says it `holds other worktrees`, naming the nested one. Pins PRD #1790 stage 2's final review, auditor 1: the holder's own repository's `git worktree list` does not know a worktree of another repository, and `git status` does not see it under an ignored directory.
 - **Does not assert:** the bound on the walk that finds it, or an unreadable directory (`nested_git_trees` unit tests); a plain clone rather than a linked worktree (same walk, unit-tested).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/015 — A merged pull request of an EARLIER branch with the same name does not make a new worktree on that name reclaimable.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a branch `agent/dispatch-reused` gets one commit and is deleted, as after its pull request merged; a new deck-owned, clean worktree is then created on a branch of the same name from `main`, and the stub `gh` reply lists one `MERGED` pull request whose `headRefOid` and only commit are the deleted branch's commit — the shape `gh pr list --head <branch>` returns for a reused dispatch name).
+- **Asserts:** a **fixture precondition** that the entry reads `owned: true` and `clean: true`; that `worktree list --json` reports `pr_state: "no_pr"` and `verdict: "keep"`; that the directory survives `worktree reclaim --yes`; and, as a **control**, that with the new branch's own `MERGED` pull request (its tip as the head) listed beside the earlier one the entry reads `merged` / `remove`. Pins issue #2510: the lookup matched on the branch name alone, so a live worktree on a reused name read the earlier branch's merge as its own and got the unattended `remove` verdict.
+- **Does not assert:** a pull request whose head moved on GitHub after the branch's last push, a branch with commits after its pull request merged, an open pull request counting by name, and the fail-closed cases (no tip, or no commits listed), all unit-tested as `parse_pr_state_ignores_a_merged_pull_request_of_an_earlier_branch_with_the_same_name` in `src/worktree_reclaim.rs`; the PR badge's side of the same decision (`session/pr/001`).
 - **Platform coverage:** mac+linux.
 
 ### Prompts
