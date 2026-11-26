@@ -2167,7 +2167,7 @@ async fn a_card_catalog_edit_goes_only_to_a_deck_that_advertises_it() {
         .expect("precondition: the deck is trusted");
 
     for edit in [None, Some(catalog_add())] {
-        let refused = crate::agent_card_catalog_edit_on(&state, &wire, None, edit)
+        let refused = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), edit)
             .await
             .expect_err("an older daemon cannot edit its card actions");
         assert_eq!(refused, crate::CARD_CATALOG_EDIT_UNSUPPORTED);
@@ -2190,7 +2190,7 @@ async fn a_card_catalog_edit_goes_only_to_a_deck_that_advertises_it() {
     let _local = select(&deck);
     let state = DesktopState::default();
     let wire = crate::dto::deck_wire_id(&deck.endpoint());
-    let read = crate::agent_card_catalog_edit_on(&state, &wire, None, None)
+    let read = crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), None)
         .await
         .expect("a read is answered");
     let names: Vec<_> = read
@@ -2199,7 +2199,7 @@ async fn a_card_catalog_edit_goes_only_to_a_deck_that_advertises_it() {
         .map(|a| a.action.name.as_str())
         .collect();
     assert_eq!(names, ["go-ahead", "merge"]);
-    crate::agent_card_catalog_edit_on(&state, &wire, None, Some(catalog_add()))
+    crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), Some(catalog_add()))
         .await
         .expect("an edit is answered");
     let script = deck.script.lock().unwrap();
@@ -2238,7 +2238,7 @@ async fn a_refused_card_catalog_edit_comes_back_as_the_daemon_s_reason() {
         .trusted(&deck.endpoint())
         .await
         .expect("precondition: the deck is trusted");
-    let refused = crate::agent_card_catalog_edit_on(&state, &wire, None, Some(catalog_add()))
+    let refused = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add()))
         .await
         .expect_err("a refused edit is an error");
     assert_eq!(refused, REASON, "the daemon's reason, as it gave it");
@@ -2271,9 +2271,10 @@ async fn a_card_catalog_edit_the_deck_never_answers_is_bounded() {
 
     tokio::time::pause();
     let started = tokio::time::Instant::now();
-    let edited = crate::agent_card_catalog_edit_on(&state, &wire, None, Some(catalog_add())).await;
+    let edited =
+        crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add())).await;
     let waited = started.elapsed();
-    let read = crate::agent_card_catalog_edit_on(&state, &wire, None, None).await;
+    let read = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), None).await;
     tokio::time::resume();
 
     let edited = edited.expect_err("an unanswered edit is an error");
@@ -2317,7 +2318,7 @@ async fn a_card_catalog_edit_that_fails_before_it_is_written_says_nothing_was_sa
 
     // The deck closes the connection on the `Hello` that would carry the edit.
     deck.script.lock().unwrap().drop_follow_on_hello = true;
-    let dropped = crate::agent_card_catalog_edit_on(&state, &wire, None, Some(catalog_add()))
+    let dropped = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add()))
         .await
         .expect_err("an edit that was never written is an error");
     assert!(
@@ -2334,7 +2335,8 @@ async fn a_card_catalog_edit_that_fails_before_it_is_written_says_nothing_was_sa
         script.silent_hello = true;
     }
     tokio::time::pause();
-    let silent = crate::agent_card_catalog_edit_on(&state, &wire, None, Some(catalog_add())).await;
+    let silent =
+        crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add())).await;
     tokio::time::resume();
     let silent = silent.expect_err("an edit whose `Hello` is never answered is an error");
     assert!(
@@ -2355,7 +2357,7 @@ async fn a_card_catalog_edit_that_fails_before_it_is_written_says_nothing_was_sa
     }
     tokio::time::pause();
     let unanswered =
-        crate::agent_card_catalog_edit_on(&state, &wire, None, Some(catalog_add())).await;
+        crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add())).await;
     tokio::time::resume();
     let unanswered = unanswered.expect_err("an unanswered edit is an error");
     assert!(
@@ -2419,6 +2421,55 @@ async fn a_card_catalog_edit_bound_to_a_replaced_daemon_is_refused() {
     );
 }
 
+/// Scenario (PR #2491 audit, A1): the app asks to read or save a deck's card
+/// actions without naming the daemon process they were read from (no
+/// `instance_id`, or an empty one), here after the deck's daemon restarted as
+/// process `b`. Nothing is sent and no connection is opened: the read is
+/// refused, and the save is refused saying nothing was saved, instead of
+/// going unbound to whichever process answers now. Control: the same save
+/// naming `b` reaches it.
+#[tokio::test]
+async fn a_card_catalog_edit_naming_no_daemon_process_is_refused_before_connecting() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-unnamed", "a");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    deck.restart_as("b");
+
+    for instance in [None, Some("")] {
+        let refused =
+            crate::agent_card_catalog_edit_on(&state, &wire, instance, Some(catalog_add()))
+                .await
+                .expect_err("an edit naming no daemon process is refused");
+        assert_eq!(
+            refused,
+            format!("{}; nothing was saved", crate::CARD_CATALOG_DAEMON_UNNAMED),
+            "{instance:?}"
+        );
+        let read = crate::agent_card_catalog_edit_on(&state, &wire, instance, None)
+            .await
+            .expect_err("a read naming no daemon process is refused");
+        assert_eq!(read, crate::CARD_CATALOG_DAEMON_UNNAMED, "{instance:?}");
+    }
+    assert_eq!(
+        deck.hellos("a") + deck.hellos("b"),
+        0,
+        "no connection was opened"
+    );
+    assert!(
+        deck.received_by("b").is_empty(),
+        "the deck was sent nothing"
+    );
+    assert!(deck.script.lock().unwrap().catalog_edit_requests.is_empty());
+
+    crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), Some(catalog_add()))
+        .await
+        .expect("an edit naming the process answering reaches it");
+    assert_eq!(deck.received_by("b"), ["card-catalog-edit"]);
+}
+
 /// Scenario (issue #2399 review, finding 1): the Card actions editor reads and
 /// saves the deck it names. With deck A selected, a read and an edit naming A
 /// reach A alone; a read or an edit naming deck B, which the app is not
@@ -2440,10 +2491,10 @@ async fn a_card_catalog_edit_reaches_only_the_deck_it_names() {
 
     let selected = select(&a);
     let state = DesktopState::default();
-    crate::agent_card_catalog_edit_on(&state, &a_wire, None, None)
+    crate::agent_card_catalog_edit_on(&state, &a_wire, Some("a"), None)
         .await
         .expect("a read of the selected deck is answered");
-    crate::agent_card_catalog_edit_on(&state, &a_wire, None, Some(catalog_add()))
+    crate::agent_card_catalog_edit_on(&state, &a_wire, Some("a"), Some(catalog_add()))
         .await
         .expect("an edit of the selected deck is answered");
     assert_eq!(sent(&a).len(), 2, "A got its read and its edit");
@@ -2452,7 +2503,7 @@ async fn a_card_catalog_edit_reaches_only_the_deck_it_names() {
         serde_json::to_value(catalog_add()).unwrap()
     );
     for edit in [None, Some(catalog_add())] {
-        let refused = crate::agent_card_catalog_edit_on(&state, &b_wire, None, edit)
+        let refused = crate::agent_card_catalog_edit_on(&state, &b_wire, Some("b"), edit)
             .await
             .expect_err("a deck the app does not observe is not edited");
         assert!(
@@ -2466,13 +2517,13 @@ async fn a_card_catalog_edit_reaches_only_the_deck_it_names() {
 
     let _selected = select(&b);
     let state = DesktopState::default();
-    crate::agent_card_catalog_edit_on(&state, &b_wire, None, None)
+    crate::agent_card_catalog_edit_on(&state, &b_wire, Some("b"), None)
         .await
         .expect("a read of the newly selected deck is answered");
-    crate::agent_card_catalog_edit_on(&state, &b_wire, None, Some(catalog_add()))
+    crate::agent_card_catalog_edit_on(&state, &b_wire, Some("b"), Some(catalog_add()))
         .await
         .expect("an edit of the newly selected deck is answered");
-    let stale = crate::agent_card_catalog_edit_on(&state, &a_wire, None, Some(catalog_add()))
+    let stale = crate::agent_card_catalog_edit_on(&state, &a_wire, Some("a"), Some(catalog_add()))
         .await
         .expect_err("a form opened on A is not written once A is gone");
     assert!(stale.contains("not one this app is observing"), "{stale}");

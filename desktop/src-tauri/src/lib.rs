@@ -2195,7 +2195,9 @@ async fn agent_card_invoke_batch(
 /// daemon to apply it to the daemon's own user config and answer the actions
 /// afterwards. The webview names no file: the daemon writes only its own user
 /// config. `instance_id` is the daemon process whose card actions the user was
-/// shown; a daemon that replaced it is sent nothing. A refused edit is the
+/// shown; a daemon that replaced it is sent nothing, and a request naming none
+/// is refused unsent (an `Option` so that refusal is said in words rather than
+/// as a missing argument). A refused edit is the
 /// daemon's reason; a daemon without the editor's capability is sent nothing.
 /// The wait is bounded
 /// ([`crate::daemon_bridge::DECK_REPLY_TIMEOUT`]).
@@ -2220,6 +2222,13 @@ pub(crate) const CARD_CATALOG_EDIT_UNSUPPORTED: &str = "this deck's daemon is fr
 pub(crate) const CARD_CATALOG_DAEMON_REPLACED: &str =
     "the deck's daemon was restarted since its cards were read";
 
+/// PR #2491 audit (A1): why a read or an edit that names no daemon process
+/// reached no daemon. Without the process whose card actions the user was
+/// shown, a replacement could not be told from it, so nothing is sent. An
+/// edit adds that nothing was saved.
+pub(crate) const CARD_CATALOG_DAEMON_UNNAMED: &str =
+    "the app did not say which of the deck's daemon processes its card actions were read from";
+
 /// The words in an edit's failure that say it may have been saved: its answer
 /// was lost after it was sent. The webview's bridge looks for them
 /// (`CARD_CATALOG_EDIT_MAY_HAVE_SAVED` in `desktop/src/lib/bridge.ts`) to tell
@@ -2235,9 +2244,13 @@ pub(crate) const CARD_CATALOG_EDIT_MAY_HAVE_SAVED: &str = "it may have been save
 /// may have been saved ([`CARD_CATALOG_EDIT_MAY_HAVE_SAVED`]); the editor then
 /// reads the catalog once more instead of repeating the edit. One that failed
 /// or ran out of time before that, connecting or on the `Hello`, says nothing
-/// was saved. With `instance_id`, the request is bound to that daemon process
+/// was saved. The request is bound to the daemon process `instance_id` names
 /// (PR #2491 review, Qodo 4), as a batch is: a daemon that replaced it is sent
-/// nothing, and the answer is [`CARD_CATALOG_DAEMON_REPLACED`].
+/// nothing, and the answer is [`CARD_CATALOG_DAEMON_REPLACED`]. A request that
+/// names no process (`None`, or an empty id) is refused before the deck is
+/// reached (PR #2491 audit, A1), answering [`CARD_CATALOG_DAEMON_UNNAMED`]:
+/// without an identity there is nothing to tell a replacement by, so missing
+/// identity never selects an unbound request.
 pub(crate) async fn agent_card_catalog_edit_on(
     state: &DesktopState,
     deck_id: &str,
@@ -2247,6 +2260,10 @@ pub(crate) async fn agent_card_catalog_edit_on(
     let deadline = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
     let until = tokio::time::Instant::now() + deadline;
     let edits = edit.is_some();
+    let Some(instance) = instance_id.filter(|id| !id.is_empty()) else {
+        let unsent = if edits { "; nothing was saved" } else { "" };
+        return Err(format!("{CARD_CATALOG_DAEMON_UNNAMED}{unsent}"));
+    };
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = match tokio::time::timeout_at(until, state.daemon.trusted(scope.endpoint())).await
     {
@@ -2271,16 +2288,9 @@ pub(crate) async fn agent_card_catalog_edit_on(
     // PR #2491 review (Qodo 4): bound, like a batch, to the daemon process
     // whose card actions the user was shown, so the `Hello` that would carry
     // the request refuses a daemon that replaced it and nothing is sent.
-    let bound;
-    let client: &DaemonClient = match instance_id {
-        Some(instance) => {
-            bound = daemon
-                .client
-                .bound_to(Incarnation::from(Some(instance.to_string())));
-            &bound
-        }
-        None => &daemon.client,
-    };
+    let client = daemon
+        .client
+        .bound_to(Incarnation::from(Some(instance.to_string())));
     // PR #2491 review (Qodo 10): the connection and its `Hello` first, with
     // nothing of the edit written, so a failure or the bound running out here
     // says plainly that nothing was saved; only once the edit is being
