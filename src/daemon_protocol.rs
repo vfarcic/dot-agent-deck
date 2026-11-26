@@ -1297,6 +1297,24 @@ pub const CAP_AGENT_CARDS: &str = "agent-cards";
 /// otherwise draws every card as a root. Advertised on every platform.
 pub const CAP_AGENT_CARDS_TREE: &str = "agent-cards-tree";
 
+/// Capability string for issue #2399's batch card actions:
+/// [`AttachRequest::InvokeCardActionBatch`], one request that previews or
+/// executes one action on many cards. Withheld by its one sender,
+/// [`crate::daemon_client::DaemonClient::invoke_card_action_batch`], unless
+/// the `Hello` on the same connection named this, so no [`PROTOCOL_VERSION`]
+/// bump: an older daemon is sent nothing, and a client offers no batch
+/// against it. Advertised on every platform: the arm is not `#[cfg]`-gated.
+pub const CAP_AGENT_CARDS_BATCH: &str = "agent-cards-batch";
+
+/// Capability string for the desktop's card-action editor (issue #2399, PR
+/// #2491 scope extension): a request that reads the user catalog's actions
+/// with where each came from, and adds, updates, removes, hides or restores
+/// one, writing the daemon's own user config. Withheld by its sender unless
+/// the `Hello` on the same connection named this, so no [`PROTOCOL_VERSION`]
+/// bump: [`AttachRequest::CardCatalogEdit`]. Advertised on every platform: the
+/// arm is not `#[cfg]`-gated.
+pub const CAP_AGENT_CARDS_CATALOG_EDIT: &str = "agent-cards-catalog-edit";
+
 /// Capability string for [`AttachRequest::AgentOpened`] (issue #2454): a
 /// client tells the daemon the user opened an agent's pane, which deals with
 /// the `waiting`, `done` or `failed` reason the agent's card report raised.
@@ -1544,6 +1562,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
     CAP_AGENT_CARDS_TREE,
+    CAP_AGENT_CARDS_BATCH,
+    CAP_AGENT_CARDS_CATALOG_EDIT,
     CAP_INTERRUPTED_WORK,
     CAP_RESTORE_AGENTS,
     CAP_REARM_ORCHESTRATOR,
@@ -1579,6 +1599,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
     CAP_AGENT_CARDS_TREE,
+    CAP_AGENT_CARDS_BATCH,
+    CAP_AGENT_CARDS_CATALOG_EDIT,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
     CAP_AGENT_OPENED,
@@ -3659,6 +3681,50 @@ pub enum AttachRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Issue #2399: one action on many cards. `mode` `preview` sends nothing
+    /// and answers, per entry, whether it is included — with the exact text
+    /// it would get, and the definition `token` and daemon `instance_id` an
+    /// execution must send back — or skipped and why. `execute` sends to the
+    /// entries the user confirmed, each through exactly the single press
+    /// [`Self::InvokeCardAction`] performs (instance, card, token, admission
+    /// caps, delivery and the card's `recent_deliveries`), so an entry whose
+    /// action changed since its preview fails alone and the others still go.
+    /// `request_id` names the batch; a repeat of an execution sends nothing
+    /// again while the batch is remembered (up to
+    /// [`crate::agent_cards::REQUEST_ID_MEMORY`], sooner when newer batches
+    /// need the room), and is answered with what the first execution
+    /// answered. That answer is the one the daemon kept: for an answer too
+    /// large to remember whole, a shortened one (each entry's message cut
+    /// short, or each entry [`crate::agent_cards::BATCH_UNKNOWN`]), which the
+    /// first execution's caller is given too.
+    /// The reply rides back on [`AttachResponse::card_action_batch`]. A
+    /// refusal of the whole request (`ok: false`) comes only before any entry
+    /// ran; an execution that started answers per entry, an entry the daemon
+    /// cannot account for being [`crate::agent_cards::BATCH_UNKNOWN`].
+    /// **Withheld unless the daemon advertises [`CAP_AGENT_CARDS_BATCH`]** on
+    /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    InvokeCardActionBatch {
+        mode: crate::agent_cards::CardBatchMode,
+        action_id: String,
+        request_id: String,
+        #[serde(default)]
+        entries: Vec<crate::agent_cards::CardBatchEntry>,
+    },
+    /// Issue #2399 (PR #2491 scope extension): the desktop's card-action
+    /// editor. With no `edit` it reads the user catalog's actions with where
+    /// each came from and writes nothing; with one it applies that one change
+    /// to the `[catalog]` actions of **the daemon's own user config**
+    /// ([`crate::config::user_config_path`]) — the request names no file and
+    /// no key outside one action — and answers the catalog as it is after the
+    /// write. A refused edit is `ok: false` with the reason, nothing written.
+    /// The reply rides back on [`AttachResponse::card_catalog_edit`].
+    /// **Withheld unless the daemon advertises
+    /// [`CAP_AGENT_CARDS_CATALOG_EDIT`]** on the connection that carries it,
+    /// so no [`PROTOCOL_VERSION`] bump.
+    CardCatalogEdit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
+    },
     /// Issue #2454: the user opened the agent in `pane_id` — its pane in the
     /// desktop app's overlay or full window, or in the TUI. That deals with
     /// the `waiting`, `done` or `failed` reason its card report raised, so
@@ -4638,6 +4704,17 @@ pub struct AttachResponse {
     /// refusal is `ok: true` with `outcome: "refused"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card_action: Option<crate::agent_cards::CardActionResult>,
+    /// Issue #2399: the answer to [`AttachRequest::InvokeCardActionBatch`],
+    /// one outcome per entry; an entry that fails leaves `ok` true. Additive
+    /// and optional; the request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_action_batch: Option<crate::agent_cards::CardBatchResult>,
+    /// Issue #2399 (PR #2491 scope extension): the answer to
+    /// [`AttachRequest::CardCatalogEdit`], the editable catalog after the
+    /// edit (or as read). Additive and optional; the request is
+    /// capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_catalog_edit: Option<crate::card_catalog::EditableCardCatalog>,
     /// PRD #1666 part 3 (Q35-15): the `e2e` build's answer to
     /// [`AttachRequest::E2eComposerControl`]'s `fence-status`. Compiled into
     /// that build alone, which is the only one that can ask for it.
@@ -8650,6 +8727,83 @@ async fn handle_connection(
             let resp = AttachResponse {
                 card_action: Some(result),
                 ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::CardCatalogEdit { edit } => {
+            // The daemon's own user config, never a path from the client.
+            let path = crate::config::user_config_path();
+            let edits = edit.is_some();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::card_catalog::edit_user_catalog_at(&path, edit.as_ref())
+            })
+            .await;
+            let resp = match result {
+                Ok(Ok(catalog)) => {
+                    if edits {
+                        // The next card read resolves the file just written.
+                        registry.agent_cards().forget_catalog();
+                    }
+                    AttachResponse {
+                        card_catalog_edit: Some(catalog),
+                        ..AttachResponse::ok()
+                    }
+                }
+                Ok(Err(reason)) => AttachResponse::err(reason),
+                Err(_) => AttachResponse::err("the catalog edit did not finish"),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::InvokeCardActionBatch {
+            mode,
+            action_id,
+            request_id,
+            entries,
+        } => {
+            // Each close entry is the same stop a single press's close sends.
+            // The batch runs on a task of its own, so the maker owns its
+            // handles.
+            let close = {
+                let registry = Arc::clone(&registry);
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                let worktree_registry = worktree_registry.clone();
+                move || {
+                    let registry = Arc::clone(&registry);
+                    let state = state.clone();
+                    let event_tx = event_tx.clone();
+                    let worktree_registry = worktree_registry.clone();
+                    move |id: String, keep: bool| async move {
+                        let (outcome, hold) = stop_agent_request(
+                            &id,
+                            keep,
+                            &registry,
+                            &state,
+                            &event_tx,
+                            &worktree_registry,
+                        )
+                        .await;
+                        drop(hold);
+                        outcome
+                    }
+                }
+            };
+            let resp = match crate::agent_cards::invoke_batch(
+                &registry,
+                &state,
+                mode,
+                &request_id,
+                &action_id,
+                &entries,
+                close,
+            )
+            .await
+            {
+                Ok(result) => AttachResponse {
+                    card_action_batch: Some(result),
+                    ..AttachResponse::ok()
+                },
+                Err(refusal) => AttachResponse::err(format!("invoke-card-action-batch: {refusal}")),
             };
             write_resp(&mut stream, &resp).await?
         }

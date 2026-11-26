@@ -43,3 +43,14 @@ pub const PORT_ENV: &str = "DAD_DOCS_SCREENSHOTS_PORT";
 /// config — keeps vite's default `dist/` and a `test-results/` under
 /// `desktop/`.
 pub const RUN_DIR_ENV: &str = "DAD_DOCS_SCREENSHOTS_RUN_DIR";
+
+/// The environment variable naming the themes the rasterizer shoots each
+/// scenario in, comma-separated (`light,dark`, `light` or `dark`). Unset — a
+/// hand-run of the config — shoots both.
+pub const THEMES_ENV: &str = "DAD_DOCS_SCREENSHOTS_THEMES";
+
+/// The environment variable saying how the rasterizer names its PNGs:
+/// `paired` (`<scenario>-<client>-<theme>.png`) or `single`
+/// (`<scenario>-<client>.png`, with exactly one theme). Unset — a hand-run of
+/// the config — is `paired`.
+pub const NAMING_ENV: &str = "DAD_DOCS_SCREENSHOTS_NAMING";

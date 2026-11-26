@@ -748,6 +748,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -803,6 +804,7 @@ mod tests {
             decks: &[],
             directories: None,
             new_agent: None,
+            dashboard: None,
         };
         for ceiling in [MIN_TOKEN_CEILING, 1024, MAX_TOKEN_CEILING] {
             let ceiling = TokenCeiling::parse(i64::from(ceiling)).expect("in range");
@@ -902,13 +904,30 @@ mod tests {
                 "previous_agent_card",
                 "next_needs_you_card",
                 "filter_needs_you_cards",
-                "close_agent_card",
+                "show_card_tab",
+                "show_terminal_tab",
                 "open_card_tree",
                 "close_card_tree",
                 "open_card_pull_request",
                 "open_card_issue",
                 "run_card_action",
-                "reply_to_agent_card",
+                "run_card_action_batch",
+                "select_agent_card",
+                "unselect_agent_card",
+                "clear_card_selection",
+                "run_card_action_on_selection",
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_card_tab",
                 "none"
             ]
         );
@@ -993,6 +1012,7 @@ mod tests {
                 decks: &[],
                 directories: Some(&listing),
                 new_agent: None,
+                dashboard: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -1021,6 +1041,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             },
             HOSTED_COMMAND_MODEL,
             TokenCeiling::default(),
@@ -1317,6 +1338,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("fails");
@@ -1343,6 +1365,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("fails");
@@ -1374,6 +1397,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("no key is stored");
@@ -1456,6 +1480,7 @@ mod tests {
                 decks: &[],
                 directories: None,
                 new_agent: None,
+                dashboard: None,
             })
             .await
             .expect_err("nothing is listening on port 1");

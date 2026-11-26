@@ -217,7 +217,8 @@ user's own words ("dispatcher", "the Claude agent", "the newest agent", "the one
 scroll"), except for an agent named by what it is doing now (its status or its tool), such as
 "the one that's stuck" or "whichever is waiting": for that one, the `label` of the agent whose
 `status` or `tool` fits, never the user's words. A request for an agent's CARD ("show the coder's
-card") is `show_agent_card`, not this one."""
+card") is `show_agent_card`, not this one, and selecting an agent's card for a batch ("select the
+coder's card", "add the tester to the selection") is `select_agent_card`."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the Daemons screen or the agent dashboard"
@@ -372,7 +373,9 @@ unfiltered — opening the dashboard from any other screen as well. Only when th
 EVERYTHING, all agents or no filter: a request for the dashboard that says none of that is
 `open_overview`, even where that cannot run. Use for show everything, show
 all agents, show all, clear the filter, remove the filter, unfiltered, or reset — a bare "reset" said on its own means THIS one. With no filter
-set it simply opens the dashboard, as `open_overview` does. Filtering to some agents is
+set it simply opens the dashboard, as `open_overview` does. While `dashboard.needs_you_only` beside
+this table is true, a bare "show all", "show all cards" or "show every agent" turns Needs you only
+off instead: `filter_needs_you_cards`. Filtering to some agents is
 `filter_dashboard`; opening one agent is `open_agent`. Clearing an agent's PROMPT — "clear the
 prompt", "clear it", "clear everything" in an agent's pane — is `clear_prompt`, not this one.
 While the New agent dialog shows a directory listing, "clear filter" and "clear the filter" empty
@@ -2794,7 +2797,11 @@ description = """Switch the agent dashboard between its two views: the table (on
 and the cards (one card per agent, the agents each one started in a tree under it, showing what
 each agent is doing and what it needs). Use when the user asks to show cards, the card view, switch to
 cards, show the table, the list view, or back to the table. Set `view` to "table" or "cards".
-Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`."""
+Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`. Read
+`dashboard` beside this table: while `dashboard.needs_you_only` is true, "show all cards", "show
+every card" and "show all" are NOT this one: they turn Needs you only off,
+which is `filter_needs_you_cards` with `needs_you` = "off". While it is false and `dashboard.view` is
+"table", "show all cards" means this row with `view` = "cards"."""
 invoke      = "setOverviewMode"
 screens     = ["overview"]
 unavailable_hint = "the dashboard's view changes on the agent dashboard"
@@ -2808,14 +2815,16 @@ try_saying  = "show cards"
 
 [[commands]]
 id          = "show_agent_card"
-description = """Open one agent's CARD: the overlay that shows what that agent reported, its
-questions and the actions it offers. Use only when the user says card — "show the coder's card",
-"open the tester's card", "card for the dispatcher". Opening an agent's terminal pane ("open the
-coder", "show the tester") is `open_agent`, not this one. Set `agent` to the user's own words for
+description = """Open one agent's CARD: that agent's pane on its Card tab, showing what the agent
+reported, its questions and the actions it offers. Use only when the user says card — "show the
+coder's card", "open the tester's card", "card for the dispatcher". Opening an agent's terminal pane
+without naming its card ("open the coder", "show the tester") is `open_agent`, not this one. A card
+with NO agent named ("show the card", "open the card", "show its card") is the card of the agent whose
+pane is already open, which is `show_card_tab`, never this row. Set `agent` to the user's own words for
 the agent."""
 invoke      = "showAgentCard"
-screens     = ["overview"]
-unavailable_hint = "an agent's card opens on the agent dashboard"
+screens     = ["overview", "agent"]
+unavailable_hint = "an agent's card opens from the agent dashboard"
 report      = "Showing {agent}'s card."
 asks_to     = "open one agent's card"
 try_saying  = "show {agent}'s card"
@@ -2826,68 +2835,108 @@ try_saying  = "show {agent}'s card"
 
 [[commands]]
 id          = "next_agent_card"
-description = """With an agent's card open, show the next agent's card in the dashboard's order
-without closing it. Use for next card, the next one, or the card after this. "next page" is
-`next_page`; the next card that needs the user is `next_needs_you_card`."""
+description = """With an agent's pane open from the agent dashboard, open the NEXT agent's pane, in
+the dashboard's order. Use for next agent, next card, the next one, or the agent after this. "next
+page" is `next_page`; the next agent that needs the user is `next_needs_you_card`."""
 invoke      = "nextAgentCard"
-screens     = ["overview"]
-unavailable_hint = "moving between cards works while an agent's card is open on the agent dashboard"
-report      = "Next card."
-asks_to     = "show the next agent's card"
-try_saying  = "next card"
+screens     = ["agent"]
+unavailable_hint = "moving between agents works while an agent's pane is open from the agent dashboard"
+report      = "Next agent."
+asks_to     = "open the next agent's pane"
+try_saying  = "next agent"
 
 [[commands]]
 id          = "previous_agent_card"
-description = """With an agent's card open, show the previous agent's card in the dashboard's order
-without closing it. Use for previous card, the one before, or go back a card. "previous page" is
-`previous_page`."""
+description = """With an agent's pane open from the agent dashboard, open the PREVIOUS agent's pane,
+in the dashboard's order. Use for previous agent, previous card, the one before, or the agent
+before this. "previous page" is `previous_page`; leaving the pane ("go back", "back to dashboard")
+is `close`."""
 invoke      = "previousAgentCard"
-screens     = ["overview"]
-unavailable_hint = "moving between cards works while an agent's card is open on the agent dashboard"
-report      = "Previous card."
-asks_to     = "show the previous agent's card"
-try_saying  = "previous card"
+screens     = ["agent"]
+unavailable_hint = "moving between agents works while an agent's pane is open from the agent dashboard"
+report      = "Previous agent."
+asks_to     = "open the previous agent's pane"
+try_saying  = "previous agent"
 
 [[commands]]
 id          = "next_needs_you_card"
-description = """With an agent's card open, jump to the next card that needs the user — an agent
-asking a question, waiting, done, failed, blocked or stopped. Use for next one that needs me, next
-card that needs me, what needs me next, or next needing attention."""
+description = """Open the pane of the next agent that needs the user — an agent asking a question,
+waiting, done, failed, blocked or stopped — in the agent dashboard's order, from the dashboard or
+from an open agent's pane. Use for next one that needs me, next card that needs me, what needs me
+next, next needing you, or next needing attention."""
 invoke      = "nextNeedsYouCard"
-screens     = ["overview"]
-unavailable_hint = "moving between cards works while an agent's card is open on the agent dashboard"
-report      = "Next card that needs you."
-asks_to     = "show the next card that needs you"
+screens     = ["overview", "agent"]
+unavailable_hint = "moving to the next agent that needs you works from the agent dashboard"
+report      = "Next agent that needs you."
+asks_to     = "open the next agent that needs you"
 try_saying  = "next one that needs me"
 
+# PR #2491 decision 2026-11-25: Needs you only is in the dashboard's ⋯ (More)
+# menu and applies to the Table view as well as the Cards view, so turning it
+# on keeps the view the user is on.
+#
+# PR #2491, 2026-11-25: "show all cards" read as `set_overview_mode` in 5 of 5
+# runs while the model could not see the filter. The voice panel now declares
+# the dashboard with each utterance (`dashboard` beside this table: its `view`
+# and `needs_you_only`), and the two rows say what the words mean in each
+# state (fixtures `needs-you-only-off-*` and
+# `show-all-cards-filter-off-switches-to-cards`).
 [[commands]]
 id          = "filter_needs_you_cards"
-description = """Turn the cards view's Needs you only on or off: on opens the way to every agent's
-card that needs the user and fades the others, off shows every card as usual. Use for only the ones that need me, show only the cards
-that need me, just the ones needing my attention (`needs_you` = "on"), or show all cards, every card,
-clear the needs you filter (`needs_you` = "off"). It shows the cards view when turned on. Filtering the
-table by status is `filter_dashboard`."""
+description = """Turn the agent dashboard's Needs you only on or off. While Needs you only is ON
+(`dashboard.needs_you_only` beside this table is true, and the user is told so where they are),
+"show all", "show all cards", "show every card", "show every agent" and "show all the cards again"
+mean THIS row with `needs_you` = "off", in either view, even when the view is the table: they ask to
+see every agent again, which is what turning the filter off does, not to switch views.
+"Show everything", "show all agents" and "clear the filter" clear the dashboard's own filter, which is
+`filter_dashboard`. "Clear the needs you filter" and "turn off needs you only"
+are this row with "off" at any time. "Only the ones that need me", "show only the cards that need me", "only the agents
+that need me", "just the ones needing my attention" and "needs you only" turn it ON (`needs_you` =
+"on"). On, the dashboard shows the agents that need the user with the agents they sit under (the
+Cards view opens the way to each such card and fades the others; the Table view shows only those
+rows); off, every agent as usual. It works in the Table view and the Cards view and keeps the view
+the user is on. It is the checkable Needs you only item in the dashboard's ⋯ (More) menu, and the
+Needs you only chip turns it off. Switching between the table and the cards ("show cards", "show the
+table") is `set_overview_mode`; filtering the table by status is `filter_dashboard`."""
 invoke      = "toggleNeedsYouFilter"
 screens     = ["overview"]
-unavailable_hint = "the Needs you filter is on the agent dashboard's cards"
+unavailable_hint = "the Needs you only filter is in the agent dashboard's ⋯ menu"
 report      = "Showing {needs_you}."
-asks_to     = "show only the cards that need you, or every card again"
+asks_to     = "turn Needs you only on to show only the agents that need you, or off to show every agent again"
 try_saying  = "only the ones that need me"
 
   [[commands.params]]
   name = "needs_you"
   kind = "needs_you_filter"
 
+# PR #2491 decision 2026-11-26: the Card panel became the agent pane's Card
+# tab, beside its Terminal tab; these two rows switch between them.
 [[commands]]
-id          = "close_agent_card"
-description = """Close the agent's card that is open over the dashboard. Use for close the card,
-close this card, or done with the card. A bare "close" closes whatever is on top and is `close`."""
-invoke      = "closeAgentCard"
-screens     = ["overview"]
-unavailable_hint = "a card closes while one is open on the agent dashboard"
-report      = "Closed the card."
-asks_to     = "close the open card"
-try_saying  = "close the card"
+id          = "show_card_tab"
+description = """In an open agent's pane, switch to its Card tab: what the agent reported, its
+questions and its actions. Use for show the card, open the card, show its card, the card tab, switch
+to the card. Showing ANOTHER agent's card, named, is `show_agent_card`. Placing a card action "only in
+the card tab" ("only show it in the card tab") is the Card actions editor's Placement,
+`show_card_action_only_in_the_card_tab`, not this row."""
+invoke      = "showCardTab"
+screens     = ["agent"]
+unavailable_hint = "the Card tab is in an agent's pane opened from the agent dashboard"
+report      = "Showing the card."
+asks_to     = "show the Card tab in this agent's pane"
+try_saying  = "show the card"
+
+[[commands]]
+id          = "show_terminal_tab"
+description = """In an open agent's pane, leave its Card tab for its Terminal tab, showing the agent's
+terminal again. Use for close the card, hide the card, done with the card, show the terminal, back to
+the terminal, switch to the terminal, the terminal tab. It keeps the pane open: a bare "close", "back
+to dashboard" or "go back" leaves the pane and is `close`; typing to the agent is `dictate_to_agent`."""
+invoke      = "showTerminalTab"
+screens     = ["agent"]
+unavailable_hint = "the Terminal tab is in an agent's pane opened from the agent dashboard"
+report      = "Showing the terminal."
+asks_to     = "go back to the terminal in this agent's pane, leaving its Card tab"
+try_saying  = "show the terminal"
 
 # Issue #2418 — the Cards tree. Opening and closing the tree under a card
 # changes what the dashboard shows and sends nothing; opening a card's pull
@@ -2898,8 +2947,8 @@ id          = "open_card_tree"
 description = """In the agent dashboard's cards, open the TREE under one agent's card: show the
 agents it started (a dispatcher's units, an orchestrator's roles) under it. Use for open the
 dispatcher's tree, expand the queue, show what is under the coder, show the agents under the
-orchestrator. Set `agent` to the user's words for the agent whose tree to open. Opening the card's
-own overlay is `show_agent_card`; opening an agent's terminal pane is `open_agent`."""
+orchestrator. Set `agent` to the user's words for the agent whose tree to open. Opening the agent
+with its card is `show_agent_card`; opening an agent's terminal pane is `open_agent`."""
 invoke      = "openCardTree"
 screens     = ["overview"]
 unavailable_hint = "a card's tree opens on the agent dashboard's cards"
@@ -2915,8 +2964,8 @@ try_saying  = "open {agent}'s tree"
 id          = "close_card_tree"
 description = """In the agent dashboard's cards, close the TREE under one agent's card, hiding the
 agents it started. Use for close the dispatcher's tree, collapse the queue, hide what is under the
-orchestrator. Set `agent` to the user's words for the agent whose tree to close. Closing the card
-overlay is `close_agent_card`."""
+orchestrator. Set `agent` to the user's words for the agent whose tree to close. Leaving the Card
+tab in an open agent's pane is `show_terminal_tab`."""
 invoke      = "closeCardTree"
 screens     = ["overview"]
 unavailable_hint = "a card's tree closes on the agent dashboard's cards"
@@ -2968,13 +3017,14 @@ description = """Press one of the buttons on an agent's card: an action the agen
 offers (such as "Merge it", "Go ahead", "Close") or an answer to a question the agent asked on
 its card. Use when the user names both the action and the agent — "send merge it to the coder",
 "press go ahead on the tester's card", "answer main to the coder". Set `agent` to the user's
-words for the agent and `action` to the button's label as the user said it. A catalog action is
+words for the agent and `action` to the button's label alone, as the user said it, without the verb in
+front of it: `main` for "answer main to the coder", `go ahead` for "press go ahead". A catalog action is
 sent to that agent; an answer to the agent's question, an action whose text the agent wrote, one
-that asks for confirmation, and closing an agent, only open its card at the step where the user
-reads it and presses Send. Stopping an agent is `stop_agent`; writing your own words to it is
-`reply_to_agent_card`."""
+that asks for confirmation, and closing an agent, only open a review showing exactly what it does,
+where the user presses Send. Stopping an agent is `stop_agent`; with an agent's pane open, typing
+the user's own words to it ("tell it …") is `dictate_to_agent`."""
 invoke      = "runCardAction"
-screens     = ["overview"]
+screens     = ["overview", "agent"]
 unavailable_hint = "a card's actions are pressed on the agent dashboard"
 report      = "Pressed {action} on {agent}'s card."
 asks_to     = "press one of the actions on an agent's card"
@@ -2988,26 +3038,304 @@ try_saying  = "press {action} on {agent}'s card"
   name = "action"
   kind = "card_action"
 
+# Issue #2399 — a batch: one card action sent to an agent and every agent
+# under it (a dispatcher's units, an orchestrator's roles). Like every batch it
+# only OPENS the confirmation, which lists who gets what and who is skipped and
+# why; the user presses Send by hand (PRD #802 D5).
 [[commands]]
-id          = "reply_to_agent_card"
-description = """Write a reply to an agent from its card with the user's own words: they are put in
-that agent's card reply box, for the user to read and send. Use when the user says reply to or
-tell an agent something from the dashboard — "reply to the coder yes go ahead", "tell the tester
-use the main branch". Set `agent` to the user's words for the agent and `reply` to exactly the
-words to send, as the user said them. It is for an agent the user NAMES, from the agent dashboard:
-with an agent's own pane open, "tell it …", "ask it to …" or "reply …" types into that agent's
-prompt and is `dictate_to_agent`, never this. Pressing a card's button is `run_card_action`."""
-invoke      = "replyToAgentCard"
+id          = "run_card_action_batch"
+description = """Send one of the card actions to an agent AND every agent under it on the agent
+dashboard — a dispatcher and all its units, an orchestrator and all its roles — after the user
+reviews it. Use when the user names an action and a group: "go ahead on everything under the
+dispatcher", "send go ahead to the whole orchestration", "close every agent under the planner".
+Set `agent` to the user's words for the agent at the top and `action` to the button's label as the
+user said it. It only opens a confirmation listing each agent, the exact text it gets and which are
+skipped; nothing is sent until the user presses Send. One agent's own button is
+`run_card_action`."""
+invoke      = "runCardActionBatch"
 screens     = ["overview"]
-unavailable_hint = "a card's reply is sent from the agent dashboard"
-report      = "Your reply to {agent} is in its card: press Send reply to send it."
-asks_to     = "reply to an agent from its card with my own words"
-try_saying  = "reply to {agent} go ahead"
+unavailable_hint = "a card action is sent to a group from the agent dashboard's cards"
+report      = "Review {action} for {agent} and every agent under it, then press Send."
+asks_to     = "send one card action to an agent and every agent under it"
+try_saying  = "{action} on everything under {agent}"
 
   [[commands.params]]
   name = "agent"
   kind = "agent_ref"
 
   [[commands.params]]
-  name = "reply"
-  kind = "reply_text"
+  name = "action"
+  kind = "card_action"
+
+# Issue #2399 review — the Cards view's selection by voice: select and
+# unselect named agents (a closed card takes everything under it along, as its
+# checkbox does), then send one action to the selection. Selecting sends
+# nothing; the action, like every batch, only OPENS the confirmation.
+[[commands]]
+id          = "select_agent_card"
+description = """Select one agent's card on the agent dashboard for a batch, so a later action can be
+sent to every selected agent at once. A card whose tree is closed takes every agent under it along.
+Use only when the user says card, selection or batch — "select the coder's card", "add the tester
+to the selection", "select the reviewer for the batch". A bare "select the coder" opens that agent
+and is `open_agent`. Set `agent` to the user's words for the agent. It sends nothing. Sending an
+action to the selection is `run_card_action_on_selection`; to an agent and everything under it in
+one go, `run_card_action_batch`."""
+invoke      = "selectAgentCard"
+screens     = ["overview"]
+unavailable_hint = "cards are selected on the agent dashboard's cards"
+report      = "Selected {agent}'s card."
+asks_to     = "select an agent's card for a batch"
+try_saying  = "select {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "unselect_agent_card"
+description = """Take one agent's card out of the batch selection on the agent dashboard; a card
+whose tree is closed takes every agent under it out too. Use for unselect the coder's card,
+deselect the tester's card, remove the reviewer from the selection. Set `agent` to the user's words
+for the agent. It sends nothing."""
+invoke      = "unselectAgentCard"
+screens     = ["overview"]
+unavailable_hint = "cards are unselected on the agent dashboard's cards"
+report      = "Took {agent}'s card out of the selection."
+asks_to     = "take an agent's card out of the batch selection"
+try_saying  = "unselect {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "clear_card_selection"
+description = """Clear the batch selection on the agent dashboard, so no agent's card is selected any more.
+Use for clear the selection, unselect everything, deselect all the cards, start the selection over.
+To take ONE agent's card out of the selection, use `unselect_agent_card`. It sends nothing."""
+invoke      = "clearCardSelection"
+screens     = ["overview"]
+unavailable_hint = "the selection is cleared on the agent dashboard's cards"
+report      = "Cleared the selection."
+asks_to     = "clear the batch selection"
+try_saying  = "clear the selection"
+
+[[commands]]
+id          = "run_card_action_on_selection"
+description = """Send one of the card actions to every SELECTED agent on the agent dashboard, after
+the user reviews it. Use when the user names an action and the selection: "go ahead on the
+selected agents", "send go ahead to the selection", "close the selected ones". Set `action` to the
+button's label as the user said it. It only opens a confirmation listing each agent, the exact text
+it gets and which are skipped; nothing is sent until the user presses Send. Selecting agents is
+`select_agent_card`; an agent and everything under it is `run_card_action_batch`."""
+invoke      = "runSelectionBatch"
+screens     = ["overview"]
+unavailable_hint = "an action is sent to the selected cards from the agent dashboard's cards"
+report      = "Review {action} for the selected agents, then press Send."
+asks_to     = "send one card action to every selected agent"
+try_saying  = "{action} on the selected agents"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"
+
+# PRD #2374 decision 2026-11-24 — the Card actions editor, where the user adds,
+# changes, hides and removes the actions agents offer on their cards (CLAUDE.md
+# rule 23). Voice OPENS: the editor, its form for a new action, one action's
+# form, and the confirmation of a removal; the rows after these choose and set
+# what writes nothing. Nothing said here writes the daemon's config — the form's Save, the removal's Remove, Hide and Restore
+# are presses by hand — so a misheard word never becomes text an agent is sent
+# or takes an action off the cards.
+#
+# PR #2491 review T1 (2026-11-25): the Card panel's Edit (since 2026-11-26 the Card tab's) opens the editor over
+# an agent's pane opened from the dashboard, so the editor's rows run on the
+# agent screen too. There an opening naming no daemon means the PANE's daemon,
+# never a selection behind the pane; a pane the Daemons screen opened, and one
+# whose daemon has no editor, are refused in words by the app.
+#
+# PR #2491 decision 2026-11-25: the editor belongs to one daemon (each
+# daemon's ⋯ menu on the dashboard opens it bound to that daemon, and it has no
+# Daemon picker), so this row names the daemon with an optional `deck`. With
+# one daemon showing cards a bare "open card actions" opens it; with several,
+# the app asks which, as a bare "show host" does. `choose_card_actions_daemon`,
+# the picker's row, is retired with the picker.
+[[commands]]
+id          = "open_card_actions_editor"
+description = """Open one daemon's Card actions editor on the agent dashboard: the list of actions
+agents can offer on their cards (such as Go ahead and Merge it), where the user adds, changes, hides
+and removes them. It is what Card actions in a daemon's ⋯ (More) menu opens, and what Edit beside Actions
+in an agent pane's Card tab opens: over an agent's pane, naming no daemon means that agent's. Use for open card
+actions, open the card actions editor, edit card actions, manage card actions, show the card actions,
+and, naming the daemon (which a user may also call a deck; speech-to-text often writes daemon as
+demon), open card actions on the build box, the build box daemon's card actions, edit the local
+daemon's card actions. When the user names the daemon, set `deck` to the daemon they meant, exactly
+as listed in `decks`; otherwise leave `deck` out. It only OPENS the editor and changes nothing.
+Pressing an action on an agent's card is `run_card_action`; changing which daemon the dashboard shows
+is `switch_deck`."""
+invoke      = "openCardActionsEditor"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Card actions editor opens from a daemon's ⋯ menu on the agent dashboard or over an agent's pane opened from it"
+report      = "Opened the Card actions editor."
+asks_to     = "open a daemon's Card actions editor"
+try_saying  = "open card actions"
+
+  [[commands.params]]
+  name     = "deck"
+  kind     = "deck_ref"
+  optional = true
+
+[[commands]]
+id          = "add_card_action"
+description = """Open the Card actions editor's form for a NEW card action, empty, for the user to fill
+in and save by hand. Use for add a card action, new card action, create a card action. It opens the
+editor first when it is closed. It saves nothing: the user types the fields and presses Save.
+Changing an action that is already listed is `edit_card_action`."""
+invoke      = "addCardAction"
+screens     = ["overview", "agent"]
+unavailable_hint = "card actions are added in the Card actions editor, from the agent dashboard or over an agent's pane opened from it"
+report      = "The form for a new card action is open: fill it in and press Save."
+asks_to     = "add a new card action"
+try_saying  = "add a card action"
+
+[[commands]]
+id          = "edit_card_action"
+description = """Open the Card actions editor's form for one listed card action, to change its text,
+label, icon or settings by hand. Use for edit the merge it action, change the go ahead action, open
+the ship it action. Set `action` to the action's label as the user said it. It saves nothing: the user
+changes the fields and presses Save. A new action is `add_card_action`; pressing an action on an
+agent's card is `run_card_action`."""
+invoke      = "editCardAction"
+screens     = ["overview", "agent"]
+unavailable_hint = "card actions are changed in the Card actions editor, from the agent dashboard or over an agent's pane opened from it"
+report      = "The form for {action} is open: change it and press Save."
+asks_to     = "change one of the card actions"
+try_saying  = "edit the {action} action"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"
+
+[[commands]]
+id          = "remove_card_action"
+description = """Ask to remove one of the user's OWN card actions in the Card actions editor. Set
+`action` to the action's label as the user said it. It only opens the editor's confirmation, which
+names the action; nothing is removed until the user presses Remove by hand. A deck default (Go ahead,
+Merge it) cannot be removed, only hidden, and hiding is done by hand in the editor."""
+invoke      = "removeCardAction"
+screens     = ["overview", "agent"]
+unavailable_hint = "card actions are removed in the Card actions editor, from the agent dashboard or over an agent's pane opened from it"
+report      = "Confirm removing {action} in the Card actions editor: press Remove."
+asks_to     = "remove one of my card actions"
+try_saying  = "remove the {action} action"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"
+
+# Issue #2399 review 12 — the rest of the Card actions editor's choices that
+# write nothing: reading the list again, the form's icon (by the icon's name,
+# held to the user's words as the directory filter is) and its two checkboxes,
+# one row per state so a spoken "ask before sending" never unticks a box that
+# was ticked. The form's Save still writes, by hand. Which daemon's actions the
+# editor shows is `open_card_actions_editor`'s `deck` since PR #2491 decision
+# 2026-11-25 retired the Daemon picker and its row.
+[[commands]]
+id          = "refresh_card_actions"
+description = """Read the open Card actions editor's list again from its daemon, keeping whatever the
+form holds. Use for refresh the card actions, reload the card actions, read the card actions again,
+check the card actions list. It writes nothing."""
+invoke      = "refreshCardActions"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Card actions editor's list is read again while the editor is open, on the agent dashboard or over an agent's pane opened from it"
+report      = "Reading the card actions again."
+asks_to     = "read the Card actions editor's list again"
+try_saying  = "refresh the card actions"
+
+[[commands]]
+id          = "choose_card_action_icon"
+description = """In the Card actions editor's form, choose the action's icon by its name, such as rocket,
+git merge, play, bug or ship. Set `icon` to the icon's name as the user said it. It only sets the
+form's icon; nothing is saved until the user presses Save."""
+invoke      = "chooseCardActionIcon"
+screens     = ["overview", "agent"]
+unavailable_hint = "a card action's icon is chosen in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
+report      = "Icon: {icon}. Press Save to keep it."
+asks_to     = "choose the icon of the card action I am editing"
+try_saying  = "icon rocket"
+
+  [[commands.params]]
+  name = "icon"
+  kind = "filter_text"
+
+[[commands]]
+id          = "ask_before_sending_card_action"
+description = """In the Card actions editor's form, tick Ask before sending, so pressing the action asks
+the user to confirm before its text is sent. Use for ask before sending, ask first, confirm before
+sending. It only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "askBeforeSendingCardAction"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
+report      = "Ask before sending is ticked. Press Save to keep it."
+asks_to     = "make the card action I am editing ask before sending"
+try_saying  = "ask before sending"
+
+[[commands]]
+id          = "send_card_action_without_asking"
+description = """In the Card actions editor's form, untick Ask before sending, so pressing the action
+sends its text at once. Use for don't ask before sending, send without asking, no confirmation. It
+only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "sendCardActionWithoutAsking"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Ask before sending box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
+report      = "Ask before sending is unticked. Press Save to keep it."
+asks_to     = "make the card action I am editing send without asking"
+try_saying  = "send without asking"
+
+[[commands]]
+id          = "offer_card_action_on_every_card"
+description = """In the Card actions editor's form, tick Offer on every card, so every agent's card offers
+the action whether or not the agent suggests it. Use for offer on every card, show it on every card,
+always offer it. It only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "offerCardActionOnEveryCard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
+report      = "Offer on every card is ticked. Press Save to keep it."
+asks_to     = "offer the card action I am editing on every card"
+try_saying  = "offer on every card"
+
+[[commands]]
+id          = "offer_card_action_when_agents_choose"
+description = """In the Card actions editor's form, untick Offer on every card, so the action is offered
+only when an agent suggests it. Use for don't offer on every card, only when agents suggest it, not on
+every card. It only sets the form's checkbox; nothing is saved until the user presses Save."""
+invoke      = "offerCardActionWhenAgentsChoose"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Offer on every card box is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
+report      = "Offer on every card is unticked. Press Save to keep it."
+asks_to     = "offer the card action I am editing only when agents suggest it"
+try_saying  = "only when agents suggest it"
+
+[[commands]]
+id          = "show_card_action_on_the_card"
+description = """In the Card actions editor's form, set Placement to Show on the card, so the action is an
+icon on each card that offers it. Use for show it on the card, put it on the card, as an icon on the
+card. It only sets the form's choice; nothing is saved until the user presses Save."""
+invoke      = "showCardActionOnCard"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
+report      = "Placement is Show on the card. Press Save to keep it."
+asks_to     = "show the card action I am editing on the card"
+try_saying  = "show it on the card"
+
+[[commands]]
+id          = "show_card_action_only_in_the_card_tab"
+description = """In the Card actions editor's form, set Placement to Only in the Card tab, so the action
+draws no icon on the card and is offered only in the Card tab of the agent's pane. Use for only in
+the Card tab, only in the card, not on the card, no icon on the card. It only sets the form's choice; nothing is saved until the user
+presses Save."""
+invoke      = "showCardActionOnlyInCardTab"
+screens     = ["overview", "agent"]
+unavailable_hint = "the Placement choice is set in the Card actions editor's form, on the agent dashboard or over an agent's pane opened from it"
+report      = "Placement is Only in the Card tab. Press Save to keep it."
+asks_to     = "offer the card action I am editing only in the Card tab"
+try_saying  = "only in the Card tab"

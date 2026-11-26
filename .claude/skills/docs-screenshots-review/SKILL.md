@@ -8,7 +8,7 @@ user-invocable: true
 
 The user docs under `docs/` (not `docs/develop/`, which is never published) and the site's home page describe two clients of one daemon, the TUI and the desktop app. This skill makes sure every docs change covers both clients, and that screenshots appear only where a person looks at them.
 
-**Who reads what** (PRD #1419, issue #2438). The published docs are written for the user's agent: they are served as raw Markdown, through `llms.txt` and `llms-full.txt`, and by `dot-agent-deck docs`. An agent reads an image's alt text, not the picture, so **the docs pages carry no screenshots**: what a user sees is said in words. Two pages are read by people and keep theirs: the **landing page** (`site/landing/index.html`) and **`docs/installation.md`**, which the landing page links as GitHub renders it. The maintainer reviews both whenever they change. A person reviewing a UI change sees it in the **pull request**, whose screenshots the [`pr-create`](../pr-create/SKILL.md) skill asks for.
+**Who reads what** (PRD #1419, issue #2438). The published docs are written for the user's agent: they are served as raw Markdown, through `llms.txt` and `llms-full.txt`, and by `dot-agent-deck docs`. An agent reads an image's alt text, not the picture, so **the docs pages carry no screenshots**: what a user sees is said in words. Two pages are read by people and keep theirs: the **landing page** (`site/landing/index.html`) and **`docs/installation.md`**, which the landing page links as GitHub renders it. The maintainer reviews both whenever they change. A person reviewing a UI change sees it in the **pull request**, whose screenshots the [`pr-create`](../pr-create/SKILL.md) skill asks for, **always in both the light and the dark theme**, side by side (PR #2491).
 
 ## 0. Show and explain both clients, unless only one has the feature
 
@@ -32,12 +32,14 @@ grep -oE '/img/[A-Za-z0-9._-]+' site/landing/index.html docs/installation.md | s
 
 **Images named `<scenario>-<client>.png` come from `cargo docs-screenshots`**; [`docs/develop/docs-screenshots.md`](../../../docs/develop/docs-screenshots.md) is the reference.
 
+**Light and dark, and what that means for these two pages.** Every screenshot of a user-visible change is captured in both themes, `<scene>-<client>-light.png` and `<scene>-<client>-dark.png` (PR #2491; [Light and dark](../../../docs/develop/docs-screenshots.md#light-and-dark)). That rule is for the screenshots that show a change, in its pull request. The landing page and `docs/installation.md` keep their existing images: one per client, in the dark theme, under the theme-less names they reference. So regenerate one of them with `--single-theme dark`, which writes that name in that theme; a plain run writes the light and dark pair under other names, which those pages do not use. Showing these pages' images in pairs, or following the landing page's own theme toggle, would be a change to the pages, for the maintainer to ask for, not something to do while refreshing an image. A PR that regenerates one still shows the changed screen in both themes in its body, as `pr-create` says.
+
 ```bash
 cargo docs-screenshots --list
-cargo docs-screenshots --scenario <name> --client <tui|desktop>   # into docs/img, which is site/static/img
+cargo docs-screenshots --scenario <name> --client <tui|desktop> --single-theme dark   # into docs/img, which is site/static/img
 ```
 
-Regenerate only the images those pages use: `--scenario` and `--client` narrow the run, and an image nothing references is not committed (`git status` after the run shows any the command wrote besides). Whatever fonts the machine has are fine; the maintainer reviews these pages on every change. Look at each image before committing it, and never commit one that shows a real home path, host name, token or someone else's project.
+Regenerate only the images those pages use: `--scenario` and `--client` narrow the run, and an image nothing references is not committed (`git status` after the run shows any the command wrote besides). Whatever fonts the machine has are fine; the maintainer reviews these pages on every change. Look at each image before committing it, and at the light version of the screen too (a plain run into a scratch `--out`), since the PR shows both, and never commit one that shows a real home path, host name, token or someone else's project.
 
 **The other images are hand-made** (`busy-deck-real.webp`, `dispatch.webp` and the like). When one goes stale, tell the user in your report: the page, the image, what it should show now.
 
