@@ -875,7 +875,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // `O_NONBLOCK` read before the daemon serves anything.
     {
         let store = crate::last_command::LastCommandStore::load(
-            crate::last_command::LastCommandStore::default_path(),
+            daemon_state_dir.join(crate::last_command::LAST_COMMAND_FILE),
         );
         state.write().await.set_last_command_store(Arc::new(store));
     }
@@ -883,7 +883,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // PRD #1741: OTLP export of agent runs, read from this process's
     // environment. Off unless it names an endpoint: no task, no client, and no
     // variable added to any agent.
-    let telemetry = crate::telemetry::start_for_daemon(&event_tx, &pty_registry);
+    let telemetry = crate::telemetry::start_for_daemon(
+        &event_tx,
+        &pty_registry,
+        crate::telemetry::exporter::config_dir_under(&daemon_state_dir),
+    );
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
     // Issue #1965: an orchestration role's exit reaches attached clients.

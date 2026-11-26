@@ -256,10 +256,8 @@ async fn harness_inprocess_daemon_journals_into_its_own_state_dir() {
         "the in-process daemon journals outside the state directory the harness gave it"
     );
     assert!(
-        !daemon
-            .state_dir
-            .starts_with(std::env::var("HOME").unwrap_or_default() + "/.local"),
-        "the harness gave the daemon a state directory under the developer's home: {}",
+        daemon.state_dir.starts_with(common::harness_temp_root()),
+        "the harness gave the daemon a state directory outside its own temp root: {}",
         daemon.state_dir.display()
     );
 }
