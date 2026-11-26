@@ -53,6 +53,17 @@ export interface CardActionForm {
    */
   error?: string;
   /**
+   * PR #2491 re-audit (F1, Edit) — counts the changed-since alerts this form
+   * has shown. Each read that moves `original` raises it, and the form draws
+   * its message keyed by it, so every change is announced as a new alert.
+   */
+  alertKey?: number;
+  /**
+   * The draft of this form's last Save whose answer was lost, so it may have
+   * been saved: a read listing the action exactly as sent shows it was.
+   */
+  sent?: CardActionInput;
+  /**
    * PR #2491 audit (A2) — the daemon process whose list the form was made
    * from: a Save is bound to it, and the form is not offered under another.
    */
@@ -90,6 +101,8 @@ export interface CardActionsReread {
   status: "reading" | "read" | "failed";
   /** Why the read failed. */
   reason?: string;
+  /** The label of an action a form's uncertain Save saved: the read lists it exactly as the form sent it. */
+  saved?: string;
 }
 
 /** What {@link useCardActionsEditor} hands the overview. */
@@ -134,6 +147,27 @@ const changedBeforeRemoval = (seen: EditableCardAction, listed: boolean) => (lis
 const changedUnderForm = (seen: EditableCardAction, listed: boolean) => (listed
   ? `${displayText(seen.label, DISPLAY_LIMITS.name)} changed since this form was opened: the list shows it as just read. Save replaces it with what this form holds.`
   : `${displayText(seen.label, DISPLAY_LIMITS.name)} is no longer listed, so this form cannot save it.`);
+
+/** The label the daemon gives an action that names none (`default_label` in `src/card_catalog.rs`). */
+function defaultLabel(name: string): string {
+  const spaced = name.replace(/-/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+/** Whether `listed` is the action `sent` asked for: every field a form's Save sends, as the daemon lists it. */
+function listedAsSent(listed: EditableCardAction, sent: CardActionInput): boolean {
+  return listed.name === sent.name && listed.label === (sent.label ?? defaultLabel(sent.name)) && listed.description === sent.description
+    && listed.prompt === sent.prompt && (listed.icon ?? null) === (sent.icon ?? null) && (listed.placement || "card") === (sent.placement ?? "card")
+    && listed.confirm === sent.confirm && listed.always === sent.always;
+}
+
+/** Whether two drafts send the same edit. */
+function sameInput(a: CardActionInput, b: CardActionInput): boolean {
+  return a.name === b.name && a.label === b.label && a.description === b.description && a.prompt === b.prompt && a.icon === b.icon
+    && a.placement === b.placement && a.confirm === b.confirm && a.always === b.always;
+}
+
+const savedEarlier = (label: string) => `${displayText(label, DISPLAY_LIMITS.name)} was saved as this form sent it earlier. Save now saves what the form holds since.`;
 
 /** Whether two reads of an action list it the same: every field the daemon compares against an edit's `base`. */
 function sameAction(a: EditableCardAction, b: EditableCardAction): boolean {
@@ -214,6 +248,40 @@ function formInput(form: CardActionForm): CardActionInput {
     confirm: values.confirm,
     always: values.always,
   };
+}
+
+/** The form with no uncertain Save to look for. */
+function withoutSent(form: CardActionForm): CardActionForm {
+  const rest = { ...form };
+  delete rest.sent;
+  return rest;
+}
+
+/**
+ * PR #2491 re-audit (F1, Edit) — an open form after a read (Refresh, the
+ * check after an edit whose answer was lost, or a write's answer) from
+ * process `from`. The form's base moves only together with a changed-since
+ * alert new for that change, whatever message the form showed before. A form
+ * whose uncertain Save the read lists exactly as sent was saved: it closes as
+ * a Save answered does (`saved` names the action), or, typed in since, keeps
+ * the new draft with the saved action as its base and says so.
+ */
+function formAfterRead(current: CardActionForm | undefined, answer: EditableCardCatalog, from: string | undefined): { form: CardActionForm | undefined; saved?: string } {
+  if (current === undefined || current.instanceId !== from) return { form: current };
+  const alertKey = (current.alertKey ?? 0) + 1;
+  const { sent } = current;
+  if (sent !== undefined) {
+    const listed = answer.actions.find((action) => action.name === sent.name);
+    if (listed !== undefined && listedAsSent(listed, sent)) {
+      if (sameInput(formInput(current), sent)) return { form: undefined, saved: listed.label };
+      return { form: { ...withoutSent(current), ...(current.mode === "edit" ? { original: listed } : {}), error: savedEarlier(listed.label), alertKey }, saved: listed.label };
+    }
+  }
+  if (current.mode !== "edit") return { form: current };
+  const fresh = answer.actions.find((action) => action.name === current.values.name);
+  const seen = current.original;
+  if (seen === undefined ? fresh === undefined : fresh !== undefined && sameAction(seen, fresh)) return { form: current };
+  return { form: { ...withoutSent(current), original: fresh, error: changedUnderForm((seen ?? fresh)!, fresh !== undefined), alertKey } };
 }
 
 const reason = (error: unknown) => displayText(error instanceof Error ? error.message : String(error), DISPLAY_LIMITS.detail);
@@ -357,7 +425,8 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       if (epoch !== writeEpoch.current) { setReread(undefined); return; }
       setHeld({ value: answer, instanceId: from });
       if (kind === "refresh") setError(undefined);
-      setReread(kind === "check" ? { kind, status: "read" } : undefined);
+      const { saved } = formAfterRead(latest.current.form, answer, from);
+      setReread(kind === "check" || saved !== undefined ? { kind, status: "read", ...(saved !== undefined ? { saved } : {}) } : undefined);
       /* PR #2491 re-audit (F1): a removal asking about an action this read
          lists changed, or no longer lists, is not confirmed under the old
          words: it closes, and the editor says why. */
@@ -370,17 +439,10 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
         }
       }
       /* ...and an open form whose action this read lists changed is told so,
-         in the form, before its Save sends the action as just read. After an
-         edit whose outcome is unknown (`check`), the form's own message stays:
-         the change may be its Save's, and the list says to check it. */
-      setForm((current) => {
-        if (current?.mode !== "edit" || current.instanceId !== from) return current;
-        const fresh = answer.actions.find((action) => action.name === current.values.name);
-        const seen = current.original;
-        if (seen === undefined ? fresh === undefined : fresh !== undefined && sameAction(seen, fresh)) return current;
-        const keep = kind === "check" && current.error !== undefined;
-        return { ...current, original: fresh, ...(keep ? {} : { error: changedUnderForm((seen ?? fresh)!, fresh !== undefined) }) };
-      });
+         in the form, in place of whatever it said, before its Save sends the
+         action as just read; one whose uncertain Save the read lists as sent
+         was saved (PR #2491 re-audit, F1, Edit). */
+      setForm((current) => formAfterRead(current, answer, from).form);
     }, (failure: unknown) => {
       if (seq !== readSeq.current || mine !== rereadSeq.current) return;
       setRefreshing(false);
@@ -442,7 +504,13 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
       writeEpoch.current += 1;
       setHeld({ value: answer, instanceId: from });
       setError(undefined);
+      const { saved } = formAfterRead(latest.current.form, answer, from);
       onDone?.();
+      /* The answer is a read too: an open form whose action it lists changed
+         is told so, after `onDone` closed a form this edit ends (PR #2491
+         re-audit, F1, Edit). */
+      setForm((current) => formAfterRead(current, answer, from).form);
+      if (saved !== undefined) setReread({ kind: "check", status: "read", saved });
     }, (failure: unknown) => {
       setBusy(false);
       if (seq !== readSeq.current) return;
@@ -646,8 +714,9 @@ export function useCardActionsEditor({ runtime, daemons, preferredDeckId, paneDe
         : { kind: "update", action: formInput(current), base: current.original ?? null };
       const sentFrom = current.generation;
       const ours = (now: CardActionForm | undefined) => now !== undefined && now.generation === sentFrom;
-      setForm({ ...current, error: undefined });
-      send(edit, current.instanceId, (why, unsure) => setForm((now) => (ours(now) ? { ...now!, error: unsure ? `This may have been saved: ${why}` : why } : now)), () => setForm((now) => (ours(now) ? undefined : now)));
+      setForm({ ...withoutSent(current), error: undefined });
+      /* An answer lost after sending keeps the draft sent, so the reading-again can tell whether it was saved. */
+      send(edit, current.instanceId, (why, unsure) => setForm((now) => (ours(now) ? { ...now!, error: unsure ? `This may have been saved: ${why}` : why, ...(unsure ? { sent: edit.action } : {}) } : now)), () => setForm((now) => (ours(now) ? undefined : now)));
       return undefined;
     },
     cancelCardActionForm: () => {

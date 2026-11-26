@@ -113,6 +113,13 @@ function RereadNote({ reread }: { reread: CardActionsReread }) {
       </p>
     );
   }
+  if (reread.saved !== undefined) {
+    return (
+      <p className="card-actions-editor-notice" role="status" data-testid="agent-card-actions-editor-reread">
+        {displayText(reread.saved, DISPLAY_LIMITS.name)} was saved: the list below was read again and shows it as the form sent it.
+      </p>
+    );
+  }
   if (reread.kind === "refresh") return null;
   return (
     <p className="card-actions-editor-notice" role="status" data-testid="agent-card-actions-editor-reread">
@@ -256,7 +263,8 @@ function ActionForm({ form, busy, editor }: { form: NonNullable<CardActionsEdito
       <label className="card-actions-editor-check"><input type="checkbox" checked={values.confirm} onChange={(event) => VOICE_ACTIONS[event.target.checked ? "askBeforeSendingCardAction" : "sendCardActionWithoutAsking"].run(controls)} />Ask before sending</label>
       <label className="card-actions-editor-check"><input type="checkbox" checked={values.always} onChange={(event) => VOICE_ACTIONS[event.target.checked ? "offerCardActionOnEveryCard" : "offerCardActionWhenAgentsChoose"].run(controls)} />Offer on every card</label>
       </fieldset>
-      {form.error && <p className="card-actions-editor-error" role="alert">{form.error}</p>}
+      {/* PR #2491 re-audit (F1, Edit): keyed by the form's changed-since alerts, so each change is a new alert, announced again. */}
+      {form.error && <p key={form.alertKey ?? 0} className="card-actions-editor-error" role="alert">{form.error}</p>}
       <div className="card-actions-editor-buttons">
         <button type="button" className="button secondary" onClick={() => VOICE_ACTIONS.cancelCardActionForm.run(controls)}>Cancel</button>
         <button type="button" className="button primary" disabled={busy} onClick={() => VOICE_ACTIONS.saveCardAction.run(controls)}>Save</button>

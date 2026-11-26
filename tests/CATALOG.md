@@ -18076,6 +18076,30 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** a read, an add and a hide naming `undefined` or `""` are refused with `CARD_CATALOG_DAEMON_UNNAMED`, and naming a process other than the one whose cards the deck shows with `CARD_CATALOG_DAEMON_REPLACED` (held to the backend's text), each edit adding that nothing was saved; none changes the catalog, and the process shown reads it and adds an action (PR #2491 re-audit, F2).
 - **Does not assert:** the production bridge (`132`) or the backend's binding (Rust `a_card_catalog_edit_bound_to_a_replaced_daemon_is_refused`).
 
+##### desktop/agent-cards/136 — A reading-again after another edit's lost answer tells an open form its action changed, whatever message it showed.
+- **Test:** vitest `desktop/agent-cards/136: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** an Edit Ship it form showing the daemon's validation refusal, with a corrected text typed, when a Hide Go ahead's answer is lost and the check read lists Ship it with another program's text: the form keeps the typed text and its message becomes the changed-since alert in place of the refusal, before Save sends the action as just read as `base` (PR #2491 re-audit, F1, Edit: the base moves only with an alert new for that change).
+- **Does not assert:** the daemon's refusal of a stale base (`agent-report/catalog-edit/005`).
+
+##### desktop/agent-cards/137 — An uncertain Save whose reading-again shows another change says the action changed.
+- **Test:** vitest `desktop/agent-cards/137: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** a Save of Ship it whose answer is lost, when the check read lists Ship it with another program's text and not as the form sent it: the form's "may have been saved" message is replaced by the changed-since alert, the typed label is kept, and Save sends the action as just read as `base` (PR #2491 re-audit, F1, Edit).
+- **Does not assert:** a check read that fails (`078`).
+
+##### desktop/agent-cards/138 — An uncertain Save whose reading-again shows the form's own draft is treated as saved.
+- **Test:** vitest `desktop/agent-cards/138: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** a Save of Ship it whose answer is lost, when the check read lists Ship it exactly as the form sent it: the form closes as an answered Save's does, the editor says "Ship it now was saved", the row shows the new label, and nothing is sent again (PR #2491 re-audit, F1, Edit).
+- **Does not assert:** a draft typed into after the lost Save, which keeps the form with the saved action as its base and says so.
+
+##### desktop/agent-cards/139 — Each change a read finds under an open form is alerted afresh.
+- **Test:** vitest `desktop/agent-cards/139: …` in `desktop/src/components/AgentCardActionsEditor.test.tsx`.
+- **Layer:** as `133`.
+- **Asserts:** two Refreshes in a row, each reading another program's new text for Ship it under an open Edit form: each shows the changed-since alert, the second as a new element (the first is gone from the document), so assistive technology announces it again; Save sends the second change as `base` (PR #2491 re-audit, F1, Edit).
+- **Does not assert:** what a particular screen reader speaks.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

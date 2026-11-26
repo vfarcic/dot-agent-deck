@@ -804,4 +804,111 @@ describe("the card actions editor (PRD #2374, 2026-11-24)", () => {
       base: { ...SHIP, prompt: "THEIRS-2491: ship it." },
     }), INSTANCE);
   });
+
+  const formAlert = (editor: HTMLElement) => within(within(editor).getByTestId("agent-card-actions-editor-form")).getByRole("alert");
+  const CHANGED_UNDER_FORM = /Ship it changed since this form was opened.*Save replaces it/;
+
+  /// Scenario: Edit Ship it, empty its text and press Save: the daemon refuses it and the form shows why. Type a corrected text, then press Hide Go ahead and lose that hide's answer, so the list is read once more; another program has changed Ship it's text meanwhile. The form's message becomes the alert that Ship it changed since the form was opened, in place of the old refusal, before Save sends the action as just read.
+  it("desktop/agent-cards/136: a reading-again after another edit's lost answer tells an open form its action changed, whatever message it showed", async () => {
+    const calls = setup({ deferred: true });
+    await openEditor();
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = editorDialog();
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Text it sends"), { target: { value: "" } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.reject("VALIDATION-2491: the text it sends is empty"));
+    expect(formAlert(editor)).toHaveTextContent("VALIDATION-2491");
+    fireEvent.change(field(editor, "Text it sends"), { target: { value: "My corrected draft" } });
+
+    await act(async () => { fireEvent.click(within(row(editor, "go-ahead")).getByRole("button", { name: "Hide Go ahead" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.fail(lost()));
+    changeShip(calls, { prompt: "OTHER-WRITER-DO-NOT-OVERWRITE" });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(field(editor, "Text it sends").value, "the draft is kept").toBe("My corrected draft");
+    expect(formAlert(editor), "the competing change is said in the form before Save").toHaveTextContent(CHANGED_UNDER_FORM);
+    expect(formAlert(editor)).not.toHaveTextContent("VALIDATION-2491");
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({
+      kind: "update",
+      action: expect.objectContaining({ name: "ship", prompt: "My corrected draft" }),
+      base: { ...SHIP, prompt: "OTHER-WRITER-DO-NOT-OVERWRITE" },
+    }), INSTANCE);
+  });
+
+  /// Scenario: Edit Ship it, type a new label and Save, and lose the answer: the form says it may have been saved. The list is read once more and shows Ship it with another program's text and its old label, not as the form sent it. The form's "may have been saved" message is replaced by the alert that Ship it changed since the form was opened, before Save sends the action as just read.
+  it("desktop/agent-cards/137: an uncertain Save whose reading-again shows another change says Ship it changed", async () => {
+    const calls = setup({ deferred: true });
+    await openEditor();
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = editorDialog();
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.fail(lost()));
+    expect(formAlert(editor)).toHaveTextContent("may have been saved");
+    changeShip(calls, { prompt: "OTHER-WRITER-2491: ship it." });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(field(editor, "Label").value, "the draft is kept").toBe("Ship it now");
+    expect(formAlert(editor)).toHaveTextContent(CHANGED_UNDER_FORM);
+    expect(formAlert(editor)).not.toHaveTextContent("may have been saved");
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, expect.objectContaining({
+      kind: "update",
+      action: expect.objectContaining({ name: "ship", label: "Ship it now" }),
+      base: { ...SHIP, prompt: "OTHER-WRITER-2491: ship it." },
+    }), INSTANCE);
+  });
+
+  /// Scenario: Edit Ship it, type a new label and Save, and lose the answer: the form says it may have been saved. The daemon did save it, so the list read once more shows Ship it exactly as the form sent it. The Save is treated as done: the form closes, the editor says Ship it now was saved, and nothing is sent again.
+  it("desktop/agent-cards/138: an uncertain Save whose reading-again shows the form's own draft is treated as saved", async () => {
+    const calls = setup({ deferred: true });
+    await openEditor();
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = editorDialog();
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    changeShip(calls, { label: "Ship it now" });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "edit", (waiting) => waiting.fail(lost()));
+    expect(formAlert(editor)).toHaveTextContent("may have been saved");
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    expect(within(editor).queryByTestId("agent-card-actions-editor-form"), "a Save the list shows landed closes its form").toBeNull();
+    expect(within(editor).getByTestId("agent-card-actions-editor-reread")).toHaveTextContent("Ship it now was saved");
+    expect(within(row(editor, "ship")).getByText("Ship it now", { exact: true })).toBeInTheDocument();
+    expect(calls.editCardCatalog).toHaveBeenCalledTimes(1);
+  });
+
+  /// Scenario: Edit Ship it and type a new label. Another program changes Ship it's text and Refresh reads it: the form shows the alert that Ship it changed. Another program changes the text again and Refresh reads it again: the alert is shown afresh, as a new element, so it is announced again, and Save sends the action as last read.
+  it("desktop/agent-cards/139: each change a read finds under an open form is alerted afresh", async () => {
+    const calls = setup({ deferred: true });
+    await openEditor();
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const editor = editorDialog();
+    fireEvent.click(within(row(editor, "ship")).getByRole("button", { name: "Edit Ship it" }));
+    fireEvent.change(field(editor, "Label"), { target: { value: "Ship it now" } });
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    changeShip(calls, { prompt: "THEIRS-ONE-2491." });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const first = formAlert(editor);
+    expect(first).toHaveTextContent(CHANGED_UNDER_FORM);
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: /Refresh/ })); });
+    changeShip(calls, { prompt: "THEIRS-TWO-2491." });
+    await settleFirst(calls, FIXTURE_DAEMON_ID, "read");
+    const second = formAlert(editor);
+    expect(second).toHaveTextContent(CHANGED_UNDER_FORM);
+    expect(second, "the second change is alerted by a new element, not the first one left in place").not.toBe(first);
+    expect(first.isConnected).toBe(false);
+
+    await act(async () => { fireEvent.click(within(editor).getByRole("button", { name: "Save" })); });
+    expect(calls.editCardCatalog).toHaveBeenCalledExactlyOnceWith(FIXTURE_DAEMON_ID, expect.objectContaining({
+      kind: "update",
+      action: expect.objectContaining({ name: "ship", label: "Ship it now" }),
+      base: { ...SHIP, prompt: "THEIRS-TWO-2491." },
+    }), INSTANCE);
+  });
 });
