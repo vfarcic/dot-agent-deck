@@ -2046,8 +2046,15 @@ fn real_single_dispatch_round_trip(close_after_report: bool) {
          Do not inspect the files or do the unit's work yourself, and do not ask me anything first. \
          When its inbox report arrives, relay the full discovered filename to me."
     );
-    deck.send_keys(directive.as_bytes());
-    deck.send_keys(b"\r");
+    // Issue #701's helper, not text and `\r` in one burst: typed that way the
+    // Enter can be read as part of a paste, and the directive then sits
+    // unsubmitted with no `UserPromptSubmit`, failing "must start its unit"
+    // (issue #2512; `dispatch/return/030` hit it while issue #2485 was worked).
+    let events = deck.subscribe_events();
+    let dispatcher_agent = dispatcher_ids
+        .first()
+        .expect("the acknowledged seed names the dispatcher's agent");
+    deck.submit_claude_prompt(&events, dispatcher_agent, &directive, unit);
 
     assert!(
         common::wait_until(Duration::from_secs(90), || {
@@ -2171,14 +2178,21 @@ fn real_single_dispatch_round_trip(close_after_report: bool) {
             "dispatcher did not settle after receiving completion\n{}",
             deck.snapshot_grid()
         );
+        const CLOSE_MARKER: &str = "close-request-c4e7";
         let directive = format!(
             "Use Bash to run exactly: dot-agent-deck close {unit}. \
              This is the completed unit you dispatched. Run the command now, \
              report its output, and leave your own pane open. Do not use git or \
-             any other cleanup command, do not dispatch again, and do not ask questions."
+             any other cleanup command, do not dispatch again, and do not ask questions. \
+             Request marker: {CLOSE_MARKER}"
         );
-        deck.send_keys(directive.as_bytes());
-        deck.send_keys(b"\r");
+        // Through the same helper as the dispatch directive above, so a close
+        // instruction left unsubmitted fails as PROMPT NOT DELIVERED rather
+        // than as a dispatcher that ignored it. The probe is a marker that ends
+        // the directive and is used nowhere else in this test: the unit's name
+        // is already on screen (its card, the dispatch command), and the
+        // helper's render check reads the first match of its probe.
+        deck.submit_claude_prompt(&events, dispatcher_agent, &directive, CLOSE_MARKER);
         assert!(
             common::wait_until(Duration::from_secs(180), || {
                 let records = common::agent_records_on(deck.attach_socket_path());
