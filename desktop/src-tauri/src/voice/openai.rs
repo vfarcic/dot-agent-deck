@@ -684,7 +684,7 @@ mod tests {
             TokenCeiling::default(),
             Some(OPENAI_COMMAND_REASONING_EFFORT),
         );
-        assert_eq!(effort["reasoning_effort"], "minimal");
+        assert_eq!(effort["reasoning_effort"], "none");
         // And it changes nothing else about the body.
         assert_eq!(effort["response_format"], bare["response_format"]);
         assert_eq!(effort["messages"], bare["messages"]);

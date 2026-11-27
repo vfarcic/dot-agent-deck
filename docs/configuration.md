@@ -367,11 +367,11 @@ level = 1.0
 | `voice.speech` | string | `"auto"` | `"auto"`, `"provider"`, `"system"`: where reading's voice comes from; an unrecognised value means `"auto"` |
 | `voice.transcription.backend` | string | `"local"` | `"local"` (no key; the endpoint must be on this machine), `"remote"` |
 | `voice.transcription.endpoint` | URL | `http://127.0.0.1:18000/v1/audio/transcriptions` for `local`, `https://api.openai.com/v1/audio/transcriptions` for `remote` | any URL; a `local` backend refuses one that is not a loopback address |
-| `voice.transcription.model` | string | `Systran/faster-whisper-tiny.en` for `local`, `whisper-1` for `remote` | |
+| `voice.transcription.model` | string | `Systran/faster-whisper-tiny.en` for `local`, `gpt-transcribe` for `remote` | |
 | `voice.transcription.language` | string | `"en"` | `"auto"` (the Speech service detects the language), or the two-letter code of a language the [Language](desktop/voice.md#settings--voice) row offers, such as `"de"` or `"sr"`; an unrecognised value means `"en"` |
 | `voice.intent.backend` | string | `"openai_compatible"` | `"openai_compatible"`, `"anthropic"` |
 | `voice.intent.endpoint` | URL | `https://api.openai.com/v1/chat/completions` for `openai_compatible`, `https://api.anthropic.com/v1/messages` for `anthropic` | |
-| `voice.intent.model` | string | `gpt-5-mini` for `openai_compatible`, `claude-haiku-4-5` for `anthropic` | |
+| `voice.intent.model` | string | `gpt-6-luna` for `openai_compatible`, `claude-haiku-4-5` for `anthropic` | `gpt-5-mini` at OpenAI's endpoint is read as `gpt-6-luna` ([why](desktop/voice.md#settings--voice)) |
 | `voice.intent.max_tokens` | integer | `4096` | `64`–`32768` |
 
 The `voice` keys are absent until you change a voice setting; [Voice Control](desktop/voice.md) explains them. An omitted endpoint or model takes the value for the backend you chose. The app does not write API keys to this file; it keeps them in the operating system's keychain. The list of remote daemons is not in this file either: it is `remotes.toml`, shared with the CLI, and the app moves any `[[endpoints.remote]]` rows written by an older version there the first time it loads the file.

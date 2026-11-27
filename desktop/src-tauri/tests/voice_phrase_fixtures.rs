@@ -3,7 +3,7 @@
 //! These fixtures are authoritative only for the shipping default intent
 //! backend, which is now the **keyed API backend on this build's own preset**
 //! — `test_support::api_preset()`, currently OpenAI chat-completions on
-//! `gpt-5-mini`. A green run with another model, endpoint or protocol would
+//! `gpt-6-luna`. A green run with another model, endpoint or protocol would
 //! prove less than it appears to, so this module deliberately offers no backend
 //! switch: it builds through `resolver_for(&IntentSettings::default())`, which
 //! is the call production makes, and therefore follows the default wherever it

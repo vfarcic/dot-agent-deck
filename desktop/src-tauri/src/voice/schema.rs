@@ -49,8 +49,8 @@ pub const TOOL_NAME: &str = "run_deck_action";
 /// bare *"go back"* fits `close_agent_view` on the agent screen and `open_deck`
 /// on the overview, and both rows' descriptions say so for their own screen.
 ///
-/// `claude-haiku-4-5` read those qualifiers. `gpt-5-mini` — the default since
-/// PRD #802's one-key work — read the instruction literally and answered
+/// `claude-haiku-4-5` read those qualifiers. `gpt-5-mini` — the default from
+/// PRD #802's one-key work until issue #1820 — read the instruction literally and answered
 /// `open_deck` on the agent screen in **seven of eight** measured runs, which
 /// the `close-agent-view-back` fixture caught. With the tie-break it failed
 /// once in six, and the Anthropic preset was re-measured across it and did not

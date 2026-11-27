@@ -171,7 +171,7 @@ A `[[modes]]` block from older releases is ignored; `dot-agent-deck validate` wa
 | Key | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | yes | — | The role's name: shown on its card, passed to `delegate --to`, `pane restart` and `pane spawn`, and used in the file names `.dot-agent-deck/worker-task-<name>.md` and `work-done-<name>.md`. Must be unique within the orchestration, must not be empty, and must not contain `/`, `\` or `..`. Case-sensitive. |
-| `command` | string | yes | — | The shell command that starts the role's agent, run in the orchestration's directory, for example `claude`, `claude --model sonnet`, `opencode --model gpt-4o`, `codex`, `agy`, `devbox run agent-coder`. May be omitted only in a block that `extends` another and inherits the role. |
+| `command` | string | yes | — | The shell command that starts the role's agent, run in the orchestration's directory, for example `claude`, `claude --model sonnet`, `opencode --model gpt-6-luna`, `codex`, `agy`, `devbox run agent-coder`. May be omitted only in a block that `extends` another and inherits the role. |
 | `agent` | string | no | derived from `command` | Which agent `command` starts, when `command` runs it through a launcher: one of `claude`, `opencode`, `pi`, `codex`, `devin`, `agy`. See [Declaring the agent behind a launcher command](#declaring-the-agent-behind-a-launcher-command). |
 | `start` | boolean | no | `false` | `true` marks the orchestrator. `validate` requires exactly one role with `start = true`. |
 | `description` | string | no | — | What the role is for. The orchestrator reads it to choose which worker gets a task, and it is shown on the role's card. `validate` warns about a worker without one. |
@@ -316,7 +316,7 @@ If a spec is referenced, verify the implementation matches it.
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "opencode --model gpt-4o"   # OpenCode 1.x; OpenCode 2 takes the model from its configuration
+command = "opencode --model gpt-6-luna"   # OpenCode 1.x; OpenCode 2 takes the model from its configuration
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = """
 Audit the change for security vulnerabilities and OWASP top-10 class issues. Report findings only; do not modify code.
