@@ -1,8 +1,9 @@
 import { SlidersHorizontal, X } from "lucide-react";
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
 import { cardKinds, cardTree, needsYouPath, type CardNode } from "../lib/agentCardsTree";
+import { layoutTreeLevel, TREE_CARD_WIDTH, type TreeLevelLayout } from "../lib/cardTreeLayout";
 import { DISPLAY_LIMITS, displayText, domIdentity } from "../lib/displayText";
 import { endedRoleOfCard } from "../lib/endedRoles";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
@@ -262,41 +263,75 @@ function SelectionBar({ selection, controls, editor }: SelectionBarProps) {
   );
 }
 
-/** A card's width on the tree, in CSS pixels, and the gap between two cards side by side. */
-const CARD_WIDTH = 224;
+/** A root card's width, and the gap between two roots side by side. */
+const CARD_WIDTH = TREE_CARD_WIDTH;
 const CARD_GAP = 12;
 const SLOT = CARD_WIDTH + CARD_GAP;
+
+/** An opened tree's box: its padding and border on each side, and the caption above its cards. */
+const BOX_PAD = 8;
+const BOX_BORDER = 1;
+const BOX_EDGES = 2 * (BOX_PAD + BOX_BORDER);
 
 /** No card's tree open: the default for a deck body given no open cards. */
 const NO_OPEN_CARDS: ReadonlySet<string> = new Set();
 
 /**
- * The cards under one card, as a level of the tree, each opening further to
- * any depth. `above` is every card on the way down to this level: a card met
- * again below itself is not drawn, so even a cyclic list cannot recurse.
+ * Issue #2533 — one level of an opened tree, laid out by
+ * {@link layoutTreeLevel}: its cards in rows, each row hanging from the spine
+ * by its own bus, each card a column holding the level under it when it is
+ * open. The level's width and every line's place across come from the
+ * layout; the lines' heights follow the rows in CSS.
+ *
+ * Every card is a child of the level itself, keyed by the card, and a row
+ * ends at a break between two of them, so a card that moves to another row
+ * (opening it, or the window narrowing) stays mounted and keeps the keyboard
+ * (PR #2550 review). Each row's first card carries its row's bus and spine,
+ * placed from its own left edge; it is as tall as the row, so the spine runs
+ * down to where the next row starts.
  */
-function TreeLevel({ nodes, depth, top, view, above }: { nodes: readonly CardNode[]; depth: number; top?: boolean; view: TreeView; above: ReadonlySet<string> }) {
-  const shown = nodes.filter((node) => !above.has(placedCardKey(node.card)));
-  if (shown.length === 0) return null;
+function TreeLevel({ level, depth, top, view }: { level: TreeLevelLayout<CardNode>; depth: number; top?: boolean; view: TreeView }) {
+  const classes = ["agent-cards-tree-level", top ? "is-top" : "", level.single ? "is-single" : ""].filter(Boolean).join(" ");
   return (
-    <ul className={`agent-cards-tree-level${top ? " is-top" : ""}`}>
-      {shown.map((node) => {
-        const key = placedCardKey(node.card);
-        const open = node.children.length > 0 && view.openCards.has(key);
-        return (
-          <li key={key}>
-            <AgentCard card={node.card} controls={view.controls} results={view.results?.(node.card)} place={view.place(node, depth, open)} ended={endedRoleOfCard(view.endedRoles, node.card.entry)} />
-            {open && <TreeLevel nodes={node.children} depth={depth + 1} view={view} above={new Set([...above, key])} />}
-          </li>
-        );
+    <div
+      className={classes}
+      role="list"
+      data-testid="agent-cards-tree-level"
+      data-rows={level.rows.length}
+      data-stem-x={level.stem}
+      style={{ width: `${level.width}px`, "--stem-x": `${level.stem}px` } as CSSProperties}
+    >
+      {level.rows.flatMap((row, at) => {
+        const items = row.items.map((item, index) => {
+          const key = view.keyOf(item.node);
+          const open = item.node.children.length > 0 && view.openCards.has(key);
+          const first = index === 0;
+          return (
+            <div
+              className="agent-cards-tree-item"
+              role="listitem"
+              key={key}
+              data-row={at}
+              data-center-x={item.center}
+              style={{ width: `${item.width}px`, "--tree-card-width": `${item.cardWidth}px` } as CSSProperties}
+            >
+              {first && row.bus && <span className="agent-cards-bus" aria-hidden="true" data-testid="agent-cards-bus" data-row={at} style={{ left: `${row.bus.left - item.left}px`, width: `${row.bus.right - row.bus.left}px` }} />}
+              {first && row.spine !== undefined && <span className="agent-cards-spine" aria-hidden="true" data-testid="agent-cards-spine" data-row={at} style={{ left: `${row.spine - item.left}px` }} />}
+              <AgentCard card={item.node.card} controls={view.controls} results={view.results?.(item.node.card)} place={view.place(item.node, depth, open)} ended={endedRoleOfCard(view.endedRoles, item.node.card.entry)} />
+              {item.level && <TreeLevel level={item.level} depth={depth + 1} view={view} />}
+            </div>
+          );
+        });
+        return at === 0 ? items : [<span className="agent-cards-tree-break" aria-hidden="true" key={`row-break\u0000${view.keyOf(row.items[0].node)}`} />, ...items];
       })}
-    </ul>
+    </div>
   );
 }
 
 /** What every level of one deck's tree draws with. */
 interface TreeView {
   openCards: ReadonlySet<string>;
+  keyOf: (node: CardNode) => string;
   controls: CardControls;
   results?: (card: PlacedCard) => CardResults;
   place: (node: CardNode, depth: number, open: boolean) => CardPlace;
@@ -304,55 +339,44 @@ interface TreeView {
   endedRoles?: readonly EndedRole[];
 }
 
+/** The strip kept free at a row's right for the lines that go around the trees above, when `trees` roots of the row are open. */
+const detourReserve = (trees: number) => (trees > 1 ? 16 + 7 * (trees - 2) : 0);
+
+/** The width each opened root's box is laid out in, when `trees` roots of a row are open in a frame `frame` pixels wide. */
+const boxRoom = (frame: number, trees: number) => Math.max(0, frame - detourReserve(trees));
+
 /**
  * Issue #2418, "Row, wrapping, roots stay put": each opened root in a row gets
- * its own level under the row, in the roots' order. Its tree starts under the
- * root and shifts left only when it would run past the frame; a strip at the
- * right is kept free for the lines, so none leaves the frame. One line per
- * root runs from the root down to its own tree, going around the trees above
- * it on the right. Measured from the DOM after every render and written
- * straight onto it, so the roots' own boxes are never touched.
- *
- * A tree wider than the frame scrolls inside its block. Its first level joins
- * the root's line at the level's middle — the first card itself when it is
- * the only one, else the rail over the cards — so the line ends there, where
- * the block's scroll has put it. When the block first overflows (or its width
- * changes) it is scrolled to put that point in the middle; a later scroll
- * lays the row out again, and while the point is scrolled out of view the
- * line ends at the block's nearer edge, inside the frame.
+ * its own level under the row, in the roots' order, in its own box (issue
+ * #2533). The box starts under the root and shifts left only when it would
+ * run past the frame; a strip at the right is kept free for the lines, so
+ * none leaves the frame. One line per root runs from the root down to the top
+ * of its box, where the box's own stem takes over, going around the boxes
+ * above it on the right. The boxes are placed when they are drawn; this
+ * measures where they ended up after every render and draws the lines, so the
+ * roots' own boxes are never touched.
  */
 function layoutRow(row: HTMLElement) {
   const grid = row.querySelector<HTMLElement>(":scope > .agent-cards-roots");
   const svg = row.querySelector<SVGSVGElement>(":scope > .agent-cards-lines");
   if (!grid || !svg) return;
   const avail = row.clientWidth;
+  const at = row.getBoundingClientRect();
   const rowBottom = grid.offsetTop + grid.offsetHeight;
   const bands = [...row.querySelectorAll<HTMLElement>(":scope > .agent-cards-band")];
   // The first level's top gap holds one detour lane per later root, so their sideways runs never share a line.
   const firstPad = 16 + 8 * Math.max(0, bands.length - 1);
   bands.forEach((band, index) => { band.style.paddingTop = `${index === 0 ? firstPad : 22}px`; });
-  // A strip kept free at the right, wide enough for this row's detour lines.
-  const reserve = bands.length > 1 ? 16 + 7 * (bands.length - 2) : 0;
-  const room = Math.max(0, avail - reserve);
   const placed = bands.map((band) => {
-    const block = band.querySelector<HTMLElement>(":scope > .agent-cards-block");
+    const box = band.querySelector<HTMLElement>(":scope > .agent-cards-box");
     const col = Number(band.dataset.col ?? 0);
-    if (!block) return { band, col, width: 0, left: 0, attach: 0 };
-    block.style.maxWidth = `${room}px`;
-    const width = block.offsetWidth;
-    const left = Math.max(0, Math.min(col * SLOT, room - width));
-    block.style.marginLeft = `${left}px`;
-    const level = block.querySelector<HTMLElement>(":scope > .agent-cards-tree-level");
-    const overflow = block.scrollWidth - block.clientWidth;
-    if (overflow > 0.5 && block.dataset.centredFor !== `${block.scrollWidth}/${block.clientWidth}`) {
-      block.dataset.centredFor = `${block.scrollWidth}/${block.clientWidth}`;
-      block.scrollLeft = level ? level.offsetLeft + level.offsetWidth / 2 - block.clientWidth / 2 : overflow / 2;
-    } else if (overflow <= 0.5) delete block.dataset.centredFor;
-    if (!block.onscroll) block.onscroll = () => layoutRow(row);
-    // Where the first level joins the line, in the block's own box, after its scroll.
-    const middle = level ? level.offsetLeft + level.offsetWidth / 2 - block.scrollLeft : width / 2;
-    const attach = left + Math.max(0, Math.min(width, middle));
-    return { band, col, width, left, attach };
+    if (!box) return { band, col, width: 0, left: 0, attach: 0 };
+    const frame = box.getBoundingClientRect();
+    const left = frame.left - at.left;
+    const level = box.querySelector<HTMLElement>(":scope > .agent-cards-tree-level");
+    // Where the box's stem starts: the line from the root ends on it, on the box's top edge.
+    const attach = level ? level.getBoundingClientRect().left - at.left + Number(level.dataset.stemX ?? 0) : left + frame.width / 2;
+    return { band, col, width: frame.width, left, attach };
   });
   const paths = placed.map((place, k) => {
     const pad = k === 0 ? firstPad : 22;
@@ -432,8 +456,11 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
   const columns = Math.max(1, Math.floor((width + CARD_GAP) / SLOT));
   const rows: CardNode[][] = [];
   for (let at = 0; at < roots.length; at += columns) rows.push(roots.slice(at, at + columns));
+  const keyOf = (node: CardNode) => placedCardKey(node.card);
+  const isOpen = (node: CardNode) => openCards.has(keyOf(node));
   const view: TreeView = {
     openCards,
+    keyOf,
     controls,
     results,
     endedRoles,
@@ -462,13 +489,28 @@ export function AgentCardsDeckBody({ deckId, cards, tree = false, openCards = NO
                   return <AgentCard key={placedCardKey(node.card)} card={node.card} controls={controls} results={results?.(node.card)} place={view.place(node, 0, open)} ended={endedRoleOfCard(endedRoles, node.card.entry)} />;
                 })}
               </div>
-              {opened.map(({ node, col }) => (
-                <div className="agent-cards-band" key={placedCardKey(node.card)} data-testid="agent-cards-band" data-root-key={node.card.entry.key} data-col={col}>
-                  <div className="agent-cards-block" aria-label={`Agents under ${displayText(node.card.entry.name, DISPLAY_LIMITS.name)}`}>
-                    <TreeLevel nodes={node.children} depth={1} top view={view} above={new Set([placedCardKey(node.card)])} />
+              {opened.map(({ node, col }) => {
+                const room = boxRoom(width, opened.length);
+                const level = layoutTreeLevel(node.children, room - BOX_EDGES, { keyOf, isOpen }, new Set([keyOf(node)]));
+                if (!level) return null;
+                const boxWidth = level.width + BOX_EDGES;
+                const left = Math.max(0, Math.min(col * SLOT, room - boxWidth));
+                const name = displayText(node.card.entry.name, DISPLAY_LIMITS.name);
+                return (
+                  <div className="agent-cards-band" key={placedCardKey(node.card)} data-testid="agent-cards-band" data-root-key={node.card.entry.key} data-col={col}>
+                    <div
+                      className="agent-cards-box"
+                      role="group"
+                      aria-label={`Agents under ${name}`}
+                      data-testid="agent-cards-box"
+                      style={{ width: `${boxWidth}px`, marginLeft: `${left}px` }}
+                    >
+                      <div className="agent-cards-box-caption" data-testid="agent-cards-box-caption" title={name} aria-hidden="true" style={{ maxWidth: `${Math.max(0, level.stem - 8)}px` }}>{name}</div>
+                      <TreeLevel level={level} depth={1} top view={view} />
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           );
         })}

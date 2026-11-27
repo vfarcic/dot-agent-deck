@@ -19,9 +19,14 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  *   roots' order;
  * - the later root's line goes around the earlier tree, never through it, and
  *   every line and tree stays inside the frame;
- * - a root whose only child has a level wider than the frame under it
- *   (`cards=tree-nested`) has its line end on that child, before and after the
- *   tree's block is scrolled;
+ * - each opened root's tree is in its own box, captioned with the root's name
+ *   and painted in one neutral tint, the same for every box (#2533);
+ * - the cards under a card wrap into rows when they do not fit, at every level
+ *   (`cards=tree-nested` has nine under one card): each row hangs from its own
+ *   bus, the spine joins each row to the next down a gap between cards, and
+ *   nothing in Cards scrolls sideways (#2533);
+ * - resizing the window with every tree open keeps every root in the place it
+ *   has at that width with every tree closed (#2533);
  * - a live update — a status word and the needs-you marker changing, checked
  *   references appearing — moves and resizes no root, with a tree open;
  * - a prompt the agent wrote is on the compact card only as an icon whose hover
@@ -446,7 +451,9 @@ async function rowGeometry(page: Page) {
       bands: [...row.querySelectorAll<HTMLElement>(":scope > .agent-cards-band")].map((band) => ({
         key: band.dataset.rootKey ?? "",
         band: rel(band.getBoundingClientRect()),
-        block: rel(band.querySelector(".agent-cards-block")!.getBoundingClientRect()),
+        block: rel(band.querySelector(".agent-cards-box")!.getBoundingClientRect()),
+        caption: band.querySelector("[data-testid='agent-cards-box-caption']")?.textContent ?? "",
+        background: getComputedStyle(band.querySelector(".agent-cards-box")!).backgroundColor,
       })),
       lines: [...row.querySelectorAll<SVGPathElement>(":scope > svg path")].map((path) => ({ key: path.dataset.rootKey ?? "", d: path.getAttribute("d") ?? "" })),
     };
@@ -481,6 +488,106 @@ function crosses(segment: { x1: number; y1: number; x2: number; y2: number }, bo
   return xb > box.left + 1 && xa < box.right - 1 && yb > box.top + 1 && ya < box.bottom - 1;
 }
 
+/**
+ * Issue #2533 — every level of every opened tree on screen, checked against
+ * the rows-under-a-bus layout, and returned as how many cards and rows each
+ * holds. Measured in the page's own pixels:
+ *
+ * - the level, its rows and its cards stay inside their box, and the box
+ *   inside the frame, and no box or the Cards view itself scrolls sideways;
+ * - a row's cards share one top edge;
+ * - unless the level holds one card, each row has a bus over its cards that
+ *   reaches every card's middle, a drop's length above them, and the line from
+ *   the parent (the level's stem) meets the first row's bus;
+ * - every row but the last has a spine from its own bus down to the next
+ *   row's, at a point both buses reach, running between the row's cards rather
+ *   than through one;
+ * - a level under a card has its stem below that card's middle.
+ */
+async function expectWrappedTrees(page: Page): Promise<{ cards: number; rows: number }[]> {
+  const found = await page.evaluate(() => {
+    const deck = document.querySelector<HTMLElement>(".agent-cards-deck")!;
+    const frame = deck.getBoundingClientRect();
+    const rect = (node: Element) => { const at = node.getBoundingClientRect(); return { left: at.left - frame.left, right: at.right - frame.left, top: at.top - frame.top, bottom: at.bottom - frame.top }; };
+    return {
+      frame: { width: deck.clientWidth, scroll: deck.scrollWidth },
+      boxes: [...document.querySelectorAll<HTMLElement>("[data-testid='agent-cards-box']")].map((box) => ({ ...rect(box), client: box.clientWidth, scroll: box.scrollWidth })),
+      levels: [...document.querySelectorAll<HTMLElement>("[data-testid='agent-cards-tree-level']")].map((level) => {
+        const at = rect(level);
+        const parent = level.parentElement?.closest(".agent-cards-tree-item")?.querySelector(":scope > article");
+        return {
+          box: rect(level.closest("[data-testid='agent-cards-box']")!),
+          level: at,
+          single: level.classList.contains("is-single"),
+          stem: at.left + Number(level.dataset.stemX),
+          parent: parent ? rect(parent) : null,
+          rows: (() => {
+            // A row is the level's items that carry its index; its bus and spine sit on its first item.
+            const byRow: Element[][] = [];
+            for (const item of level.querySelectorAll(":scope > .agent-cards-tree-item")) (byRow[Number(item.getAttribute("data-row"))] ??= []).push(item);
+            return byRow.map((items) => {
+              const bus = items.map((item) => item.querySelector(":scope > .agent-cards-bus")).find(Boolean);
+              const spine = items.map((item) => item.querySelector(":scope > .agent-cards-spine")).find(Boolean);
+              return {
+                bus: bus ? rect(bus) : null,
+                spine: spine ? rect(spine) : null,
+                cards: items.map((item) => rect(item.querySelector(":scope > article")!)),
+              };
+            });
+          })(),
+        };
+      }),
+    };
+  });
+  expect(found.frame.scroll, "the Cards view does not scroll sideways").toBeLessThanOrEqual(found.frame.width);
+  for (const box of found.boxes) {
+    expect(box.scroll, "a tree's box does not scroll sideways").toBeLessThanOrEqual(box.client);
+    expect(box.left).toBeGreaterThanOrEqual(-TOLERANCE);
+    expect(box.right, "a tree's box stays inside the frame").toBeLessThanOrEqual(found.frame.width + TOLERANCE);
+  }
+  const middle = (card: { left: number; right: number }) => (card.left + card.right) / 2;
+  const line = 2;
+  for (const level of found.levels) {
+    expect(level.level.left).toBeGreaterThanOrEqual(level.box.left - TOLERANCE);
+    expect(level.level.right, "a level stays inside its box").toBeLessThanOrEqual(level.box.right + TOLERANCE);
+    if (level.parent) expect(Math.abs(level.stem - middle(level.parent)), "a level hangs below its parent's middle").toBeLessThanOrEqual(line);
+    for (const [at, row] of level.rows.entries()) {
+      for (const card of row.cards) {
+        expect(card.left, "a card stays inside its box").toBeGreaterThanOrEqual(level.box.left - TOLERANCE);
+        expect(card.right, "a card stays inside its box").toBeLessThanOrEqual(level.box.right + TOLERANCE);
+        expect(Math.abs(card.top - row.cards[0].top), "a row's cards share one top edge").toBeLessThanOrEqual(TOLERANCE);
+      }
+      if (level.single) continue;
+      const bus = row.bus;
+      expect(bus, `row ${at} has its bus`).not.toBeNull();
+      for (const card of row.cards) {
+        expect(middle(card), `row ${at}'s bus reaches each card's middle`).toBeGreaterThanOrEqual(bus!.left - line);
+        expect(middle(card), `row ${at}'s bus reaches each card's middle`).toBeLessThanOrEqual(bus!.right + line);
+        expect(Math.abs(card.top - bus!.top - 16), `row ${at}'s cards hang a drop below its bus`).toBeLessThanOrEqual(line);
+      }
+      if (at === 0) {
+        expect(level.stem, "the stem meets the first row's bus").toBeGreaterThanOrEqual(bus!.left - line);
+        expect(level.stem, "the stem meets the first row's bus").toBeLessThanOrEqual(bus!.right + line);
+      }
+      const next = level.rows[at + 1];
+      if (!next) {
+        expect(row.spine, "the last row has no spine below it").toBeNull();
+        continue;
+      }
+      const spine = row.spine;
+      expect(spine, `row ${at} has a spine to the next row`).not.toBeNull();
+      expect(Math.abs(spine!.top - bus!.top), `row ${at}'s spine starts on its bus`).toBeLessThanOrEqual(line);
+      expect(Math.abs(spine!.bottom - next.bus!.top), `row ${at}'s spine ends on the next row's bus`).toBeLessThanOrEqual(line);
+      for (const reached of [bus!, next.bus!]) {
+        expect(spine!.left, `row ${at}'s spine meets both buses`).toBeGreaterThanOrEqual(reached.left - line);
+        expect(spine!.left, `row ${at}'s spine meets both buses`).toBeLessThanOrEqual(reached.right + line);
+      }
+      for (const card of row.cards) expect(spine!.left > card.left + line && spine!.left < card.right - line, `row ${at}'s spine runs through a card`).toBe(false);
+    }
+  }
+  return found.levels.map((level) => ({ cards: level.rows.reduce((sum, row) => sum + row.cards.length, 0), rows: level.rows.length }));
+}
+
 for (const width of WIDTHS) {
   test.describe(`desktop/agent-cards/019 — the Cards tree at ${width}px`, () => {
     test.use({ viewport: { width, height: 900 } });
@@ -492,6 +599,12 @@ for (const width of WIDTHS) {
       for (const key of keys) if (await toggleOf(page, key).count()) await toggleOf(page, key).click();
       await expect(page.getByTestId("agent-cards-band")).toHaveCount(5);
       await expectNoSidewaysScroll(page);
+      await expectWrappedTrees(page);
+      // An orchestration open inside a dispatcher's tree: its roles are a level of their own, wrapped to fit as well.
+      await toggleOf(page, await keyOf(page, "prd-2374")).click();
+      await expect(page.locator("article[data-card-key][data-depth='2']")).toHaveCount(3);
+      await expectNoSidewaysScroll(page);
+      await expectWrappedTrees(page);
       for (const row of await rowGeometry(page)) {
         for (const band of row.bands) expect(band.block.right, `${band.key}'s tree stays inside the frame`).toBeLessThanOrEqual(row.width + TOLERANCE);
         for (const line of row.lines) {
@@ -557,6 +670,11 @@ for (const width of WIDTHS) {
       expect(geometry.bands.map((band) => band.key)).toEqual([first.key, second.key]);
       const [earlier, later] = geometry.bands;
       expect(later.band.top, "the later root's tree is on a level of its own").toBeGreaterThanOrEqual(earlier.band.bottom - TOLERANCE);
+      // Each tree is in its own box, captioned with its root's name, and the two boxes look the same (#2533).
+      expect(later.block.top, "the later box starts below the earlier one").toBeGreaterThan(earlier.block.bottom);
+      const names = await page.evaluate((keys) => keys.map((key) => document.querySelector(`article[data-card-key="${key}"] [data-testid='agent-card-open-agent']`)?.textContent ?? ""), [first.key, second.key]);
+      expect([earlier.caption, later.caption]).toEqual(names);
+      expect(later.background, "every box has the same tint").toBe(earlier.background);
       const line = geometry.lines.find((candidate) => candidate.key === second.key);
       expect(line, "the later root has a line").toBeDefined();
       for (const segment of segments(line!.d)) {
@@ -570,42 +688,59 @@ for (const width of WIDTHS) {
       await expectNoSidewaysScroll(page);
     });
 
-    test("a root whose only child has a level wider than the frame has its line end on that child, scrolled or not", async ({ page }) => {
+    /// Scenario: At this width, open a root whose only child has nine cards under it, then open that child. The nine wrap into rows inside the root's box, each row hanging from its own line and joined to the next by the spine, the root's line ends on the box's top edge above the child, and nothing in Cards scrolls sideways.
+    test("nine cards under one card wrap into rows joined by the spine, and nothing scrolls sideways", async ({ page }) => {
       await openCardsTree(page, "tree-nested");
       const root = await keyOf(page, "deep-queue");
       await toggleOf(page, root).click();
       const child = await keyOf(page, "prd-2400");
       await toggleOf(page, child).click();
       await expect(page.locator("article[data-card-key][data-depth='2']")).toHaveCount(9);
-      const attachment = () => page.evaluate(({ rootKey, childKey }) => {
+      const levels = await expectWrappedTrees(page);
+      const deepest = levels.find((level) => level.cards === 9);
+      expect(deepest, "the nine cards are one level").toBeDefined();
+      expect(deepest!.rows, "nine cards do not fit one row at this width").toBeGreaterThan(1);
+      // The root's line ends on the box's top edge, right above its only child, where the box's stem takes it on.
+      const at = await page.evaluate(({ rootKey, childKey }) => {
         const path = document.querySelector<SVGPathElement>(`[data-testid='agent-cards-line'][data-root-key="${rootKey}"]`)!;
         const row = path.closest(".agent-cards-row")!.getBoundingClientRect();
         const card = document.querySelector(`article[data-card-key="${childKey}"]`)!.getBoundingClientRect();
-        const block = document.querySelector(".agent-cards-block")!;
-        return {
-          d: path.getAttribute("d") ?? "",
-          width: (path.closest(".agent-cards-row") as HTMLElement).clientWidth,
-          card: { left: card.left - row.left, right: card.right - row.left, top: card.top - row.top },
-          overflow: block.scrollWidth - block.clientWidth,
-        };
+        const box = document.querySelector("[data-testid='agent-cards-box']")!.getBoundingClientRect();
+        return { d: path.getAttribute("d") ?? "", middle: (card.left + card.right) / 2 - row.left, boxTop: box.top - row.top };
       }, { rootKey: root, childKey: child });
-      const expectOnChild = (at: Awaited<ReturnType<typeof attachment>>, when: string) => {
-        const end = endOf(at.d);
-        expect(end.x, `${when}: the line ends over the child (${at.d}; child ${at.card.left}..${at.card.right})`).toBeGreaterThanOrEqual(at.card.left - TOLERANCE);
-        expect(end.x, `${when}: the line ends over the child (${at.d}; child ${at.card.left}..${at.card.right})`).toBeLessThanOrEqual(at.card.right + TOLERANCE);
-        expect(Math.abs(end.y - at.card.top), `${when}: the line ends on the child's top edge (${at.d}; child top ${at.card.top})`).toBeLessThanOrEqual(1);
-        for (const segment of segments(at.d)) for (const x of [segment.x1, segment.x2]) {
-          expect(x).toBeGreaterThanOrEqual(-TOLERANCE);
-          expect(x).toBeLessThanOrEqual(at.width + TOLERANCE);
-        }
-      };
-      const first = await attachment();
-      expect(first.overflow, "the grandchildren's level is wider than the frame").toBeGreaterThan(0);
-      expectOnChild(first, "as opened");
-      await page.locator(".agent-cards-block").evaluate((block) => { block.scrollLeft += 40; });
-      await expect.poll(async () => endOf((await attachment()).d).x).not.toBe(endOf(first.d).x);
-      expectOnChild(await attachment(), "after a scroll");
+      const end = endOf(at.d);
+      expect(Math.abs(end.x - at.middle), `the line ends above the child (${at.d}; child's middle ${at.middle})`).toBeLessThanOrEqual(1);
+      expect(Math.abs(end.y - at.boxTop), `the line ends on the box's top edge (${at.d}; box top ${at.boxTop})`).toBeLessThanOrEqual(1);
       await expectNoSidewaysScroll(page);
+    });
+
+    /// Scenario: At this width, note where every root is with every tree closed, open every root's tree, make the window wider and then narrower again. Back at this width every root is where it was with the trees closed, every tree is wrapped to fit, and nothing scrolls sideways at either width.
+    test("resizing the window with every tree open keeps the roots in their places", async ({ page }) => {
+      await openCardsTree(page);
+      const closed = await rootBoxes(page);
+      for (const box of closed) if (await toggleOf(page, box.key).count()) await toggleOf(page, box.key).click();
+      await expect(page.getByTestId("agent-cards-band")).toHaveCount(5);
+      for (const other of [width + 300, Math.max(375, width - 200), width]) {
+        await page.setViewportSize({ width: other, height: 900 });
+        await expect.poll(() => page.evaluate(() => document.documentElement.clientWidth)).toBe(other);
+        // The roots and trees are laid out again once the frame's resize is reported, a frame after the window's:
+        // wait until the roots' columns are the frame's and nothing overflows it, whichever way the window moved.
+        await expect.poll(() => page.evaluate(() => {
+          const deck = document.querySelector<HTMLElement>(".agent-cards-deck")!;
+          const grid = document.querySelector<HTMLElement>("[data-testid='agent-cards-roots']")!;
+          const columns = Number(/repeat\((\d+),/.exec(grid.style.gridTemplateColumns)?.[1] ?? 0);
+          return columns === Math.max(1, Math.floor((deck.clientWidth + 12) / 236)) && deck.scrollWidth <= deck.clientWidth;
+        })).toBe(true);
+        await expectWrappedTrees(page);
+        await expectNoSidewaysScroll(page);
+      }
+      const after = await rootBoxes(page);
+      expect(after.map((box) => box.key)).toEqual(closed.map((box) => box.key));
+      for (const [at, was] of closed.entries()) {
+        expect(Math.abs(after[at].x - was.x), `${was.key} is in its column`).toBeLessThanOrEqual(TOLERANCE);
+        expect(after[at].row, `${was.key} is in its row`).toBe(was.row);
+        if (was.row === 0) expect(Math.abs(after[at].y - was.y), `${was.key} is where it was`).toBeLessThanOrEqual(TOLERANCE);
+      }
     });
 
     test("a live status change and references appearing move no root, with a tree open", async ({ page }) => {
