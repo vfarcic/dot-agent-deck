@@ -200,12 +200,22 @@ async fn start_agent(server: &Server, command: &str) -> String {
 }
 
 async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> String {
+    start_agent_for_pane_in(server, command, pane_id, None).await
+}
+
+/// [`start_agent_for_pane`], with the agent working in `cwd`.
+async fn start_agent_for_pane_in(
+    server: &Server,
+    command: &str,
+    pane_id: &str,
+    cwd: Option<&str>,
+) -> String {
     let mut s = UnixStream::connect(&server.path).await.unwrap();
     write_request(
         &mut s,
         &AttachRequest::StartAgent {
             command: Some(command.into()),
-            cwd: None,
+            cwd: cwd.map(str::to_string),
             display_name: None,
             rows: 24,
             cols: 80,
@@ -2700,7 +2710,20 @@ async fn config_gen_002_daemon_posts_exact_prompt_for_target_cwd() {
     let request = config_generation_request("config-target", "pending");
     drop(request);
     let server = start_server().await;
-    let target = start_agent_for_pane(&server, "cat", "config-target").await;
+    // The prompt is long enough that the deck also saves it to a file for the
+    // agent, in the agent's folder or else the deck's state directory. A test
+    // process has no usable state directory (issue #2531: before that, this
+    // body landed in the developer's real one), so the target works in a
+    // folder of its own, as a real agent does.
+    let target_home = server._dir.path().join("target-home");
+    std::fs::create_dir(&target_home).unwrap();
+    let target = start_agent_for_pane_in(
+        &server,
+        "cat",
+        "config-target",
+        Some(target_home.to_str().unwrap()),
+    )
+    .await;
     let control = start_agent_for_pane(&server, "cat", "config-control").await;
     let project = server._dir.path().join("target-project");
     std::fs::create_dir(&project).unwrap();

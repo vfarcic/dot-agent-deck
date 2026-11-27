@@ -20,8 +20,8 @@ export type RuntimeMode = "fixture" | "live";
  */
 export const UNREPORTED = "Unavailable";
 
-export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
-export type RunHealth = "healthy" | "attention" | "failed" | "idle";
+type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
+type RunHealth = "healthy" | "attention" | "failed" | "idle";
 /**
  * The status an agent is shown in. `needs_input` and `idle` are the TUI's
  * Needs Input and Idle (issue #1676): an agent waiting on the user and one that
@@ -181,8 +181,11 @@ export type AgentBackground = {
   subagents: number;
   sinceMs?: number;
 };
-export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
-export type PanelTab = "terminal" | "diff" | "checks" | "handoffs" | "artifacts";
+type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
+/** PR #2491 decision 2026-11-26 — `card` is the agent pane's Card tab, offered where the agent's daemon shows cards. */
+export type PanelTab = "terminal" | "card" | "diff" | "checks" | "handoffs" | "artifacts";
+/** The part of the Card tab a pane opened at: a card's references `+N` opens it at the references, its actions `+N` at the actions. */
+export type CardTabSection = "references" | "actions";
 
 /**
  * Which of `AgentTile`'s two presentations to render (PRD #1105 M1).
@@ -531,7 +534,7 @@ export interface DaemonProjectListing {
   primary?: string;
 }
 
-export interface DaemonOrchestrationRole {
+interface DaemonOrchestrationRole {
   /** Identity: matched by name at the launch, and it becomes the pane's label. */
   name: string;
   /** `name`, escaped for rendering. */
@@ -713,19 +716,19 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
  */
 
 /** Where a card is grouped: by the dispatcher that started it, its orchestration, or neither. */
-export interface AgentCardGroup {
+interface AgentCardGroup {
   id: string;
   kind: "dispatcher" | "orchestration" | "standalone" | string;
   label: string | null;
 }
 
-export interface AgentCardRelations {
+interface AgentCardRelations {
   dispatcher?: { key: string; name: string } | null;
   orchestration?: { id: string; label: string; role: string; is_orchestrator: boolean } | null;
 }
 
 /** What the agent itself last published — the agent's word, not checked by the deck. */
-export interface AgentCardReport {
+interface AgentCardReport {
   source: "agent";
   status: "working" | "waiting" | "done" | "failed" | string;
   summary: string | null;
@@ -733,7 +736,7 @@ export interface AgentCardReport {
   revision: number;
 }
 
-export interface AgentCardField {
+interface AgentCardField {
   name: string;
   label: string;
   description: string | null;
@@ -745,7 +748,7 @@ export interface AgentCardField {
   value: unknown;
 }
 
-export interface AgentCardQuestion {
+interface AgentCardQuestion {
   id: string;
   text: string;
   source: "agent" | string;
@@ -754,7 +757,7 @@ export interface AgentCardQuestion {
 }
 
 /** The latest delivery of one prompt action to the agent's inbox. */
-export interface AgentCardDelivery {
+interface AgentCardDelivery {
   message_id: string;
   state: "queued" | "delivered" | "uncertain" | "not_delivered" | string;
   detail: string | null;
@@ -797,7 +800,7 @@ export interface AgentCardAction {
 }
 
 /** One action the user invoked on a card: what was sent, exactly, and what became of it. Kept after the report stops offering the action. */
-export interface AgentCardDeliveryRecord {
+interface AgentCardDeliveryRecord {
   action_id: string;
   label: string;
   /** The exact text sent: the action's prompt, or the user's reply. */
@@ -929,6 +932,135 @@ export interface AgentCardsSnapshot {
    * daemon, whose cards are drawn as roots with no roll-up.
    */
   tree?: boolean;
+  /**
+   * Issue #2399 — the daemon advertised batch card actions, so the Cards view
+   * may offer one action to many of these cards (`invokeCardActionBatch`).
+   * `false` (or absent) for an older daemon, which is never sent a batch.
+   */
+  batch?: boolean;
+  /**
+   * Issue #2399 (PR #2491 scope extension) — the daemon advertised the card
+   * actions editor's request, so the app may read and edit its card actions
+   * (`readCardCatalog`, `editCardCatalog`). `false` (or absent) for an older
+   * daemon, whose actions the editor shows read-only and sends nothing.
+   */
+  catalogEdit?: boolean;
+}
+
+/**
+ * PRD #2374 decision 2026-11-24 — one card action as the editor lists it, in
+ * the daemon's words: the action in effect (`source` `default` for the deck's
+ * own definition, `user` for the user config's), whether a deck default has
+ * its name, whether the user's entry overrides that default, and whether the
+ * user hid it (a hidden default is listed with the deck's own values).
+ */
+export interface EditableCardAction {
+  name: string;
+  label: string;
+  description: string;
+  prompt: string;
+  icon: string | null;
+  placement: string;
+  confirm: boolean;
+  always: boolean;
+  source: "default" | "user" | string;
+  default: boolean;
+  overridden: boolean;
+  hidden: boolean;
+}
+
+/** A daemon's card actions as the editor lists them, the catalog's problems, and the user config file it reads. */
+export interface EditableCardCatalog {
+  actions: EditableCardAction[];
+  errors: string[];
+  user_config: string | null;
+}
+
+/** One action as the editor's form sends it: the keys a `[[catalog.actions]]` entry may carry, and nothing else. */
+export interface CardActionInput {
+  name: string;
+  label?: string;
+  description: string;
+  prompt: string;
+  icon?: string;
+  placement?: string;
+  confirm: boolean;
+  always: boolean;
+}
+
+/** One change the card actions editor asks a daemon to make to its user catalog. */
+export type CardCatalogEdit =
+  | { kind: "add"; action: CardActionInput }
+  /*
+   * Issue #2399 re-review N5: `base` is the action as the editor read it
+   * (`null`: it read none); the daemon refuses an edit whose base is not the
+   * file's action of that name any more. Left out, the daemon does not check.
+   */
+  | { kind: "update"; action: CardActionInput; base?: EditableCardAction | null }
+  | { kind: "remove" | "hide" | "restore"; name: string; base?: EditableCardAction | null };
+
+/**
+ * Issue #2399 — one card a batch names, in the daemon's own words: its pane
+ * and the agent generation shown. An `execute` entry also carries the
+ * `action_token` and `instance_id` its preview answered.
+ */
+interface CardBatchEntry {
+  pane_id: string;
+  agent_id: string;
+  action_token?: string;
+  instance_id?: string;
+}
+
+/**
+ * Issue #2399 — how one batch is asked for: `preview` sends nothing and
+ * answers what each card would get; `execute` sends to the entries the user
+ * confirmed from that preview. `instanceId` is the daemon process that listed
+ * the cards (the call is bound to it); `requestId` names the batch.
+ */
+export interface CardBatchOptions {
+  mode: "preview" | "execute";
+  entries: CardBatchEntry[];
+  requestId: string;
+  instanceId?: string;
+}
+
+/**
+ * Issue #2399 — what happened, or would happen, to one card of a batch, as the
+ * daemon answered: `included` (with the exact `prompt` it gets) or `skipped`
+ * for a preview; `delivered`, `closed` or `failed` for an execution. A skip or
+ * a failure carries a stable `code` and a sentence to show. `unknown` is an
+ * execution nobody confirmed, which may or may not have reached the agent. The
+ * bridge gives it code `no_answer` when its wait ran out (possibly before the
+ * request was written) and `connection_lost` when the connection broke after
+ * the request was written; the hook's fallback for a rejected call carries no
+ * code. A daemon answers it for an entry of a batch it started and cannot
+ * account for: `interrupted` (its run was cut short) or `answer_not_kept` (a
+ * repeat of a batch whose outcome for this agent it did not keep).
+ */
+export interface CardBatchOutcome extends CardBatchEntry {
+  outcome: "included" | "skipped" | "delivered" | "closed" | "failed" | "unknown" | string;
+  name?: string;
+  label?: string;
+  kind?: string;
+  prompt?: string;
+  prompt_source?: string;
+  message_id?: string;
+  /**
+   * A `delivered` entry's delivery state when the daemon answered, as its own
+   * card records the same press (`recent_deliveries`): `queued` — the text is
+   * in the agent's inbox and the agent has not confirmed it yet. `delivered`
+   * is the outcome the press reached, not the agent's receipt.
+   */
+  state?: string;
+  kept_worktree?: string;
+  code?: string;
+  message?: string;
+}
+
+/** Issue #2399 — the daemon's answer to one batch: an outcome per card it named. */
+export interface CardBatchResult {
+  request_id: string;
+  entries: CardBatchOutcome[];
 }
 
 /**
@@ -997,7 +1129,7 @@ export interface WorkflowStage {
   enabled: boolean;
 }
 
-export interface CheckResult {
+interface CheckResult {
   id: string;
   name: string;
   status: "passed" | "failed" | "running" | "queued";
@@ -1005,7 +1137,7 @@ export interface CheckResult {
   command?: string;
 }
 
-export interface Artifact {
+interface Artifact {
   id: string;
   name: string;
   kind: "file" | "report" | "recording";
@@ -1051,7 +1183,18 @@ export type DeckView =
    * (`bindViewIncarnation`), and a key holding `undefined` is a deck that named
    * no process, on which the backend sends no action.
    */
-  | { kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview"; incarnation?: string };
+  | {
+    kind: "agent"; deckId: string; agentId: string; from: "deck" | "overview"; incarnation?: string;
+    /**
+     * PR #2491 decision 2026-11-26 — the pane opens on its Card tab rather than
+     * on Terminal: set only where the user asked for the card itself (a card's
+     * `+N`, voice's "show the coder's card"). Every other way in opens on
+     * Terminal.
+     */
+    cardTab?: boolean;
+    /** …and the Card tab scrolled to this part of it, which takes the keyboard. */
+    cardSection?: CardTabSection;
+  };
 
 /**
  * An agent's tab membership exactly as the daemon reports it, mirroring
@@ -1463,7 +1606,7 @@ export interface AgentProfile {
  * PRD #1258 M4 — one watched role's filesystem on a deck's host, as its daemon
  * reports it. A figure the daemon could not read is absent, never zero.
  */
-export interface HostDiskUsage {
+interface HostDiskUsage {
   role: string;
   freeBytes?: number;
   totalBytes?: number;
@@ -1750,7 +1893,7 @@ export interface DeckActionResult {
   agentIncarnation?: string;
 }
 
-export interface OrchestrationLaunchRole {
+interface OrchestrationLaunchRole {
   role: string;
   command: string;
   start: boolean;
@@ -2014,6 +2157,23 @@ export interface DeckRuntimeState {
   consumeAgentCards?: () => void;
   /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
   invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
+  /** Issue #2399 — preview or execute one action on many cards of one deck; the daemon checks and performs each as a single press. */
+  invokeCardActionBatch?: (deckId: string, actionId: string, options: CardBatchOptions) => Promise<CardBatchResult>;
+  /**
+   * PRD #2374 decision 2026-11-24 — read one daemon's card actions for the
+   * editor. Rejects with the reason it could not. Bound to daemon process
+   * `instanceId` (PR #2491 audit, A1/A2): a process that replaced it, or no
+   * process named, is sent nothing and the read rejects.
+   */
+  readCardCatalog?: (deckId: string, instanceId: string | undefined) => Promise<EditableCardCatalog>;
+  /**
+   * PRD #2374 decision 2026-11-24 — change one daemon's card actions; answers
+   * them after the change, or rejects with the daemon's reason (nothing
+   * written). Bound to daemon process `instanceId`, the one whose list the
+   * edit was made from (PR #2491 audit, A1/A2): a process that replaced it,
+   * or no process named, is sent nothing and the edit rejects.
+   */
+  editCardCatalog?: (deckId: string, edit: CardCatalogEdit, instanceId: string | undefined) => Promise<EditableCardCatalog>;
   /**
    * PRD #1790 stage 2 — each deck's interrupted work (what a restart of its
    * daemon left behind), the dialog that lists it, and the calls that act on
@@ -2203,7 +2363,7 @@ export interface DeckRuntimeState {
    * screen is the one piece of live state that exists ONLY in the webview; see
    * `DeckBridge.declareVoiceScreen` for the whole of that seam.
    */
-  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto, reading?: import("./lib/bridge").VoiceReadingStateDto) => void;
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto, reading?: import("./lib/bridge").VoiceReadingStateDto, dashboard?: import("./lib/bridge").VoiceDashboardDto) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
   /**
    * PRD #1261 — answer a pending numbered choice, locally

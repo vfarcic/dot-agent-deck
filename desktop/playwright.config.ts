@@ -1,4 +1,7 @@
+import { accessSync, constants, realpathSync } from "node:fs";
 import { createServer } from "node:net";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { defineConfig, devices } from "@playwright/test";
 
@@ -30,6 +33,48 @@ import { defineConfig, devices } from "@playwright/test";
  * and never on a timer, so a failure here is meant to be a fact rather than a
  * coin toss. `.config/nextest.toml` takes the same position for the Rust tiers.
  */
+
+/**
+ * The host's `ldd` under devbox (issue #2399).
+ *
+ * Before launching WebKit, Playwright checks the host for its libraries by
+ * running `ldd` — found on `PATH` — on every binary of the browser. Inside a
+ * `devbox shell` the `ldd` on `PATH` is nix glibc's, whose loader does not
+ * read the host's library cache, so it reports `libglib-2.0.so.0` and dozens
+ * more as missing on a machine that has them, and the WebKit projects fail
+ * before any test. So when the `ldd` on `PATH` resolves into `/nix/store` and
+ * the host has `/usr/bin/ldd`, `scripts/host-ldd` — one script that runs
+ * `/usr/bin/ldd` — goes first on `PATH`. Nothing else on `PATH` moves, and
+ * nothing changes where `ldd` is not nix's (CI, a plain shell). Set here, in
+ * every evaluation, so the workers that launch the browsers have it too.
+ */
+function onPath(command: string): string | undefined {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, command);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // not here
+    }
+  }
+  return undefined;
+}
+
+const HOST_LDD_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "scripts", "host-ldd");
+if (process.platform === "linux") {
+  const ldd = onPath("ldd");
+  const nixLdd = ldd !== undefined && realpathSync(ldd).startsWith("/nix/store/");
+  let hostLdd = false;
+  try {
+    accessSync("/usr/bin/ldd", constants.X_OK);
+    hostLdd = true;
+  } catch {
+    // no host ldd to point at
+  }
+  if (nixLdd && hostLdd) process.env.PATH = `${HOST_LDD_DIR}${path.delimiter}${process.env.PATH ?? ""}`;
+}
 
 /**
  * Which port this run serves the bundle on (issue #1481).

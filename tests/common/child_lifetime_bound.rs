@@ -59,8 +59,8 @@
 //! **Self-contained, for the same reason `src/test_temp.rs` is** (issue #474):
 //! this file is compiled into every crate that `#[path]`-includes it, where
 //! `crate::` names that *test binary's* own root and nothing this repository
-//! defines is in scope. It uses `std`, the `ctor` dev-dependency, and one
-//! public constant from the library, each by its extern-crate path; no
+//! defines is in scope. It uses `std`, the `ctor` dev-dependency, and two
+//! public constants from the library, each by its extern-crate path; no
 //! `crate::` or file-scope `super::` path may appear here.
 //!
 //! Enforced by linkage-check rule 10: a file under `tests/` that constructs an
@@ -227,6 +227,24 @@ pub unsafe fn pin_before_main() {
         // which starts a thread from a constructor of its own.)
         unsafe { std::env::set_var(var, value) };
     }
+    // Issue #2531: point the state directory where nothing can be created.
+    // This file is here because it is the one every crate that builds an agent
+    // registry or runs a daemon includes (linkage-check rule 10), not because
+    // the state directory has anything to do with the lifetime cap. A test
+    // process otherwise resolves the developer's `~/.local/state/dot-agent-deck`
+    // (or a deck pane's inherited override), and a daemon run in-process there
+    // journals every fixture agent it spawns into the real Interrupted work
+    // list. A test that needs a state directory chooses its own: a child gets
+    // one in its environment, an in-process daemon through
+    // `Daemon::with_state_dir_override`.
+    #[cfg(unix)]
+    // SAFETY: as above, a pre-main constructor with no other thread.
+    unsafe {
+        std::env::set_var(
+            "DOT_AGENT_DECK_STATE_DIR",
+            dot_agent_deck::platform::paths::TEST_UNREACHABLE_STATE_DIR,
+        )
+    };
     let _ = ARMED_BEFORE_MAIN.set(());
 }
 

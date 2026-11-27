@@ -331,6 +331,46 @@ describe("the restart notice's interrupted work line", () => {
   });
 });
 
+describe("the restart notice over an open agent pane (issue #2555)", () => {
+  /** Process B keeps one agent of its own, so there is a pane to open after the restart. */
+  const keepsOne = (agents: AgentSession[]) => agents.slice(0, 1).map((one) => ({ ...one, id: "b-only", displayName: "b-only-agent" }));
+
+  /** The deck restarts and lists interrupted work; then the user opens B's one agent from the dashboard. */
+  async function paneUnderNotice() {
+    const { bridge } = recordingBridge({ list: three() });
+    const { rerender } = render(<Shell bridge={bridge} deck={deckOf("process-a")} />);
+    await act(async () => { rerender(<Shell bridge={bridge} deck={deckOf("process-b", keepsOne)} />); });
+    const toast = await screen.findByTestId("restart-toast");
+    const show = await within(toast).findByTestId("restart-toast-interrupted-show");
+    await act(async () => { fireEvent.click(screen.getByRole("row", { name: "Open b-only-agent agent" })); });
+    const pane = screen.getByTestId("agent-pane-overlay");
+    await waitFor(() => expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull());
+    return { toast, show, pane };
+  }
+
+  /** Scenario: the deck restarts, listing interrupted work, and the user opens an agent's pane with the restart notice still in the corner. The notice's Show and X are the only controls reachable outside the pane; Show goes to the dashboard and opens the "Interrupted work" dialog. */
+  it("keeps Show and the X reachable over the pane, and Show opens the dialog", async () => {
+    const { toast, show, pane } = await paneUnderNotice();
+    const outside = Array.from(document.querySelectorAll("button, a[href], input, select, textarea, [tabindex]"))
+      .filter((element) => !pane.contains(element) && !element.closest("[inert]"));
+    expect(outside).toEqual([show, within(toast).getByRole("button", { name: "Dismiss restart notice" })]);
+    expect(show).toBeEnabled();
+    await act(async () => { fireEvent.click(show); });
+    expect(await screen.findByTestId("interrupted-dialog")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+  });
+
+  /** Scenario: with the pane open under the restart notice, the user starts Close agent, so its confirmation is drawn above the pane. The notice's Show is disabled while the confirmation is up — it is not a way past a question being answered — and comes back once it is cancelled. */
+  it("disables Show while a dialog is drawn above the pane", async () => {
+    const { show, pane } = await paneUnderNotice();
+    await act(async () => { fireEvent.click(within(pane).getByRole("button", { name: "Close agent" })); });
+    const confirmation = await screen.findByRole("alertdialog");
+    await waitFor(() => expect(show).toBeDisabled());
+    await act(async () => { fireEvent.click(within(confirmation).getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(show).toBeEnabled());
+  });
+});
+
 describe("the restart notice and an incomplete empty list (PR #2431 review)", () => {
   /** Scenario: the deck restarts and its new daemon's interrupted work list comes back empty but incomplete, so the dashboard offers a banner; the restart toast adds "The deck could not read its whole work journal, so some interrupted work may not be listed." with a Show that opens the "Interrupted work" dialog, which says the list is incomplete. */
   it("offers Show for an incomplete empty list", async () => {

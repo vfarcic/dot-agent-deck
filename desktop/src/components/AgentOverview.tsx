@@ -1,8 +1,8 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Ellipsis, Filter, LayoutList, Layers, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { worktreePreview } from "../lib/worktreeClose";
-import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
+import { type AgentCardEntry, type AgentSession, type AgentStatus, type CardTabSection, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
@@ -43,10 +43,16 @@ import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
 import { ENDED_ROLE_WORDS, endedRoleOfCard, endedRolesOf } from "../lib/endedRoles";
 import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
-import { needsYouSentence, type PlacedCard } from "../lib/agentCards";
+import { needsYouSentence, placedCardKey, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
-import { AgentCardsDeckBody, AgentCardsToolbar } from "./AgentCardsGrid";
-import { AgentCardOverlay } from "./AgentCardOverlay";
+import { AgentCardsDeckBody, AgentCardsNotes, AgentCardsSelectionBar, NO_UNCOUNTED, needsYouCountDescription, type SelectionBarEditor, type UncountedDaemons } from "./AgentCardsGrid";
+import { needsYouRowKeys } from "../lib/agentCardsTree";
+import { MoreMenu, type MoreMenuItem } from "./MoreMenu";
+import { AgentCardReviewDialog } from "./AgentCardReviewDialog";
+import type { PaneCardsChannel, PaneCardsView } from "../lib/paneCards";
+import { AgentCardBatchDialog } from "./AgentCardBatchDialog";
+import { AgentCardActionsEditor } from "./AgentCardActionsEditor";
+import { useCardActionsEditor, type CardActionsDaemon } from "../hooks/useCardActionsEditor";
 import { OverviewRowCard } from "./OverviewRowMenu";
 
 /**
@@ -253,7 +259,7 @@ export interface OverviewGroup {
  * Issue #1965 — `groups` with each orchestration's exited roles attached, from
  * the deck's own reply.
  */
-export function withEndedRoles(groups: OverviewGroup[], endedRoles: readonly EndedRole[] | undefined): OverviewGroup[] {
+function withEndedRoles(groups: OverviewGroup[], endedRoles: readonly EndedRole[] | undefined): OverviewGroup[] {
   if (!endedRoles?.length) return groups;
   const withRows = groups.map((group) => {
     if (group.kind !== "orchestration") return group;
@@ -656,7 +662,7 @@ export const OVERVIEW_CLOCK_TICK_MS = 10_000;
  * interval before correcting would show a time that is knowably wrong at the
  * one moment the user is looking straight at it.
  */
-export function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): number {
+function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     let timer: number | undefined;
@@ -707,7 +713,7 @@ const WRITE_LEASE_TITLE: Record<"read" | "none", string> = {
  * marker on one that is not (CLAUDE.md rule 22). Absence — a daemon that
  * reported no lease — prints nothing, and is not read as read-only.
  */
-export function shownWriteLease(writeLease: OverviewAgent["writeLease"]): "read" | "none" | undefined {
+function shownWriteLease(writeLease: OverviewAgent["writeLease"]): "read" | "none" | undefined {
   return writeLease === "read" || writeLease === "none" ? writeLease : undefined;
 }
 
@@ -854,13 +860,13 @@ function modalOtherThanInterruptedOpen(): boolean {
 const MAX_NUMBERED_ROWS = 1_000;
 
 /** Already at the bottom, for "scroll down". */
-export const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
+const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
 /** Already at the top, for "scroll up". */
-export const DASHBOARD_AT_TOP = "The dashboard is already at the top.";
+const DASHBOARD_AT_TOP = "The dashboard is already at the top.";
 /** A menu or dialog is in front of the dashboard, such as the open Daemon selector. */
 export const DASHBOARD_COVERED = "Something is open over the dashboard, so it was not scrolled. Close it first.";
 /** Nothing to scroll: every daemon and agent fits in the window. */
-export const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
+const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
 
 /**
  * Issue #2306 — where the dashboard's own smooth scroll is heading, by region:
@@ -967,14 +973,14 @@ export const STOP_TARGET_GONE = "That agent is not on the dashboard any more, so
  */
 export const STOP_TARGET_RESTARTED = `${AGENT_GONE_AFTER_RESTART[0].toUpperCase()}${AGENT_GONE_AFTER_RESTART.slice(1)}, so nothing was closed.`;
 /** The orchestration a spoken close named is no longer on the overview. */
-export const ORCHESTRATION_GONE = "That orchestration is not on the dashboard any more, so nothing was closed.";
+const ORCHESTRATION_GONE = "That orchestration is not on the dashboard any more, so nothing was closed.";
 /** A confirmation is already open; a second would replace it under the user's pointer. */
 export const CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — answer it first. Nothing else was stopped.";
 /** The New agent dialog is modal, so a stop's confirmation could not be reached behind it. */
 export const STOP_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was stopped.";
 
 /** What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role. */
-export function stopTargetName(agent: OverviewAgent): string {
+function stopTargetName(agent: OverviewAgent): string {
   const raw = agent.tab.kind === "orchestration" && agent.tab.roleName ? agent.tab.roleName : agent.displayName;
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
@@ -1076,20 +1082,20 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
   Yes/No. It asks an agent to write a file the user can review, so it is drawn
   neutral rather than as a stop.
 */
-export const GENERATE_CONFIG_TITLE = "Generate .dot-agent-deck.toml";
-export const GENERATE_CONFIG_BODY = "No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?";
+const GENERATE_CONFIG_TITLE = "Generate .dot-agent-deck.toml";
+const GENERATE_CONFIG_BODY = "No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?";
 /** PRD #2119 — the same question when the daemon reports the project already has a config: the TUI's words again. */
-export const UPDATE_CONFIG_TITLE = "Update .dot-agent-deck.toml";
-export const UPDATE_CONFIG_BODY = "This project already has an orchestration config. Want to instruct your agent to analyze the project and update the existing config?";
+const UPDATE_CONFIG_TITLE = "Update .dot-agent-deck.toml";
+const UPDATE_CONFIG_BODY = "This project already has an orchestration config. Want to instruct your agent to analyze the project and update the existing config?";
 /**
  * PR #2362 review — the question when the daemon could not tell whether the project has a config (or did not say):
  * it claims neither, since the request the daemon then sends is the conditional one. Titled Generate, like the
  * button. The TUI's words again (`render_config_gen_prompt`, CLAUDE.md rule 22).
  */
-export const UNKNOWN_CONFIG_BODY = "Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?";
+const UNKNOWN_CONFIG_BODY = "Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?";
 
 /** PRD #2119 — the confirmation's body for what the daemon reported: an existing config, none, or unknown. */
-export function configConfirmationBody(agent: Pick<OverviewAgent, "projectConfigExists">): string {
+function configConfirmationBody(agent: Pick<OverviewAgent, "projectConfigExists">): string {
   if (agent.projectConfigExists === true) return UPDATE_CONFIG_BODY;
   if (agent.projectConfigExists === false) return GENERATE_CONFIG_BODY;
   return UNKNOWN_CONFIG_BODY;
@@ -1107,7 +1113,7 @@ export const GENERATE_TARGET_RESTARTED = `${AGENT_GONE_AFTER_RESTART[0].toUpperC
 /** A confirmation is already open; a second would replace it under the user's pointer. */
 export const GENERATE_CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — answer it first. Nothing was sent.";
 /** The New agent dialog is modal, so the question could not be reached behind it. */
-export const GENERATE_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was sent.";
+const GENERATE_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was sent.";
 /** Prefix of the failure sentence, the TUI's (`daemon_client::CONFIG_GEN_FAILED_PREFIX`), for a request the app itself could not hand over. */
 const GENERATE_CONFIG_FAILED_PREFIX = "Failed to send config prompt";
 
@@ -1194,7 +1200,7 @@ function interruptedSeveral(names: string[], definite: boolean, then: string): s
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, onNewAgentChange, notice, selfUpgrade, onConfigRequestSent }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, agentPane, paneCards, voiceChannel, newAgentVoice, onConfirmationChange, onNewAgentChange, notice, selfUpgrade, onConfigRequestSent }: {
   runtime: DeckRuntimeState;
   /**
    * PRD #2119 — told when Generate config was sent from this screen, after it
@@ -1220,6 +1226,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * readline's next-history key, and an agent's terminal may be waiting for it.
    */
   agentPaneOpen?: boolean;
+  /**
+   * PR #2491 decision 2026-11-25 — the agent whose pane is open over this
+   * screen: where the pane header's previous and next move from.
+   */
+  agentPane?: { deckId: string; agentId: string; incarnation?: string };
+  /**
+   * PR #2491 decision 2026-11-25 — where this screen publishes the cards the
+   * agent pane's Card tab draws; absent where no pane is drawn beside it.
+   */
+  paneCards?: PaneCardsChannel;
   /**
    * PRD #1223 U5 — where this screen publishes what a voice dispatch may need
    * from it: `closeNewAgent`, only while the New agent dialog is open. Absent
@@ -1737,12 +1753,20 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          it; withheld while the New agent dialog is open over the dashboard. */
       ...(interrupted && !newAgent ? { showInterruptedWork, hideInterruptedWork, interruptedDialog } : {}),
       /* PRD #2374 — the cards' members, only while the runtime offers cards;
-         `closeAgentCard` only while a card is open. */
+         `closeCardReview` only while a review is open. */
       ...(cards.shown ? cards.voice : {}),
+      /* PRD #2374 decision 2026-11-24 — the Card actions editor's members,
+         while the cards are shown and a daemon on screen has them. */
+      ...(cards.shown && cardActionsEditor.shown ? cardActionsEditor.controls : {}),
     };
+    /* PR #2491 (2026-11-25) — the dashboard's view and Needs you only as
+       they stand, while the runtime offers cards: the voice panel declares
+       them with each utterance on the dashboard, so the command model reads
+       "show all cards" as the filter's off switch while the filter is on. */
+    const dashboardState = cards.shown ? { dashboardState: () => ({ view: cards.mode, needsYouOnly: cards.needsYouOnly }) } : {};
     voiceChannel.current = newAgent
-      ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
-      : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
+      ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves, ...dashboardState }
+      : newAgentAvailable ? { openNewAgent, ...directoryMoves, ...dashboardState } : { ...directoryMoves, ...dashboardState };
     return () => { voiceChannel.current = undefined; };
   });
   const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters }), [onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters]);
@@ -1851,22 +1875,38 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [voiceContext]);
   /*
     PRD #2374 — the agent cards: the Table |
-    Cards switch, the cards grid, the card overlay and the table's needs-you
+    Cards switch, the cards grid, the single-action review and the table's needs-you
     marker and row menu. A card's `open` action opens the agent exactly as a
     row does.
   */
   const cardDeckList = useMemo(() => decks.map((deck) => ({ deckId: deck.snapshot.connection.deckId, connected: deck.connected })), [decks]);
-  const openCardAgent = useCallback((target: { deckId: string; agentId: string; incarnation?: string }) => {
-    VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
-  }, [voiceContext]);
+  /* A card opens its agent's pane through the target the agent's table row
+     opens (issue #2418, D12), so the two cannot open different things. The
+     listed agent is the card's only when the daemon process that listed it is
+     the card's too (PR #2491 review, Qodo 5): agent ids are per-process, so
+     after a restart an older card keeps its own identity instead of opening
+     the newer agent that took its id. */
+  const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
+    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => cardIsAgent(card.entry, candidate));
+    return agent
+      ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
+      : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
+  }, [decks]);
+  const openCardAgent = useCallback((card: PlacedCard, options?: { cardTab?: boolean; cardSection?: CardTabSection }) => {
+    VOICE_ACTIONS.openAgent.run(voiceContext, { ...cardOpenTarget(card), ...(options?.cardTab ? { cardTab: true } : {}), ...(options?.cardSection ? { cardSection: options.cardSection } : {}) });
+  }, [cardOpenTarget, voiceContext]);
   /* PRD #2374 — in the Cards view, the cards of a deck whose daemon has them,
      after the dashboard filter; `undefined` for a deck that keeps its usual
      body (the Table view, or a daemon with no cards or not answering). */
-  const cardsOnScreen = (deck: (typeof decks)[number]): PlacedCard[] | undefined => {
+  const cardsOnScreen = (deck: (typeof decks)[number]): PlacedCard[] | undefined => (cards.mode === "cards" ? cardsOfDeck(deck) : undefined);
+  /* The cards of a deck whose daemon has them, after the dashboard filter,
+     whichever view is on screen: what Needs you only and the top bar's
+     needs-you count read in the Table view too (PR #2491 decision 2026-11-25). */
+  function cardsOfDeck(deck: (typeof decks)[number]): PlacedCard[] | undefined {
     const deckId = deck.snapshot.connection.deckId;
-    if (cards.mode !== "cards" || !deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
+    if (!deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
     return cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents)));
-  };
+  }
   /* PRD #1790 stage 2 — a deck's banner, while its daemon lists interrupted work and it was not hidden for this process. */
   const interruptedBannerFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
     const deckId = deck.snapshot.connection.deckId;
@@ -1886,7 +1926,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} openTarget={cardOpenTarget} endedRoles={deck.snapshot.endedRoles} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} endedRoles={deck.snapshot.endedRoles} selection={cards.batchFor(deckId) ? cards.selection : undefined} />;
   };
   const openCardReference = useContext(OpenCardReference);
   /* Issue #2418 — whether the dashboard filter keeps a card off the Cards
@@ -1898,21 +1938,132 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       return deck !== undefined && !cardMatchesFilter(card, deck.matchingAgents);
     };
   }, [decks, filtering]);
-  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
-  /* Issue #1965 — the exited role the open card is for, from its own deck's reply: the overlay says why in full. */
-  const overlayCard = cards.overlay?.card;
-  const overlayEnded = overlayCard
-    ? endedRoleOfCard(decks.find((deck) => deck.snapshot.connection.deckId === overlayCard.deckId)?.snapshot.endedRoles, overlayCard.entry)
-    : undefined;
+  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, pane: agentPane, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
+  /* The cards on screen across the daemons, whichever view shows: the top
+     bar's needs-you count and the "nothing needs you" note read them. */
+  /* `cardsOfDeck` reads the cards, the decks and the filter, which are the memo's inputs. */
+  const cardsShown = useMemo(() => decks.flatMap((deck) => cardsOfDeck(deck) ?? []), [cards.decksWithCards, cards.placed, decks, filtering]);
+  const needYouCount = cardsShown.filter((card) => card.entry.needs_you).length;
+  /* PR #2491 review S1 — the daemons on screen the cards do not speak for: a
+     connected one that reports no cards (and has an agent on screen), and one
+     that is not answering. While any is listed, neither the note above the
+     daemons nor the ⋯ says that nothing needs the user. */
+  const uncountedDecks = useMemo<UncountedDaemons>(() => {
+    const notReporting = new Set<string>();
+    const notAnswering = new Set<string>();
+    for (const deck of decks) {
+      if (cardsOfDeck(deck) !== undefined) continue;
+      if (!deck.connected) notAnswering.add(deckName(deck.snapshot.connection));
+      else if (deck.matchingAgents.length > 0) notReporting.add(deckName(deck.snapshot.connection));
+    }
+    return notReporting.size === 0 && notAnswering.size === 0 ? NO_UNCOUNTED : { notReporting: [...notReporting], notAnswering: [...notAnswering] };
+  }, [cards.decksWithCards, cards.placed, decks, filtering]);
+  const needYouDescription = needsYouCountDescription(needYouCount, uncountedDecks);
+  /*
+    PR #2491 decision 2026-11-25 — Needs you only in the Table view: each
+    daemon that has cards shows only the rows whose card needs the user and
+    the rows of the agents above them in its card tree, the path the Cards
+    view keeps bright; the rest are hidden rather than faded, since a table
+    row has no tree to keep it in place. A group with none of those rows is
+    left out, and a daemon with none says so in one line. A daemon without
+    cards keeps its rows: it marks nothing as needing the user. The rows
+    numbered for voice are the rows shown, as under the dashboard filter.
+  */
+  const needsYouRows = useMemo(() => (cards.mode === "table" && cards.needsYouOnly ? needsYouRowKeys(cardsShown, cards.treeFor) : undefined), [cards.mode, cards.needsYouOnly, cards.treeFor, cardsShown]);
+  const shownDecks = useMemo(() => (needsYouRows === undefined ? decks : decks.map((deck): FleetDeck => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (deckId === undefined || !deck.connected || !cards.decksWithCards.has(deckId)) return deck;
+    const kept = deck.matchingAgents.filter((agent) => {
+      const card = cards.cardFor(deckId, agent.id, agent.incarnation);
+      return card !== undefined && needsYouRows.has(placedCardKey(card));
+    });
+    const shown = groupAgents(kept);
+    return {
+      ...deck,
+      sections: deck.groups.flatMap((group) => {
+        const matching = shown.find((candidate) => candidate.key === group.key);
+        return matching ? [{ group: matching, matching: true }] : [];
+      }),
+      shownCount: kept.length,
+      needsYouOnly: true,
+    };
+  })), [cards.cardFor, cards.decksWithCards, decks, needsYouRows]);
+  /* PRD #2374 decision 2026-11-24 — the Card actions editor, over the daemons
+     whose cards the dashboard shows, in the dashboard's order. Each daemon's
+     ⋯ menu opens it bound to that daemon (PR #2491 decision 2026-11-25). */
+  const cardActionDaemons = useMemo<CardActionsDaemon[]>(() => decks.flatMap((deck) => {
+    const deckId = deck.snapshot.connection.deckId;
+    const snapshot = deckId !== undefined ? runtime.agentCards?.[deckId] : undefined;
+    return deckId !== undefined && snapshot ? [{ deckId, name: deckName(deck.snapshot.connection), editable: snapshot.catalogEdit === true, instanceId: snapshot.instanceId }] : [];
+  }), [decks, runtime.agentCards]);
+  /* PR #2491 (the maintainer, 2026-11-25) — the daemons the selected cards
+     are on, in the dashboard's order: the selection bar's Edit card actions
+     opens one of their editors, and with a selection on screen on exactly one
+     daemon, a spoken "open card actions" naming none opens that daemon's. */
+  const selectionDaemons = useMemo(() => {
+    const deckIds = cards.mode === "cards" && cards.selection && cards.selection.selected.size > 0 ? cards.selection.deckIds : [];
+    return cardActionDaemons.filter((daemon) => deckIds.includes(daemon.deckId));
+  }, [cardActionDaemons, cards.mode, cards.selection]);
+  /* PR #2491 review T1 — with an agent's pane open over the dashboard, an
+     opening that names no daemon (a spoken "open card actions" there) means
+     the pane's daemon, never the selection's behind it. */
+  const cardActionsEditor = useCardActionsEditor({ runtime, daemons: cardActionDaemons, preferredDeckId: selectionDaemons.length === 1 ? selectionDaemons[0].deckId : undefined, paneDeckId: agentPaneOpen ? agentPane?.deckId : undefined });
+  /* The editor's opening, stable across renders, for the surfaces outside the
+     overview's own controls (the selection bar, the agent pane's Card tab):
+     it always reaches the editor as it stands now. */
+  const latestEditor = useRef(cardActionsEditor);
+  latestEditor.current = cardActionsEditor;
+  const openCardActionsEditor = useCallback((deckId?: string) => latestEditor.current.controls.openCardActionsEditor(deckId), []);
+  const { shown: editorShown, offeredFor: editorOfferedFor } = cardActionsEditor;
+  const selectionEditor = useMemo<SelectionBarEditor | undefined>(() => (editorShown
+    ? { daemons: selectionDaemons.filter((daemon) => editorOfferedFor(daemon.deckId)), controls: { openCardActionsEditor, reportRefused: cards.clickControls.reportRefused } }
+    : undefined), [cards.clickControls.reportRefused, editorOfferedFor, editorShown, openCardActionsEditor, selectionDaemons]);
+  /* PR #2491 decision 2026-11-25 — the items of a daemon's ⋯ menu: Card
+     actions, opening the editor bound to that daemon, while it shows cards
+     (read-only, with the reason, on a daemon whose release cannot edit them).
+     Later items join this list. */
+  const deckMoreItems = (deck: FleetDeck): MoreMenuItem[] | undefined => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (!cards.shown || deckId === undefined || !cardActionsEditor.offeredFor(deckId)) return undefined;
+    const editor = { ...cardActionsEditor.controls, reportRefused: cards.clickControls.reportRefused };
+    return [{
+      key: "card-actions",
+      label: "Card actions",
+      testId: "daemon-card-actions",
+      title: "Add, change, hide or remove the actions this daemon's agents offer on their cards",
+      onSelect: () => VOICE_ACTIONS.openCardActionsEditor.run(editor, deckId),
+    }];
+  };
+  const needYouCountId = useId();
+  /* Issue #1965 — the exited role a card is for, from its own deck's reply: the Card tab says why in full. */
+  const endedForCard = useCallback((card: PlacedCard) => endedRoleOfCard(decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.snapshot.endedRoles, card.entry), [decks]);
   /* Issue #2418 (D12) — a card's name opens its agent through `openAgent`
      with the same members a table row's click uses, so the two cannot open
      different things. */
   const cardControls = useMemo(() => ({ ...cards.clickControls, navigate: voiceContext.navigate, revealAgent: voiceContext.revealAgent }), [cards.clickControls, voiceContext]);
-  const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
-    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => candidate.id === card.entry.agent_id);
-    return agent
-      ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
-      : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
+  /* PR #2491 decision 2026-11-25 — what the agent pane's Card tab draws,
+     published for the pane beside this screen; withdrawn on unmount. */
+  const paneCardsView = useMemo<PaneCardsView | undefined>(() => (cards.shown
+    ? {
+      shownFor: (deckId) => cards.decksWithCards.has(deckId),
+      cardFor: cards.cardFor,
+      resultsFor: cards.resultsFor,
+      treeFor: cards.treeFor,
+      endedFor: endedForCard,
+      notice: cards.notice,
+      /* PR #2491 (the maintainer, 2026-11-25) — the panel's Edit, beside its
+         Actions heading, opens the editor of the agent's daemon. */
+      cardActionsFor: editorOfferedFor,
+      controls: { ...cards.clickControls, openCardActionsEditor },
+    }
+    : undefined), [editorOfferedFor, openCardActionsEditor, cards.cardFor, cards.clickControls, cards.decksWithCards, cards.notice, cards.resultsFor, cards.shown, cards.treeFor, endedForCard]);
+  useLayoutEffect(() => { paneCards?.set(paneCardsView); }, [paneCards, paneCardsView]);
+  useEffect(() => () => { paneCards?.set(undefined); }, [paneCards]);
+  /* Issue #2399 review — the batch dialog names each agent's daemon the way
+     the dashboard's section header does, when a batch reaches more than one. */
+  const batchDaemonName = useCallback((deckId: string) => {
+    const deck = decks.find((candidate) => candidate.snapshot.connection.deckId === deckId);
+    return deck ? deckName(deck.snapshot.connection) : deckId;
   }, [decks]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   /* The confirmation on screen as of the last render, read by an answer that
@@ -1955,8 +2106,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     !rowsShown
       ? undefined
       /* Issue #1496 — the rows SHOWING, so a number names a row on screen. */
-      : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.sections.flatMap((section) => (section.matching ? section.group.agents : [])) : [])).slice(0, MAX_NUMBERED_ROWS)
-  ), [decks, rowsShown]);
+      : shownDecks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.sections.flatMap((section) => (section.matching ? section.group.agents : [])) : [])).slice(0, MAX_NUMBERED_ROWS)
+  ), [shownDecks, rowsShown]);
   const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => {
     /* Issue #1668 — an orchestration's row by its run's title and its name,
        as Reading names it, so two runs' coders are two names in a choice. */
@@ -2333,8 +2484,49 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" aria-label="Open daemons" title="Open daemons" onClick={openDeck}><SquareTerminal size={14} /></button>}
             {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} consumeCards={runtime.consumeAgentCards} />}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
+            {/* PR #2491 decision 2026-11-25 — while Needs you only is on, a chip beside Filter says so, and one press anywhere on it turns it off. */}
+            {cards.shown && cards.needsYouOnly && (
+              <button
+                type="button"
+                className="button secondary compact needs-you-chip"
+                data-testid="needs-you-chip"
+                aria-label="Needs you only: show every agent"
+                title="Needs you only is on. Press to show every agent again."
+                onClick={() => VOICE_ACTIONS.toggleNeedsYouFilter.run(cards.clickControls, { needsYouOnly: false })}
+              ><span>Needs you only</span><X size={12} aria-hidden="true" /></button>
+            )}
             {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
+            {/*
+              PR #2491 decision 2026-11-25 — the Dashboard's ⋯ menu, right of
+              Refresh: Needs you only, checkable, for both views. The count on
+              it is how many agents on screen need the user, which the line
+              above the cards used to say.
+            */}
+            {cards.shown && (
+              <>
+                <MoreMenu
+                  label="More"
+                  menuLabel="More"
+                  testId="overview-more"
+                  className="more-menu"
+                  menuTestId="overview-more-menu"
+                  buttonClassName="button secondary compact more-menu-button"
+                  icon={<Ellipsis size={14} aria-hidden="true" />}
+                  describedBy={needYouDescription !== undefined ? needYouCountId : undefined}
+                  badge={needYouCount > 0 ? <span className="more-menu-count" data-testid="overview-needs-you-count" aria-hidden="true">{needYouCount}</span> : undefined}
+                  items={[{
+                    key: "needs-you-only",
+                    label: "Needs you only",
+                    testId: "overview-needs-you-only",
+                    checked: cards.needsYouOnly,
+                    title: cards.needsYouOnly ? "Show every agent again" : "Show only the agents that need you, with the agents they sit under",
+                    onSelect: () => VOICE_ACTIONS.toggleNeedsYouFilter.run(cards.clickControls, { needsYouOnly: !cards.needsYouOnly }),
+                  }]}
+                />
+                {needYouDescription !== undefined && <span id={needYouCountId} hidden>{needYouDescription}</span>}
+              </>
+            )}
           </div>
         </header>
 
@@ -2400,12 +2592,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.controls} />}
+          {cards.shown && <AgentCardsNotes cards={cardsShown} needsYouOnly={cards.needsYouOnly} cardsView={cards.mode === "cards"} uncounted={uncountedDecks} />}
           {/* PRD #2374 — in the Cards view every deck keeps its own section and
               header, with the daemon's own controls; a deck whose daemon has
               cards shows them as the section's body, and one with no cards (or
               that is not answering) keeps its usual body. */}
-          {decks.map((deck) => (
+          {shownDecks.map((deck) => (
             <DeckGroup
               /*
                 PRD #742 M5: the KEY, not the label. `socketPath` is
@@ -2448,11 +2640,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
               onCloseHost={() => { if (deck.snapshot.connection.deckId !== undefined) closeHostMetrics(deck.snapshot.connection.deckId); }}
               interruptedBanner={interruptedBannerFor(deck)}
+              moreItems={deckMoreItems(deck)}
             />
           ))}
+          {/* PR #2491 review — last in the scroll region, so it sticks to the region's foot while cards are selected and, scrolled to the end, sits below the last card rather than over it. */}
+          {cards.mode === "cards" && cards.selection && <AgentCardsSelectionBar selection={cards.selection} controls={cards.clickControls} editor={selectionEditor} />}
         </section>
       </main>
-      {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} ended={overlayEnded} />}
+      {cards.review && <AgentCardReviewDialog review={cards.review} controls={cards.clickControls} />}
+      {cards.batch && <AgentCardBatchDialog view={cards.batch} controls={cards.clickControls} daemonName={batchDaemonName} />}
+      {cardActionsEditor.view && <AgentCardActionsEditor view={cardActionsEditor.view} editor={cardActionsEditor} />}
       {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
@@ -2503,6 +2700,8 @@ interface FleetDeck {
   shownCount: number;
   /** The agents the filter shows (all of {@link agents} while none is set): the Cards view shows their cards. */
   matchingAgents: OverviewAgent[];
+  /** PR #2491 decision 2026-11-25 — `sections` hold only the rows Needs you only keeps (the Table view). */
+  needsYouOnly?: boolean;
   counts: { status: StatusWord; count: number }[];
   connected: boolean;
 }
@@ -2514,8 +2713,17 @@ interface FleetDeck {
  * their order or what they say (PRD #2374 review).
  */
 function cardMatchesFilter(card: PlacedCard, matching: readonly OverviewAgent[]): boolean {
-  return matching.some((agent) => agent.id === card.entry.agent_id
-    && (agent.incarnation === undefined || card.entry.instance_id === "" || card.entry.instance_id === agent.incarnation));
+  return matching.some((agent) => cardIsAgent(card.entry, agent));
+}
+
+/**
+ * Whether `entry` is the card of `agent`: the same id, listed by the same
+ * daemon process when both name one. Agent ids are per-process, so a card from
+ * before a restart is not the card of the newer agent that took its id.
+ */
+function cardIsAgent(entry: Pick<AgentCardEntry, "agent_id" | "instance_id">, agent: Pick<OverviewAgent, "id" | "incarnation">): boolean {
+  return agent.id === entry.agent_id
+    && (agent.incarnation === undefined || entry.instance_id === "" || entry.instance_id === agent.incarnation);
 }
 
 /** One group as the filter leaves it: its matching agents, or a line saying none match. */
@@ -2567,9 +2775,11 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner }: {
+function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner, moreItems }: {
   /** PRD #1790 stage 2 — this deck's interrupted work banner, while its daemon lists any. */
   interruptedBanner?: ReactNode;
+  /** PR #2491 decision 2026-11-25 — the items of this daemon's ⋯ menu; no menu while it has none. */
+  moreItems?: readonly MoreMenuItem[];
   deck: FleetDeck;
   /** PRD #2374 — in the Cards view, this deck's cards, shown in place of its agent table. */
   cardsBody?: ReactNode;
@@ -2717,6 +2927,19 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={upgradeLabel ?? `Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={upgradeTitle} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {(onStopDaemon || stopDaemonReason) && <button type="button" className="button secondary compact daemon-stop" data-testid="daemon-stop" aria-label={`Stop the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={stopDaemonReason ? displayTitle(stopDaemonReason) : undefined} disabled={!onStopDaemon} onClick={onStopDaemon}><CircleStop size={13} /><span>Stop daemon</span></button>}
+        {/* PR #2491 decision 2026-11-25 — this daemon's ⋯ menu, just left of New agent. */}
+        {moreItems && moreItems.length > 0 && (
+          <MoreMenu
+            label={`More for ${deckName(connection)}`}
+            menuLabel={`More for ${deckName(connection)}`}
+            testId="daemon-more"
+            menuTestId="daemon-more-menu"
+            className="more-menu daemon-more"
+            buttonClassName="button secondary compact more-menu-button"
+            icon={<Ellipsis size={13} aria-hidden="true" />}
+            items={moreItems}
+          />
+        )}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
         </div>
         {/*
@@ -2743,6 +2966,7 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
           agents={deck.agents}
           sections={deck.sections}
           filtering={filtering}
+          needsYouOnly={deck.needsYouOnly === true}
           now={now}
           columns={columns}
           connection={connection}
@@ -2779,9 +3003,11 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent, onAddDaemon }: {
+function DaemonBody({ agents, sections, filtering, needsYouOnly, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent, onAddDaemon }: {
   agents: OverviewAgent[];
   sections: OverviewSection[];
+  /** PR #2491 decision 2026-11-25 — `sections` are what Needs you only keeps in the Table view. */
+  needsYouOnly: boolean;
   filtering: boolean;
   /** The one instant every relative cell on this screen is measured against. */
   now: number;
@@ -2955,6 +3181,10 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
     shows none of: while filtering it reads like every other empty daemon. The
     connection notes above stay first — they say why nothing can be listed.
   */
+  /* PR #2491 decision 2026-11-25 — under Needs you only, a daemon none of whose agents needs the user is one line too. */
+  if (needsYouOnly && !sections.length) {
+    return <p className="overview-filter-empty" data-testid="overview-needs-you-empty">{filterDaemonName(connection)}: no agent needs you</p>;
+  }
   if (filtering && !sections.some((section) => section.matching)) {
     return <p className="overview-filter-empty" data-testid="overview-filter-empty">{filterDaemonName(connection)}: no matching agents</p>;
   }

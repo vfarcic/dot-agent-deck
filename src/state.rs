@@ -375,8 +375,11 @@ impl BackgroundTrack {
             }
             EventType::Thinking | EventType::ToolStart => {
                 // Issue #1757: only the step from an ended turn to a new one
-                // starts a turn.
-                if self.turn_ended {
+                // starts a turn. Issue #2505: a turn Claude Code opens itself
+                // to report a finished background job continues the chain
+                // that started the job, so a command started earlier in that
+                // chain is still this turn's when it ends.
+                if self.turn_ended && !crate::injected_prompt::opens_harness_turn(event) {
                     self.turn_started_ms = now_ms;
                 }
                 self.turn_ended = false;
@@ -4999,6 +5002,9 @@ impl AppState {
         // command's `ShellBusy` says nothing about the agent moving on) — and
         // the pane's status before it, to see the turn start.
         let may_start_turn = !event.is_daemon_synthetic();
+        // Issue #2505: a turn Claude Code opens itself to report a finished
+        // background job is not the agent moving on from its report.
+        let harness_turn = crate::injected_prompt::opens_harness_turn(&event);
         let status_before = pane_id.as_deref().and_then(|pane| self.pane_status(pane));
         let applied = self.apply_event_reporting(event, attested_agent);
         let Some(pane_id) = pane_id else {
@@ -5067,7 +5073,8 @@ impl AppState {
                     // such a pause, keeps that record; one entered from work
                     // does not.
                     self.pauses_after_turn_end.insert(pane_id.clone(), began_at);
-                } else if status_after.as_ref().is_some_and(is_turn_in_progress)
+                } else if !harness_turn
+                    && status_after.as_ref().is_some_and(is_turn_in_progress)
                     && let Some(agent_id) = live_agent_id.as_deref()
                 {
                     registry
@@ -18037,7 +18044,8 @@ mod tests {
     /// deals with the `done` its card report raised. Moving between two busy
     /// statuses inside one turn does not, nor does answering a permission
     /// prompt inside it, nor a daemon-synthesized `ShellBusy`, which says a
-    /// command is running, not that the agent moved on.
+    /// command is running, not that the agent moved on. Nor does a turn Claude
+    /// Code opens itself with a `<task-notification>` (issue #2505).
     #[test]
     fn the_agent_starting_its_next_turn_deals_with_its_card_report() {
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -18147,6 +18155,22 @@ mod tests {
         registry.agent_cards().publish("pane", &agent, done());
         state.apply_event_watching_waiting(event(EventType::ToolStart, 19), &registry);
         assert_eq!(dealt_with(), Some(false));
+        // Issue #2505: a turn Claude Code opens itself to report a finished
+        // background job is not the agent moving on; the next typed prompt is.
+        state.apply_event_watching_waiting(event(EventType::Idle, 20), &registry);
+        let mut notification = event(EventType::Thinking, 21);
+        notification.user_prompt = Some(
+            "<task-notification>\n<task-id>b7x2k</task-id>\n<status>completed</status>".into(),
+        );
+        state.apply_event_watching_waiting(notification, &registry);
+        assert_eq!(state.pane_status("pane"), Some(SessionStatus::Thinking));
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 22), &registry);
+        assert_eq!(dealt_with(), Some(false), "a task-notification turn");
+        state.apply_event_watching_waiting(event(EventType::Idle, 23), &registry);
+        let mut typed = event(EventType::Thinking, 24);
+        typed.user_prompt = Some("carry on".into());
+        state.apply_event_watching_waiting(typed, &registry);
+        assert_eq!(dealt_with(), Some(true), "the next typed prompt");
     }
 
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions
@@ -20666,6 +20690,17 @@ mod tests {
             .expect("the slow worker reaches its restart")
             .unwrap();
         let fast_dispatch = dispatch(fast);
+        // The fast worker has asked for its turn once its old agent's episode
+        // is closed: it finds the turn held by the slow worker and closes it
+        // before waiting. Only then is the slow one let go, so the fast one is
+        // not still on its way there, as it can be on a loaded runner.
+        tokio::time::timeout(spacing * 4, async {
+            while registry.waiting_notice_is_current(fast, episode) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the fast worker asks for its turn while the slow one holds it");
         go.send(()).unwrap();
         // The fast worker is in its paced wait once the slow one has its fresh
         // agent, and keeps its old agent until the wait is over.
@@ -22268,6 +22303,102 @@ mod tests {
             .pane_background_of(CLI_PANE)
             .expect("the carried-over command is still background work");
         assert_eq!((work.commands, awaited_of(Some(work))), (1, 0));
+    }
+
+    /// Scenario: Drive a daemon-owned Claude Code pane through a turn that starts a long background command and ends while it runs, so the card reads Waiting. Claude Code then opens a turn of its own with a `<task-notification>` prompt about another job and ends it while the long command still runs: the card still reads Waiting, and reads Idle once the command exits. A typed prompt, and a deck message Claude Code also delivers as a `<task-notification>`, start a new chain instead, so the same carried-over command leaves the card Idle with its background line.
+    #[spec("status/waiting/001")]
+    #[test]
+    fn status_waiting_001_a_task_notification_turn_continues_the_chain() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.into());
+        let frame = |event_type: &str, prompt: Option<&str>| {
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": "conversation", "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "claude_code", "event_type": event_type, "timestamp": Utc::now(),
+                "user_prompt": prompt
+            }))
+            .unwrap()
+        };
+        // As Claude Code 2.1.322 submits it, cut by the hook to 200 bytes.
+        let notification = "<task-notification>\n<task-id>b7x2k</task-id>\n\
+            <tool-use-id>toolu_01</tool-use-id>\n<status>completed</status>\n\
+            <summary>Background command \"Run the desktop tests\" completed (exit code 0)";
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(5));
+        let waiting = waiting_status_1757();
+        // Turn A starts the long command and ends while it runs.
+        let start_chain = |state: &mut AppState, session: i32| {
+            tick();
+            state.apply_event(frame("thinking", Some("merge the PR")));
+            tick();
+            state.observe_command_sessions(
+                CLI_PANE,
+                CLI_AGENT_ID,
+                &[session].into_iter().collect(),
+            );
+            state.apply_event(frame("idle", None));
+        };
+        // A later turn opened by `prompt` reads the result and ends.
+        let later_turn = |state: &mut AppState, prompt: AgentEvent| {
+            tick();
+            state.apply_event(prompt);
+            tick();
+            state.apply_event(frame("tool_start", None));
+            state.apply_event(frame("tool_end", None));
+            tick();
+            state.apply_event(frame("idle", None));
+        };
+
+        state.apply_event(frame("session_start", None));
+        start_chain(&mut state, 3001);
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(waiting.clone()));
+        // Turns B and C: Claude Code wakes the agent about its other jobs.
+        for _ in 0..2 {
+            later_turn(&mut state, frame("thinking", Some(notification)));
+            assert_eq!(
+                state.pane_status_of(CLI_PANE),
+                Some(waiting.clone()),
+                "a task-notification turn continues the chain that started the command"
+            );
+            let work = state.pane_background_of(CLI_PANE).expect("the command");
+            assert_eq!((work.commands, awaited_of(Some(work))), (1, 1));
+        }
+        // The long command exits.
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &HashSet::new());
+        state.apply_event(frame("shell_idle", None));
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(SessionStatus::Idle));
+        assert_eq!(state.pane_background_of(CLI_PANE), None);
+
+        // Control: a typed prompt starts a new chain.
+        start_chain(&mut state, 3002);
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(waiting.clone()));
+        later_turn(&mut state, frame("thinking", Some("what is left?")));
+        assert_eq!(
+            state.pane_status_of(CLI_PANE),
+            Some(SessionStatus::Idle),
+            "a typed prompt's turn leaves the earlier command an earlier turn's"
+        );
+        let work = state.pane_background_of(CLI_PANE).expect("the command");
+        assert_eq!((work.commands, awaited_of(Some(work))), (1, 0));
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &HashSet::new());
+        state.apply_event(frame("shell_idle", None));
+
+        // Control: a deck message, which Claude Code also wakes with a
+        // `<task-notification>`, is a new chain too, whatever its prompt reads.
+        start_chain(&mut state, 3003);
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(waiting));
+        let mut deck_message = frame("thinking", Some(notification));
+        deck_message.metadata.insert(
+            crate::inbox_prompt::DECK_MESSAGE_METADATA_KEY.into(),
+            String::new(),
+        );
+        later_turn(&mut state, deck_message);
+        assert_eq!(
+            state.pane_status_of(CLI_PANE),
+            Some(SessionStatus::Idle),
+            "a deck message's turn starts a new chain"
+        );
     }
 
     /// Scenario: An OpenCode pane whose private server the deck could not recognise (its command line was not read) is sampled before a turn, so the server counts as a command from an earlier turn. The next turn's tool starts a command in a session of its own below that server, and the turn ends while it runs. The scan counts the new command as a session of its own, so the card reads Waiting with two commands, one of them awaited.

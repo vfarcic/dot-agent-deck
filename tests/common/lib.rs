@@ -14724,6 +14724,10 @@ pub struct InProcDaemon {
     /// `DOT_AGENT_DECK_ATTACH_SOCKET` for a real-binary integration test
     /// against this in-process daemon (this feature's `daemon status`).
     pub attach_path: PathBuf,
+    /// Issue #2531: the state directory this daemon keeps its work journal,
+    /// launch records, inbox spool and retained reports under — inside this
+    /// daemon's own tempdir, never the developer's.
+    pub state_dir: PathBuf,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -14827,13 +14831,22 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         let attach = dir.path().join("attach.sock");
         (dir, hook, attach)
     };
+    // Issue #2531: this daemon runs in the test process, whose own state
+    // directory resolves beneath `/dev/null` (`child_lifetime_bound`'s
+    // constructor) — and resolved to the developer's real one before that,
+    // which is how fixture orchestrations reached their Interrupted work list.
+    // Give it one of its own, beside its sockets.
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).expect("create the in-process daemon's state dir");
+    harden_dir_0700(&state_dir);
 
     let state: dot_agent_deck::state::SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
         dot_agent_deck::state::AppState::default(),
     ));
     let daemon = Daemon::with_attach(state.clone(), attach_path.clone())
         .with_idle_shutdown(None)
-        .with_lock_dir_override(lock_dir_path());
+        .with_lock_dir_override(lock_dir_path())
+        .with_state_dir_override(Some(state_dir.clone()));
     let registry = daemon.pty_registry.clone();
     let event_tx = daemon.event_tx.clone();
 
@@ -14906,6 +14919,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         event_tx,
         hook_path,
         attach_path,
+        state_dir,
         handle,
     }
 }

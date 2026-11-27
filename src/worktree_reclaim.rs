@@ -2,7 +2,9 @@
 //!
 //! Reclaims a git worktree only when three gates all hold: its PR's state is
 //! `MERGED` (via `gh`, never git ancestry — squash-merges never enter `main`'s
-//! ancestry, so an ancestry check misses genuinely merged branches), the tree
+//! ancestry, so an ancestry check misses genuinely merged branches — and only
+//! for a pull request whose commits include the branch's tip, so an earlier
+//! branch's pull request under the same name does not count, issue #2510), the tree
 //! is clean (`git status --porcelain` empty — a merged branch's worktree can
 //! still hold uncommitted files that were never part of the PR), and the deck
 //! can prove it created the worktree (otherwise the tree is reported as
@@ -436,9 +438,11 @@ fn derive_push_repo_slugs(repo_dir: &Path, branch: &str) -> Vec<String> {
 /// repository for the reason [`crate::pull_request::GH_PR_FIELDS`] carries
 /// them: `--head` matches a branch NAME, so a fork's pull request from a
 /// branch named like ours is listed too (issue #1687), and only the fork the
-/// branch is pushed to is ours (issue #1779).
+/// branch is pushed to is ours (issue #1779). `headRefOid` and `commits`
+/// (issue #2510) tell a merged pull request of this branch from one of an
+/// earlier branch that had the same name ([`crate::pull_request::branch_history`]).
 pub(crate) const GH_PR_FIELDS: &str =
-    "state,headRefName,isCrossRepository,headRepository,headRepositoryOwner";
+    "state,headRefName,headRefOid,commits,isCrossRepository,headRepository,headRepositoryOwner";
 
 /// `gh pr list --head <branch> --state all --repo <owner/name> --json`
 /// [`GH_PR_FIELDS`] — `--state all` because `gh pr list` defaults to
@@ -446,7 +450,7 @@ pub(crate) const GH_PR_FIELDS: &str =
 /// from `origin` via [`derive_repo_slug`], because letting `gh` infer it
 /// queries the upstream repo from a fork checkout with no default set.
 /// [`parse_pr_state`] reads the answer, against the repository the branch is
-/// pushed to ([`derive_push_repo_slugs`]).
+/// pushed to ([`derive_push_repo_slugs`]) and the branch's tip ([`branch_tip`]).
 pub(crate) fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
     let repo_slug = match derive_repo_slug(repo_dir) {
         Some(slug) => slug,
@@ -477,7 +481,23 @@ pub(crate) fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
         ));
     }
     let push_repos = derive_push_repo_slugs(repo_dir, branch);
-    parse_pr_state(&String::from_utf8_lossy(&out.stdout), branch, &push_repos)
+    let tip = branch_tip(repo_dir, branch);
+    parse_pr_state(
+        &String::from_utf8_lossy(&out.stdout),
+        branch,
+        &push_repos,
+        tip.as_deref(),
+    )
+}
+
+/// The commit `branch` points at, or `None` when `git` cannot say.
+fn branch_tip(repo_dir: &Path, branch: &str) -> Option<String> {
+    let out = git_at(repo_dir)
+        .args(crate::pull_request::branch_tip_args(branch))
+        .output()
+        .ok()?;
+    let tip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !tip.is_empty()).then_some(tip)
 }
 
 /// The PR state `gh pr list --json` output reports for exactly `branch`.
@@ -492,10 +512,24 @@ pub(crate) fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 /// repository, or a branch with no `push_repos`, cannot be matched, so it stays
 /// someone else's and the worktree is kept. Unlike the badge, an entry naming
 /// the branch that does not say where its branch lives is `Unresolvable`
-/// rather than read as ours, since this verdict can delete a directory. Zero
-/// matches is `NoPr`, more than one `Unresolvable` (ambiguous), never
+/// rather than read as ours, since this verdict can delete a directory.
+///
+/// Issue #2510: a merged or closed entry is also someone else's unless the
+/// branch's `tip` is its head commit or one of its commits
+/// ([`crate::pull_request::branch_history`]). `gh pr list --head` lists every
+/// pull request ever opened from a branch of that name, so a worktree on a
+/// branch cut again under a used name would otherwise read the earlier
+/// branch's merge as its own while it is still being worked in. An entry that
+/// cannot be told about (no tip, or no commits listed) is `Unresolvable`.
+///
+/// Zero matches is `NoPr`, more than one `Unresolvable` (ambiguous), never
 /// guessing.
-pub(crate) fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) -> PrState {
+pub(crate) fn parse_pr_state(
+    json: &str,
+    branch: &str,
+    push_repos: &[String],
+    tip: Option<&str>,
+) -> PrState {
     let entries: Vec<serde_json::Value> = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => return PrState::Unresolvable(format!("could not parse gh output: {e}")),
@@ -525,6 +559,41 @@ pub(crate) fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) ->
             }
         }
     }
+    let mut ours = Vec::new();
+    for entry in matching {
+        let commits: Option<Vec<&str>> =
+            entry
+                .get("commits")
+                .and_then(|c| c.as_array())
+                .map(|commits| {
+                    commits
+                        .iter()
+                        .filter_map(|c| c.get("oid").and_then(|o| o.as_str()))
+                        .collect()
+                });
+        let history = crate::pull_request::branch_history(
+            entry.get("state").and_then(|s| s.as_str()) == Some("OPEN"),
+            tip,
+            entry.get("headRefOid").and_then(|h| h.as_str()),
+            commits.as_deref(),
+        );
+        match history {
+            crate::pull_request::BranchHistory::Ours => ours.push(entry),
+            crate::pull_request::BranchHistory::NotOurs => {}
+            crate::pull_request::BranchHistory::Unknown => {
+                return PrState::Unresolvable(if tip.is_none() {
+                    "could not read the branch's tip commit, so whether a closed or merged \
+                     pull request named after it is this branch's is unknown"
+                        .to_string()
+                } else {
+                    "gh listed no commits for a closed or merged pull request named after \
+                     this branch, so whether it is this branch's is unknown"
+                        .to_string()
+                });
+            }
+        }
+    }
+    let matching = ours;
     match matching.as_slice() {
         [] => PrState::NoPr,
         [one] => match one.get("state").and_then(|s| s.as_str()) {
@@ -839,6 +908,63 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
 mod tests {
     use super::*;
 
+    /// [`parse_pr_state`] for a branch whose tip is `t`, the head commit the
+    /// entries below carry.
+    fn state_at_tip(json: &str, branch: &str, push_repos: &[String]) -> PrState {
+        parse_pr_state(json, branch, push_repos, Some("t"))
+    }
+
+    /// Issue #2510: a merged pull request listed for the branch's name whose
+    /// commits do not include the branch's tip is an earlier branch's with the
+    /// same name, so the worktree has no pull request; one whose commits do is
+    /// the branch's; and one that cannot be told about is unresolvable.
+    #[test]
+    fn parse_pr_state_ignores_a_merged_pull_request_of_an_earlier_branch_with_the_same_name() {
+        assert!(
+            ["headRefOid", "commits"]
+                .iter()
+                .all(|wanted| GH_PR_FIELDS.split(',').any(|field| field == *wanted)),
+            "gh must be asked for each PR's head commit and commits"
+        );
+        let entry = |state: &str, head: &str, commits: &str| {
+            format!(
+                r#"{{"state":"{state}","headRefName":"feat/x","isCrossRepository":false,"headRefOid":"{head}","commits":{commits}}}"#
+            )
+        };
+        let earlier = entry("MERGED", "old", r#"[{"oid":"old"}]"#);
+        let at = |json: &str, tip: Option<&str>| parse_pr_state(json, "feat/x", &[], tip);
+        assert_eq!(at(&format!("[{earlier}]"), Some("t")), PrState::NoPr);
+        assert_eq!(
+            at(
+                &format!("[{}]", entry("CLOSED", "old", r#"[{"oid":"old"}]"#)),
+                Some("t")
+            ),
+            PrState::NoPr
+        );
+        let own = entry("MERGED", "t", r#"[{"oid":"t"}]"#);
+        assert_eq!(
+            at(&format!("[{earlier},{own}]"), Some("t")),
+            PrState::Merged
+        );
+        // The head moved on GitHub after the branch's last push.
+        let moved = entry("MERGED", "m", r#"[{"oid":"t"},{"oid":"m"}]"#);
+        assert_eq!(at(&format!("[{moved}]"), Some("t")), PrState::Merged);
+        // A commit after the merge is in no pull request.
+        assert_eq!(at(&format!("[{own}]"), Some("later")), PrState::NoPr);
+        // An open one counts by its name.
+        let open = entry("OPEN", "old", "null");
+        assert_eq!(at(&format!("[{earlier},{open}]"), Some("t")), PrState::Open);
+        // Fail closed: no tip, or no commits listed, never reads as merged.
+        assert!(matches!(
+            at(&format!("[{own}]"), None),
+            PrState::Unresolvable(_)
+        ));
+        assert!(matches!(
+            at(&format!("[{}]", entry("MERGED", "old", "null")), Some("t")),
+            PrState::Unresolvable(_)
+        ));
+    }
+
     #[test]
     fn decide_merged_clean_owned_removes() {
         let v = decide(&PrState::Merged, &Cleanliness::Clean, Ownership::Ours);
@@ -1016,14 +1142,15 @@ mod tests {
                 .any(|field| field == "isCrossRepository"),
             "gh must be asked where each PR's branch lives"
         );
-        let fork = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true}"#;
-        let own = r#"{"state":"OPEN","headRefName":"feat/x","isCrossRepository":false}"#;
+        let fork = r#"{"state":"MERGED","headRefName":"feat/x","headRefOid":"t","isCrossRepository":true}"#;
+        let own =
+            r#"{"state":"OPEN","headRefName":"feat/x","headRefOid":"t","isCrossRepository":false}"#;
         assert_eq!(
-            parse_pr_state(&format!("[{fork}]"), "feat/x", &[]),
+            state_at_tip(&format!("[{fork}]"), "feat/x", &[]),
             PrState::NoPr
         );
         assert_eq!(
-            parse_pr_state(&format!("[{fork},{own}]"), "feat/x", &[]),
+            state_at_tip(&format!("[{fork},{own}]"), "feat/x", &[]),
             PrState::Open
         );
     }
@@ -1040,32 +1167,33 @@ mod tests {
                 .all(|wanted| GH_PR_FIELDS.split(',').any(|field| field == *wanted)),
             "gh must be asked which repository each PR's branch lives in"
         );
-        let mine = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true,
+        let mine = r#"{"state":"MERGED","headRefName":"feat/x","headRefOid":"t","isCrossRepository":true,
             "headRepository":{"name":"r"},"headRepositoryOwner":{"login":"me"}}"#;
-        let stranger = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true,
+        let stranger = r#"{"state":"MERGED","headRefName":"feat/x","headRefOid":"t","isCrossRepository":true,
             "headRepository":{"name":"r"},"headRepositoryOwner":{"login":"stranger"}}"#;
         let me = ["me/r".to_string()];
-        let unnamed = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":true,
+        let unnamed = r#"{"state":"MERGED","headRefName":"feat/x","headRefOid":"t","isCrossRepository":true,
             "headRepository":null,"headRepositoryOwner":{"login":"me"}}"#;
         assert_eq!(
-            parse_pr_state(&format!("[{mine},{stranger}]"), "feat/x", &me),
+            state_at_tip(&format!("[{mine},{stranger}]"), "feat/x", &me),
             PrState::Merged
         );
         assert_eq!(
-            parse_pr_state(&format!("[{stranger}]"), "feat/x", &me),
+            state_at_tip(&format!("[{stranger}]"), "feat/x", &me),
             PrState::NoPr
         );
         assert_eq!(
-            parse_pr_state(&format!("[{mine}]"), "feat/x", &[]),
+            state_at_tip(&format!("[{mine}]"), "feat/x", &[]),
             PrState::NoPr
         );
         assert_eq!(
-            parse_pr_state(&format!("[{unnamed}]"), "feat/x", &me),
+            state_at_tip(&format!("[{unnamed}]"), "feat/x", &me),
             PrState::NoPr
         );
-        let own = r#"{"state":"OPEN","headRefName":"feat/x","isCrossRepository":false}"#;
+        let own =
+            r#"{"state":"OPEN","headRefName":"feat/x","headRefOid":"t","isCrossRepository":false}"#;
         assert!(matches!(
-            parse_pr_state(&format!("[{mine},{own}]"), "feat/x", &me),
+            state_at_tip(&format!("[{mine},{own}]"), "feat/x", &me),
             PrState::Unresolvable(_)
         ));
     }
@@ -1101,23 +1229,23 @@ mod tests {
 
     #[test]
     fn parse_pr_state_without_is_cross_repository_is_unresolvable() {
-        let json = r#"[{"state":"MERGED","headRefName":"feat/x"}]"#;
+        let json = r#"[{"state":"MERGED","headRefName":"feat/x","headRefOid":"t"}]"#;
         assert!(matches!(
-            parse_pr_state(json, "feat/x", &[]),
+            state_at_tip(json, "feat/x", &[]),
             PrState::Unresolvable(_)
         ));
     }
 
     #[test]
     fn parse_pr_state_two_own_pull_requests_are_unresolvable() {
-        let one = r#"{"state":"MERGED","headRefName":"feat/x","isCrossRepository":false}"#;
-        let two = r#"{"state":"CLOSED","headRefName":"feat/x","isCrossRepository":false}"#;
+        let one = r#"{"state":"MERGED","headRefName":"feat/x","headRefOid":"t","isCrossRepository":false}"#;
+        let two = r#"{"state":"CLOSED","headRefName":"feat/x","headRefOid":"t","isCrossRepository":false}"#;
         assert!(matches!(
-            parse_pr_state(&format!("[{one},{two}]"), "feat/x", &[]),
+            state_at_tip(&format!("[{one},{two}]"), "feat/x", &[]),
             PrState::Unresolvable(_)
         ));
         assert_eq!(
-            parse_pr_state(&format!("[{one}]"), "feat/x", &[]),
+            state_at_tip(&format!("[{one}]"), "feat/x", &[]),
             PrState::Merged
         );
     }

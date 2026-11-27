@@ -217,6 +217,13 @@ mod pin_lockstep;
 /// here under `python3`.
 #[cfg(test)]
 mod pr_review_verdict;
+/// PR #2491 audit K4: what `.claude/skills/pr-create/pr-screenshots.sh` lets
+/// into the Markdown it prints — control characters in alt text and a
+/// repository that is not `<owner>/<name>` are refused before the push. Tests
+/// only, and Unix only: the script is driven under `bash` against a local bare
+/// repository standing in for the remote.
+#[cfg(all(test, unix))]
+mod pr_screenshots;
 /// Issue #1591: where a PRD lives — its `prds/` file when one exists, else its
 /// issue body — is decided by `.claude/skills/prd-start/prd-source.sh`, and
 /// each PRD skill fork replaced its `dot-ai` mirror. Tests only, and Unix only:
@@ -275,6 +282,12 @@ mod review_findings;
 /// script is driven under `bash` against an offline `gh` stand-in.
 #[cfg(all(test, unix))]
 mod review_wait;
+/// Issue #2529: the tool caches of `.rwx/ci.yml`'s tasks built on `nix-install`
+/// carry the Nix release in their names, and renovate.json's NixOS/nix manager
+/// moves those names with `NIX_VERSION`. Tests only — RWX accepts any name, so
+/// a name a bump leaves behind shows only when a run restores the wrong cache.
+#[cfg(test)]
+mod rwx_nix_cache_keys;
 /// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
 /// prefix test that decides which worktree a toolchain process is building for.
 /// Tests only — the rule lives in the script, no CI job runs it, and both ways

@@ -1,17 +1,21 @@
-import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { VoiceNumber } from "./VoiceNumber";
 import {
   AlertTriangle,
+  BellRing,
   BookOpenText,
   Box,
   Check,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CircleDot,
   CircleStop,
   FileCode2,
   FileCog,
   GitCompareArrows,
   Handshake,
+  IdCard,
   Maximize2,
   Pencil,
   ShieldCheck,
@@ -48,6 +52,9 @@ import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 
 const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
   { id: "terminal", label: "Terminal", icon: SquareTerminal },
+  /* PR #2491 decision 2026-11-26 — offered wherever the pane has the agent's
+     card (`cardTab`), with or without the experimental flag. */
+  { id: "card", label: "Card", icon: IdCard },
   { id: "diff", label: "Diff", icon: GitCompareArrows },
   { id: "checks", label: "Checks", icon: ShieldCheck },
   { id: "handoffs", label: "Delegations", icon: Handshake },
@@ -56,14 +63,16 @@ const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
 
 /**
  * Issue #1400 — the tab this agent's pane actually shows. With the agent
- * details hidden (`DesktopFeatures.showAgentDetails` off) only Terminal is on
- * offer, so a stored tab naming one of the other four falls back to it rather
- * than rendering a panel no tab selects. Derived, never written back, so the
- * stored choice survives the flag being turned on. `App`'s list of shown
- * terminals reads this too, so the two cannot disagree about which tiles
- * mounted one.
+ * details hidden (`DesktopFeatures.showAgentDetails` off) only Terminal and,
+ * where the pane has the agent's card (`hasCard`, PR #2491 decision
+ * 2026-11-26), Card are on offer, so a stored tab naming one of the other four
+ * falls back to Terminal rather than rendering a panel no tab selects; so does
+ * Card on a pane with no card. Derived, never written back, so the stored
+ * choice survives the flag being turned on. `App`'s list of shown terminals
+ * reads this too, so the two cannot disagree about which tiles mounted one.
  */
-export function shownPanelTab(tab: PanelTab, showDetails: boolean): PanelTab {
+export function shownPanelTab(tab: PanelTab, showDetails: boolean, hasCard = false): PanelTab {
+  if (tab === "card") return hasCard ? "card" : "terminal";
   return showDetails ? tab : "terminal";
 }
 
@@ -117,6 +126,20 @@ function useTileClock(ticking: boolean): number {
 export interface AgentTileProps {
   agent: AgentSession;
   /**
+   * PR #2491 decision 2026-11-25 — the overview pane's navigation (previous,
+   * next and next needing-you agent), in the header, when the agent's daemon
+   * shows cards.
+   */
+  cardHeader?: { controls: Pick<VoiceActionContext, "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">> };
+  /**
+   * PR #2491 decision 2026-11-26 — the agent's Card tab, beside Terminal:
+   * `panel` is what it shows (rendered only while it is the shown tab), and
+   * `needsYou` puts a bell on the tab and says so in its name. The terminal
+   * stays mounted, in the same box, under the Card tab, so switching tabs
+   * never resizes it.
+   */
+  cardTab?: { panel: ReactNode; needsYou: boolean };
+  /**
    * PR #1451 round 3, change 3 — the number this tile shows while voice is
    * on: first in its header and in its accessible name. The 1–4 keys focus
    * the same tiles in the same order.
@@ -135,7 +158,8 @@ export interface AgentTileProps {
    * where a later implementer will look for them:
    *
    * 1. **Panel tabs — the same set at BOTH sizes** (all five with
-   *    `showDetails`, Terminal alone without it). The tab set is a property of
+   *    `showDetails`, Terminal alone without it, and Card beside Terminal
+   *    wherever `cardTab` is given). The tab set is a property of
    *    the agent, not of the box. `tab` is controlled by `App` and keyed by
    *    agent id, so the overlay inherits the tile's tab and hands it back on
    *    close; a presentation that dropped tabs would have to coerce that
@@ -344,6 +368,8 @@ function formatTokens(tokens: number): string {
 
 export function AgentTile({
   agent,
+  cardHeader,
+  cardTab,
   voiceNumber,
   presentation,
   showDetails,
@@ -388,7 +414,10 @@ export function AgentTile({
   // inline status condition and the composer's own copy of it could.
   const input = terminalInputState(agent);
   const fixture = mode === "fixture";
-  const tab = shownPanelTab(storedTab, showDetails);
+  const tab = shownPanelTab(storedTab, showDetails, cardTab !== undefined);
+  /* The tabs on offer: Terminal; Card where the pane has the agent's card;
+     the other four with the agent details shown. */
+  const offeredTabs = tabs.filter(({ id }) => id === "terminal" || (id === "card" ? cardTab !== undefined : showDetails));
   /**
    * PRD #1105 M1 difference 4. The Reader launcher is `"tile"`-only, and
    * hiding the BUTTON is not enough: `readerOpen` is reset only when
@@ -648,6 +677,37 @@ export function AgentTile({
           </div>
         </div>
         <div className="agent-header-actions">
+          {/* PR #2491 decision 2026-11-25 — the moves between agents, in the dashboard's order. */}
+          {cardHeader && (
+            <div className="agent-pane-card-nav" role="group" aria-label="Agents">
+              <button
+                type="button"
+                className="agent-pane-control"
+                data-testid="agent-pane-previous"
+                aria-label="Previous agent"
+                title="Previous agent ([)"
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => VOICE_ACTIONS.previousAgentCard.run(cardHeader.controls)}
+              ><ChevronLeft size={14} /></button>
+              <button
+                type="button"
+                className="agent-pane-control"
+                data-testid="agent-pane-next"
+                aria-label="Next agent"
+                title="Next agent (])"
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => VOICE_ACTIONS.nextAgentCard.run(cardHeader.controls)}
+              ><ChevronRight size={14} /></button>
+              <button
+                type="button"
+                className="agent-pane-needs-you"
+                data-testid="agent-pane-next-needs-you"
+                title="Next agent that needs you (n)"
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={() => VOICE_ACTIONS.nextNeedsYouCard.run(cardHeader.controls)}
+              ><BellRing size={13} aria-hidden="true" /><span className="agent-pane-needs-you-words">Next needing you</span></button>
+            </div>
+          )}
           {/*
             PRD #1105 M5's deck entry point, and M2's way back out. Both are
             native `<button>`s in the header rather than a click handler on the
@@ -722,22 +782,28 @@ export function AgentTile({
       </div>
 
       <div className="agent-tabs" role="tablist" aria-label={`${title.shown} details`}>
-        {(showDetails ? tabs : tabs.filter(({ id }) => id === "terminal")).map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            className={tab === id ? "is-active" : ""}
-            role="tab"
-            aria-selected={tab === id}
-            aria-label={label}
-            title={label}
-            onMouseDown={(event) => event.stopPropagation()}
-            onClick={() => onTabChange(id)}
-          >
-            <Icon size={13} aria-hidden="true" />
-            <span>{label}</span>
-            {id === "checks" && agent.checks.length > 0 && <em>{agent.checks.length}</em>}
-          </button>
-        ))}
+        {offeredTabs.map(({ id, label, icon: Icon }) => {
+          /* PR #2491 decision 2026-11-26 — the Card tab's bell while the agent needs you, drawn as the Checks tab draws its count, and said in its name. */
+          const named = id === "card" && cardTab?.needsYou ? "Card, needs you" : label;
+          return (
+            <button
+              key={id}
+              className={tab === id ? "is-active" : ""}
+              role="tab"
+              aria-selected={tab === id}
+              aria-label={named}
+              title={named}
+              data-testid={id === "card" ? "agent-card-tab" : undefined}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => onTabChange(id)}
+            >
+              <Icon size={13} aria-hidden="true" />
+              <span>{label}</span>
+              {id === "checks" && agent.checks.length > 0 && <em>{agent.checks.length}</em>}
+              {id === "card" && cardTab?.needsYou && <em className="agent-tab-bell" data-testid="card-tab-bell"><BellRing size={10} aria-hidden="true" /></em>}
+            </button>
+          );
+        })}
         {!readerSuppressed && (
           <button
             className="reader-open"
@@ -754,8 +820,8 @@ export function AgentTile({
 
       {!readerSuppressed && readerOpen && <OutputReader agent={agent} onClose={() => setReaderOpen(false)} />}
 
-      <div className="agent-panel" role="tabpanel">
-        {tab === "terminal" && (
+      <div className="agent-panel" role="tabpanel" aria-label={tab === "card" ? `${title.shown}'s card` : undefined}>
+        {(tab === "terminal" || tab === "card") && (
           /*
             PRD #1105 — `data-terminal-state` is the sibling of the viewport's
             own `data-input-state`, and it answers the outer question: is there
@@ -763,8 +829,13 @@ export function AgentTile({
             than left absent so both directions can be asserted, and so a
             reader of the DOM never has to infer a state from a missing
             attribute.
+
+            PR #2491 decision 2026-11-26 — kept mounted, in its own box, while
+            the Card tab is drawn over it (`is-covered` hides it without
+            changing its size), so switching tabs never resizes the agent's
+            terminal.
           */
-          <div className="agent-terminal-stack" data-terminal-state={noTerminal?.reason ?? "attached"}>
+          <div className={`agent-terminal-stack${tab === "card" ? " is-covered" : ""}`} data-terminal-state={noTerminal?.reason ?? "attached"}>
             {noTerminal ? (
               /*
                 No `TerminalViewport` — this is the whole point rather than a
@@ -826,6 +897,7 @@ export function AgentTile({
             )}
           </div>
         )}
+        {tab === "card" && cardTab && <div className="agent-card-tab">{cardTab.panel}</div>}
         {tab === "diff" && (
           <div className="text-panel diff-panel">
             <div className="panel-caption"><FileCode2 size={14} /> Changed files</div>

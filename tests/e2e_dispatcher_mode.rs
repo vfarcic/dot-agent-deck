@@ -1923,6 +1923,8 @@ fn real_single_dispatch_round_trip(close_after_report: bool) {
     const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
     const CLOSE_MAX_LIFETIME_SECS: &str = "900";
     const RETURN_MAX_LIFETIME_SECS: &str = "300";
+    /// Ends the dispatch directive and is its `submit_claude_prompt` probe.
+    const DISPATCH_MARKER: &str = "dispatch-request-9b2e";
 
     // Both the dispatcher and the unit it spawns inherit this command. Keep them
     // fully interactive (no `-p`), pin the cheap model, and pre-allow every tool
@@ -2044,10 +2046,23 @@ fn real_single_dispatch_round_trip(close_after_report: bool) {
          Find the only filename beginning {SENTINEL_PREFIX}. Report the full matching \
          filename and say whether it exists. Do not ask questions.\" \
          Do not inspect the files or do the unit's work yourself, and do not ask me anything first. \
-         When its inbox report arrives, relay the full discovered filename to me."
+         When its inbox report arrives, relay the full discovered filename to me. \
+         Request marker: {DISPATCH_MARKER}"
     );
-    deck.send_keys(directive.as_bytes());
-    deck.send_keys(b"\r");
+    // Issue #701's helper, not text and `\r` in one burst: typed that way the
+    // Enter can be read as part of a paste, and the directive then sits
+    // unsubmitted with no `UserPromptSubmit`, failing "must start its unit"
+    // (issue #2512; `dispatch/return/030` hit it while issue #2485 was worked).
+    // The probe is a marker that ends the directive, so the helper's render
+    // check passes only once the whole directive is in the input: with the
+    // unit's name as the probe, it would accept the directive's last word
+    // (`me.`) anywhere later on screen, such as a `name.` on a card (Qodo,
+    // PR #2551).
+    let events = deck.subscribe_events();
+    let dispatcher_agent = dispatcher_ids
+        .first()
+        .expect("the acknowledged seed names the dispatcher's agent");
+    deck.submit_claude_prompt(&events, dispatcher_agent, &directive, DISPATCH_MARKER);
 
     assert!(
         common::wait_until(Duration::from_secs(90), || {
@@ -2171,14 +2186,21 @@ fn real_single_dispatch_round_trip(close_after_report: bool) {
             "dispatcher did not settle after receiving completion\n{}",
             deck.snapshot_grid()
         );
+        const CLOSE_MARKER: &str = "close-request-c4e7";
         let directive = format!(
             "Use Bash to run exactly: dot-agent-deck close {unit}. \
              This is the completed unit you dispatched. Run the command now, \
              report its output, and leave your own pane open. Do not use git or \
-             any other cleanup command, do not dispatch again, and do not ask questions."
+             any other cleanup command, do not dispatch again, and do not ask questions. \
+             Request marker: {CLOSE_MARKER}"
         );
-        deck.send_keys(directive.as_bytes());
-        deck.send_keys(b"\r");
+        // Through the same helper as the dispatch directive above, so a close
+        // instruction left unsubmitted fails as PROMPT NOT DELIVERED rather
+        // than as a dispatcher that ignored it. The probe is a marker that ends
+        // the directive and is used nowhere else in this test: the unit's name
+        // is already on screen (its card, the dispatch command), and the
+        // helper's render check reads the first match of its probe.
+        deck.submit_claude_prompt(&events, dispatcher_agent, &directive, CLOSE_MARKER);
         assert!(
             common::wait_until(Duration::from_secs(180), || {
                 let records = common::agent_records_on(deck.attach_socket_path());

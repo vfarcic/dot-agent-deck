@@ -512,6 +512,36 @@ describe("agent pane identity fence", () => {
   });
 
   /**
+   * Scenario: a failed action's notice is in the corner when Planner's pane
+   * opens over the deck (issue #2555). The notice's X is then the one control
+   * reachable outside the pane (this runtime has no voice surface) — the deck
+   * selector and the rest of the deck stay inert — and clicking it dismisses
+   * the notice with the pane still open.
+   */
+  it("keeps a notice's dismiss reachable over the pane, and nothing else behind it", async () => {
+    const deck = harness(documentSelectingOneDeck(), { error: "Launch failed: the worktree is busy" });
+    const runtime = deck.runtime("local");
+    render(<DeckShell runtime={runtime} initialView={{ kind: "deck" }} />);
+    const toast = screen.getByTestId("toast");
+    expect(toast).toHaveTextContent("Launch failed: the worktree is busy");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    const pane = screen.getByTestId("agent-pane-overlay");
+    await waitFor(() => expect(screen.getByTestId("deck-selector-toggle").closest("[inert]")).not.toBeNull());
+    const dismiss = within(toast).getByRole("button", { name: "Dismiss message" });
+    // Equality to the complete set, as above: any other control reachable
+    // outside the pane is a regression.
+    expect(reachableOutside(pane)).toEqual([dismiss]);
+    expect(toast.closest("[inert]")).toBeNull();
+
+    dismiss.focus();
+    expect(dismiss).toHaveFocus();
+    fireEvent.click(dismiss);
+    expect(runtime.clearError).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("agent-pane-overlay")).toBe(pane);
+  });
+
+  /**
    * Scenario: a daemon-origin pane is open on the local deck when the selected
    * deck moves to build-box, which runs a Planner of its own with the same id.
    * The pane does not adopt it — no pane is on screen at all — and it does not

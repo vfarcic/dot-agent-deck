@@ -130,6 +130,18 @@ ctor::declarative::ctor! {
             }
             #[cfg(unix)]
             std::env::set_var("XDG_RUNTIME_DIR", unreachable_runtime_dir());
+            // Issue #2531: and the state directory, which no endpoint scrub
+            // reaches. Without it `config::state_dir()` falls back to the
+            // developer's `~/.local/state/dot-agent-deck` (or takes a deck
+            // pane's inherited override), and a test that opens a work
+            // journal, launch records or a daemon there writes fixture agents
+            // into the real Interrupted work list. A test that needs a state
+            // directory passes its own tempdir.
+            #[cfg(unix)]
+            std::env::set_var(
+                "DOT_AGENT_DECK_STATE_DIR",
+                crate::platform::paths::TEST_UNREACHABLE_STATE_DIR,
+            );
         }
         let _ = CLEARED_BEFORE_MAIN.set(leaked);
     }
@@ -600,6 +612,62 @@ mod tests {
         let mut stream =
             std::os::unix::net::UnixStream::connect(control).expect("reach the control socket");
         let _ = writeln!(stream, "probe ran");
+    }
+
+    /// Set only on the re-executed child of
+    /// [`a_unit_test_never_resolves_the_real_state_dir`].
+    #[cfg(unix)]
+    const STATE_DIR_CHILD_ENV: &str = "DAD_UNIT_STATE_DIR_CHILD";
+
+    /// Scenario: Read the state directory this unit-test process resolves, then
+    /// start a fresh copy of the unit-test binary as if launched from a deck pane
+    /// whose `DOT_AGENT_DECK_STATE_DIR` names the developer's real state
+    /// directory, and read it there too. Both must be the unreachable path
+    /// beneath `/dev/null`, so a unit test that opens a work journal, launch
+    /// records or a daemon without its own tempdir writes nothing (issue #2531).
+    #[cfg(unix)]
+    #[test]
+    fn a_unit_test_never_resolves_the_real_state_dir() {
+        let unreachable = std::path::Path::new(crate::platform::paths::TEST_UNREACHABLE_STATE_DIR);
+        {
+            // Sibling tests set the variable for a moment under this lock.
+            let _env = crate::config::STATE_DIR_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                crate::config::state_dir(),
+                unreachable,
+                "this unit-test process resolves a usable state directory"
+            );
+        }
+        if std::env::var_os(STATE_DIR_CHILD_ENV).is_some() {
+            return;
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/test-user".into());
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("unit-test binary path"))
+                .args([
+                    "--exact",
+                    "test_isolation::tests::a_unit_test_never_resolves_the_real_state_dir",
+                    "--test-threads=1",
+                ])
+                .env(STATE_DIR_CHILD_ENV, "1")
+                .env(
+                    "DOT_AGENT_DECK_STATE_DIR",
+                    format!("{home}/.local/state/dot-agent-deck"),
+                )
+                .output()
+                .expect("re-execute the unit-test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "a unit-test process kept an inherited state directory:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run the check:\n{stdout}"
+        );
     }
 
     /// Scenario: Ask for the bare pins and assert both endpoint variables are

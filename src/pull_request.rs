@@ -106,8 +106,75 @@ pub use crate::pull_request_info::{
 /// repository's own open PR with 28 checks, it took the reply from 461 bytes
 /// to about 20 KB and the call from about 0.55–0.9 s to 0.87–1.4 s. The
 /// worktree reclaimer's lookup asks for its own, smaller list.
+///
+/// `headRefOid` (issue #2510) is the head commit, which tells a merged or
+/// closed pull request of this branch from one of an earlier branch with the
+/// same name ([`branch_history`]).
 pub(crate) const GH_PR_FIELDS: &str = "number,state,isDraft,reviewDecision,url,headRefName,\
-     isCrossRepository,headRepository,headRepositoryOwner,statusCheckRollup";
+     headRefOid,isCrossRepository,headRepository,headRepositoryOwner,statusCheckRollup";
+
+/// [`GH_PR_FIELDS`] and `commits`, asked for only when a merged or closed
+/// pull request's head is not the branch's tip ([`query_gh`]): `commits`
+/// carries every listed commit's message and authors, which is heavy to fetch
+/// on every poll of an open pull request.
+const GH_PR_FIELDS_WITH_COMMITS: &str = "number,state,isDraft,reviewDecision,url,headRefName,\
+     headRefOid,isCrossRepository,headRepository,headRepositoryOwner,statusCheckRollup,commits";
+
+/// Issue #2510: whether a pull request that `gh pr list --head` found by its
+/// branch NAME belongs to this branch, or to an earlier branch that had the
+/// same name and was deleted after its pull request merged or closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchHistory {
+    /// The pull request is this branch's.
+    Ours,
+    /// The pull request's commits do not include the branch's tip.
+    NotOurs,
+    /// Not known: the branch's tip could not be read, or `gh` listed no
+    /// commits for a pull request whose head is not that tip.
+    Unknown,
+}
+
+/// The one decision both of a branch's pull request lookups (the card's badge
+/// and the worktree reclaimer's verdict) make about a pull request listed for
+/// the branch's name. An open (or draft) one counts by name: its head branch
+/// is live on GitHub, and it is where this branch's pushes go. A merged or
+/// closed one counts only when the branch's `tip` is its head commit or one of
+/// its `commits`, so that every commit on the branch was in that pull request.
+/// A branch cut again under a used name, from `main`, has a tip that none of
+/// the earlier pull request's commits is; so does a branch that gained commits
+/// after its pull request merged, whose newest work no pull request holds.
+pub(crate) fn branch_history(
+    open: bool,
+    tip: Option<&str>,
+    head: Option<&str>,
+    commits: Option<&[&str]>,
+) -> BranchHistory {
+    if open {
+        return BranchHistory::Ours;
+    }
+    let Some(tip) = tip else {
+        return BranchHistory::Unknown;
+    };
+    if head == Some(tip) {
+        return BranchHistory::Ours;
+    }
+    match commits {
+        Some(commits) if commits.contains(&tip) => BranchHistory::Ours,
+        Some(_) => BranchHistory::NotOurs,
+        None => BranchHistory::Unknown,
+    }
+}
+
+/// The arguments of `git rev-parse` that print the commit `branch` points at,
+/// or fail when it has none.
+pub(crate) fn branch_tip_args(branch: &str) -> [String; 4] {
+    [
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        "--quiet".to_string(),
+        format!("refs/heads/{branch}^{{commit}}"),
+    ]
+}
 
 /// Whether a fork's pull request is the branch's own: its head repository,
 /// `head_owner`/`head_name` as `gh` names them, is one of `push_repos`, the
@@ -216,33 +283,52 @@ pub(crate) struct PrKey {
     /// `owner/name` of each GitHub repository the branch is pushed to: the
     /// forks whose pull request is the branch's. Empty without a push remote.
     pub push: Vec<String>,
+    /// The commit the branch points at, `None` when it has none (an unborn
+    /// branch). Part of the key (issue #2510) because whether a merged or
+    /// closed pull request is the branch's depends on it ([`branch_history`]),
+    /// so a commit on a branch whose pull request merged looks it up again,
+    /// and two checkouts of one branch at different commits are two lookups.
+    pub tip: Option<String>,
+}
+
+impl PrKey {
+    /// Whether `other` names the same branch of the same repository, pushed to
+    /// the same places, whatever commit either points at.
+    pub(crate) fn same_branch(&self, other: &Self) -> bool {
+        self.slug == other.slug && self.branch == other.branch && self.push == other.push
+    }
 }
 
 /// What reading a directory's branch found: its key, and whether the push
-/// remote could be read at all. A `git` that could not run or outlived
-/// [`GIT_TIMEOUT`] leaves `push_known` false, and the monitor then keeps the
-/// push repositories it last read for the same branch ([`BranchProbe::resolve`])
-/// rather than let a slow `git` change the key, which would drop the badge and
-/// look the pull request up again.
+/// remote and the branch's tip could be read at all. A `git` that could not
+/// run or outlived [`GIT_TIMEOUT`] leaves `push_known` (or `tip_known`) false,
+/// and the monitor then keeps the push repositories (or the tip) it last read
+/// for the same branch ([`BranchProbe::resolve`]) rather than let a slow `git`
+/// change the key, which would look the pull request up again, and with no
+/// tip read would leave a merged one unproven.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchProbe {
     pub key: PrKey,
     pub push_known: bool,
+    pub tip_known: bool,
 }
 
 impl BranchProbe {
     /// The key a directory has after this probe, given the one it had.
     pub(crate) fn resolve(probe: Option<Self>, previous: Option<PrKey>) -> Option<PrKey> {
-        match (probe?, previous) {
-            (
-                Self {
-                    key,
-                    push_known: false,
-                },
-                Some(previous),
-            ) if previous.slug == key.slug && previous.branch == key.branch => Some(previous),
-            (probe, _) => Some(probe.key),
+        let mut probe = probe?;
+        if let Some(previous) = previous
+            && previous.slug == probe.key.slug
+            && previous.branch == probe.key.branch
+        {
+            if !probe.push_known {
+                probe.key.push = previous.push;
+            }
+            if !probe.tip_known {
+                probe.key.tip = previous.tip;
+            }
         }
+        Some(probe.key)
     }
 }
 
@@ -312,12 +398,17 @@ pub(crate) async fn branch_key(cwd: &Path) -> Option<BranchProbe> {
     }
     let slug = origin_repo(cwd).await?;
     let push = push_repos(cwd, &branch).await;
+    let tip_args = branch_tip_args(&branch);
+    let tip_args: Vec<&str> = tip_args.iter().map(String::as_str).collect();
+    let tip = git_run(cwd, &tip_args).await;
     Some(BranchProbe {
         push_known: push.is_ok(),
+        tip_known: tip.is_ok(),
         key: PrKey {
             slug,
             branch,
             push: push.unwrap_or_default(),
+            tip: tip.unwrap_or_default(),
         },
     })
 }
@@ -358,6 +449,14 @@ struct GhPr {
     review_decision: Option<String>,
     url: String,
     head_ref_name: String,
+    /// The head commit. Absent (an older `gh`, or a reply that did not ask
+    /// for it) reads as unknown.
+    #[serde(default)]
+    head_ref_oid: Option<String>,
+    /// The commits `gh` lists for the pull request, when they were asked
+    /// for ([`GH_PR_FIELDS_WITH_COMMITS`]).
+    #[serde(default)]
+    commits: Option<Vec<GhCommit>>,
     /// The PR's branch lives in a fork. Absent (an older `gh`) reads as not.
     #[serde(default)]
     is_cross_repository: bool,
@@ -371,6 +470,11 @@ struct GhPr {
     /// as no checks.
     #[serde(default)]
     status_check_rollup: Option<Vec<GhCheck>>,
+}
+
+#[derive(serde::Deserialize)]
+struct GhCommit {
+    oid: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -511,6 +615,20 @@ fn summarize_checks(rollup: &[GhCheck]) -> Option<PullRequestChecks> {
 }
 
 impl GhPr {
+    /// [`branch_history`] for this pull request and the branch's `tip`.
+    fn history(&self, tip: Option<&str>) -> BranchHistory {
+        let commits: Option<Vec<&str>> = self
+            .commits
+            .as_ref()
+            .map(|commits| commits.iter().map(|c| c.oid.as_str()).collect());
+        branch_history(
+            self.state == "OPEN",
+            tip,
+            self.head_ref_oid.as_deref(),
+            commits.as_deref(),
+        )
+    }
+
     fn into_info(self) -> Option<PullRequestInfo> {
         let state = match (self.state.as_str(), self.is_draft) {
             ("OPEN", true) => PullRequestState::Draft,
@@ -544,17 +662,58 @@ impl GhPr {
 /// when it reports none. Only an exact `headRefName` match counts, from a
 /// branch of the repository itself or of one of `push_repos`, the forks the
 /// branch is pushed to ([`is_push_repo`]): any other fork's pull request from a branch
-/// with the same name is someone else's. Of several,
+/// with the same name is someone else's. A merged or closed one counts only
+/// when [`branch_history`] reads it as the branch's, given the branch's `tip`
+/// (issue #2510); one it cannot tell about counts as not. Of several,
 /// an open (or draft) one wins, then the highest number. An entry with a state
 /// this build does not know, or a URL off `https://github.com/`, is skipped.
 pub fn parse_pr_list(
     json: &str,
     branch: &str,
     push_repos: &[String],
+    tip: Option<&str>,
 ) -> Result<Option<PullRequestInfo>, String> {
+    select_pr(json, branch, push_repos, tip, &HashSet::new()).map(|selection| selection.pr)
+}
+
+/// What [`select_pr`] read from one `gh pr list` reply.
+#[derive(Debug, Default, PartialEq)]
+struct Selection {
+    /// The branch's pull request, as [`parse_pr_list`] picks it.
+    pr: Option<PullRequestInfo>,
+    /// The answer could change once `gh` lists the pull requests' commits: no
+    /// open pull request won, and a merged or closed one was left out only
+    /// because `gh` listed none of its commits.
+    unproven: bool,
+    /// The merged or closed pull requests whose commits were listed and do
+    /// not include the tip, each with the head commit it had then. A pull
+    /// request's commits change only with its head (reopened and pushed to,
+    /// for one), so while the head is the same, at this tip it stays someone
+    /// else's.
+    not_ours: NotOurs,
+}
+
+/// Merged or closed pull requests proven not a branch's at one tip, by number
+/// and the head commit they had when that was proven ([`Selection::not_ours`]).
+pub(crate) type NotOurs = HashSet<(u64, String)>;
+
+/// [`parse_pr_list`] in full ([`Selection`]). A merged or closed pull request
+/// that is in `not_ours` with the same head commit, as an earlier lookup at
+/// the same tip found it, is left out without its commits; that is what
+/// spares a branch on a reused name the second, heavier `gh pr list` on every
+/// poll. One whose head has moved since is looked at again.
+fn select_pr(
+    json: &str,
+    branch: &str,
+    push_repos: &[String],
+    tip: Option<&str>,
+    not_ours: &NotOurs,
+) -> Result<Selection, String> {
     let entries: Vec<GhPr> =
         serde_json::from_str(json).map_err(|e| format!("could not parse gh output: {e}"))?;
-    Ok(entries
+    let mut unproven = false;
+    let mut proven_not_ours = HashSet::new();
+    let best = entries
         .into_iter()
         .filter(|pr| {
             pr.head_ref_name == branch
@@ -567,11 +726,42 @@ pub fn parse_pr_list(
                         push_repos,
                     ))
         })
+        .filter(|pr| {
+            if pr.state != "OPEN"
+                && pr
+                    .head_ref_oid
+                    .as_ref()
+                    .is_some_and(|head| not_ours.contains(&(pr.number, head.clone())))
+            {
+                return false;
+            }
+            match pr.history(tip) {
+                BranchHistory::Ours => true,
+                BranchHistory::NotOurs => {
+                    if let Some(head) = &pr.head_ref_oid {
+                        proven_not_ours.insert((pr.number, head.clone()));
+                    }
+                    false
+                }
+                BranchHistory::Unknown => {
+                    unproven |= pr.commits.is_none();
+                    false
+                }
+            }
+        })
         .filter_map(GhPr::into_info)
         .max_by_key(|pr| {
             let open = matches!(pr.state, PullRequestState::Open | PullRequestState::Draft);
             (open, pr.number)
-        }))
+        });
+    let open = best
+        .as_ref()
+        .is_some_and(|pr| matches!(pr.state, PullRequestState::Open | PullRequestState::Draft));
+    Ok(Selection {
+        pr: best,
+        unproven: unproven && !open && tip.is_some(),
+        not_ours: proven_not_ours,
+    })
 }
 
 /// The arguments of `gh pr view` for pull request `number` of `repo_slug`,
@@ -594,16 +784,46 @@ pub fn parse_pr_view(json: &str) -> Result<Option<PullRequestInfo>, String> {
 }
 
 /// Run `gh pr list` for `key`. Never blocks the runtime, and gives up after
-/// [`GH_TIMEOUT`].
-async fn query_gh(cwd: PathBuf, key: PrKey) -> Result<Option<PullRequestInfo>, GhFailure> {
+/// [`GH_TIMEOUT`]. When a merged or closed pull request's head is not the
+/// branch's tip, which happens once a pull request was updated on GitHub (a
+/// merge of its base, for one) and also for an earlier branch's with the same
+/// name, a second `gh pr list` asks for the commits too ([`select_pr`]).
+/// `not_ours` are the pull requests an earlier lookup of `key` proved
+/// someone else's; the answer carries those this one proved.
+async fn query_gh(
+    cwd: PathBuf,
+    key: PrKey,
+    not_ours: NotOurs,
+) -> Result<(Option<PullRequestInfo>, NotOurs), GhFailure> {
+    let first = list_prs(&cwd, &key, &not_ours, GH_PR_FIELDS).await?;
+    if !first.unproven {
+        return Ok((first.pr, first.not_ours));
+    }
+    let second = list_prs(&cwd, &key, &not_ours, GH_PR_FIELDS_WITH_COMMITS).await?;
+    Ok((second.pr, second.not_ours))
+}
+
+/// One `gh pr list` for `key` asking for `fields`, read by [`select_pr`].
+async fn list_prs(
+    cwd: &Path,
+    key: &PrKey,
+    not_ours: &NotOurs,
+    fields: &str,
+) -> Result<Selection, GhFailure> {
     let stdout = run_gh(
         "gh pr list",
-        Some(&cwd),
-        &gh_pr_list_args(&key.branch, &key.slug, GH_PR_FIELDS),
+        Some(cwd),
+        &gh_pr_list_args(&key.branch, &key.slug, fields),
     )
     .await?;
-    parse_pr_list(&String::from_utf8_lossy(&stdout), &key.branch, &key.push)
-        .map_err(GhFailure::error)
+    select_pr(
+        &String::from_utf8_lossy(&stdout),
+        &key.branch,
+        &key.push,
+        key.tip.as_deref(),
+        not_ours,
+    )
+    .map_err(GhFailure::error)
 }
 
 /// Why a `gh` lookup gave no answer, in the words issue #2418's checked
@@ -1152,7 +1372,8 @@ pub async fn run_pull_request_monitor(
 ) {
     let mut events = event_tx.subscribe();
     let mut probes: JobPool<PathBuf, Option<BranchProbe>> = JobPool::new(permits.clone());
-    let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, GhFailure>> =
+    #[allow(clippy::type_complexity)]
+    let mut lookups: JobPool<PrKey, Result<(Option<PullRequestInfo>, NotOurs), GhFailure>> =
         JobPool::new(permits);
     // One timer for the monitor's life: a sleep rebuilt on every pass would
     // start over at each broadcast message, so steady unrelated traffic could
@@ -1162,6 +1383,10 @@ pub async fn run_pull_request_monitor(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cwds: HashMap<PathBuf, CwdEntry> = HashMap::new();
     let mut keys: HashMap<PrKey, KeyEntry> = HashMap::new();
+    // Issue #2510: per key (and so per tip), the merged or closed pull
+    // requests a lookup proved are not the branch's, so the next poll need
+    // not fetch their commits again.
+    let mut not_ours: HashMap<PrKey, NotOurs> = HashMap::new();
     let mut kicked_sessions: HashSet<String> = HashSet::new();
     // The key each session's current value was resolved under (`None`: no
     // key), so a session that moved to another branch drops the old branch's
@@ -1195,7 +1420,10 @@ pub async fn run_pull_request_monitor(
                 entry.in_flight = false;
                 entry.fetched_at = Some(Instant::now());
                 match result {
-                    Ok(value) => entry.record(value, Instant::now()),
+                    Ok((value, proven)) => {
+                        entry.record(value, Instant::now());
+                        not_ours.entry(key.clone()).or_default().extend(proven);
+                    }
                     Err(error) => {
                         let detail = error.detail.clone();
                         if entry.record_failure(error) {
@@ -1282,6 +1510,7 @@ pub async fn run_pull_request_monitor(
             }
         }
         keys.retain(|key, _| key_cwd.contains_key(key));
+        not_ours.retain(|key, _| key_cwd.contains_key(key));
         lookups.retain(|key| key_cwd.contains_key(key));
         for (key, cwd) in &key_cwd {
             let entry = keys.entry(key.clone()).or_default();
@@ -1297,14 +1526,20 @@ pub async fn run_pull_request_monitor(
                 "looking up the branch's pull request"
             );
             let (job_key, cwd) = (key.clone(), cwd.clone());
-            lookups.spawn(key.clone(), async move { query_gh(cwd, job_key).await });
+            let known = not_ours.get(key).cloned().unwrap_or_default();
+            lookups.spawn(
+                key.clone(),
+                async move { query_gh(cwd, job_key, known).await },
+            );
         }
 
         // What each session should show now. A session whose directory has no
         // answer yet keeps what it has, and so does one whose key has none yet
         // while that key is the one its value came from — a failed re-read
-        // keeps the last answer. A session whose key changed drops the old
-        // key's PR at once and shows the new key's when that resolves.
+        // keeps the last answer, as does one whose branch moved to a new tip
+        // (a key that differs only in its tip). A session that moved to
+        // another branch drops the old key's PR at once and shows the new
+        // key's when that resolves.
         let live_sessions: HashSet<&String> = sessions.iter().map(|(id, _)| id).collect();
         shown_keys.retain(|id, _| live_sessions.contains(id));
         let mut want: HashMap<String, Option<PullRequestInfo>> = HashMap::new();
@@ -1319,7 +1554,15 @@ pub async fn run_pull_request_monitor(
                 None => None,
                 Some(key) => match keys.get(key).and_then(|k| k.value.clone()) {
                     Some(value) => value,
-                    None if shown_keys.get(session_id) == Some(&entry.key) => continue,
+                    // The same branch at a new tip keeps what it shows until
+                    // the new tip's lookup answers, so a commit does not
+                    // blink the badge.
+                    None if shown_keys.get(session_id).is_some_and(|shown| {
+                        shown.as_ref().is_some_and(|shown| shown.same_branch(key))
+                    }) =>
+                    {
+                        continue;
+                    }
                     None => None,
                 },
             };
@@ -1352,6 +1595,19 @@ mod tests {
         entries.to_string()
     }
 
+    /// The tip of the branch the unit tests look pull requests up for, and
+    /// the head commit [`gh_pr`] gives each of them.
+    const TIP: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// [`parse_pr_list`] for a branch whose tip is [`TIP`].
+    fn parse_at_tip(
+        json: &str,
+        branch: &str,
+        push_repos: &[String],
+    ) -> Result<Option<PullRequestInfo>, String> {
+        parse_pr_list(json, branch, push_repos, Some(TIP))
+    }
+
     fn gh_pr(
         number: u64,
         branch: &str,
@@ -1366,7 +1622,153 @@ mod tests {
             "isDraft": draft,
             "reviewDecision": review,
             "url": format!("https://github.com/o/r/pull/{number}"),
+            "headRefOid": TIP,
         })
+    }
+
+    /// Scenario: the branch's name was used before, by a branch whose pull
+    /// request merged (or closed) and was deleted, and `gh` lists that pull
+    /// request for the name. Its commits do not include this branch's tip, so
+    /// the badge shows none; a merged pull request whose head is the tip, or
+    /// whose commits include it (its head moved on GitHub after the last
+    /// push), is the branch's, and an open one is by name (issue #2510).
+    #[test]
+    fn a_merged_pull_request_of_an_earlier_branch_with_the_same_name_is_not_the_branchs() {
+        use serde_json::json;
+        let earlier = "1111111111111111111111111111111111111111";
+        let pr = |number, state: &str, head: &str, commits: serde_json::Value| {
+            let mut pr = gh_pr(number, "feat/x", state, false, json!(""));
+            pr["headRefOid"] = json!(head);
+            pr["commits"] = commits;
+            pr
+        };
+        let number = |entries: serde_json::Value, tip: Option<&str>| {
+            parse_pr_list(&gh(entries), "feat/x", &[], tip)
+                .unwrap()
+                .map(|pr| pr.number)
+        };
+        let old_merged = pr(1972, "MERGED", earlier, json!([{"oid": earlier}]));
+        let old_closed = pr(1973, "CLOSED", earlier, json!([{"oid": earlier}]));
+        assert_eq!(number(json!([old_merged.clone()]), Some(TIP)), None);
+        assert_eq!(number(json!([old_closed]), Some(TIP)), None);
+        // Control: the branch's own merged pull request wins although the
+        // earlier one has the higher number.
+        let own = pr(1234, "MERGED", TIP, json!([{"oid": TIP}]));
+        assert_eq!(
+            number(json!([old_merged.clone(), own]), Some(TIP)),
+            Some(1234)
+        );
+        let moved_on = pr(
+            1234,
+            "MERGED",
+            earlier,
+            json!([{"oid": TIP}, {"oid": earlier}]),
+        );
+        assert_eq!(number(json!([moved_on]), Some(TIP)), Some(1234));
+        let open = pr(1234, "OPEN", earlier, serde_json::Value::Null);
+        assert_eq!(number(json!([open]), Some(TIP)), Some(1234));
+        // No tip, or no commits listed: not known to be the branch's.
+        assert_eq!(number(json!([old_merged]), None), None);
+        let unlisted = pr(1972, "MERGED", earlier, serde_json::Value::Null);
+        assert_eq!(number(json!([unlisted.clone()]), Some(TIP)), None);
+
+        // Only that last case asks `gh` again, for the commits, and only
+        // while no open pull request already won.
+        let unproven = |entries: serde_json::Value, tip: Option<&str>| {
+            select_pr(&gh(entries), "feat/x", &[], tip, &HashSet::new())
+                .unwrap()
+                .unproven
+        };
+        assert!(unproven(json!([unlisted.clone()]), Some(TIP)));
+        assert!(!unproven(json!([unlisted.clone()]), None));
+        let listed = pr(1972, "MERGED", earlier, json!([{"oid": earlier}]));
+        assert!(!unproven(json!([listed]), Some(TIP)));
+        let open = pr(1234, "OPEN", TIP, serde_json::Value::Null);
+        assert!(!unproven(json!([unlisted.clone(), open]), Some(TIP)));
+
+        // A lookup that saw the commits remembers which pull requests they
+        // ruled out, and the next lookup at the same tip leaves those out
+        // without asking for commits again; reopened, one counts by name.
+        let listed = pr(1972, "MERGED", earlier, json!([{"oid": earlier}]));
+        let seen = select_pr(
+            &gh(json!([listed])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(seen.not_ours, HashSet::from([(1972, earlier.to_string())]));
+        let next = select_pr(
+            &gh(json!([unlisted])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert_eq!(next, Selection::default());
+        let reopened = pr(1972, "OPEN", earlier, serde_json::Value::Null);
+        let reopened = select_pr(
+            &gh(json!([reopened])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert_eq!(reopened.pr.map(|pr| pr.number), Some(1972));
+        // Reopened, given this branch's commits and closed again: its head
+        // moved, so the memory no longer applies and its commits are read.
+        let reclosed = pr(1972, "CLOSED", TIP, serde_json::Value::Null);
+        let reclosed = select_pr(
+            &gh(json!([reclosed])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert_eq!(reclosed.pr.map(|pr| pr.number), Some(1972));
+        let reclosed = pr(1972, "CLOSED", "m", serde_json::Value::Null);
+        let reclosed = select_pr(
+            &gh(json!([reclosed])),
+            "feat/x",
+            &[],
+            Some(TIP),
+            &seen.not_ours,
+        )
+        .unwrap();
+        assert!(reclosed.unproven, "a moved head asks for the commits again");
+        assert!(
+            GH_PR_FIELDS.split(',').any(|field| field == "headRefOid")
+                && !GH_PR_FIELDS.split(',').any(|field| field == "commits"),
+            "every lookup asks for the head commit, and none but the second for commits"
+        );
+        assert_eq!(
+            GH_PR_FIELDS_WITH_COMMITS,
+            format!("{GH_PR_FIELDS},commits"),
+            "the second lookup asks for everything the first does"
+        );
+    }
+
+    #[test]
+    fn branch_history_counts_an_open_pull_request_by_name_and_a_closed_one_by_its_commits() {
+        use BranchHistory::*;
+        let tip = Some("t");
+        assert_eq!(branch_history(true, None, None, None), Ours);
+        assert_eq!(branch_history(false, tip, Some("t"), None), Ours);
+        assert_eq!(
+            branch_history(false, tip, Some("h"), Some(&["h", "t"])),
+            Ours
+        );
+        assert_eq!(branch_history(false, tip, Some("h"), Some(&["h"])), NotOurs);
+        assert_eq!(branch_history(false, tip, None, Some(&[])), NotOurs);
+        assert_eq!(branch_history(false, tip, Some("h"), None), Unknown);
+        assert_eq!(
+            branch_history(false, None, Some("t"), Some(&["t"])),
+            Unknown
+        );
     }
 
     #[test]
@@ -1404,7 +1806,7 @@ mod tests {
             ("OPEN", false, json!(""), PullRequestState::Open, None),
         ];
         for (state, draft, review, want_state, want_review) in cases {
-            let pr = parse_pr_list(
+            let pr = parse_at_tip(
                 &gh(json!([gh_pr(7, "feat/x", state, draft, review)])),
                 "feat/x",
                 &[],
@@ -1428,7 +1830,7 @@ mod tests {
             gh_pr(1000, "feat/x", "CLOSED", false, serde_json::Value::Null),
         ]));
         assert_eq!(
-            parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap().number,
+            parse_at_tip(&out, "feat/x", &[]).unwrap().unwrap().number,
             1234
         );
         // A draft is open too.
@@ -1437,7 +1839,7 @@ mod tests {
             gh_pr(1234, "feat/x", "OPEN", true, serde_json::Value::Null),
         ]));
         assert_eq!(
-            parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap().number,
+            parse_at_tip(&out, "feat/x", &[]).unwrap().unwrap().number,
             1234
         );
     }
@@ -1450,16 +1852,16 @@ mod tests {
             gh_pr(1234, "feat/x", "MERGED", false, json!("APPROVED")),
             gh_pr(1100, "feat/x", "CLOSED", false, serde_json::Value::Null),
         ]));
-        let pr = parse_pr_list(&out, "feat/x", &[]).unwrap().unwrap();
+        let pr = parse_at_tip(&out, "feat/x", &[]).unwrap().unwrap();
         assert_eq!((pr.number, pr.state), (1234, PullRequestState::Merged));
     }
 
     #[test]
     fn no_match_unknown_states_and_foreign_urls_read_as_no_pr() {
         use serde_json::json;
-        assert_eq!(parse_pr_list("[]", "feat/x", &[]).unwrap(), None);
+        assert_eq!(parse_at_tip("[]", "feat/x", &[]).unwrap(), None);
         assert_eq!(
-            parse_pr_list(
+            parse_at_tip(
                 &gh(json!([gh_pr(1, "other", "OPEN", false, json!(""))])),
                 "feat/x",
                 &[]
@@ -1468,7 +1870,7 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_pr_list(
+            parse_at_tip(
                 &gh(json!([gh_pr(1, "feat/x", "QUEUED", false, json!(""))])),
                 "feat/x",
                 &[]
@@ -1479,7 +1881,7 @@ mod tests {
         let mut foreign = gh_pr(1, "feat/x", "OPEN", false, json!(""));
         foreign["url"] = json!("https://evil.example/pull/1");
         assert_eq!(
-            parse_pr_list(&gh(json!([foreign])), "feat/x", &[]).unwrap(),
+            parse_at_tip(&gh(json!([foreign])), "feat/x", &[]).unwrap(),
             None
         );
     }
@@ -1502,13 +1904,13 @@ mod tests {
         let mut own = gh_pr(1234, "feat/x", "OPEN", false, json!(""));
         own["isCrossRepository"] = json!(false);
         assert_eq!(
-            parse_pr_list(&gh(json!([own, fork.clone()])), "feat/x", &[])
+            parse_at_tip(&gh(json!([own, fork.clone()])), "feat/x", &[])
                 .unwrap()
                 .map(|pr| pr.number),
             Some(1234)
         );
         assert_eq!(
-            parse_pr_list(&gh(json!([fork])), "feat/x", &[]).unwrap(),
+            parse_at_tip(&gh(json!([fork])), "feat/x", &[]).unwrap(),
             None
         );
     }
@@ -1536,7 +1938,7 @@ mod tests {
         };
         let number = |json: &str, push: &[&str]| {
             let push: Vec<String> = push.iter().map(|p| p.to_string()).collect();
-            parse_pr_list(json, "feat/x", &push)
+            parse_at_tip(json, "feat/x", &push)
                 .unwrap()
                 .map(|pr| pr.number)
         };
@@ -1565,8 +1967,15 @@ mod tests {
             slug: "o/r".into(),
             branch: branch.into(),
             push: push.iter().map(|p| p.to_string()).collect(),
+            tip: Some("t".into()),
         };
-        let probe = |key, push_known| Some(BranchProbe { key, push_known });
+        let probe = |key, push_known| {
+            Some(BranchProbe {
+                key,
+                push_known,
+                tip_known: true,
+            })
+        };
         let previous = Some(key("feat/x", &["me/r"]));
         assert_eq!(
             BranchProbe::resolve(probe(key("feat/x", &[]), false), previous.clone()),
@@ -1587,7 +1996,28 @@ mod tests {
             BranchProbe::resolve(probe(key("feat/x", &[]), false), None),
             Some(key("feat/x", &[]))
         );
-        assert_eq!(BranchProbe::resolve(None, previous), None);
+        assert_eq!(BranchProbe::resolve(None, previous.clone()), None);
+
+        // Issue #2510: a tip that could not be read keeps the last one read
+        // for the same branch, and one that was read replaces it.
+        let at = |tip: Option<&str>| PrKey {
+            tip: tip.map(str::to_string),
+            ..key("feat/x", &["me/r"])
+        };
+        let unread_tip = Some(BranchProbe {
+            key: at(None),
+            push_known: true,
+            tip_known: false,
+        });
+        assert_eq!(BranchProbe::resolve(unread_tip, previous.clone()), previous);
+        let moved = Some(BranchProbe {
+            key: at(Some("u")),
+            push_known: true,
+            tip_known: true,
+        });
+        assert_eq!(BranchProbe::resolve(moved, previous), Some(at(Some("u"))));
+        assert!(at(Some("u")).same_branch(&at(Some("t"))));
+        assert!(!at(Some("u")).same_branch(&key("feat/y", &["me/r"])));
     }
 
     #[test]
@@ -1609,7 +2039,7 @@ mod tests {
 
     #[test]
     fn unparsable_gh_output_is_an_error_not_no_pr() {
-        assert!(parse_pr_list("not json", "feat/x", &[]).is_err());
+        assert!(parse_at_tip("not json", "feat/x", &[]).is_err());
     }
 
     #[test]
@@ -1873,8 +2303,8 @@ mod tests {
                 "--repo",
                 "o/r",
                 "--json",
-                "number,state,isDraft,reviewDecision,url,headRefName,isCrossRepository,\
-                 headRepository,headRepositoryOwner,statusCheckRollup",
+                "number,state,isDraft,reviewDecision,url,headRefName,headRefOid,\
+                 isCrossRepository,headRepository,headRepositoryOwner,statusCheckRollup",
             ]
         );
     }
@@ -1918,7 +2348,7 @@ mod tests {
     fn checks_of(rollup: serde_json::Value) -> Option<PullRequestChecks> {
         let mut pr = gh_pr(7, "feat/x", "OPEN", false, serde_json::json!(""));
         pr["statusCheckRollup"] = rollup;
-        parse_pr_list(&gh(serde_json::json!([pr])), "feat/x", &[])
+        parse_at_tip(&gh(serde_json::json!([pr])), "feat/x", &[])
             .unwrap()
             .unwrap()
             .checks
@@ -2057,7 +2487,7 @@ mod tests {
             checks_of(json!([check_run("COMPLETED", "SOMETHING_NEW")])),
             None
         );
-        let pr = parse_pr_list(
+        let pr = parse_at_tip(
             &gh(json!([gh_pr(7, "feat/x", "OPEN", false, json!(""))])),
             "feat/x",
             &[],
@@ -2346,6 +2776,13 @@ mod tests {
         ]);
         assert_eq!(branch_key(&repo).await, None, "the default branch");
         git(&["checkout", "-q", "-b", "feat/x"]);
+        let tip = {
+            let out = crate::git_env::fixture_git(&repo, sandbox.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
         assert_eq!(
             branch_key(&repo).await,
             Some(BranchProbe {
@@ -2353,8 +2790,10 @@ mod tests {
                     slug: "o/r".into(),
                     branch: "feat/x".into(),
                     push: Vec::new(),
+                    tip: Some(tip),
                 },
                 push_known: true,
+                tip_known: true,
             }),
             "a branch with no push remote"
         );

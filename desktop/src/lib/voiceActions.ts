@@ -1,4 +1,4 @@
-import type { DeckView, InboxActionVerb } from "../types";
+import type { CardTabSection, DeckView, InboxActionVerb } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 import type { CardStep, OverviewMode } from "./agentCards";
@@ -130,6 +130,10 @@ export type AgentViewTarget = {
    * listed when it is opened.
    */
   incarnation?: string;
+  /** PR #2491 decision 2026-11-26 — the pane opens on its Card tab: only where the user asked for the card itself (a card's `+N`, voice's "show the coder's card"). */
+  cardTab?: boolean;
+  /** …scrolled to this part of the Card tab. */
+  cardSection?: CardTabSection;
 };
 
 /** One agent, named the way every caller here names one. */
@@ -291,6 +295,15 @@ export type VoiceActionContext = {
    * surface (the toolbar's button) leaves no rejection unhandled.
    */
   reportPending: (pending: string, work: Promise<string | undefined>, done: string) => void;
+  /**
+   * PR #2491 decision 2026-11-25 — ask which one, the way a spoken name that
+   * fits several agents is asked about: the voice panel offers `ask`'s
+   * candidates as the numbered "Which daemon?" choice, and the row being
+   * dispatched runs again with the one chosen as its `param`. Said as a
+   * refusal (`ask.sentence`) where no choice can be offered (a confirmation
+   * open, too many candidates, or a press rather than speech).
+   */
+  askVoiceChoice: (ask: VoiceChoiceAsk) => void;
   /**
    * Close the New agent dialog (PRD #1223 U5) — every close route the dialog
    * has, reached by voice. Answers `undefined` when it closed, or the dialog's
@@ -657,16 +670,25 @@ export type VoiceActionContext = {
   /** Show the dashboard as its table or as cards (remembered per window). */
   setOverviewMode: (mode: OverviewMode) => string | undefined;
   /**
-   * Open one agent's card in the card overlay; with `section`, at that part of
-   * it (issue #2418 review: a card's `+N` opens it at its checked references).
+   * PR #2491 decision 2026-11-26 — open one agent's pane from its card: on
+   * Terminal (`"terminal"`, a click on the card or the table's Show card), on
+   * its Card tab (`"card"`, voice's "show the coder's card"), or on its Card
+   * tab at one part of it (a card's `+N`).
    */
-  showAgentCard: (target: AgentCardRef, section?: CardOverlaySection) => string | undefined;
-  /** Move the open card overlay one card on or back, or to the next card that needs the user. */
+  showAgentCard: (target: AgentCardRef, opensOn: PaneOpening) => string | undefined;
+  /** Open the pane of the next or previous agent in the dashboard's order, or of the next one that needs the user. */
   stepAgentCard: (step: CardStep) => string | undefined;
   /** Show only the cards that need the user, or every card. */
   setNeedsYouFilter: (on: boolean) => string | undefined;
-  /** Close the card overlay. Published only while it is open, so `closeTopmost` can read its presence. */
-  closeAgentCard: () => string | undefined;
+  /**
+   * PR #2491 decision 2026-11-26 — show the open agent pane's Card tab or its
+   * Terminal tab. Remembered for that opening only: the next opening of any
+   * agent starts on Terminal. Served by the shell while an agent's pane is
+   * open; switching to Terminal with no card showing says so and does nothing.
+   */
+  choosePaneTab: (tab: "card" | "terminal") => string | undefined;
+  /** Close the single-action review on screen without sending. Published only while one is open. */
+  closeCardReview: () => string | undefined;
   /** Issue #2418 — open or close the tree under one card: the cards the daemon hung under it. Shows the Cards view. */
   setCardTree: (target: AgentCardRef, open: boolean) => string | undefined;
   /**
@@ -678,27 +700,106 @@ export type VoiceActionContext = {
   /**
    * Press one action of one card: by id from a button, by its label from
    * voice. A prompt action is sent; one that asks for confirmation, a close,
-   * and `reply` open the card's overlay at that step instead. `token` is the
-   * version of the action the pressed button showed (the daemon refuses a
-   * changed one); `review` opens the overlay at a review step showing the
-   * exact text instead of sending — what a control that shows only a label
-   * asks for (review B8).
+   * and one whose text the agent wrote open the single-action review instead,
+   * and `reply` (the user's own words) opens the agent's pane to type them.
+   * `token` is the version of the action the pressed button showed (the
+   * daemon refuses a changed one); `review` opens the review showing the exact
+   * text instead of sending — what a control that shows only a label asks for
+   * (review B8); `openPane` also opens the agent's pane, on Terminal,
+   * under the review (the table's row menu).
    */
-  runCardAction: (target: AgentCardRef, action: { actionId?: string; label?: string; token?: string; review?: boolean }) => string | undefined;
-  /** Send `text` as a reply to one card's agent. */
-  /** Put `text` in the card's reply box for review, or — `sendNow`, the reply box's own Send reply — send it. */
-  replyToAgentCard: (target: AgentCardRef, text: string, sendNow?: boolean) => string | undefined;
-  /** The card overlay's confirm step: send the action it is asking about, confirmed. */
+  runCardAction: (target: AgentCardRef, action: { actionId?: string; label?: string; token?: string; review?: boolean; openPane?: boolean }) => string | undefined;
+  /** The single-action review's Send: send the action it is asking about, confirmed. */
   confirmCardAction: () => void;
   /** Open or close one table row's ⋯ menu. */
   toggleOverviewRowMenu: (rowKey: string) => void;
+  /*
+   * Issue #2399 — one action on many cards. Every batch stops at a
+   * confirmation built from the daemon's preview: none of these sends
+   * anything but `sendCardBatch`, which is the confirmation's own Send.
+   */
+  /**
+   * Start a batch of one action on a card and every card under it, by the
+   * action's id (a button) or its label as spoken: asks the daemon for a
+   * preview and opens the confirmation. Sends nothing.
+   */
+  runCardActionBatch: (target: AgentCardRef, action: { actionId?: string; label?: string }) => string | undefined;
+  /** PR #2491 review — empty the Cards view's selection; says so in words when nothing is selected. */
+  clearCardSelection: () => string | undefined;
+  /**
+   * Select or unselect one card; a closed card takes every card under it
+   * along. `want` says which (voice's "select" / "unselect"); without it the
+   * card flips, as its checkbox does.
+   */
+  toggleCardSelected: (target: AgentCardRef, want?: boolean) => string | undefined;
+  /**
+   * Start a batch of one action on the selected cards, by the action's id (a
+   * button) or its label as spoken: opens the confirmation. Sends nothing.
+   */
+  runSelectionBatch: (action: { actionId?: string; label?: string }) => string | undefined;
+  /** The batch confirmation's Send: execute the entries the preview included. */
+  sendCardBatch: () => void;
+  /**
+   * Close the batch confirmation, or its results, sending nothing. Refused,
+   * with the sentence returned, while the batch is being sent.
+   */
+  closeCardBatch: () => string | undefined;
+  /*
+   * PRD #2374 decision 2026-11-24 — the card actions editor. Each answers the
+   * sentence saying why it did nothing, or `undefined`. Opening the editor and
+   * its forms, reading it again and setting the form's
+   * icon and checkboxes are voice's (issue #2399 review 12); every press that
+   * writes a daemon's config (Save, a removal's confirmation, Hide, Restore)
+   * is the user's own, by hand.
+   */
+  /**
+   * Open the Card actions editor bound to the daemon `deckId` (its ⋯ menu's,
+   * or the one voice named); `undefined`: the only daemon showing cards, and
+   * with several the sentence asking which (PR #2491 decision 2026-11-25).
+   */
+  openCardActionsEditor: (deckId?: string) => string | CardActionsWhich | undefined;
+  /** Close the editor, or the removal it is asking to confirm. */
+  closeCardActionsEditor: () => string | undefined;
+  /** Read the shown daemon's card actions again, keeping the form. Writes nothing. */
+  refreshCardActions: () => string | undefined;
+  /** Open the editor's form for a new action. */
+  addCardAction: () => string | undefined;
+  /**
+   * Open the editor's form for one listed action, by name (a button) or by
+   * label as spoken. With the list not read yet (the editor closed, or still
+   * reading) it answers a promise instead, settled once the list is read: with
+   * `undefined` when the form opened, or the sentence saying why it did not
+   * (PR #2491 review, Qodo 3).
+   */
+  editCardAction: (action: { name?: string; label?: string }) => string | undefined | Promise<string | undefined>;
+  /** Ask to remove one of the user's own actions: opens the editor's confirmation. Writes nothing. Answers as {@link editCardAction} does. */
+  removeCardAction: (action: { name?: string; label?: string }) => string | undefined | Promise<string | undefined>;
+  /** The removal confirmation's Remove: write the removal. */
+  confirmRemoveCardAction: () => string | undefined;
+  /** Hide a deck default from every card, by name. Writes the daemon's config. */
+  hideCardAction: (name: string) => string | undefined;
+  /** Bring a deck default back as the deck ships it, by name. Writes the daemon's config. */
+  restoreCardAction: (name: string) => string | undefined;
+  /** The form's Save: write the action as the form holds it. */
+  saveCardAction: () => string | undefined;
+  /** The form's Cancel: close it, writing nothing. */
+  cancelCardActionForm: () => string | undefined;
+  /** Set the form's icon: a grid icon's own name, or an icon's name as spoken. Writes nothing. */
+  chooseCardActionIcon: (name: string) => string | undefined;
+  /** Tick or untick one of the form's checkboxes — Ask before sending (`confirm`) or Offer on every card (`always`). Writes nothing. */
+  setCardActionFlag: (flag: "confirm" | "always", on: boolean) => string | undefined;
+  /** Set the form's Placement: Show on the card (`card`, keeping a file's `compact`) or Only in the Card tab (`detail`). Writes nothing. */
+  setCardActionPlacement: (placement: "card" | "detail") => string | undefined;
 };
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
 export type AgentCardRef = { deckId: string; agentId: string; incarnation?: string };
 
-/** A part of the card overlay a control can open it at. */
-export type CardOverlaySection = "references";
+/**
+ * PR #2491 decision 2026-11-26 — where an agent's pane opened from its card
+ * starts: on Terminal, on its Card tab, or on its Card tab at one part of it.
+ */
+export type PaneOpening = "terminal" | "card" | CardTabSection;
 
 /**
  * One registry entry.
@@ -738,7 +839,7 @@ export type VoiceActionEntry = {
 
 /** PRD #1790 stage 2 — what voice says while a reclaim's dry run is checking, and once it has answered with nothing to read back. */
 export const INTERRUPTED_RECLAIM_CHECKING = "Checking what reclaiming it would do…";
-export const INTERRUPTED_RECLAIM_CHECKED = "Checked.";
+const INTERRUPTED_RECLAIM_CHECKED = "Checked.";
 
 /** PRD #1401 — what voice says while the system browser is being handed the page. */
 export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
@@ -750,10 +851,18 @@ export const PULL_REQUEST_CLOSING = "Closing the pull request…";
 export const PULL_REQUEST_CLOSED = "Closed.";
 
 /** PRD #2374 — what a card row says when the words named no mode, filter, action or reply it can use. */
-export const CARD_MODE_UNHEARD = "Say whether you want the table or the cards.";
-export const CARD_FILTER_UNHEARD = "Say whether you want only the cards that need you, or every card.";
-export const CARD_ACTION_UNHEARD = "Say which of the card's actions to press, by the label on its button.";
-export const CARD_REPLY_UNHEARD = "Say what to reply.";
+const CARD_MODE_UNHEARD = "Say whether you want the table or the cards.";
+const CARD_FILTER_UNHEARD = "Say whether you want only the cards that need you, or every card.";
+const CARD_ACTION_UNHEARD = "Say which of the card's actions to press, by the label on its button.";
+const CARD_BATCH_UNHEARD = "Say which action to send to the card and every card under it, by the label on its button.";
+/** What the editor's voice members say when no action name was heard. */
+const CARD_ACTION_EDIT_UNHEARD = "Say which card action, by its label in the Card actions editor.";
+/** PR #2491 review (Qodo 3): what voice says while a spoken edit or removal waits for the editor to read the list, and once it is done. */
+const CARD_ACTIONS_READING = "Reading the card actions…";
+export const CARD_ACTION_FORM_OPENED = "Opened the action's form.";
+export const CARD_ACTION_REMOVAL_ASKED = "Asking to confirm the removal.";
+const CARD_ICON_UNHEARD = "Say which icon, by its name in the Card actions form's icon grid, such as rocket or git merge.";
+const CARD_SELECTION_BATCH_UNHEARD = "Say which action to send to the selected cards, by the label on its button.";
 
 /** The card a target names: its deck, agent and, where known, the daemon process that listed it. */
 function cardRefOf(target: AgentCardRef): AgentCardRef {
@@ -789,7 +898,7 @@ export const VOICE_ACTIONS = {
          carries `agentLabel` as well, which belongs to the dictation row and
          not in a `DeckView` — a spread would put it in the app's view state,
          where nothing reads it and everything compares it. */
-      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from, ...("incarnation" in target ? { incarnation: target.incarnation } : {}) });
+      context.navigate({ kind: "agent", deckId: target.deckId, agentId: target.agentId, from: target.from, ...("incarnation" in target ? { incarnation: target.incarnation } : {}), ...(target.cardTab ? { cardTab: true } : {}), ...(target.cardSection ? { cardSection: target.cardSection } : {}) });
     },
   },
 
@@ -1488,20 +1597,22 @@ export const VOICE_ACTIONS = {
   },
 
   showAgentCard: {
-    label: "Open one agent's card",
+    label: "Open one agent's pane from its card",
     voice: true,
     needs: ["showAgentCard"],
-    /* A spoken "show <agent>'s card" opens the overlay at its top, and its
-       checked references are a section of it; the card's `+N` control names
-       that section so it opens there. */
-    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { cardSection?: CardOverlaySection }) => {
-      const refused = target.cardSection !== undefined ? context.showAgentCard(cardRefOf(target), target.cardSection) : context.showAgentCard(cardRefOf(target));
+    /* PR #2491 decision 2026-11-26 — a spoken "show <agent>'s card" asks for
+       the card itself, so with no `opensOn` (the voice row sends none) the
+       pane opens on its Card tab. A click on a card and the table's Show card
+       pass `"terminal"`, as every way into an agent opens on Terminal; a
+       card's `+N` names the part of the Card tab it counted. */
+    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { opensOn?: PaneOpening }) => {
+      const refused = context.showAgentCard(cardRefOf(target), target.opensOn ?? "card");
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
 
   nextAgentCard: {
-    label: "Show the next card in the card overlay",
+    label: "Open the next agent's pane, in the dashboard's order",
     voice: true,
     needs: ["stepAgentCard"],
     run: (context: Pick<VoiceActionContext, "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
@@ -1511,7 +1622,7 @@ export const VOICE_ACTIONS = {
   },
 
   previousAgentCard: {
-    label: "Show the previous card in the card overlay",
+    label: "Open the previous agent's pane, in the dashboard's order",
     voice: true,
     needs: ["stepAgentCard"],
     run: (context: Pick<VoiceActionContext, "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
@@ -1521,7 +1632,7 @@ export const VOICE_ACTIONS = {
   },
 
   nextNeedsYouCard: {
-    label: "Show the next card that needs you",
+    label: "Open the pane of the next agent that needs you",
     voice: true,
     needs: ["stepAgentCard"],
     run: (context: Pick<VoiceActionContext, "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
@@ -1531,7 +1642,7 @@ export const VOICE_ACTIONS = {
   },
 
   toggleNeedsYouFilter: {
-    label: "Show only the cards that need you, or every card",
+    label: "Show only the agents that need you, or every agent, in either view",
     voice: true,
     needs: ["setNeedsYouFilter"],
     run: (context: Pick<VoiceActionContext, "setNeedsYouFilter"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: Pick<VoiceDispatchTarget, "needsYouOnly">) => {
@@ -1540,12 +1651,24 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  closeAgentCard: {
-    label: "Close the card overlay",
+  /* PR #2491 decision 2026-11-26 — the agent pane's Card and Terminal tabs,
+     switched by voice (the tab strip itself is the pane's own control). */
+  showCardTab: {
+    label: "Show the Card tab in the open agent pane",
     voice: true,
-    needs: ["closeAgentCard"],
-    run: (context: Pick<VoiceActionContext, "closeAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
-      const refused = context.closeAgentCard();
+    needs: ["choosePaneTab"],
+    run: (context: Pick<VoiceActionContext, "choosePaneTab"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.choosePaneTab("card");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  showTerminalTab: {
+    label: "Leave the Card tab for the Terminal tab in the open agent pane",
+    voice: true,
+    needs: ["choosePaneTab"],
+    run: (context: Pick<VoiceActionContext, "choosePaneTab"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.choosePaneTab("terminal");
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1596,7 +1719,7 @@ export const VOICE_ACTIONS = {
     label: "Press one of a card's actions",
     voice: true,
     needs: ["runCardAction"],
-    run: (context: Pick<VoiceActionContext, "runCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel" | "cardActionToken" | "cardActionReview">) => {
+    run: (context: Pick<VoiceActionContext, "runCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel" | "cardActionToken" | "cardActionReview" | "cardActionOpenPane">) => {
       const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
         ? CARD_ACTION_UNHEARD
         : context.runCardAction(cardRefOf(target), {
@@ -1604,26 +1727,331 @@ export const VOICE_ACTIONS = {
           ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
           ...(target.cardActionToken !== undefined ? { token: target.cardActionToken } : {}),
           ...(target.cardActionReview ? { review: true } : {}),
+          ...(target.cardActionOpenPane ? { openPane: true } : {}),
         });
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
 
-  replyToAgentCard: {
-    label: "Reply to a card's agent with your own words",
-    voice: true,
-    needs: ["replyToAgentCard"],
-    run: (context: Pick<VoiceActionContext, "replyToAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardReplyText" | "cardReplySend">) => {
-      const refused = target.cardReplyText?.trim() ? context.replyToAgentCard(cardRefOf(target), target.cardReplyText, target.cardReplySend === true) : CARD_REPLY_UNHEARD;
+  confirmCardAction: {
+    label: "Send the card action the single-action review is asking you to confirm",
+    no_voice: "the confirm step of a card action that asks for confirmation, and of both closes; voice has no confirm-before-acting step yet (PRD #802 D5), so `run_card_action` on such an action opens this step on screen and stops — the press that sends it is the user's own, by hand",
+    needs: ["confirmCardAction"],
+    run: (context: Pick<VoiceActionContext, "confirmCardAction">) => context.confirmCardAction(),
+  },
+
+  closeCardReview: {
+    label: "Close the single-action review without sending",
+    no_voice: "the review's Cancel; voice's `close` reaches the review while it is the topmost overlay, through the fence it registers, as it reaches the batch confirmation, so a row naming it directly would close it out from under anything opened over it",
+    needs: ["closeCardReview"],
+    run: (context: Pick<VoiceActionContext, "closeCardReview"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.closeCardReview();
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
 
-  confirmCardAction: {
-    label: "Send the card action the overlay is asking you to confirm",
-    no_voice: "the confirm step of a card action that asks for confirmation, and of both closes; voice has no confirm-before-acting step yet (PRD #802 D5), so `run_card_action` on such an action opens this step on screen and stops — the press that sends it is the user's own, by hand",
-    needs: ["confirmCardAction"],
-    run: (context: Pick<VoiceActionContext, "confirmCardAction">) => context.confirmCardAction(),
+  /* Issue #2399 — batch card actions. Voice can START a batch on a card and
+     everything under it, which only opens the confirmation; sending it is
+     the confirmation's Send, by hand (PRD #802 D5). */
+  runCardActionBatch: {
+    label: "Send one action to a card and every card under it, after confirming",
+    voice: true,
+    needs: ["runCardActionBatch"],
+    run: (context: Pick<VoiceActionContext, "runCardActionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_BATCH_UNHEARD
+        : context.runCardActionBatch(cardRefOf(target), {
+          ...(target.cardActionId !== undefined ? { actionId: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+        });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* PR #2491 review — every card's checkbox is always shown, so there is no
+     selection to turn on; the selection bar's Clear, and voice, empty it. */
+  clearCardSelection: {
+    label: "Clear the Cards view's selection",
+    voice: true,
+    needs: ["clearCardSelection"],
+    run: (context: Pick<VoiceActionContext, "clearCardSelection"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.clearCardSelection();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  toggleCardSelected: {
+    label: "Select or unselect one card for a batch",
+    no_voice: "a card's checkbox, which flips; voice says which it wants instead, through `select_agent_card` and `unselect_agent_card` (the same member with `want` set), so saying it twice does not undo it",
+    needs: ["toggleCardSelected"],
+    run: (context: Pick<VoiceActionContext, "toggleCardSelected"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.toggleCardSelected(cardRefOf(target));
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* Issue #2399 review — voice builds the same selection the checkboxes do,
+     one named card at a time, across trees and across the daemons voice
+     reaches, and starts a batch on it. Selecting a closed
+     card takes everything under it along, as its checkbox does. */
+  selectAgentCard: {
+    label: "Select one card for a batch",
+    voice: true,
+    needs: ["toggleCardSelected"],
+    run: (context: Pick<VoiceActionContext, "toggleCardSelected"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.toggleCardSelected(cardRefOf(target), true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  unselectAgentCard: {
+    label: "Take one card out of the batch selection",
+    voice: true,
+    needs: ["toggleCardSelected"],
+    run: (context: Pick<VoiceActionContext, "toggleCardSelected"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.toggleCardSelected(cardRefOf(target), false);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  runSelectionBatch: {
+    label: "Send one action to the selected cards, after confirming",
+    voice: true,
+    needs: ["runSelectionBatch"],
+    run: (context: Pick<VoiceActionContext, "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_SELECTION_BATCH_UNHEARD
+        : context.runSelectionBatch({
+          ...(target.cardActionId !== undefined ? { actionId: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+        });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  sendCardBatch: {
+    label: "Send the batch the confirmation is showing",
+    no_voice: "the batch confirmation's Send; voice has no confirm-before-acting step yet (PRD #802 D5), so `run_card_action_batch` opens this confirmation on screen and stops — the press that sends the batch is the user's own, by hand",
+    needs: ["sendCardBatch"],
+    run: (context: Pick<VoiceActionContext, "sendCardBatch">) => context.sendCardBatch(),
+  },
+
+  closeCardBatch: {
+    label: "Close the batch confirmation or its results",
+    no_voice: "the dialog's Cancel, Close and `Escape`; the dialog is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\") closes it as the thing on top, through `closeTopmost` — a row of its own would be a second reading of words `close` already answers. It is voice-reachable through that entry, and refused by every route while the batch is being sent",
+    needs: ["closeCardBatch"],
+    run: (context: Pick<VoiceActionContext, "closeCardBatch">) => context.closeCardBatch(),
+  },
+
+  /* PRD #2374 decision 2026-11-24 — the card actions editor. Voice opens
+     the editor, its form for a new action, an action's form and a removal's
+     confirmation (the editor of the daemon named), reads it again and sets the form's icon
+     and checkboxes (issue #2399 review 12); nothing it says writes the
+     daemon's config. Every write —
+     Save, the removal's Remove, Hide and Restore — is a press by hand, so a
+     misheard word can neither change what an agent is sent nor take an
+     action away. */
+  /* PR #2491 decision 2026-11-25 — a daemon's ⋯ menu passes its own deck;
+     voice, the deck its optional `deck_ref` resolved to (`preselectDeckId`),
+     or none, when the only daemon showing cards is meant. */
+  openCardActionsEditor: {
+    label: "Open one daemon's Card actions editor",
+    voice: true,
+    needs: ["openCardActionsEditor"],
+    run: (context: Pick<VoiceActionContext, "openCardActionsEditor"> & Partial<Pick<VoiceActionContext, "reportRefused" | "askVoiceChoice">>, target?: string | Pick<VoiceDispatchTarget, "preselectDeckId">) => {
+      const answer = context.openCardActionsEditor(typeof target === "string" ? target : target?.preselectDeckId || undefined);
+      if (answer === undefined) return;
+      if (typeof answer === "string") { context.reportRefused?.(answer); return; }
+      /* Several daemons and none named: asked which, as a name that fits several agents is. */
+      if (context.askVoiceChoice) context.askVoiceChoice({ param: "deck", kind: "deck_ref", candidates: answer.which.map((daemon) => ({ value: daemon.deckId, label: daemon.name })), sentence: answer.refused });
+      else context.reportRefused?.(answer.refused);
+    },
+  },
+
+  closeCardActionsEditor: {
+    label: "Close the Card actions editor, or the removal it is asking to confirm",
+    no_voice: "the editor's Close and `Escape`; the editor is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\") closes it, or the removal it is asking to confirm, as the thing on top through `closeTopmost` — a row of its own would be a second reading of words `close` already answers",
+    needs: ["closeCardActionsEditor"],
+    run: (context: Pick<VoiceActionContext, "closeCardActionsEditor">) => { context.closeCardActionsEditor(); },
+  },
+
+  refreshCardActions: {
+    label: "Read the Card actions editor's list again",
+    voice: true,
+    needs: ["refreshCardActions"],
+    run: (context: Pick<VoiceActionContext, "refreshCardActions"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.refreshCardActions();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  addCardAction: {
+    label: "Open the Card actions editor's form for a new action",
+    voice: true,
+    needs: ["addCardAction"],
+    run: (context: Pick<VoiceActionContext, "addCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.addCardAction();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  editCardAction: {
+    label: "Open one card action's form in the Card actions editor",
+    voice: true,
+    needs: ["editCardAction"],
+    /* A request that waits for the editor to read its list is reported as it settles: the form opened, or why not. */
+    run: (context: Pick<VoiceActionContext, "editCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_ACTION_EDIT_UNHEARD
+        : context.editCardAction({
+          ...(target.cardActionId !== undefined ? { name: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+        });
+      if (typeof refused === "string") context.reportRefused?.(refused);
+      else if (refused !== undefined) context.reportPending?.(CARD_ACTIONS_READING, refused, CARD_ACTION_FORM_OPENED);
+    },
+  },
+
+  removeCardAction: {
+    label: "Ask to remove one of your own card actions",
+    voice: true,
+    needs: ["removeCardAction"],
+    /* A request that waits for the editor to read its list is reported as it settles: the form opened, or why not. */
+    run: (context: Pick<VoiceActionContext, "removeCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_ACTION_EDIT_UNHEARD
+        : context.removeCardAction({
+          ...(target.cardActionId !== undefined ? { name: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+        });
+      if (typeof refused === "string") context.reportRefused?.(refused);
+      else if (refused !== undefined) context.reportPending?.(CARD_ACTIONS_READING, refused, CARD_ACTION_REMOVAL_ASKED);
+    },
+  },
+
+  confirmRemoveCardAction: {
+    label: "Remove the card action the editor is asking to confirm",
+    no_voice: "the removal confirmation's Remove, which deletes the action from the daemon's config; voice has no confirm-before-acting step yet (PRD #802 D5), so `remove_card_action` opens this confirmation on screen and stops — the press that removes it is the user's own, by hand",
+    needs: ["confirmRemoveCardAction"],
+    run: (context: Pick<VoiceActionContext, "confirmRemoveCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.confirmRemoveCardAction();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  hideCardAction: {
+    label: "Hide a deck default card action",
+    no_voice: "Hide writes the daemon's config at once, with no step to read first, and takes the action off every card; voice opens the editor and an action's form, and every write in the editor is a press by hand, so a misheard name cannot take an action off the agents' cards",
+    needs: ["hideCardAction"],
+    run: (context: Pick<VoiceActionContext, "hideCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, name: string) => {
+      const refused = context.hideCardAction(name);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  restoreCardAction: {
+    label: "Restore a deck default card action",
+    no_voice: "Restore writes the daemon's config at once and throws away the user's own version of that default; voice opens the editor and an action's form, and every write in the editor is a press by hand",
+    needs: ["restoreCardAction"],
+    run: (context: Pick<VoiceActionContext, "restoreCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, name: string) => {
+      const refused = context.restoreCardAction(name);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  saveCardAction: {
+    label: "Save the card action the editor's form holds",
+    no_voice: "the form's Save writes the action — the exact text agents are sent — to the daemon's config; voice opens the form (`add_card_action`, `edit_card_action`), the fields are typed by hand, and the press that writes them is the user's own, so a misheard word never becomes text an agent is sent",
+    needs: ["saveCardAction"],
+    run: (context: Pick<VoiceActionContext, "saveCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.saveCardAction();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  chooseCardActionIcon: {
+    label: "Choose the icon of the card action in the editor's form",
+    voice: true,
+    needs: ["chooseCardActionIcon"],
+    /* The grid passes the icon it draws; voice, the icon's name as the user said it (`filterText`). */
+    run: (context: Pick<VoiceActionContext, "chooseCardActionIcon"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: string | Pick<VoiceDispatchTarget, "filterText">) => {
+      const said = typeof target === "string" ? target : target.filterText;
+      const refused = said ? context.chooseCardActionIcon(said) : CARD_ICON_UNHEARD;
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* The form's two checkboxes, one entry per state each, so a spoken "ask
+     before sending" never toggles a box that was already ticked. The boxes
+     dispatch the entry for the state they are being set to. */
+  askBeforeSendingCardAction: {
+    label: "Tick Ask before sending in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("confirm", true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  sendCardActionWithoutAsking: {
+    label: "Untick Ask before sending in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("confirm", false);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  offerCardActionOnEveryCard: {
+    label: "Tick Offer on every card in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("always", true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  offerCardActionWhenAgentsChoose: {
+    label: "Untick Offer on every card in the Card actions form",
+    voice: true,
+    needs: ["setCardActionFlag"],
+    run: (context: Pick<VoiceActionContext, "setCardActionFlag"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionFlag("always", false);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* Issue #2399 re-review N4: the form's Placement choice, one entry per
+     choice, so saying one twice keeps it. The select dispatches the entry
+     for the choice picked. */
+  showCardActionOnCard: {
+    label: "Choose Show on the card as the Card actions form's Placement",
+    voice: true,
+    needs: ["setCardActionPlacement"],
+    run: (context: Pick<VoiceActionContext, "setCardActionPlacement"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionPlacement("card");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  showCardActionOnlyInCardTab: {
+    label: "Choose Only in the Card tab as the Card actions form's Placement",
+    voice: true,
+    needs: ["setCardActionPlacement"],
+    run: (context: Pick<VoiceActionContext, "setCardActionPlacement"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.setCardActionPlacement("detail");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  cancelCardActionForm: {
+    label: "Close the Card actions editor's form without saving",
+    no_voice: "the form's Cancel, which only closes the form; voice's `close` closes the editor it is in, and saying another action's name (`edit_card_action`, `add_card_action`) replaces the form",
+    needs: ["cancelCardActionForm"],
+    run: (context: Pick<VoiceActionContext, "cancelCardActionForm">) => { context.cancelCardActionForm(); },
   },
 
   toggleOverviewRowMenu: {
@@ -1992,7 +2420,7 @@ export const VOICE_ACTIONS = {
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
-export type VoiceActionId = keyof typeof VOICE_ACTIONS;
+type VoiceActionId = keyof typeof VOICE_ACTIONS;
 
 /**
  * Compile-time proof that each entry's `needs` covers what its `run` requires.
@@ -2143,12 +2571,10 @@ export type VoiceDispatchTarget = AgentViewTarget & {
   cardActionLabel?: string;
   /** PRD #2374 — the version (`token`) of the card action the pressed button showed. */
   cardActionToken?: string;
-  /** PRD #2374 — open the card at a review step showing the action's exact text instead of sending it (review B8). */
+  /** PRD #2374 — open a review showing the action's exact text instead of sending it (review B8). */
   cardActionReview?: boolean;
-  /** PRD #2374 — the words of a reply: a `reply_to_agent_card` dispatch's (the transcript's own), or the reply box's. */
-  cardReplyText?: string;
-  /** PRD #2374 — send the reply now: set only by the reply box's Send reply, which shows the words. A spoken reply opens that box instead. */
-  cardReplySend?: boolean;
+  /** PR #2491 decision 2026-11-25 — also open the agent's pane, on Terminal, under the review (the table's row menu). */
+  cardActionOpenPane?: boolean;
   /**
    * The New agent form the utterance was JUDGED against — its deck and chosen
    * directory as declared — or absent when no live form was declared. The
@@ -2251,7 +2677,20 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused" | "reportPending">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused" | "reportPending" | "askVoiceChoice">;
+
+/**
+ * PR #2491 decision 2026-11-25 — what a dispatch the screen could not settle
+ * asks the user to choose from: the row's `param` of `kind`, one candidate
+ * per thing on screen (its value, as the param's resolver gives it, and the
+ * name the screen shows), and the sentence said when no choice is offered.
+ */
+export interface VoiceChoiceAsk {
+  param: string;
+  kind: "deck_ref";
+  candidates: { value: string; label: string }[];
+  sentence: string;
+}
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -2290,7 +2729,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * on the overview and over the Runs screen on the deck. Its Cancel is reached
  * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "showApprovalRequest" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
+type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "choosePaneTab" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "showApprovalRequest" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the
@@ -2309,10 +2748,19 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | "showInterruptedWork" | "hideInterruptedWork" | "interruptedDialog" | AgentCardMember>;
 
 /** PRD #2374 — the agent cards' members, served by the overview. */
-export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference";
+type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeCardReview" | "runCardAction" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
+
+/** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
+/** PR #2491 decision 2026-11-25 — "open card actions" with several daemons and none named: the sentence, and the daemons to choose from. */
+export interface CardActionsWhich {
+  refused: string;
+  which: { deckId: string; name: string }[];
+}
+
+export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag" | "setCardActionPlacement";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
-export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";
+type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";
 
 /**
  * What the New agent dialog publishes about its directory browser (PRD #1223),
@@ -2359,7 +2807,14 @@ export type NewAgentVoiceChannel = { current: NewAgentVoice | undefined };
  * is no browser to move — to the shell that dispatches, the way
  * {@link VoiceContextChannel} carries the deck's.
  */
-export type VoiceOverviewChannel = { current: Partial<VoiceOverviewContext> | undefined };
+export type VoiceOverviewChannel = { current: VoiceOverviewPublished | undefined };
+
+/**
+ * What the overview publishes: its members, and (PR #2491, 2026-11-25) the
+ * dashboard's view and Needs you only as they stand, which the voice panel
+ * declares with each utterance on the dashboard. Not a member: no action runs it.
+ */
+export type VoiceOverviewPublished = Partial<VoiceOverviewContext> & { dashboardState?: () => import("./bridge").VoiceDashboardDto };
 
 /**
  * How a screen publishes its half of the context up to the host that dispatches

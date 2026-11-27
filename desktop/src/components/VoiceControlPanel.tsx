@@ -83,8 +83,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText, sanitizeText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
-import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceReadingStateDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
+import { VOICE_ACTIONS, type VoiceChoiceAsk, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
+import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDashboardDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceReadingStateDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceItemAnswerDto, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedOpens, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
@@ -173,7 +173,7 @@ const VOICE_CHAIN_POLL_MS = 16;
  * it was ("use claude" refused as if the orchestration chip were still
  * chosen). Several frames, so the render and its effects have both run.
  */
-export const VOICE_CHAIN_STEP_GAP_MS = 64;
+const VOICE_CHAIN_STEP_GAP_MS = 64;
 
 /**
  * PRD #1184 — what the voice row says when a chain's numbered choice ends
@@ -1288,6 +1288,17 @@ const INTERRUPTED_DIALOG_INVOKES: ReadonlySet<string> = new Set(Object.entries(V
 const IMPLICIT_PANE_INVOKES: ReadonlySet<string> = new Set(["confirmStopAgent", "confirmGenerateConfig", "scrollUp", "scrollDown", "scrollToTop", "scrollToBottom"]);
 
 /**
+ * PR #2491 review V1 — the Card actions editor rows that, said over an agent's
+ * pane without naming a daemon, open the editor of the PANE's daemon: the
+ * opening itself, and add, edit and remove, which open it when it is closed.
+ * {@link dispatchLost} holds each to the pane it was said over, so an answer
+ * that arrives after the user moved to another daemon's pane opens nothing
+ * there. A daemon named in the utterance (`deck_ref`) is not held: it names
+ * its own target.
+ */
+const EDITOR_PANE_INVOKES: ReadonlySet<string> = new Set(["openCardActionsEditor", "addCardAction", "editCardAction", "removeCardAction"]);
+
+/**
  * The gate for dispatching a resolved outcome: {@link contextLost}'s `answer`
  * touch, then its `agent` touch for every agent the outcome's params name —
  * so a stop resolved before a same-id replacement, or before the selected deck
@@ -1305,6 +1316,15 @@ function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly Voi
     if (incarnationsDiffer(was.pane.spawnedAtMs, now.pane.spawnedAtMs)) return { code: "replaced", why: "the agent in the pane was replaced" };
     const moved = contextLost(was, now, { agent: was.pane });
     if (moved) return moved;
+  }
+  /* PR #2491 review V1 — the editor's daemon is read from the pane on screen
+     when the answer is dispatched, so a pane other than the one it was said
+     over (or one that opened or closed since) refuses rather than opening
+     another daemon's editor. Only the pane's address counts: the editor is
+     bound to its daemon, not to the agent's process. */
+  if (invoke !== undefined && EDITOR_PANE_INVOKES.has(invoke) && was.screen === "agent" && !params.some((param) => param.kind === "deck_ref")) {
+    const samePane = was.pane === undefined ? now.pane === undefined : showsAgent(now.pane, { ...was.pane, incarnation: was.pane.incarnation });
+    if (!samePane) return { code: "pane", why: now.pane === undefined ? "the pane closed" : "the pane on screen changed" };
   }
   /* PRD #1790 stage 2 (auditor 2) — an action on the Interrupted work dialog
      acts on the dialog it was said to, as its deck, process, opening, items,
@@ -1731,6 +1751,13 @@ interface VoiceControlPanelProps {
    * another page is told that page instead of "no matching action".
    */
   pages?: () => VoicePager | undefined;
+  /**
+   * PR #2491 (2026-11-25) — the agent dashboard's view and whether Needs you
+   * only is on, declared with each utterance while the dashboard is the
+   * screen, so the command model can tell "show all cards" the filter's off
+   * switch from the Cards view.
+   */
+  dashboard?: () => VoiceDashboardDto | undefined;
   /** PR #1451 round 3 — told when the numbered choice opens or closes, so the lists behind it can hide their numbers. */
   onChoiceChange?: (open: boolean) => void;
   /**
@@ -1785,7 +1812,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, reading, readingAgents, readingDecks, onReadingSwitch, onReadingNoticeShown, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, reading, readingAgents, readingDecks, onReadingSwitch, onReadingNoticeShown, onVoiceChange, agentIncarnations, numbered, pages, dashboard, onChoiceChange, keyboard }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -1804,6 +1831,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   numberedRef.current = numbered;
   const pagesRef = useRef(pages);
   pagesRef.current = pages;
+  const dashboardRef = useRef(dashboard);
+  dashboardRef.current = dashboard;
+  /* The dashboard declared with an utterance judged against `screen`: only the dashboard's own. */
+  const declaredDashboard = (screen: VoiceScreen): VoiceDashboardDto | undefined => (screen === "overview" ? dashboardRef.current?.() : undefined);
   /**
    * PR #1451 round 3, change 3 — the numbered list as it stood when the user
    * began to speak: read when the microphone opens and refreshed by every
@@ -3198,6 +3229,37 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     });
     return true;
   }, [setPanelState]);
+  /**
+   * PR #2491 decision 2026-11-25 — offer what a dispatch asked about
+   * ({@link askVoiceChoice}) as a `param_ambiguous` tie of the row it was
+   * dispatching, so the choice, its answers and its gates are the ones a name
+   * that fits several agents gets. `false` when no choice can be offered,
+   * which leaves the refusal already reported. With `chain`, the dispatch was
+   * a chain's step: the chain pauses on the choice, and its answer goes on
+   * with the steps after it (Qodo 12 on PR #2491).
+   */
+  const offerAsked = useCallback((answer: VoiceResultDto, outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, asked: VoiceChoiceAsk, declared: VoiceContext, chain?: VoiceChainPause) => {
+    if (outcome.invoke === undefined) return false;
+    const candidates: VoiceResolvedParamDto[] = asked.candidates.map((candidate) => ({ name: asked.param, kind: asked.kind, spoken: "", value: candidate.value, label: candidate.label, names: [candidate.label] }));
+    const tie: VoiceResultDto = {
+      ...answer,
+      outcome: {
+        kind: "param_ambiguous",
+        transcript: outcome.transcript,
+        action: outcome.action,
+        invoke: outcome.invoke,
+        param: asked.param,
+        spoken: "",
+        matches: candidates.map((candidate) => candidate.label),
+        candidates,
+        params: outcome.params.filter((param) => param.name !== asked.param),
+        sentence: asked.sentence,
+      },
+    };
+    if (!offerChoice(tie, declared, chain)) return false;
+    setResult(tie);
+    return true;
+  }, [offerChoice]);
   /* PRD #1184 — `runChain`, for an answered choice to go on with its chain.
      A ref because `runChain` is built after `dispatchChoice`, which reads it. */
   const runChainRef = useRef<RunChain | undefined>(undefined);
@@ -3221,7 +3283,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     setResult({ outcome, resolveMs: null, backend: NUMBERS_BACKEND });
     refusedRef.current = false;
+    choiceAsked.current = undefined;
     const dispatched = dispatchDeclared(outcome, declared);
+    /* An entry names what it runs on, so nothing it dispatches is offered as a choice; an ask is not left behind. */
+    choiceAsked.current = undefined;
     if (refusedRef.current) setResult(undefined);
     else if (!dispatched) setProblem(NOTHING_DISPATCHED);
     else if (dispatched.undo) setUndo({ run: dispatched.undo });
@@ -3426,7 +3491,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     setResult({ outcome, resolveMs: null, backend: offer.backend });
     refusedRef.current = false;
     refusalRef.current = undefined;
+    choiceAsked.current = undefined;
     const dispatched = dispatchDeclared(outcome, offer.declared);
+    /* The answer to a choice carries what was chosen; an ask is not offered again, nor left behind. */
+    choiceAsked.current = undefined;
     if (paused) {
       if (refusedRef.current) {
         setResult(undefined);
@@ -3602,10 +3670,17 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       refusedRef.current = false;
       refusalRef.current = undefined;
-      const dispatched = dispatchDeclaredRef.current(
-        { kind: "dispatch", transcript: chain.transcript, action: step.action, invoke: step.invoke, params: step.params, sentence: step.sentence },
-        index === 0 ? declared : { ...now, deck: judgedOn.deck, incarnations: declared.incarnations },
-      );
+      choiceAsked.current = undefined;
+      const outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }> = { kind: "dispatch", transcript: chain.transcript, action: step.action, invoke: step.invoke, params: step.params, sentence: step.sentence };
+      const dispatched = dispatchDeclaredRef.current(outcome, index === 0 ? declared : { ...now, deck: judgedOn.deck, incarnations: declared.incarnations });
+      const asked = choiceAsked.current as VoiceChoiceAsk | undefined;
+      choiceAsked.current = undefined;
+      /* Qodo 12 on PR #2491 — the step asked which one ("open card actions"
+         with several daemons): the chain pauses on that numbered choice, as on
+         a step that matched several things, and nothing after it runs on a
+         guess. Its answer goes on from the next step (`dispatchChoice`); a
+         choice that cannot be offered stops the chain on the refusal. */
+      if (asked && offerAsked({ outcome, resolveMs: null, backend }, outcome, asked, judgedOn, { ...progress, index, chain, declared, backend })) return;
       if (refusedRef.current) {
         stop(index, refusalRef.current ?? "it was refused");
         return;
@@ -3624,7 +3699,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (from) setResult({ outcome: { ...chain, sentence: `${progress.reports.map((report, at) => at === 0 ? report.replace(/\.$/u, "") : report.charAt(0).toLowerCase() + report.slice(1).replace(/\.$/u, "")).join(", then ")}.` }, resolveMs: null, backend });
     const undos = progress.undos;
     if (progress.reversible && undos.length === chain.steps.length) setUndo({ run: () => { for (const undo of [...undos].reverse()) undo(); } });
-  }, [current, offerChoice, setProblem]);
+  }, [current, offerAsked, offerChoice, setProblem]);
   useEffect(() => { runChainRef.current = runChain; }, [runChain]);
 
   const resolveOne = useCallback(async (utterance: string, ours: () => boolean, alone?: string) => {
@@ -3654,7 +3729,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setPhase("resolving");
       let verdict: VoiceChoiceAnswerDto;
       try {
-        declareVoiceScreen?.(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.(), endpointsRef.current?.());
+        declareVoiceScreen?.(screenRef.current, directoriesRef.current?.(), newAgentRef.current?.(), endpointsRef.current?.(), undefined, undefined, declaredDashboard(screenRef.current));
         /* A choice between numbered items is answered by the webview's rule:
            its entries may be other decks' agents, which Rust's liveness
            check reads against the selected deck alone. What stands behind
@@ -3701,7 +3776,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const declaredDictation = mode.kind === "dictating" ? { deckId: mode.target.deckId, agentId: mode.target.agentId } : undefined;
     setPhase("resolving");
     try {
-      declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading());
+      declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading(), declaredDashboard(declared.screen));
       const answer = await resolveVoice(utterance);
       // Abandoned, or replaced by a later utterance. Say nothing and run
       // nothing: voice is off, or this belongs to the cycle that replaced it.
@@ -3759,7 +3834,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
           }, VOICE_JOIN_WINDOW_MS);
           return;
         }
-        declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading());
+        declareVoiceScreen?.(declared.screen, declared.directories, declared.newAgent, endpointsRef.current?.(), declaredDictation, declaredReading(), declaredDashboard(declared.screen));
         const own = await resolveVoice(alone);
         if (!ours()) return;
         if (!HOLDABLE_OUTCOMES.has(own.outcome.kind)) {
@@ -3777,7 +3852,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         offerChoice(final, declared);
       } else if (final.outcome.kind === "dispatch") {
         refusedRef.current = false;
+        choiceAsked.current = undefined;
         const dispatched = dispatchDeclared(final.outcome, declared);
+        const asked = choiceAsked.current as VoiceChoiceAsk | undefined;
+        choiceAsked.current = undefined;
+        /* PR #2491 decision 2026-11-25 — the dispatch asked which one: offered
+           as the numbered choice, whose answer runs the row again with it. */
+        if (asked && offerAsked(final, final.outcome, asked, declared)) return;
         /* What the dispatch reached refused it, in its own sentence, so the
            outcome's sentence — "Showing …", written before anything ran — is
            now false, and an Undo would reverse nothing. The refusal is the
@@ -3793,7 +3874,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     } catch (cause) {
       if (ours()) setProblem(sentenceOf(cause));
     }
-  }, [answerNumber, answerQuestion, answerVoiceChoice, clearHeld, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerChoice, reportHeld, resolveVoice, runChain, setPhase]);
+  }, [answerNumber, answerQuestion, answerVoiceChoice, clearHeld, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerAsked, offerChoice, reportHeld, resolveVoice, runChain, setPhase]);
 
   /**
    * One whole utterance: take it, transcribe, resolve, listen again.
@@ -4219,6 +4300,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     refusalRef.current = reason;
     setProblem(reason);
   }, []);
+  /**
+   * PR #2491 decision 2026-11-25 — a dispatch that cannot tell which of
+   * several things on screen was meant ("open card actions" with several
+   * daemons) asks, as a spoken name that fits several agents does. Reported
+   * as its refusal at once; the dispatch's caller then offers the candidates
+   * as the numbered choice where one can be offered ({@link offerAsked}),
+   * and otherwise the refusal is what the user reads.
+   */
+  const choiceAsked = useRef<VoiceChoiceAsk | undefined>(undefined);
+  const askVoiceChoice = useCallback((ask: VoiceChoiceAsk) => {
+    reportRefused(ask.sentence);
+    choiceAsked.current = ask;
+  }, [reportRefused]);
   /**
    * PRD #1401 — a dispatch whose effect settles later: `pending` now, through
    * {@link reportRefused} so the resolver's sentence (written before anything
@@ -5056,6 +5150,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       reportNothingToClose,
       reportRefused,
       reportPending,
+      askVoiceChoice,
       ...(voiceCommands ? { showVoiceCommands } : {}),
       /* PRD #802 — published only while the overlay is OPEN, and that is how
          "an overlay is open" reaches a dispatch at all: it is a `useState`
@@ -5501,6 +5596,15 @@ const VOICE_CHOICE_NOUNS: Record<string, string> = {
 };
 
 /**
+ * One offered entry's identity in the list. `value` alone is not one: an
+ * agent's id is its daemon's own, so two daemons under All daemons can both
+ * offer agent `planner` (#2399 re-review). The deck and the daemon process
+ * that listed it tell them apart; the kind does for a choice across sections.
+ */
+const voiceChoiceKey = (candidate: VoiceResolvedParamDto) =>
+  `${candidate.kind}\u0000${candidate.deckId ?? ""}\u0000${candidate.incarnation ?? ""}\u0000${candidate.value}`;
+
+/**
  * PRD #1261 — the numbered choice, as a modal dialog in `ConfirmDialog`'s
  * look (PR #1451 round 3, the maintainer's call).
  *
@@ -5577,7 +5681,7 @@ function VoiceChoiceDialog({ offer, secondsLeft, onPick, onCancel }: {
         </p>
         <ol className="voice-choice-list">
           {candidates.map((candidate, at) => (
-            <li key={candidate.value}>
+            <li key={voiceChoiceKey(candidate)}>
               <button ref={at === 0 ? firstEntry : undefined} type="button" className="button secondary" onClick={() => onPick(candidate)}>
                 {`${at + 1}. ${displayText(candidate.label, DISPLAY_LIMITS.name)}`}
               </button>

@@ -157,6 +157,20 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // contains no `std::env::current_dir` — all zero for it.
     "authoring_seeds",
     "build_id",
+    // Issue #2399 (PR #2491 scope extension, PRD #2374 decision 2026-11-24),
+    // argued rather than added quietly, on `agent_cards`' terms above. The
+    // desktop's Card actions editor names the editor's WIRE types here —
+    // `CatalogActionEdit`, `CatalogActionInput` and `EditableCardCatalog` —
+    // which it passes between the webview and the daemon as they are (the
+    // daemon validates and writes; CLAUDE.md rule 18). A desktop-side copy of
+    // those shapes would be a second definition to keep in step with the
+    // daemon's. The module also holds the catalog reader and the editor's
+    // writer, which act on the USER config the daemon reads (never a
+    // project's), and the desktop's production code calls neither. Checked
+    // against this rule's lines: it resolves no project, names no
+    // FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "card_catalog",
     "config",
     "daemon_attach",
     "daemon_client",

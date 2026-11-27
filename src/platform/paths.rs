@@ -2588,6 +2588,24 @@ pub fn resolve_attach_socket_path() -> ResolvedEndpoint {
     }
 }
 
+/// Issue #2531: where every test process's `DOT_AGENT_DECK_STATE_DIR` points
+/// from before `main`, so a test that opens a state store without choosing its
+/// own directory gets an error instead of the developer's real state directory.
+///
+/// Beneath `/dev/null`, a character device, so a `create_dir_all`, an `open`
+/// and a `stat` through it all fail with `ENOTDIR`: nothing can be created
+/// there, by the test or by another local user, and nothing is left behind.
+/// The same choice, and the same reasons, as the unreachable `XDG_RUNTIME_DIR`
+/// the test constructors already set (issue #1473).
+///
+/// Set by the lib unit tests' constructor (`src/test_isolation.rs`) and by
+/// `tests/common/child_lifetime_bound.rs`, which every integration-test crate
+/// that builds an agent registry or runs a daemon includes (linkage-check rule
+/// 10). Production code never reads it.
+#[cfg(unix)]
+#[doc(hidden)]
+pub const TEST_UNREACHABLE_STATE_DIR: &str = "/dev/null/dot-agent-deck-test-no-real-state";
+
 /// Per-user state directory (detached-daemon log, spawn mutex). Resolution
 /// order on Unix:
 ///

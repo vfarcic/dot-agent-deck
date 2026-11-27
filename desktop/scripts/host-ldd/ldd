@@ -1,0 +1,6 @@
+#!/bin/sh
+# Issue #2399 — the host's ldd, for Playwright's host-requirement check
+# under devbox. playwright.config.ts puts this directory first on PATH only
+# when the ldd on PATH is nix's and /usr/bin/ldd exists; see
+# docs/develop/desktop-gui.md, "One devbox gotcha, handled by the config".
+exec /usr/bin/ldd "$@"

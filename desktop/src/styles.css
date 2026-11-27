@@ -59,6 +59,11 @@
   --teal-edge: #bed5cf;
   --teal-soft: #d9ebe5;
   --teal-wash: #edf5f1;
+  /* PR #2491 (2026-11-25): the floating selection bar's ground, a toolbar that
+     must not read as more of the page. A step deeper than --teal-soft, so the
+     action group inside it still shows as its own box; --ink on it is 10.9:1,
+     --teal (its border and Clear's) 4.1:1, --muted 6.2:1. */
+  --teal-toolbar: #bfded4;
 
   /* Green: passed / done. */
   --green: #28724d;
@@ -271,6 +276,7 @@
     --teal-edge: #33564f;
     --teal-soft: #1c332e;
     --teal-wash: #16241f;
+    --teal-toolbar: #1f453c;  /* lighter than --teal-soft, as raised is lighter in dark: --ink 8.8:1, --teal 4.9:1, --muted 4.9:1 */
     /* Green: passed / done. */
     --green: #5cbb87;
     --green-rim: #4f8266;
@@ -391,6 +397,7 @@
   --teal-edge: #33564f;
   --teal-soft: #1c332e;
   --teal-wash: #16241f;
+  --teal-toolbar: #1f453c;  /* lighter than --teal-soft, as raised is lighter in dark: --ink 8.8:1, --teal 4.9:1, --muted 4.9:1 */
   /* Green: passed / done. */
   --green: #5cbb87;
   --green-rim: #4f8266;
@@ -1367,6 +1374,9 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .daemon-upgrade { flex: 0 0 auto; margin-left: auto; }
 .daemon-pips + .daemon-upgrade { margin-left: 0; }
 .daemon-upgrade + .daemon-new-agent { margin-left: 0; }
+/* PR #2491 decision 2026-11-25 — the daemon's ⋯ sits just left of New agent, the two packed to the right as New agent alone was. */
+.daemon-more { margin-left: auto; }
+.daemon-pips + .daemon-more, .daemon-upgrade + .daemon-more, .daemon-stop + .daemon-more, .daemon-more + .daemon-new-agent { margin-left: 0; }
 /* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
    otherwise sit on top of the report text, which is the same corner. The STACK
    is what is positioned (issue #1234): each undismissed cleanup warning is its
@@ -1448,6 +1458,16 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
   .top-actions .dashboard-counters-button span { display: inline; }
   .top-actions .dashboard-counters-button .dashboard-counters-word { display: none; }
   .topbar.overview-topbar { grid-template-columns: minmax(0, 1fr) auto; }
+  /* PR #2491 decision 2026-11-25 — the ⋯ menu and the Needs you only chip
+     stay too: the ⋯ holds Needs you only and the count of agents that need
+     you, and the chip is the only sign the filter is on. The actions wrap
+     under one another rather than run past the window's edge, and so does a
+     daemon's header row, so its name is not squeezed by its ⋯. */
+  .top-actions .more-menu-button.secondary, .top-actions .needs-you-chip.secondary { display: inline-flex; }
+  .top-actions .needs-you-chip span { display: inline; }
+  .top-actions .more-menu-button .more-menu-count { display: grid; }
+  .overview-topbar .top-actions { flex-wrap: wrap; justify-content: flex-end; row-gap: 6px; padding-block: 6px; }
+  .daemon-group-header-row { flex-wrap: wrap; row-gap: 6px; }
   .fixture-bar { padding: 6px 10px; flex-wrap: wrap; }
   .fixture-bar p { width: calc(100% - 88px); }
   .connection-banner { margin-inline: 8px; }
@@ -2145,15 +2165,17 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .overview-mode-switch button + button { border-left: 1px solid var(--line-strong); }
 .overview-mode-switch button.is-selected { color: var(--teal); background: var(--teal-soft); }
 .overview-mode-switch button:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: -2px; }
-.agent-cards { display: grid; gap: 14px; }
-.agent-cards-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
-.agent-cards-count { color: var(--muted); font-size: var(--text-sm); }
-.agent-cards-filter.is-on { color: var(--amber); border-color: var(--amber-rim); background: var(--amber-soft); }
+.agent-cards-notes { display: grid; gap: 8px; }
 .agent-cards-empty { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); font-size: var(--text-base); text-align: center; }
 /* Issue #2418 — the Cards tree: roots in a wrapping grid that never moves, and
    under each row the trees of the roots opened in it ("Row, wrapping, roots
-   stay put"). `layoutRow` in AgentCardsGrid.tsx places each tree and draws the
-   lines from the roots; the levels below are joined by these borders. */
+   stay put"). `layoutRow` in AgentCardsGrid.tsx draws the lines from the roots
+   to their trees' boxes. Issue #2533: each opened tree sits in its own box, one
+   neutral tint for every box (a card's colour means its status, so the boxes
+   carry none), captioned with its root's name; inside it the cards under each
+   card wrap into rows instead of scrolling sideways. `layoutTreeLevel`
+   (lib/cardTreeLayout.ts) places the rows, buses and spines across; their
+   heights follow the rows here. */
 .agent-cards-deck { display: grid; gap: 12px; min-width: 0; }
 .agent-cards-note { margin: 0; color: var(--muted); font-size: var(--text-sm); }
 .agent-cards-rows { display: grid; gap: 12px; min-width: 0; }
@@ -2162,23 +2184,23 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-lines path { fill: none; stroke: var(--line-strong); stroke-width: 1.5; }
 .agent-cards-roots { position: relative; z-index: 1; display: grid; gap: 12px; align-items: stretch; justify-content: start; }
 .agent-cards-band { position: relative; z-index: 1; padding-top: 22px; min-width: 0; }
-.agent-cards-block { position: relative; width: max-content; max-width: 100%; overflow-x: auto; }
-.agent-cards-tree-level { position: relative; width: max-content; margin: 0; padding: 16px 0 0; list-style: none; display: flex; justify-content: center; }
-.agent-cards-tree-level::before { content: ""; position: absolute; top: 0; left: 50%; height: 16px; border-left: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level.is-top { padding-top: 0; }
-.agent-cards-tree-level.is-top::before { display: none; }
-.agent-cards-tree-level > li { position: relative; flex: none; display: flex; flex-direction: column; align-items: center; padding: 16px 5px 0; }
-.agent-cards-tree-level > li::before, .agent-cards-tree-level > li::after { content: ""; position: absolute; top: 0; height: 16px; width: 50%; border-top: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level > li::before { right: 50%; }
-.agent-cards-tree-level > li::after { left: 50%; border-left: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level > li:first-child::before, .agent-cards-tree-level > li:last-child::after { border-top: 0; }
-.agent-cards-tree-level > li:last-child::before { border-right: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level > li:last-child::after { border-left: 0; }
-.agent-cards-tree-level > li:only-child { padding-top: 0; }
-.agent-cards-tree-level > li:only-child::before, .agent-cards-tree-level > li:only-child::after { display: none; }
-.agent-cards-tree-level:has(> li:only-child) { padding-top: 16px; }
-.agent-cards-tree-level.is-top:has(> li:only-child) { padding-top: 0; }
-.agent-cards-tree-level .agent-card { width: 224px; }
+.agent-cards-box { position: relative; box-sizing: border-box; max-width: 100%; padding: 0 8px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper-sunken); }
+.agent-cards-box-caption { height: 24px; overflow: hidden; color: var(--muted); font-size: var(--text-xs); font-weight: 600; line-height: 24px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-cards-tree-level { --tree-line: 1.5px solid var(--line-strong); position: relative; box-sizing: border-box; display: flex; flex-wrap: wrap; align-items: stretch; padding-top: 16px; }
+/* The stem: from the parent card down to the first row's bus; a top level's comes in from the box's top edge, past the caption. */
+.agent-cards-tree-level::before { content: ""; position: absolute; top: 0; left: var(--stem-x); height: 16px; border-left: var(--tree-line); }
+.agent-cards-tree-level.is-top::before { top: -25px; height: 41px; }
+/* Where one row ends and the next starts: the cards stay children of the level, so one moving to another row is not drawn afresh. */
+.agent-cards-tree-break { flex: 0 0 100%; height: 0; }
+.agent-cards-tree-item { position: relative; box-sizing: border-box; flex: none; display: flex; flex-direction: column; align-items: center; padding: 16px 5px 0; }
+.agent-cards-tree-level.is-single > .agent-cards-tree-item { padding-top: 0; }
+/* A row's bus, on its first card's top edge, and the spine on from it to the next row: down the gap between two items, which runs the row's full height. */
+.agent-cards-bus { position: absolute; top: 0; height: 0; border-top: var(--tree-line); }
+.agent-cards-spine { position: absolute; top: 0; bottom: 0; border-left: var(--tree-line); }
+/* Each card's drop from its row's bus. */
+.agent-cards-tree-item::before { content: ""; position: absolute; top: 0; left: 50%; height: 16px; border-left: var(--tree-line); }
+.agent-cards-tree-level.is-single > .agent-cards-tree-item::before { display: none; }
+.agent-cards-tree-item .agent-card { width: var(--tree-card-width, 224px); }
 .agent-card { --tone: var(--line-strong); --tone-soft: var(--paper-strong); min-width: 0; max-width: 100%; padding: 9px 10px; display: flex; flex-direction: column; gap: 5px; border: 1px solid var(--line); border-left: 3px solid var(--tone); border-radius: 7px; background: var(--paper-strong); text-align: left; cursor: pointer; }
 .agent-card:hover { border-color: var(--line-strong); border-left-color: var(--tone); }
 /* Issue #2418 (D12): the wrapper that keeps a control's click from reaching the card adds no box of its own. */
@@ -2196,10 +2218,43 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-header .agent-card-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; }
 .agent-card-toggle, .agent-card-close { flex: 0 0 auto; width: 22px; height: 20px; }
 .agent-card-header .agent-card-needs-you { flex: none; white-space: nowrap; }
+.agent-card-header .agent-card-needs-you.is-compact { position: relative; gap: 0; padding: 2px 3px; }
+/* PRD #2374 decision 2026-11-24: the status line keeps its height whatever it holds. */
+.agent-card-meta-row { flex: none; height: 18px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.agent-card-meta-row .agent-card-meta { flex: 1 1 auto; width: auto; min-width: 0; }
+/* Issue #2399 review 2 — the card's bottom row: the roll-up (or nothing), then the action icons at its right end. Its height is fixed, so a card with icons is the height of one without; it is the height of the icons' group (PR #2491 review). */
+.agent-card-foot { flex: none; height: 22px; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.agent-card-foot > .agent-card-rollup-block { flex: 1 1 auto; min-width: 0; }
+.agent-card-foot-actions { flex: none; margin-left: auto; }
+/* PR #2491 review — one box around every set of action icons, drawn the same on a card, in the selection bar and in an overlay's batch row, so the actions are found in the same place everywhere; each icon keeps its own outline and focus ring inside it. */
+.action-icon-group { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px; justify-self: start; width: fit-content; min-width: 0; max-width: 100%; padding: 1px; border: 1px solid var(--teal-rim); border-radius: 6px; background: var(--teal-soft); }
+.agent-card-action-icons { flex: none; flex-wrap: nowrap; }
+.agent-card-action-icon { width: 22px; height: 18px; color: var(--muted); }
+.agent-card-action-icon:hover:not(:disabled):not([aria-disabled="true"]), .agent-card-action-icon:focus-visible { color: var(--teal); border-color: var(--teal); }
+/* PR #2491 v9 review — every action icon, on a card, in the selection bar and in the Card tab, shows that the pointer is on it (a filled, outlined button) and where the keyboard is (a ring outside it), in both themes. */
+.action-icon-group .icon-button:hover:not(:disabled):not([aria-disabled="true"]) { color: var(--teal); border-color: var(--teal); background: var(--paper-strong); box-shadow: 0 0 0 1px var(--teal); }
+.action-icon-group .icon-button:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 2px; }
+.agent-card-action-icon:disabled, .agent-card-action-icon[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
+/* Issue #2399 review — an action icon's explanation on keyboard focus, drawn over the page so no card clips it. */
+.action-tip { position: fixed; z-index: 1000; max-width: 320px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper-strong); color: var(--ink); box-shadow: 0 10px 26px rgb(var(--scrim-rgb) / .13); font-size: var(--text-sm); line-height: 1.35; white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }
+/* Issue #2399 re-review N2: a text taller than the room the window has is cut, and says so on a line of its own that the text cannot push out (it can itself be cut when the room is smaller than that line). */
+.action-tip.is-cut { display: flex; flex-direction: column; overflow: hidden; }
+.action-tip.is-cut .action-tip-text { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.action-tip-cut { flex: none; margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line); font-style: italic; white-space: normal; }
+.agent-card-actions-more { flex: none; height: 18px; min-width: 24px; padding: 0 3px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); background: transparent; font-size: var(--text-xs); font-weight: 700; cursor: pointer; }
+.agent-card-actions-more:hover, .agent-card-actions-more:focus-visible { color: var(--teal); border-color: var(--teal); }
+/* The batch buttons of the selection and the overlay, as icons (decision 2026-11-24). */
+.agent-cards-batch-icon { width: 28px; height: 26px; color: var(--ink); }
+.agent-cards-batch-icon:hover, .agent-cards-batch-icon:focus-visible { color: var(--teal); border-color: var(--teal); }
 /* The status line is a button only so the keyboard reaches the overlay: it is drawn as the line of text it is. */
-.agent-card-meta { flex: none; display: block; width: 100%; height: 18px; padding: 0; border: 0; border-radius: 3px; line-height: 18px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); background: transparent; font: inherit; font-size: var(--text-xs); text-align: left; cursor: pointer; }
+.agent-card-meta { flex: none; display: flex; align-items: center; justify-content: flex-start; gap: 8px; width: 100%; height: 18px; padding: 0; border: 0; border-radius: 3px; line-height: 18px; overflow: hidden; white-space: nowrap; color: var(--muted); background: transparent; font: inherit; font-size: var(--text-xs); text-align: left; cursor: pointer; }
 .agent-card-meta:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
-.agent-card-meta > * + * { margin-left: 8px; }
+/* PR #2491 CI red (desktop/agent-cards/076): the status keeps its own width and the text around it yields, so a wider font than the dev box's
+   truncates the kind ("ORCHES…") instead of cutting the status chip at the card's edge. The ended text yields first, as it did when the line
+   was a single run of text, and the status itself truncates only when it alone is wider than the line. */
+.agent-card-meta > * { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-card-meta > .card-status { flex: 0 0 auto; max-width: 100%; line-height: normal; }
+.agent-card-meta > .agent-card-ended { flex-shrink: 1000; }
 .agent-card-kind { text-transform: uppercase; letter-spacing: .04em; }
 .agent-card-refs { position: relative; flex: none; height: 22px; line-height: 22px; overflow: hidden; white-space: nowrap; }
 /* Issue #2418 review (D-R1): a badge that would be cut is hidden whole, kept in the flow so the ones before it never move, and counted by `+N`. */
@@ -2221,8 +2276,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 /* The repository's colour is a dot beside the name, never the text's own colour, so the name reads in both themes; a label with no usable colour gets the neutral one. */
 .agent-card-label-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--line-strong); box-shadow: inset 0 0 0 1px rgb(var(--scrim-rgb) / .18); }
 .agent-card-labels-more { position: absolute; top: 1px; right: 0; height: 16px; padding: 0 3px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--ink); background: var(--paper-sunken); font-size: var(--text-xs); font-weight: 600; line-height: 14px; text-align: center; font-variant-numeric: tabular-nums; }
-.agent-card-overlay-labels { display: flex; flex-wrap: wrap; gap: 4px 6px; }
-.agent-card-overlay-labels .agent-card-label + .agent-card-label { margin-left: 0; }
+.agent-card-panel-labels { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.agent-card-panel-labels .agent-card-label + .agent-card-label { margin-left: 0; }
 .issue-state-open .pr-badge-state { color: var(--gh-open-fg); }
 .issue-state-closed .pr-badge-state { color: var(--gh-merged-fg); }
 .issue-state-merged .pr-badge-state { color: var(--gh-merged-fg); }
@@ -2241,6 +2296,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .card-source { display: inline-block; margin-right: 4px; padding: 0 4px; border-radius: 3px; font-size: var(--text-xs); font-weight: 600; vertical-align: 1px; }
 .card-source.is-agent { color: var(--muted); border: 1px dashed var(--line-strong); }
 .card-source.is-deck { color: var(--teal); background: var(--teal-soft); }
+.card-source.is-catalog { color: var(--muted); border: 1px solid var(--line); }
+.agent-cards-batch-text-source { margin: 0; }
 .card-custom { margin-left: 5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 3px; color: var(--faint); font-size: var(--text-xs); font-weight: 500; }
 .agent-card-fields { margin: 0; display: grid; gap: 4px; font-size: var(--text-sm); }
 .agent-card-field { display: grid; grid-template-columns: minmax(80px, 35%) minmax(0, 1fr); gap: 8px; }
@@ -2251,30 +2308,57 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-prompt, .agent-card-disabled, .agent-card-result, .agent-card-delivery { color: var(--muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
 .agent-card-disabled { color: var(--faint); }
 .agent-card-result { color: var(--ink); }
-.agent-card-backdrop { padding-top: 6vh; }
-.agent-card-overlay { width: min(720px, 100%); max-height: 100%; overflow-y: auto; padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
-.agent-card-overlay-header { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px; }
-.agent-card-overlay-identity { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.agent-card-overlay-identity h2 { margin: 0; font-size: var(--text-xl); overflow-wrap: anywhere; }
 .agent-card-agent-type { color: var(--muted); font-size: var(--text-sm); }
-.agent-card-overlay-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
-.agent-card-overlay-position { margin-right: 4px; color: var(--muted); font-size: var(--text-sm); }
-.agent-card-overlay-body { display: grid; gap: 12px; }
-.agent-card-overlay-refs:focus { outline: none; }
-.agent-card-overlay-refs:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 3px; }
-.agent-card-overlay-ref-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
-.agent-card-overlay-ref { display: grid; gap: 3px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; }
-.agent-card-overlay-ref-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.agent-card-overlay-ref .agent-card-ref-text { white-space: normal; overflow-wrap: anywhere; }
-.agent-card-overlay-ref-note.is-stale { color: var(--amber-ink); }
-.agent-card-overlay-ref-checked { font-size: var(--text-sm); font-weight: 600; overflow-wrap: anywhere; }
+/* PR #2491 decision 2026-11-26 — the agent pane's Card tab: drawn over the
+   terminal's box, which stays mounted and keeps its size under it
+   (`visibility: hidden` takes it out of sight, of the keyboard and of a screen
+   reader without changing its box), so switching tabs never resizes the
+   agent's terminal. The card scrolls on its own, in a readable column. */
+.agent-panel { position: relative; }
+.agent-terminal-stack.is-covered { visibility: hidden; }
+.agent-card-tab { position: absolute; inset: 0; overflow-y: auto; background: var(--paper-strong); }
+.agent-card-panel { max-width: 760px; min-width: 0; display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; }
+.agent-tabs button em.agent-tab-bell { display: inline-flex; align-items: center; color: var(--amber-ink); background: var(--amber-soft); }
+.agent-card-panel-part { padding-top: 10px; border-top: 1px solid var(--line); }
+.agent-card-panel-part:first-of-type { padding-top: 0; border-top: 0; }
+.agent-card-panel-part h4 { margin: 4px 0 0; color: var(--muted); font-size: var(--text-sm); }
+.agent-card-panel-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.agent-card-panel-needs-you { justify-self: start; }
+.agent-card-panel-refs { display: grid; gap: 6px; }
+.agent-card-panel-refs:focus { outline: none; }
+.agent-card-panel-refs:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 3px; }
+.agent-card-panel-ref-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.agent-card-panel-ref { display: grid; gap: 3px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; }
+.agent-card-panel-ref-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.agent-card-panel-ref .agent-card-ref-text { white-space: normal; overflow-wrap: anywhere; }
+.agent-card-panel-ref-note.is-stale { color: var(--amber-ink); }
+.agent-card-panel-ref-checked { font-size: var(--text-sm); font-weight: 600; overflow-wrap: anywhere; }
+.agent-card-panel-deliveries { display: grid; gap: 6px; }
+.agent-card-panel-questions { display: grid; gap: 8px; }
+.agent-card-panel-actions .action-icon-group { flex-wrap: wrap; }
+.agent-card-panel-results { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.agent-card-panel-notice { margin: 0; padding: 8px 10px; border: 1px solid var(--amber); border-radius: 6px; color: var(--ink); background: var(--amber-soft); font-size: var(--text-xs); overflow-wrap: anywhere; }
+/* The pane header's moves between agents. */
+.agent-pane-card-nav { display: flex; align-items: center; gap: 2px; margin-right: 6px; }
+.agent-pane-needs-you { height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: transparent; font-size: var(--text-base); font-weight: 650; white-space: nowrap; cursor: pointer; }
+.agent-pane-needs-you:hover { border-color: var(--teal); background: var(--teal-soft); }
+.agent-pane-needs-you:focus-visible, .agent-pane-control:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
+/* In the pane, the header's identity keeps its line and its controls wrap onto the next one when the window is narrow, rather than pushing the name or Close agent out of the pane; under 640 px Next needing you keeps its bell, its words staying its accessible name. */
+[data-presentation="overlay"] .agent-header { flex-wrap: wrap; row-gap: 6px; column-gap: 8px; }
+[data-presentation="overlay"] .agent-identity { flex: 1 1 220px; }
+[data-presentation="overlay"] .agent-header-actions { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; row-gap: 4px; max-width: 100%; }
+@media (max-width: 640px) { .agent-pane-needs-you .agent-pane-needs-you-words { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; } }
 .agent-card-section { display: grid; gap: 6px; }
 .agent-card-section h3 { margin: 0; font-size: var(--text-base); }
+/* PR #2491 (the maintainer, 2026-11-25) — the Card tab's Edit beside its Actions heading: a small link-styled button opening the daemon's Card actions editor. */
+.agent-card-panel-actions-heading { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.agent-card-panel-edit-actions { padding: 0 2px; border: 0; border-radius: 3px; color: var(--teal-deep); background: transparent; font-size: var(--text-sm); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.agent-card-panel-edit-actions:hover { color: var(--teal); }
+.agent-card-panel-edit-actions:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
 .agent-card-section p { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .agent-card-question { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 5px; }
 .agent-card-question-text { white-space: pre-wrap; }
-.agent-card-options, .agent-card-actions { display: grid; gap: 8px; }
-.agent-card-action { display: grid; justify-items: start; gap: 3px; }
+.agent-card-options { display: flex; flex-wrap: wrap; gap: 6px; }
 /* Issue #2418 (D16): the exact text an action sends reads as a quotation — a rule at its left and no box — so it is not taken for a field to type in. */
 .agent-card-prompt-text { margin: 0; padding: 1px 0 1px 10px; max-width: 100%; border-left: 3px solid var(--line-strong); color: var(--ink); background: transparent; font-size: var(--text-sm); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-card-prompt-text .exact-text-escape { font-style: normal; }
@@ -2282,25 +2366,110 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 /* A marker for a character the preview cannot show as itself (PRD #2374 review R3): a boxed code, set apart from the prompt's own text in shape, face and colour. */
 .exact-text-escape { display: inline-block; margin: 0 1px; padding: 0 3px; border: 1px solid var(--amber-rim); border-radius: 3px; color: var(--amber-ink); background: var(--amber-soft); font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: var(--text-xs); font-weight: 600; line-height: 1.3; white-space: nowrap; }
 .exact-text-note { color: var(--muted); font-size: var(--text-xs); }
-.agent-card-confirm { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--amber-rim); border-radius: 6px; background: var(--amber-bright); }
+/* The single-action review: a small dialog of its own over the dashboard or the pane. */
+.agent-card-confirm { width: min(520px, 100%); max-height: 100%; overflow-y: auto; display: grid; gap: 8px; padding: 14px 16px; border: 1px solid var(--amber-rim); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
 .agent-card-confirm h3 { margin: 0; font-size: var(--text-lg); }
 .agent-card-confirm p { margin: 0; font-size: var(--text-sm); }
 .agent-card-confirm-detail { color: var(--amber-ink); }
-.agent-card-confirm-buttons, .agent-card-reply-buttons { display: flex; flex-wrap: wrap; gap: 7px; }
-.agent-card-reply textarea { width: 100%; min-height: 70px; padding: 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font: inherit; font-size: var(--text-base); resize: vertical; }
+.agent-card-confirm-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .agent-card-gone { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); text-align: center; }
-.agent-card-overlay-notice { margin: 0; padding: 8px 10px; border: 1px solid var(--amber); border-radius: 6px; color: var(--ink); background: var(--amber-soft); font-size: var(--text-xs); overflow-wrap: anywhere; }
 /* Issue #2454 — the daemon's Needs you as a name-cell badge, shaped like `.overview-lease` and the ORCHESTRATOR badge beside it. */
 .overview-needs-you { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 1px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .overview-card-menu { position: relative; flex: 0 0 auto; }
 .overview-card-menu-button { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-card-menu-button:hover, .overview-card-menu-button:focus-visible, .overview-card-menu-button[aria-expanded="true"] { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
 .overview-card-menu-list { position: absolute; z-index: 20; top: 24px; right: 0; min-width: 160px; padding: 4px; display: grid; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--paper-strong); box-shadow: 0 10px 30px rgb(var(--scrim-rgb) / .2); }
-.overview-card-menu-list button { padding: 6px 8px; border: 0; border-radius: 4px; color: var(--ink); background: transparent; font-size: var(--text-sm); text-align: left; cursor: pointer; }
+/* PR #2491 — a ⋯ menu stays inside the window: MoreMenu places it (placeMenu) and caps its width to the window, and a long item ellipsizes, its whole text on hover. */
+.overview-card-menu-list { max-width: calc(100vw - 16px); grid-template-columns: minmax(0, 1fr); }
+.more-menu-label { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.overview-card-menu-list button { min-width: 0; padding: 6px 8px; border: 0; border-radius: 4px; color: var(--ink); background: transparent; font-size: var(--text-sm); text-align: left; cursor: pointer; }
 .overview-card-menu-list button:hover, .overview-card-menu-list button:focus-visible { background: var(--teal-soft); }
 .overview-card-menu-list button:disabled { color: var(--faint); cursor: default; }
-/* Full screen at narrow widths: the overlay is the whole window, its body scrolls. */
-@media (max-width: 640px) { .agent-card-backdrop { padding: 0; } .agent-card-overlay { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }
+.overview-card-menu-list button:focus { outline: none; background: var(--teal-soft); }
+/* PR #2491 decision 2026-11-25 — the ⋯ menus of a daemon's header and of the top bar: the Table row's menu, under a full-size button. */
+.more-menu .overview-card-menu-list { top: calc(100% + 4px); max-width: calc(100vw - 32px); }
+.more-menu .overview-card-menu-list button { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.more-menu-mark { width: 14px; flex: none; display: grid; place-items: center; color: var(--teal); }
+.more-menu-button { position: relative; padding-inline: 7px; }
+.more-menu-button[aria-expanded="true"] { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.more-menu-count { position: absolute; top: -6px; right: -6px; min-width: 16px; height: 16px; padding: 0 4px; display: grid; place-items: center; border-radius: 8px; color: var(--paper-strong); background: var(--amber); font-size: var(--text-xs); font-weight: 700; line-height: 1; }
+.needs-you-chip { display: inline-flex; align-items: center; gap: 5px; color: var(--amber); border-color: var(--amber-rim); background: var(--amber-soft); }
+.needs-you-chip:hover, .needs-you-chip:focus-visible { border-color: var(--amber); }
+
+
+/* Issue #2399 — batch card actions: the selection line under the toolbar, a
+   card's checkbox, and the batch's confirmation and results. The dialog never
+   grows past the window: its list scrolls, and Cancel and Send stay in view.
+   Each exact prompt wraps inside it rather than scrolling sideways. */
+/* PR #2491 review — the selection bar: the last thing in the dashboard's scroll region, stuck to its foot while cards are selected, so it stays in reach
+   wherever the region is scrolled; scrolled to the end it sits below the last card, which is the room the cards get for it. It is inside the region,
+   which ends above the voice row, so it never covers that. `margin-top: auto` puts it at the region's foot when the cards are fewer than fill it.
+   Its actions wrap inside their group on a narrow window. */
+/* PR #2491 (the maintainer, 2026-11-25): the bar is a floating toolbar, not more of the page, so it has a look of its own: the accent tint, an accent
+   border and an elevation shadow. The action group inside it keeps the group's own look, the same as on a card and in an overlay. Clear's border is the
+   accent too, because the page's line colour does not show on the tint (3:1 is the bar for it). */
+.agent-cards-selection-bar { position: sticky; bottom: 0; z-index: 5; flex: none; margin-top: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; padding: 8px 12px; border: 1.5px solid var(--teal); border-radius: 8px; background: var(--teal-toolbar); box-shadow: 0 10px 28px rgb(var(--scrim-rgb) / .24), 0 2px 6px rgb(var(--scrim-rgb) / .18); }
+.agent-cards-selection-count { flex: none; color: var(--ink); font-size: var(--text-sm); font-weight: 700; }
+.agent-cards-selection-hint { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: var(--text-sm); }
+.agent-cards-selection-actions { flex: 0 1 auto; }
+.agent-cards-selection-clear { flex: none; margin-left: auto; }
+/* PR #2491 (the maintainer, 2026-11-25) — Edit card actions, after the action group and set apart from it by a gap and a rule in the accent, so it
+   reads as a way into the editor rather than one more action to send. With the selection across daemons it is a ⋯-style menu, which opens upward:
+   the bar sits at the foot of the dashboard. */
+.agent-cards-selection-edit { flex: none; display: inline-flex; align-items: center; margin-left: 6px; padding-left: 12px; border-left: 1px solid var(--teal); }
+.agent-cards-selection-edit-button { width: 28px; height: 26px; color: var(--ink); border-color: var(--teal); }
+.agent-cards-selection-edit-button:hover, .agent-cards-selection-edit-button:focus-visible { color: var(--teal); background: var(--teal-soft); }
+.agent-cards-selection-edit .agent-cards-selection-edit-button[aria-expanded="true"] { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.agent-cards-selection-edit-menu .overview-card-menu-list { top: auto; bottom: calc(100% + 6px); left: 0; right: auto; max-width: calc(100vw - 32px); }
+.agent-cards-selection-edit-menu .overview-card-menu-list button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-cards-selection-bar .agent-cards-selection-clear { border-color: var(--teal); }
+.agent-card-select { flex: none; display: inline-flex; align-items: center; }
+.agent-card-select input { margin: 0; width: 14px; height: 14px; accent-color: var(--teal); cursor: pointer; }
+.agent-card.is-selected { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
+.agent-cards-batch-backdrop { padding-top: 6vh; }
+.agent-cards-batch { width: min(640px, 100%); max-height: 100%; min-width: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
+.agent-cards-batch:focus { outline: none; }
+.agent-cards-batch-header { flex: none; padding: 14px 16px 8px; display: grid; gap: 4px; border-bottom: 1px solid var(--line); }
+.agent-cards-batch-header h2 { margin: 0; font-size: var(--text-xl); overflow-wrap: anywhere; }
+.agent-cards-batch-scope { margin: 0; color: var(--muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.agent-cards-batch-body { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 10px 16px; display: grid; align-content: start; gap: 8px; }
+.agent-cards-batch-body h3 { margin: 4px 0 0; font-size: var(--text-base); }
+.agent-cards-batch-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; min-width: 0; }
+.agent-cards-batch-entry { min-width: 0; display: grid; gap: 4px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; }
+/* One text several agents get: quoted once, then the agents (decision 2026-11-24). */
+.agent-cards-batch-group { min-width: 0; display: grid; gap: 6px; }
+.agent-cards-batch-group.is-shared { padding: 8px; border: 1px solid var(--line); border-radius: 5px; }
+.agent-cards-batch-group.is-shared .agent-cards-batch-list { gap: 4px; }
+.agent-cards-batch-group.is-shared .agent-cards-batch-entry { padding: 4px 8px; border-style: dashed; }
+.agent-cards-batch-gets { margin: 0; color: var(--muted); font-size: var(--text-sm); }
+.agent-cards-batch-entry.is-skipped { color: var(--muted); }
+.agent-cards-batch-entry.is-failed { border-color: var(--red); }
+.agent-cards-batch-who { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.agent-cards-batch-name { overflow-wrap: anywhere; }
+.agent-cards-batch-daemon { color: var(--muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.agent-cards-batch-refusal { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+.agent-cards-batch-outcome { font-size: var(--text-sm); font-weight: 700; }
+.agent-cards-batch-entry.is-failed .agent-cards-batch-outcome { color: var(--red); }
+.agent-cards-batch-entry.is-done .agent-cards-batch-outcome { color: var(--teal); }
+.agent-cards-batch-entry.is-unknown { border-color: var(--amber-rim); }
+.agent-cards-batch-entry.is-unknown .agent-cards-batch-outcome { color: var(--amber); }
+.agent-cards-batch-reason, .agent-cards-batch-what { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
+/* PR #2491 decision 2026-11-25 — the skipped agents fold into one line counting them by reason, a disclosure that lists them grouped by reason; past ten included agents, the names after the first few fold behind "+N more". */
+.agent-cards-batch-skipped { display: grid; gap: 8px; min-width: 0; }
+.agent-cards-batch-skipped-toggle, .agent-cards-batch-more { justify-self: start; display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--ink); font: inherit; font-size: var(--text-sm); text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.agent-cards-batch-skipped-toggle:hover, .agent-cards-batch-more:hover { border-color: var(--teal); background: var(--teal-soft); }
+.agent-cards-batch-skipped-toggle:focus-visible, .agent-cards-batch-more:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 2px; }
+.agent-cards-batch-chevron { flex: none; transition: transform .12s ease; }
+.agent-cards-batch-skipped-toggle[aria-expanded="true"] .agent-cards-batch-chevron { transform: rotate(90deg); }
+.agent-cards-batch-skipped-list { display: grid; gap: 10px; min-width: 0; }
+.agent-cards-batch-skipped-group { display: grid; gap: 6px; min-width: 0; }
+.agent-cards-batch-skipped-group h4 { margin: 0; font-size: var(--text-sm); color: var(--muted); }
+.agent-cards-batch-prompt { min-width: 0; }
+.agent-cards-batch-error { margin: 0; color: var(--red); overflow-wrap: anywhere; }
+.agent-cards-batch-buttons { flex: none; padding: 10px 16px 14px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--line); }
+/* PR #2491 audit K1: why Send waits, beside it, while a batch of several texts has one not yet in view. */
+.agent-cards-batch-unseen { margin: 0 auto 0 0; align-self: center; color: var(--muted); font-size: var(--text-sm); }
+@media (max-width: 640px) { .agent-cards-batch-backdrop { padding: 0; } .agent-cards-batch { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }
 
 /* PRD #1790 stage 2 — a deck's interrupted work: its banner, the dialog, and the restart notice's hint line. */
 .interrupted-banner { margin: 8px 16px 0; padding: 6px 10px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--amber-edge); border-radius: var(--radius); color: var(--amber-ink); background: var(--amber-soft); font-size: var(--text-base); }
@@ -2326,6 +2495,57 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .toast-hint { display: block; margin-top: 4px; }
 /* PR #2431 round 7: the hint's Show is a labelled button, not the toast's 22 px close button, so it takes back the size, frame and fill `.toast button` sets for that one. */
 .toast .toast-hint .button { width: auto; height: auto; display: inline-flex; vertical-align: middle; border: 1px solid var(--line-strong); white-space: nowrap; }
+
+/* PRD #2374 decision 2026-11-24 — the Card actions editor. */
+.card-actions-editor-backdrop { padding-top: 6vh; }
+.card-actions-editor { position: relative; width: min(680px, 100%); max-height: 100%; min-width: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
+.card-actions-editor-header { flex: none; padding: 12px 16px 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); }
+.card-actions-editor-header h2 { margin: 0; min-width: 0; font-size: var(--text-xl); overflow-wrap: anywhere; }
+.card-actions-editor-body { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 10px 16px 16px; display: grid; align-content: start; gap: 10px; }
+.card-actions-editor-body p { margin: 0; }
+.card-actions-editor-file, .card-actions-editor-readonly { color: var(--muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.card-actions-editor-readonly { padding: 8px 10px; border: 1px solid var(--amber-rim); border-radius: 5px; color: var(--ink); background: var(--amber-soft); }
+.card-actions-editor-error { color: var(--red); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.card-actions-editor-notice { color: var(--amber); font-size: var(--text-sm); }
+.card-actions-editor-problems { padding: 8px 10px; border: 1px solid var(--amber-rim); border-radius: 5px; font-size: var(--text-sm); overflow-wrap: anywhere; }
+.card-actions-editor-problems ul { margin: 4px 0 0; padding-left: 18px; }
+.card-actions-editor-toolbar { display: flex; justify-content: flex-start; }
+.card-actions-editor-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; min-width: 0; }
+.card-actions-editor-row { min-width: 0; display: grid; gap: 5px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 5px; }
+.card-actions-editor-row.is-hidden { opacity: .7; border-style: dashed; }
+.card-actions-editor-row-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.card-actions-editor-row-icon { display: inline-grid; place-items: center; width: 22px; height: 22px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
+.card-actions-editor-row-label { overflow-wrap: anywhere; }
+.card-actions-editor-source, .card-actions-editor-hidden, .card-actions-editor-flag { padding: 1px 6px; border-radius: 3px; color: var(--muted); background: var(--paper); font-size: var(--text-xs); white-space: nowrap; }
+.card-actions-editor-source.is-user { color: var(--teal); }
+.card-actions-editor-hidden { color: var(--amber); background: var(--amber-soft); }
+.card-actions-editor-prompt { margin: 0; }
+.card-actions-editor-when { color: var(--muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.card-actions-editor-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.card-actions-editor-form { min-width: 0; display: grid; gap: 8px; padding: 10px; border: 1px solid var(--teal); border-radius: 6px; background: var(--paper); }
+.card-actions-editor-form h3 { margin: 0; font-size: var(--text-base); overflow-wrap: anywhere; }
+.card-actions-editor-field { min-width: 0; display: grid; gap: 3px; }
+.card-actions-editor-field > label, .card-actions-editor-field-name { font-size: var(--text-sm); font-weight: 700; }
+.card-actions-editor-field input, .card-actions-editor-field textarea { min-width: 0; width: 100%; box-sizing: border-box; font: inherit; }
+.card-actions-editor-field textarea { resize: vertical; }
+.card-actions-editor-field small { color: var(--muted); font-size: var(--text-xs); }
+.card-actions-editor-field input[readonly] { color: var(--muted); background: transparent; }
+.card-actions-editor-icon-row { display: flex; align-items: center; gap: 8px; }
+.card-actions-editor-icon { display: inline-grid; place-items: center; width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: var(--paper-strong); }
+.card-actions-editor-picker { min-width: 0; display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper-strong); }
+.card-actions-editor-picker input { min-width: 0; width: 100%; box-sizing: border-box; font: inherit; }
+.card-actions-editor-icons { display: grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap: 4px; max-height: 180px; overflow-y: auto; }
+.card-actions-editor-icon-option { width: 100%; height: 32px; color: var(--ink); }
+.card-actions-editor-icon-option.is-chosen, .card-actions-editor-icon-option:hover, .card-actions-editor-icon-option:focus-visible { color: var(--teal); border-color: var(--teal); }
+.card-actions-editor-check { display: flex; align-items: center; gap: 6px; font-size: var(--text-sm); }
+/* Issue #2399 review 13: the removal's confirmation is a dialog of its own over the editor, which it fences. */
+.card-actions-editor-remove-backdrop { align-items: center; }
+.card-actions-editor-confirm { width: min(440px, 100%); display: grid; gap: 8px; padding: 12px; border: 1px solid var(--red); border-radius: 6px; background: var(--paper-strong); box-shadow: 0 10px 30px rgb(var(--scrim-rgb) / .28); }
+.card-actions-editor-confirm:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
+.card-actions-editor-form fieldset { display: contents; }
+.card-actions-editor-confirm h3 { margin: 0; overflow-wrap: anywhere; }
+.card-actions-editor-confirm p { margin: 0; font-size: var(--text-sm); }
+@media (max-width: 640px) { .card-actions-editor-backdrop { padding: 0; } .card-actions-editor { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }
 
 /* Issue #2511 — the marker saying an approval is waiting while something the
    user is in (an agent's pane, a dialog, a sheet) holds the review back. Top

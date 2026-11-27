@@ -378,12 +378,31 @@ pub fn is_text_changed(error: &str) -> bool {
     error.contains(crate::daemon_protocol::PROJECT_ERR_TRUST_TEXT_CHANGED)
 }
 
+/// A field's label (`Command: `, `State: `), and the scroll hint.
+///
+/// The terminal's own foreground, faded with `Modifier::DIM`, so it sits
+/// behind the value on light and dark themes alike (issue #2518). Faded
+/// halfway toward the background, as xterm draws faint text, black on white
+/// measures about 3.95:1; `theme/contrast/003` holds a dimmed label to 3:1 and
+/// the value beside it to 4.5:1. It was `Color::Gray`, ANSI 7, which a light
+/// theme that keeps the slot light shows at about 1.3:1 to 2.5:1 on its
+/// background. A terminal that ignores `DIM` draws the label at full contrast,
+/// which is still legible, with the `: ` after it separating it from the value.
 fn label_style() -> Style {
-    Style::default().fg(Color::Gray)
+    Style::default()
+        .fg(Color::Reset)
+        .add_modifier(Modifier::DIM)
 }
 
+/// A value the user is asked to approve: a role's command, its prompt, its
+/// flags.
+///
+/// `Color::Reset`, the terminal's own foreground, which contrasts with the
+/// terminal's own background whatever the theme (`src/palette.rs`'s module
+/// docs). It was `Color::White`, ANSI 15, which a light theme shows at about
+/// 1:1 on its background (issue #2518).
 fn value_style() -> Style {
-    Style::default().fg(Color::White)
+    Style::default().fg(Color::Reset)
 }
 
 fn mark_style() -> Style {

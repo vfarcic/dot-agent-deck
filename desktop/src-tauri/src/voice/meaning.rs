@@ -79,7 +79,7 @@ use serde_json::{Value, json};
 
 use super::resolver::{IntentError, MeaningFuture};
 use super::table::{CommandRow, CommandTable, Screen};
-use super::{Transcript, VoiceDirectories, VoiceNewAgent};
+use super::{DashboardView, Transcript, VoiceDashboard, VoiceDirectories, VoiceNewAgent};
 use crate::model_service::TokenCeiling;
 
 /// The tool (Anthropic) and schema (OpenAI-compatible) name of the answer.
@@ -157,10 +157,16 @@ struct MeaningAction {
 /// dashboard's filter in 7 votes of 8, and "use the build box deck" over the
 /// open dialog only the Daemon selector in 5 of 8, where told the dialog first
 /// it was 0 of 8 for both (2026-10-20, `gpt-5-mini`).
+///
+/// **The dashboard's state, while declared** (PR #2491, 2026-11-25): on the
+/// agent dashboard, which view shows and whether Needs you only is on, so
+/// "show all cards" can be listed as turning the filter off while it is on.
+/// App state in the app's words, as the screen is ([`Place::dashboard`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Place {
     screen: Screen,
     dialog: Dialog,
+    dashboard: Option<VoiceDashboard>,
 }
 
 /// The New agent dialog, as far as [`Place`] says.
@@ -189,7 +195,20 @@ impl Place {
             (Some(dialog), None) if dialog.form.is_some() => Dialog::Form,
             (Some(_), None) => Dialog::Open,
         };
-        Self { screen, dialog }
+        Self {
+            screen,
+            dialog,
+            dashboard: None,
+        }
+    }
+
+    /// This place with the agent dashboard's state as the voice panel declared
+    /// it (PR #2491, 2026-11-25). Said only on the dashboard itself.
+    pub fn dashboard(self, dashboard: Option<&VoiceDashboard>) -> Self {
+        Self {
+            dashboard: dashboard.copied(),
+            ..self
+        }
     }
 
     /// What the classifier is told: every word of it the app's own.
@@ -208,7 +227,25 @@ impl Place {
             }
             Dialog::Form => format!("the New agent dialog, open over {view} and showing its form."),
         };
-        format!("The user is looking at {looking_at}\n{PLACE_INSTRUCTIONS}")
+        let dashboard = match (self.screen, self.dashboard) {
+            (Screen::Overview, Some(dashboard)) => {
+                let view = match dashboard.view {
+                    DashboardView::Table => "Table",
+                    DashboardView::Cards => "Cards",
+                };
+                if dashboard.needs_you_only {
+                    format!(
+                        " The dashboard shows its {view} view, with Needs you only on: only the \
+                         agents that need the user are listed, so asking to see all or every agent \
+                         or card again asks to turn Needs you only off."
+                    )
+                } else {
+                    format!(" The dashboard shows its {view} view, with Needs you only off.")
+                }
+            }
+            _ => String::new(),
+        };
+        format!("The user is looking at {looking_at}{dashboard}\n{PLACE_INSTRUCTIONS}")
     }
 }
 
@@ -1019,6 +1056,51 @@ mod tests {
             assert!(system.starts_with(&bare), "{said}");
             assert!(system[bare.len()..].contains(said), "{said}");
         }
+    }
+
+    /// Scenario: on the agent dashboard with its view and Needs you only
+    /// declared, the classifier is told which view shows and whether the
+    /// filter is on, in the app's words, so "show all cards" can be read as
+    /// turning the filter off while it is on; with nothing declared, and on
+    /// another screen, it is told nothing about the dashboard (PR #2491,
+    /// 2026-11-25: `desktop/agent-cards/120`).
+    #[test]
+    fn meaning_place_says_the_dashboard_view_and_needs_you_only() {
+        let transcript = Transcript::new("show all cards");
+        let system = |place: Place| {
+            system_turn(
+                &MeaningRequest::new(&transcript, table(), &every_action(table())).at(place),
+            )
+        };
+        let on = crate::voice::VoiceDashboard {
+            view: crate::voice::DashboardView::Table,
+            needs_you_only: true,
+        };
+        let off = crate::voice::VoiceDashboard {
+            view: crate::voice::DashboardView::Cards,
+            needs_you_only: false,
+        };
+        let filtered = system(Place::of(Screen::Overview, None, None).dashboard(Some(&on)));
+        assert!(
+            filtered.contains(
+                "The dashboard shows its Table view, with Needs you only on: only the agents that \
+                 need the user are listed, so asking to see all or every agent or card again asks \
+                 to turn Needs you only off."
+            ),
+            "{filtered}"
+        );
+        let plain = system(Place::of(Screen::Overview, None, None).dashboard(Some(&off)));
+        assert!(
+            plain.contains("The dashboard shows its Cards view, with Needs you only off."),
+            "{plain}"
+        );
+        let undeclared = system(Place::of(Screen::Overview, None, None));
+        assert!(
+            !undeclared.contains("The dashboard shows its"),
+            "{undeclared}"
+        );
+        let pane = system(Place::of(Screen::Agent, None, None).dashboard(Some(&on)));
+        assert!(!pane.contains("The dashboard shows its"), "{pane}");
     }
 
     /// Scenario: in both dialects' bodies, as serialized for the wire, the

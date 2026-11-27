@@ -503,6 +503,12 @@ code = "onOpen"
 reason = "The tile's expand button: forwards `onOpen`, which DeckSurface wires to VOICE_ACTIONS.openAgent (`open_agent`)."
 
 [[site]]
+file = "desktop/src/components/EndedCardPane.tsx"
+handler = "onClick"
+code = "onClose"
+reason = "The ended pane's Back to dashboard (PR #2491 review J1): forwards `onClose`, which DeckShell wires to VOICE_ACTIONS.closeAgentView (`close`), as the agent pane's own does."
+
+[[site]]
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
 code = "onClose"
@@ -512,7 +518,13 @@ reason = "The open pane's close X: forwards `onClose`, which DeckSurface wires t
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
 code = "() => onTabChange(id)"
-reason = "Gap: switches the tile's tab (terminal, output, hand-offs). No row picks a tile tab."
+reason = "Gap: switches the tile's tab. The pane's Card and Terminal tabs are voice's `show_card_tab` and `show_terminal_tab` (VOICE_ACTIONS.showCardTab / showTerminalTab, through the shell's `choosePaneTab`, PR #2491 decision 2026-11-26), but no row picks the experimental Diff, Checks, Delegations or Artifacts tab."
+
+[[site]]
+file = "desktop/src/components/EndedCardPane.tsx"
+handler = "onClick"
+code = "() => onTabChange(id)"
+reason = "Switches the ended pane between its Terminal and Card tabs (PR #2491 decision 2026-11-26), the two tabs voice switches with `show_terminal_tab` and `show_card_tab` (VOICE_ACTIONS.showTerminalTab / showCardTab, through the shell's `choosePaneTab`, which serves the ended pane too)."
 
 [[site]]
 file = "desktop/src/components/AgentTile.tsx"
@@ -873,6 +885,25 @@ file = "desktop/src/components/HostMetricsPanel.tsx"
 handler = "onClick"
 code = "() => { onClose(); button.current?.focus(); }"
 reason = "The Host popover's close X: a dismissal; voice closes it with `close` (closeTopmost → closeHostMetrics)."
+
+# --- desktop/src/components/MoreMenu.tsx ---
+#
+# PR #2491 decision 2026-11-25 — the app's ⋯ ("More") menu, shared by every
+# daemon's header, the Dashboard's top bar and a Table row. Opening and
+# closing it is a view toggle; voice reaches each item's own registry entry
+# directly, so the menu itself is not a capability.
+
+[[site]]
+file = "desktop/src/components/MoreMenu.tsx"
+handler = "onClick"
+code = '() => (open ? close(false) : openWith("first"))'
+reason = "A ⋯ button opens or closes its menu: a view toggle with nothing behind it but the menu's items, each of which voice reaches directly through its own registry entry (`open_card_actions_editor`, `filter_needs_you_cards`, `show_agent_card`, `run_card_action`), so a row to open the menu would only add a step."
+
+[[site]]
+file = "desktop/src/components/MoreMenu.tsx"
+handler = "onClick"
+code = "() => { close(true); item.onSelect(); }"
+reason = "One item of a ⋯ menu: closes the menu and runs the item's `onSelect`, which every host passes as a single `VOICE_ACTIONS.<id>.run(…)` dispatch (Card actions, Needs you only, Show card, a card's primary action), so the capability is the registry entry the host names, already voice-reachable."
 
 # --- desktop/src/components/NavigationRail.tsx ---
 
@@ -1284,13 +1315,91 @@ handler = "onChange"
 code = "(event) => onSave({ ...settings, zoom: { level: clampZoom(Number(event.target.value)) } })"
 reason = "Settings → Zoom level select; a preference edit inside the Settings sheet (opened by `open_settings`) — no row sets the zoom."
 
-# --- desktop/src/components/AgentCardOverlay.tsx ---
+# --- desktop/src/components/ActionTipButton.tsx ---
+#
+# Issue #2399 review (finding 7) — the icon button the cards, the selection
+# toolbar and the overlay's batch section draw their actions with. Its press
+# forwards the caller's own `onClick`, which is a control site of its own where
+# it is written (each one a single `VOICE_ACTIONS.<id>.run(…)`).
 
 [[site]]
-file = "desktop/src/components/AgentCardOverlay.tsx"
+file = "desktop/src/components/ActionTipButton.tsx"
+handler = "onClick"
+code = "press"
+reason = "The action icon button's own press: it hides the button's keyboard tooltip and forwards the caller's `onClick`, which is checked where each caller writes it (the card's `runCardAction`, the toolbar's `runSelectionBatch`, the overlay's `runCardActionBatch`); for an action the daemon disabled it does nothing. It is no capability of its own."
+
+# --- desktop/src/components/AgentCardActionsEditor.tsx ---
+#
+# PRD #2374 decision 2026-11-24 — the Card actions editor's form. Voice opens
+# the editor, the form for a new action and an action's form
+# (`open_card_actions_editor`, `add_card_action`, `edit_card_action`); what the
+# form holds is typed by hand, and its Save (`saveCardAction`, `no_voice`) is
+# the press that writes it, so a misheard word never becomes text an agent is
+# sent. These are keystrokes and choices inside that form, not capabilities.
+# The form's icon, its two checkboxes and the editor's daemon dispatch through
+# the registry and have voice rows of their own (issue #2399 review 12).
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
 handler = "onChange"
-code = "(event) => setReply(event.target.value)"
-reason = "A keystroke into the card overlay's reply box (PRD #2374). Sending the reply is the Send reply button, which dispatches `replyToAgentCard` — a `voice: true` entry whose `reply_to_agent_card` row sends the spoken words directly."
+code = '(event) => setField("name", event.target.value)'
+reason = "A keystroke into the Card actions form's Name field (a new action's name). The form opens by voice (`add_card_action`); its fields are typed by hand and written only by the form's Save."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("label", event.target.value)'
+reason = "A keystroke into the Card actions form's Label field. The form opens by voice (`add_card_action`, `edit_card_action`); its fields are typed by hand and written only by the form's Save."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("prompt", event.target.value)'
+reason = "A keystroke into the Card actions form's Text it sends field — the exact text agents are sent, so it is typed and read by hand, never taken from a transcript. The form opens by voice; only its Save writes it."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = '(event) => setField("description", event.target.value)'
+reason = "A keystroke into the Card actions form's Tell agents when to offer it field. The form opens by voice (`add_card_action`, `edit_card_action`); its fields are typed by hand and written only by the form's Save."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onClick"
+code = "() => setPicking((open) => !open)"
+reason = "The Card actions form's Choose icon button: shows or hides the icon grid inside the form, a pointer aid for picking the form's icon field. It writes nothing; the form's Save does."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onChange"
+code = "(event) => setQuery(event.target.value)"
+reason = "A keystroke into the icon grid's Search icons box, which only narrows the grid shown inside the Card actions form."
+
+[[site]]
+file = "desktop/src/components/AgentCardActionsEditor.tsx"
+handler = "onClick"
+code = '() => { VOICE_ACTIONS.chooseCardActionIcon.run(controls, name); setPicking(false); }'
+reason = "One icon in the Card actions form's icon grid: dispatches the choice through the registry (`chooseCardActionIcon`, whose `choose_card_action_icon` row chooses an icon by its name) and then closes the grid, which is local to the form. Nothing is written until the form's Save."
+
+# --- desktop/src/components/AgentCardBatchDialog.tsx ---
+
+[[site]]
+file = "desktop/src/components/AgentCardBatchDialog.tsx"
+handler = "onClick"
+code = "() => toggleGroup(groupKey)"
+reason = "The batch confirmation's +N more, one per text group: lists every name in that group where the dialog shows the first few, while every distinct text stays quoted (PR #2491 audit K1). It changes what the open dialog shows and acts on nothing; the dialog already counts the agents in words, and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) and is sent only by hand."
+
+[[site]]
+file = "desktop/src/components/AgentCardBatchDialog.tsx"
+handler = "onClick"
+code = "showNext"
+reason = "The batch confirmation's Show next text, shown while Send waits for a batch of several distinct texts to have each been in view: it scrolls the next text not yet seen into view. It moves the open dialog's scroll and acts on nothing; the hint beside it says how many texts there are, Send itself stays hand-only (PRD #802 D5), and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) (PR #2491 audit K1)."
+
+[[site]]
+file = "desktop/src/components/AgentCardBatchDialog.tsx"
+handler = "onClick"
+code = "() => setSkippedOpen((open) => !open)"
+reason = "The batch confirmation's skipped line: lists the skipped agents grouped by reason where the line counts them by reason. It changes what the open dialog shows and acts on nothing; the line itself says how many were skipped and why, and the confirmation it sits in opens by voice (`run_card_action_batch`, `run_card_action_on_selection`) and is sent only by hand."
 
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"

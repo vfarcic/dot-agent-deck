@@ -27,6 +27,10 @@ pub struct TestEntry {
     pub fn_name: String,
     /// Path relative to the repo root, e.g. `tests/e2e_hook_delivery.rs`.
     pub file: String,
+    /// The inline modules the function sits in within `file`, joined with
+    /// `::` (e.g. `tests::deeper`); empty at the file's top level. Two
+    /// sibling modules can each hold a function of the same name.
+    pub module_path: String,
     /// `/// Scenario:` doc comment with paragraph breaks preserved.
     /// Empty string when the test has no Scenario comment (linkage-check
     /// rule 7 catches this separately).
@@ -111,44 +115,98 @@ pub fn run(workspace_root: &Path) -> Result<String, String> {
 // Pure helpers — covered by unit tests in this file
 // ---------------------------------------------------------------------------
 
-/// IDs in `head` not in `base`. Sorted by spec_id.
-pub fn compute_created(
-    base: &BTreeMap<String, TestEntry>,
-    head: &BTreeMap<String, TestEntry>,
-) -> Vec<TestEntry> {
-    let mut out: Vec<TestEntry> = head
+/// Every `#[spec]` test found at one ref, grouped by catalog id. An id
+/// can carry more than one test (issue #2496), so each id maps to all of
+/// them, sorted by `(file, module_path, fn_name)`.
+pub type Inventory = BTreeMap<String, Vec<TestEntry>>;
+
+/// The tests under one id at the base and at HEAD, paired with each other.
+/// A base test and a HEAD test pair when they have the same file, module
+/// path and function name; each base test pairs at most once. When that
+/// leaves exactly one test unpaired on each side, those two pair as well,
+/// but only if the id has a single test at each ref (as before issue
+/// #2496), or the two share a file or a function name. That keeps a test
+/// that moved file or was renamed compared rather than reported as new,
+/// without pairing a deleted test with an unrelated new one under an id
+/// several tests share.
+fn pair_tests<'a>(
+    base: &'a [TestEntry],
+    head: &'a [TestEntry],
+) -> (Vec<(&'a TestEntry, &'a TestEntry)>, Vec<&'a TestEntry>) {
+    let same_test = |b: &TestEntry, h: &TestEntry| {
+        b.file == h.file && b.module_path == h.module_path && b.fn_name == h.fn_name
+    };
+    let mut base_used = vec![false; base.len()];
+    let mut pairs = Vec::new();
+    let mut unpaired_head = Vec::new();
+    for h in head {
+        let found = base
+            .iter()
+            .enumerate()
+            .find(|(i, b)| !base_used[*i] && same_test(b, h));
+        match found {
+            Some((i, b)) => {
+                base_used[i] = true;
+                pairs.push((b, h));
+            }
+            None => unpaired_head.push(h),
+        }
+    }
+    let unpaired_base: Vec<&TestEntry> = base
         .iter()
-        .filter(|(id, _)| !base.contains_key(*id))
-        .map(|(_, t)| t.clone())
+        .zip(&base_used)
+        .filter(|(_, used)| !**used)
+        .map(|(b, _)| b)
         .collect();
-    out.sort_by(|a, b| a.spec_id.cmp(&b.spec_id));
+    if let ([b], [h]) = (unpaired_base.as_slice(), unpaired_head.as_slice()) {
+        let lone_on_both_sides = base.len() == 1 && head.len() == 1;
+        if lone_on_both_sides || b.file == h.file || b.fn_name == h.fn_name {
+            pairs.push((b, h));
+            unpaired_head.clear();
+        }
+    }
+    (pairs, unpaired_head)
+}
+
+/// HEAD tests with no counterpart at the base: every test under an id the
+/// base does not have, plus a test added under an id the base already has.
+/// Sorted by spec_id, then file and function name.
+pub fn compute_created(base: &Inventory, head: &Inventory) -> Vec<TestEntry> {
+    let mut out: Vec<TestEntry> = Vec::new();
+    for (id, head_tests) in head {
+        let base_tests = base.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        let (_, unpaired) = pair_tests(base_tests, head_tests);
+        out.extend(unpaired.into_iter().cloned());
+    }
+    out.sort_by(|a, b| (&a.spec_id, &a.file, &a.fn_name).cmp(&(&b.spec_id, &b.file, &b.fn_name)));
     out
 }
 
-/// IDs in BOTH `base` and `head` where either the function body or the
-/// Scenario doc comment differs. Sorted by spec_id.
-pub fn compute_modified(
-    base: &BTreeMap<String, TestEntry>,
-    head: &BTreeMap<String, TestEntry>,
-) -> Vec<ModifiedRow> {
+/// Tests present at both refs, paired as [`pair_tests`] describes, where
+/// either the function body or the Scenario doc comment differs. Sorted by
+/// spec_id, then file and function name.
+pub fn compute_modified(base: &Inventory, head: &Inventory) -> Vec<ModifiedRow> {
     let mut out: Vec<ModifiedRow> = Vec::new();
-    for (id, head_entry) in head {
-        let Some(base_entry) = base.get(id) else {
+    for (id, head_tests) in head {
+        let Some(base_tests) = base.get(id) else {
             continue;
         };
-        let scenario_changed = base_entry.scenario != head_entry.scenario;
-        let body_changed = base_entry.body_fingerprint != head_entry.body_fingerprint;
-        if scenario_changed || body_changed {
-            out.push(ModifiedRow {
-                spec_id: id.clone(),
-                fn_name: head_entry.fn_name.clone(),
-                file: head_entry.file.clone(),
-                scenario_changed,
-                body_changed,
-            });
+        let (pairs, _) = pair_tests(base_tests, head_tests);
+        for (base_entry, head_entry) in pairs {
+            let scenario_changed = base_entry.scenario != head_entry.scenario;
+            let body_changed = base_entry.body_fingerprint != head_entry.body_fingerprint;
+            if scenario_changed || body_changed {
+                out.push(ModifiedRow {
+                    spec_id: id.clone(),
+                    fn_name: head_entry.fn_name.clone(),
+                    file: head_entry.file.clone(),
+                    scenario_changed,
+                    body_changed,
+                });
+            }
         }
     }
-    out.sort_by(|a, b| a.spec_id.cmp(&b.spec_id));
+    out.sort_by(|a, b| (&a.spec_id, &a.file, &a.fn_name).cmp(&(&b.spec_id, &b.file, &b.fn_name)));
     out
 }
 
@@ -288,10 +346,8 @@ impl Ord for AllowlistChange {
 /// Parse a set of `(file_path, source_text)` pairs into the per-id
 /// inventory. The path is preserved verbatim so it can be displayed
 /// in the rendered report.
-pub fn collect_tests_from_sources(
-    sources: &[(String, String)],
-) -> Result<BTreeMap<String, TestEntry>, String> {
-    let mut out: BTreeMap<String, TestEntry> = BTreeMap::new();
+pub fn collect_tests_from_sources(sources: &[(String, String)]) -> Result<Inventory, String> {
+    let mut out: Inventory = BTreeMap::new();
     for (path, source) in sources {
         let parsed = match syn::parse_file(source) {
             Ok(p) => p,
@@ -302,7 +358,15 @@ pub fn collect_tests_from_sources(
         // `tabs/selection/*` unit tests in `src/tab.rs`) are found, not
         // just top-level test fns in `tests/`. Mirrors the docs
         // generator's `collect_spec_tests_from_items` walk.
-        collect_entries_from_items(&parsed.items, path, &mut out);
+        collect_entries_from_items(&parsed.items, path, "", &mut out);
+    }
+    // The two refs read their files in different orders (`git ls-tree` at
+    // the base, `read_dir` at HEAD), so sort each id's tests to make the
+    // inventory independent of that order.
+    for tests in out.values_mut() {
+        tests.sort_by(|a, b| {
+            (&a.file, &a.module_path, &a.fn_name).cmp(&(&b.file, &b.module_path, &b.fn_name))
+        });
     }
     Ok(out)
 }
@@ -314,7 +378,8 @@ pub fn collect_tests_from_sources(
 fn collect_entries_from_items(
     items: &[syn::Item],
     path: &str,
-    out: &mut BTreeMap<String, TestEntry>,
+    module_path: &str,
+    out: &mut Inventory,
 ) {
     for item in items {
         match item {
@@ -323,21 +388,25 @@ fn collect_entries_from_items(
                     let fn_name = item_fn.sig.ident.to_string();
                     let scenario = read_scenario_doc(&item_fn.attrs).unwrap_or_default();
                     let body_fingerprint = fingerprint_block(&item_fn.block);
-                    out.insert(
-                        spec_id.clone(),
-                        TestEntry {
-                            spec_id,
-                            fn_name,
-                            file: path.to_string(),
-                            scenario,
-                            body_fingerprint,
-                        },
-                    );
+                    out.entry(spec_id.clone()).or_default().push(TestEntry {
+                        spec_id,
+                        fn_name,
+                        file: path.to_string(),
+                        module_path: module_path.to_string(),
+                        scenario,
+                        body_fingerprint,
+                    });
                 }
             }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, nested_items)) = &item_mod.content {
-                    collect_entries_from_items(nested_items, path, out);
+                    let name = item_mod.ident.to_string();
+                    let nested_path = if module_path.is_empty() {
+                        name
+                    } else {
+                        format!("{module_path}::{name}")
+                    };
+                    collect_entries_from_items(nested_items, path, &nested_path, out);
                 }
             }
             _ => {}
@@ -623,7 +692,7 @@ fn git_ls_tree(reference: &str, path: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, String> {
+fn collect_tests_at_ref(reference: &str) -> Result<Inventory, String> {
     let mut sources: Vec<(String, String)> = Vec::new();
     for f in git_ls_tree(reference, "tests")? {
         if !f.ends_with(".rs") {
@@ -656,7 +725,7 @@ fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, 
     collect_tests_from_sources(&sources)
 }
 
-fn collect_tests_on_disk(root: &Path) -> Result<BTreeMap<String, TestEntry>, String> {
+fn collect_tests_on_disk(root: &Path) -> Result<Inventory, String> {
     let mut sources: Vec<(String, String)> = Vec::new();
     // tests/ — parse every .rs (minus the huge spec-less harness module).
     let tests_dir = root.join("tests");
@@ -694,9 +763,12 @@ fn collect_tests_on_disk(root: &Path) -> Result<BTreeMap<String, TestEntry>, Str
 /// `abs_path` comes out of [`walk_rs_files`], so its separators are the host's,
 /// and `to_string_lossy` — what this used to end with — keeps them, so on
 /// Windows the inventory tables printed `tests\e2e_foo.rs` (issue #831).
-/// The field is display-only — [`compute_created`] and [`compute_modified`] key
-/// on `spec_id` and compare only `scenario` and `body_fingerprint`, never
-/// `file` — which is why this was cosmetic rather than a wrong report. It is
+/// At the time this was display-only — [`compute_created`] and
+/// [`compute_modified`] keyed on `spec_id` and compared only `scenario` and
+/// `body_fingerprint`, never `file` — which is why this was cosmetic rather
+/// than a wrong report. Since issue #2496 the pairing does read `file`, so a
+/// separator that differed between the two sides could now unpair a test that
+/// shares its id with another. It is
 /// still worth fixing at the source: the same field is filled from
 /// `git ls-tree` output on the base side ([`collect_tests_at_ref`]), which is
 /// always forward-slashed, so one field had two producers that disagreed by
@@ -816,6 +888,7 @@ mod tests {
             spec_id: spec_id.to_string(),
             fn_name: fn_name.to_string(),
             file: format!("tests/e2e_{}.rs", spec_id.replace('/', "_")),
+            module_path: String::new(),
             scenario: scenario.to_string(),
             body_fingerprint: body.to_string(),
         }
@@ -836,29 +909,29 @@ mod tests {
 
     #[test]
     fn created_section_lists_only_ids_new_in_head() {
-        let mut base: BTreeMap<String, TestEntry> = BTreeMap::new();
+        let mut base: Inventory = BTreeMap::new();
         base.insert(
             "hooks/delivery/001".to_string(),
-            entry("hooks/delivery/001", "delivery_001_x", "x", "body-a"),
+            vec![entry("hooks/delivery/001", "delivery_001_x", "x", "body-a")],
         );
-        let mut head: BTreeMap<String, TestEntry> = base.clone();
+        let mut head: Inventory = base.clone();
         head.insert(
             "dashboard/pane/005".to_string(),
-            entry(
+            vec![entry(
                 "dashboard/pane/005",
                 "pane_005_y",
                 "Render a card",
                 "body-b",
-            ),
+            )],
         );
         head.insert(
             "chain-smoke/claude/002".to_string(),
-            entry(
+            vec![entry(
                 "chain-smoke/claude/002",
                 "claude_002_z",
                 "Drive Claude end to end",
                 "body-c",
-            ),
+            )],
         );
 
         let created = compute_created(&base, &head);
@@ -872,30 +945,41 @@ mod tests {
 
     #[test]
     fn modified_section_lists_ids_with_changed_body_or_scenario() {
-        let mut base: BTreeMap<String, TestEntry> = BTreeMap::new();
+        let mut base: Inventory = BTreeMap::new();
         base.insert(
             "hooks/delivery/001".to_string(),
-            entry(
+            vec![entry(
                 "hooks/delivery/001",
                 "delivery_001_x",
                 "Original.",
                 "body-a",
-            ),
+            )],
         );
         base.insert(
             "hooks/delivery/002".to_string(),
-            entry("hooks/delivery/002", "delivery_002_x", "Same.", "body-x"),
+            vec![entry(
+                "hooks/delivery/002",
+                "delivery_002_x",
+                "Same.",
+                "body-x",
+            )],
         );
         base.insert(
             "hooks/delivery/003".to_string(),
-            entry("hooks/delivery/003", "delivery_003_x", "Same.", "body-y"),
+            vec![entry(
+                "hooks/delivery/003",
+                "delivery_003_x",
+                "Same.",
+                "body-y",
+            )],
         );
 
-        let mut head: BTreeMap<String, TestEntry> = base.clone();
+        let mut head: Inventory = base.clone();
         // Scenario change only.
-        head.get_mut("hooks/delivery/001").unwrap().scenario = "Updated narrative.".to_string();
+        head.get_mut("hooks/delivery/001").unwrap()[0].scenario = "Updated narrative.".to_string();
         // Body change only.
-        head.get_mut("hooks/delivery/002").unwrap().body_fingerprint = "body-x-changed".to_string();
+        head.get_mut("hooks/delivery/002").unwrap()[0].body_fingerprint =
+            "body-x-changed".to_string();
         // delivery/003 unchanged.
 
         let modified = compute_modified(&base, &head);
@@ -1004,6 +1088,7 @@ mod tests {
             spec_id: "dashboard/pane/004".into(),
             fn_name: "pane_004_card_title_row".into(),
             file: "tests/render_dashboard.rs".into(),
+            module_path: String::new(),
             scenario: "Render a single dashboard card. Pin it.".into(),
             body_fingerprint: "fp".into(),
         }];
@@ -1011,6 +1096,165 @@ mod tests {
         assert!(report.contains("| dashboard/pane/004 | L1 |"));
         assert!(report.contains("`pane_004_card_title_row`"));
         assert!(report.contains("Render a single dashboard card."));
+    }
+
+    /// Two files that each hold a test under one shared catalog id, as
+    /// `tests/` really does (issue #2496: `inbox/doorbell/035` has three).
+    fn shared_id_sources() -> Vec<(String, String)> {
+        let a = r#"
+            #[spec("inbox/doorbell/035")]
+            #[test]
+            /// Scenario: the first test under the shared id.
+            fn doorbell_035_first() { let _ = 1; }
+        "#;
+        let b = r#"
+            #[spec("inbox/doorbell/035")]
+            #[test]
+            /// Scenario: the second test under the shared id.
+            fn doorbell_035_second() { let _ = 2; }
+        "#;
+        vec![
+            ("tests/e2e_doorbell_a.rs".to_string(), a.to_string()),
+            ("tests/e2e_doorbell_b.rs".to_string(), b.to_string()),
+        ]
+    }
+
+    #[test]
+    fn modified_ignores_untouched_tests_that_share_an_id_when_files_are_read_in_another_order() {
+        // Issue #2496. The base side reads `git ls-tree` (sorted) and HEAD
+        // reads `read_dir` (filesystem order), so the same unchanged files
+        // can arrive in a different order on each side. Nothing changed, so
+        // nothing is Modified, and nothing is Created either.
+        let base_sources = shared_id_sources();
+        let mut head_sources = base_sources.clone();
+        head_sources.reverse();
+        let base = collect_tests_from_sources(&base_sources).expect("parses");
+        let head = collect_tests_from_sources(&head_sources).expect("parses");
+
+        assert_eq!(compute_modified(&base, &head), Vec::<ModifiedRow>::new());
+        assert_eq!(compute_created(&base, &head), Vec::<TestEntry>::new());
+    }
+
+    #[test]
+    fn modified_names_the_one_changed_test_among_several_sharing_an_id() {
+        // Issue #2496: with a shared id, a body change in one test is
+        // reported against that test's function and file, and its untouched
+        // sibling is not reported.
+        let base_sources = shared_id_sources();
+        let mut head_sources = base_sources.clone();
+        head_sources[1].1 = head_sources[1].1.replace("let _ = 2;", "let _ = 3;");
+        head_sources.reverse();
+        let base = collect_tests_from_sources(&base_sources).expect("parses");
+        let head = collect_tests_from_sources(&head_sources).expect("parses");
+
+        let modified = compute_modified(&base, &head);
+        assert_eq!(modified.len(), 1, "{modified:?}");
+        assert_eq!(modified[0].spec_id, "inbox/doorbell/035");
+        assert_eq!(modified[0].fn_name, "doorbell_035_second");
+        assert_eq!(modified[0].file, "tests/e2e_doorbell_b.rs");
+        assert!(modified[0].body_changed);
+        assert!(!modified[0].scenario_changed);
+    }
+
+    #[test]
+    fn created_lists_a_test_added_under_an_id_the_base_already_has() {
+        // Issue #2496: pairing is per test, so a second test added under an
+        // existing id is Created, and the untouched first one is not Modified.
+        let base_sources = vec![shared_id_sources().remove(0)];
+        let head_sources = shared_id_sources();
+        let base = collect_tests_from_sources(&base_sources).expect("parses");
+        let head = collect_tests_from_sources(&head_sources).expect("parses");
+
+        let created = compute_created(&base, &head);
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(created[0].fn_name, "doorbell_035_second");
+        assert_eq!(compute_modified(&base, &head), Vec::<ModifiedRow>::new());
+    }
+
+    #[test]
+    fn a_lone_test_that_moved_file_is_compared_not_created() {
+        // When an id has one test at each ref, they pair even if the file or
+        // function name changed, as they did before issue #2496.
+        let base_sources = vec![shared_id_sources().remove(0)];
+        let mut head_sources = base_sources.clone();
+        head_sources[0].0 = "tests/e2e_doorbell_moved.rs".to_string();
+        head_sources[0].1 = head_sources[0].1.replace("let _ = 1;", "let _ = 9;");
+        let base = collect_tests_from_sources(&base_sources).expect("parses");
+        let head = collect_tests_from_sources(&head_sources).expect("parses");
+
+        assert_eq!(compute_created(&base, &head), Vec::<TestEntry>::new());
+        let modified = compute_modified(&base, &head);
+        assert_eq!(modified.len(), 1, "{modified:?}");
+        assert_eq!(modified[0].file, "tests/e2e_doorbell_moved.rs");
+        assert!(modified[0].body_changed);
+    }
+
+    #[test]
+    fn a_deleted_and_an_unrelated_added_test_under_a_shared_id_are_not_paired() {
+        // A review finding on issue #2496's fix: with siblings under the id,
+        // one test deleted and another added in a different file with a
+        // different name are two changes, not one test that moved. The new
+        // test is Created, and nothing is Modified.
+        let base_sources = shared_id_sources();
+        let mut head_sources = vec![base_sources[0].clone()];
+        head_sources.push((
+            "tests/e2e_doorbell_c.rs".to_string(),
+            r#"
+                #[spec("inbox/doorbell/035")]
+                #[test]
+                /// Scenario: an unrelated new test under the shared id.
+                fn doorbell_035_third() { let _ = 4; }
+            "#
+            .to_string(),
+        ));
+        let base = collect_tests_from_sources(&base_sources).expect("parses");
+        let head = collect_tests_from_sources(&head_sources).expect("parses");
+
+        assert_eq!(compute_modified(&base, &head), Vec::<ModifiedRow>::new());
+        let created = compute_created(&base, &head);
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(created[0].fn_name, "doorbell_035_third");
+    }
+
+    #[test]
+    fn same_named_tests_in_sibling_inline_modules_are_told_apart() {
+        // A review finding on issue #2496's fix: two inline modules in one
+        // file can each hold a function of the same name under the same id.
+        // An untouched one is not Modified, and one added beside them is
+        // Created.
+        let one = r#"
+            mod a {
+                #[spec("tabs/selection/009")]
+                #[test]
+                /// Scenario: the copy in module a.
+                fn selection_009_x() { let _ = 1; }
+            }
+            mod b {
+                #[spec("tabs/selection/009")]
+                #[test]
+                /// Scenario: the copy in module b.
+                fn selection_009_x() { let _ = 2; }
+            }
+        "#;
+        let two = format!(
+            "{one}{}",
+            r#"
+            mod c {
+                #[spec("tabs/selection/009")]
+                #[test]
+                /// Scenario: the copy in module c.
+                fn selection_009_x() { let _ = 3; }
+            }
+        "#
+        );
+        let base = collect_tests_from_sources(&[("src/tab.rs".to_string(), one.to_string())])
+            .expect("parses");
+        let head = collect_tests_from_sources(&[("src/tab.rs".to_string(), two)]).expect("parses");
+
+        assert_eq!(compute_modified(&base, &head), Vec::<ModifiedRow>::new());
+        let created = compute_created(&base, &head);
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(created[0].module_path, "c");
     }
 
     #[test]
@@ -1027,7 +1271,7 @@ mod tests {
         let sources = vec![("tests/e2e_x.rs".to_string(), src.to_string())];
         let map = collect_tests_from_sources(&sources).expect("parses");
         assert_eq!(map.len(), 1);
-        let t = &map["hooks/delivery/001"];
+        let t = &map["hooks/delivery/001"][0];
         assert_eq!(t.fn_name, "delivery_001_x");
         assert_eq!(t.scenario, "A short, in-process check.");
         assert!(!t.body_fingerprint.is_empty());
@@ -1063,10 +1307,13 @@ mod tests {
         let sources = vec![("src/tab.rs".to_string(), src.to_string())];
         let map = collect_tests_from_sources(&sources).expect("parses");
         assert_eq!(map.len(), 3);
-        assert_eq!(map["dashboard/pane/004"].fn_name, "pane_004_top");
-        assert_eq!(map["tabs/selection/001"].fn_name, "selection_001_nested");
-        assert_eq!(map["tabs/selection/001"].file, "src/tab.rs");
-        assert_eq!(map["tabs/selection/002"].fn_name, "selection_002_deep");
+        assert_eq!(map["dashboard/pane/004"][0].fn_name, "pane_004_top");
+        assert_eq!(map["tabs/selection/001"][0].fn_name, "selection_001_nested");
+        assert_eq!(map["tabs/selection/001"][0].file, "src/tab.rs");
+        assert_eq!(map["tabs/selection/001"][0].module_path, "tests");
+        assert_eq!(map["tabs/selection/002"][0].module_path, "tests::deeper");
+        assert_eq!(map["dashboard/pane/004"][0].module_path, "");
+        assert_eq!(map["tabs/selection/002"][0].fn_name, "selection_002_deep");
     }
 
     #[test]
@@ -1186,14 +1433,17 @@ mod tests {
 
         // These two are the assertions that go red on Windows without the fix:
         // the walk hands `rel_to_root` `tests\nested\e2e_walked.rs` there.
-        assert_eq!(map["walked/tests/001"].file, "tests/nested/e2e_walked.rs");
-        assert_eq!(map["walked/src/001"].file, "src/deep/nest/tab.rs");
+        assert_eq!(
+            map["walked/tests/001"][0].file,
+            "tests/nested/e2e_walked.rs"
+        );
+        assert_eq!(map["walked/src/001"][0].file, "src/deep/nest/tab.rs");
 
         for (spec_id, walked) in [
             ("walked/tests/001", &tests_file),
             ("walked/src/001", &src_file),
         ] {
-            let recorded = &map[spec_id].file;
+            let recorded = &map[spec_id][0].file;
             assert!(
                 !recorded.contains(std::path::MAIN_SEPARATOR) || std::path::MAIN_SEPARATOR == '/',
                 "{recorded} still carries the native separator"
@@ -1238,7 +1488,7 @@ mod tests {
         .expect("write the odd-name fixture");
 
         let map = collect_tests_on_disk(root).expect("the fixture tree must be walkable");
-        let recorded = &map["walked/odd/001"].file;
+        let recorded = &map["walked/odd/001"][0].file;
         assert_eq!(recorded, r"tests/we\ird.rs");
         assert_eq!(
             std::fs::canonicalize(root.join(recorded)).expect("the recorded path must resolve"),

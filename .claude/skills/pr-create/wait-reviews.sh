@@ -33,6 +33,21 @@
 #     `names_head`. Its bound counts from the PR's creation, so a later push
 #     never buys it another wait; there is no review left to come.
 #
+# A `comment` signal with `settle_minutes` is for an app that names the head in
+# its comment BEFORE it has finished that head's review (Qodo, issue #2507: 130
+# of its 340 inline findings on 150 PRs were posted 47 to 714 s after its
+# comment first named their head). Naming the head is then necessary but not
+# enough; the comment counts once one of these also holds:
+#
+#   - the app has posted an inline review comment, not a reply, written on the
+#     head (`original_commit_id`): on every head measured, its findings for
+#     the head arrived in one batch, so once one is there the rest are;
+#   - the comment was never edited and is `first_review_settle_minutes` old: the
+#     app's first review on the PR, which it posts in one step;
+#   - the comment's last edit is `settle_minutes` old.
+#
+# reviewers.json's note on the entry has the measurements behind those numbers.
+#
 # The head is read again on every poll and once more before the verdict. When
 # it moves, the reviewers that review every push start over on the new head.
 # A GitHub read that fails after the first one is retried on the next poll;
@@ -78,6 +93,11 @@ bad=$(jq -r '
       or ((.timeout_minutes | type) != "number") or .timeout_minutes <= 0
       or (.signal.kind as $k | ["comment", "check_run", "review"] | index($k) | not)
       or (.signal.kind == "comment" and ((.signal.contains | type) != "string" or .signal.contains == ""))
+      or (.signal.settle_minutes != null and (.signal.kind != "comment" or .signal.names_head != true
+                                              or (.signal.settle_minutes | type) != "number" or .signal.settle_minutes <= 0
+                                              or (.signal.first_review_settle_minutes | type) != "number"
+                                              or .signal.first_review_settle_minutes < 0))
+      or (.signal.settle_minutes == null and .signal.first_review_settle_minutes != null)
       or (.signal.kind == "check_run" and ((.signal.name | type) != "string" or .signal.name == ""
                                            or (.signal.app | type) != "string" or .signal.app == ""))
     )
@@ -131,6 +151,22 @@ fetch() {
   echo '[]' >"$tmp/$name.json"
 }
 
+# Inline comments are read only from the head commit's committer date on, so a
+# poll reads what changed since the head was made rather than the PR's whole
+# review history (Qodo's finding on PR #2544). A finding on the head is written
+# after the commit, so it falls inside that window unless the committer's
+# clock ran ahead; then the settle period still ends the wait. When the date
+# cannot be read, every page is read.
+since_head=
+since_for=
+# Sets $since_head for the current head, reading it once per head.
+read_since_head() {
+  [ "$since_for" = "$head" ] && return
+  since_for="$head"
+  since_head=$(gh api "repos/{owner}/{repo}/commits/$head" --jq .commit.committer.date 2>/dev/null) || since_head=
+  printf '%s\n' "$since_head" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$' || since_head=
+}
+
 read_pr || die "cannot read pull request #$pr"
 head="$new_head"
 created="$new_created"
@@ -141,12 +177,17 @@ for ((i = 0; i < count; i++)); do status[i]=pending; done
 
 while :; do
   kinds=$(for ((i = 0; i < count; i++)); do
-    [ "${status[i]}" = pending ] && jq -r --argjson i "$i" '.reviewers[$i].signal.kind' "$registry"
+    [ "${status[i]}" = pending ] && jq -r --argjson i "$i" '.reviewers[$i].signal | .kind, (if .settle_minutes != null then "inline" else empty end)' "$registry"
   done | sort -u)
   echo '[]' >"$tmp/comments.json"
   echo '[]' >"$tmp/checks.json"
   echo '[]' >"$tmp/reviews.json"
+  echo '[]' >"$tmp/inline.json"
   case "$kinds" in *comment*) fetch comments 'add // []' api "repos/{owner}/{repo}/issues/$pr/comments" --paginate ;; esac
+  case "$kinds" in *inline*)
+    read_since_head
+    fetch inline 'add // []' api "repos/{owner}/{repo}/pulls/$pr/comments?per_page=100${since_head:+&since=$since_head}" --paginate ;;
+  esac
   case "$kinds" in *check_run*) fetch checks '[.[].check_runs[]]' api "repos/{owner}/{repo}/commits/$head/check-runs?per_page=100" --paginate ;; esac
   case "$kinds" in *review*) fetch reviews 'add // []' api "repos/{owner}/{repo}/pulls/$pr/reviews" --paginate ;; esac
 
@@ -154,16 +195,25 @@ while :; do
   waiting=no
   for ((i = 0; i < count; i++)); do
     [ "${status[i]}" = pending ] || continue
-    found=$(jq -r -n --argjson i "$i" --arg head "$head" \
+    found=$(jq -r -n --argjson i "$i" --arg head "$head" --argjson now "$now" \
       --slurpfile reg "$registry" --slurpfile c "$tmp/comments.json" \
-      --slurpfile k "$tmp/checks.json" --slurpfile v "$tmp/reviews.json" '
+      --slurpfile k "$tmp/checks.json" --slurpfile v "$tmp/reviews.json" \
+      --slurpfile p "$tmp/inline.json" '
+      def age($t): if ($t | type) == "string" then $now - ($t | fromdateiso8601) else -1 end;
       ($reg[0].reviewers[$i]) as $r
       | ($r.signal) as $s
+      | ([ $p[0][] | select(.user.login == $r.login and .in_reply_to_id == null
+                            and .original_commit_id == $head) ] | length > 0) as $findings
       | (if $s.kind == "comment" then
            [ $c[0][]
              | select(.user.login == $r.login)
              | select((.body // "") | contains($s.contains))
-             | select(($s.names_head // false | not) or ((.body // "") | contains($head))) ]
+             | select(($s.names_head // false | not) or ((.body // "") | contains($head)))
+             | select($s.settle_minutes == null
+                      or $findings
+                      or (.created_at == .updated_at
+                          and age(.created_at) >= $s.first_review_settle_minutes * 60)
+                      or age(.updated_at) >= $s.settle_minutes * 60) ]
          elif $s.kind == "check_run" then
            [ $k[0][] | select(.name == $s.name and .app.slug == $s.app and .status == "completed") ]
          else

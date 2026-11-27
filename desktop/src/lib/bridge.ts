@@ -1,4 +1,4 @@
-import { createFixtureFleet, docsAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureCardCatalog, createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, fleetAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, FIXTURE_REMOTE_DAEMON_ID, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -54,6 +54,11 @@ import type { HandoffEdge,
   AgentCardTarget,
   CardActionOptions,
   CardActionResult,
+  CardBatchOptions,
+  CardBatchOutcome,
+  CardBatchResult,
+  CardCatalogEdit,
+  EditableCardCatalog,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
@@ -1095,6 +1100,17 @@ export interface VoiceDictationTargetDto {
 export interface VoiceReadingStateDto {
   reading: boolean;
   speaking: boolean;
+}
+
+/**
+ * PR #2491 (2026-11-25) — the agent dashboard as it stands, declared with
+ * each utterance on it — `voice::VoiceDashboard`: which view shows and whether
+ * Needs you only is on. The command model reads it, so "show all cards" turns
+ * the filter off while it is on and switches to the Cards view while it is off.
+ */
+export interface VoiceDashboardDto {
+  view: "table" | "cards";
+  needsYouOnly: boolean;
 }
 
 /**
@@ -2152,9 +2168,11 @@ export interface DeckBridge {
    * on ({@link VoiceDictationTargetDto}), which keeps that utterance off the
    * Commands backend entirely. `reading` is the seventh (PRD #1497): whether
    * reading mode is on and whether the app was speaking while the utterance
-   * was recorded ({@link VoiceReadingStateDto}).
+   * was recorded ({@link VoiceReadingStateDto}). `dashboard` is the eighth
+   * (PR #2491, 2026-11-25): the agent dashboard's view and whether Needs you
+   * only is on, while the dashboard is the screen ({@link VoiceDashboardDto}).
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, dashboard?: VoiceDashboardDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -2512,6 +2530,34 @@ export interface DeckBridge {
    */
   invokeCardAction?(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult>;
   /**
+   * Issue #2399 — preview or execute one action on many cards of deck
+   * `deckId` in one request (`agent_card_invoke_batch`). A preview sends
+   * nothing and answers, per card, the exact text it would get or why it is
+   * skipped; an execution sends to the confirmed entries, each carrying the
+   * token and instance its preview answered, and the daemon checks each as a
+   * single press. Bound to `options.instanceId`, like {@link invokeCardAction}.
+   */
+  invokeCardActionBatch?(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult>;
+  /**
+   * PRD #2374 decision 2026-11-24 — the card actions editor: read deck
+   * `deckId`'s card actions with where each came from
+   * (`agent_card_catalog_edit` with no edit). The daemon reads its own user
+   * config; a daemon without the editor is sent nothing and the call rejects.
+   * Only daemon process `instanceId` is read (PR #2491 review, Qodo 4): a
+   * daemon that replaced it is sent nothing and the call rejects, and so does
+   * a call naming no process (PR #2491 audit, A1).
+   */
+  readCardCatalog?(deckId: string, instanceId: string | undefined): Promise<EditableCardCatalog>;
+  /**
+   * PRD #2374 decision 2026-11-24 — ask deck `deckId`'s daemon to apply one
+   * edit to its own user config's card actions; answers them after the edit.
+   * A refusal rejects with the daemon's reason, and nothing was written.
+   * `instanceId` is the daemon process whose card actions the user was shown:
+   * a daemon that replaced it is sent nothing and the call rejects (PR #2491
+   * review, Qodo 4), and so does a call naming no process (PR #2491 audit, A1).
+   */
+  editCardCatalog?(deckId: string, edit: CardCatalogEdit, instanceId: string | undefined): Promise<EditableCardCatalog>;
+  /**
    * PRD #1790 stage 2 — one deck's interrupted work (`interrupted_work_list`):
    * what a restart of its daemon left behind, from daemon process
    * `target.instance`, with each item's Git and pull request facts when `git`
@@ -2562,6 +2608,8 @@ export function normalizeAgentCards(value: unknown): AgentCardsSnapshot | null {
     entries: record.entries as AgentCardEntry[],
     catalogErrors: Array.isArray(record.catalogErrors) ? record.catalogErrors.filter((e): e is string => typeof e === "string") : [],
     tree: record.tree === true,
+    batch: record.batch === true,
+    catalogEdit: record.catalogEdit === true,
   };
 }
 
@@ -3337,12 +3385,22 @@ class FixtureDeckBridge implements DeckBridge {
    * PRD #2374 — the `agent-cards` docs scene's card list: served only for
    * `/?fixture=1&state=docs&cards=1`, so no other fixture scene shows cards,
    * needs-you bells or row menus; issue #2418's tree scene, with eight roots
-   * and their trees, for `cards=tree`. Every other deck and scene answers as
-   * a daemon without cards does.
+   * and their trees, for `cards=tree`; issue #2399's batch scene, the same
+   * cards from a daemon that does batches, for `cards=batch`. Every other deck
+   * and scene answers as a daemon without cards does.
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
+    const cards = this.sceneCardsFor(deckId);
+    return cards && cards.deckId === deckId ? cards : null;
+  }
+  /** The scene's cards for one deck: PR #2491's `cards=fleet` scene has two daemons showing cards; every other scene one at most. */
+  private sceneCardsFor(deckId: string): AgentCardsSnapshot | null {
+    if (this.fleetCardsScene()) return fleetAgentCards(deckId) ?? null;
     const cards = this.sceneCards();
     return cards && cards.deckId === deckId ? cards : null;
+  }
+  private fleetCardsScene(): boolean {
+    return this.fixtureState === "docs-fleet" && new URLSearchParams(window.location.search).get("cards") === "fleet";
   }
   /**
    * The docs and tree scenes' cards, as last pushed. Issue #2418 review: the
@@ -3351,11 +3409,14 @@ class FixtureDeckBridge implements DeckBridge {
    * follow a live update; the preview itself never changes them.
    */
   private treeCards?: AgentCardsSnapshot;
+  /** The tree scene's deck as it was before a browser test took it offline, kept to bring back. */
+  private offlineDeck?: DeckSnapshot;
   private cardListeners = new Set<(snapshot: AgentCardsSnapshot) => void>();
   private sceneCards(): AgentCardsSnapshot | null {
     const scene = new URLSearchParams(window.location.search).get("cards");
     if (this.fixtureState !== "docs") return null;
     if (scene === "1") return docsAgentCards();
+    if (scene === "batch") return docsBatchAgentCards();
     if (scene !== "tree" && scene !== "tree-nested") return null;
     if (!this.treeCards) {
       this.treeCards = treeAgentCards(scene);
@@ -3363,7 +3424,21 @@ class FixtureDeckBridge implements DeckBridge {
         this.treeCards = next;
         for (const listener of this.cardListeners) listener(next);
       };
-      (window as Window & { __dadFixtureCards?: unknown }).__dadFixtureCards = { snapshot: () => structuredClone(this.treeCards), push };
+      /* PR #2491 review J2: `connected(false)` makes the scene's deck stop
+         answering, as a daemon that went away does (no agents, and the
+         runtime drops its cards); `connected(true)` brings it back, and the
+         runtime reads its cards again. */
+      const connected = (online: boolean) => {
+        if (online && this.offlineDeck) {
+          this.snapshot = this.offlineDeck;
+          this.offlineDeck = undefined;
+        } else if (!online && !this.offlineDeck) {
+          this.offlineDeck = this.snapshot;
+          this.snapshot = { ...structuredClone(this.snapshot), connection: { ...this.snapshot.connection, status: "disconnected", message: "The fixture daemon stopped answering." }, agents: [] };
+        }
+        this.emitSnapshot();
+      };
+      (window as Window & { __dadFixtureCards?: unknown }).__dadFixtureCards = { snapshot: () => structuredClone(this.treeCards), push, connected };
     }
     return this.treeCards;
   }
@@ -3406,6 +3481,65 @@ class FixtureDeckBridge implements DeckBridge {
   }
   async interruptedWorkStartOver(target: InterruptedTarget, id: string, agent: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>> {
     return this.interrupted.startOver(target, id, agent, dryRun);
+  }
+  /**
+   * PRD #2374 decision 2026-11-24 — the preview's card actions editor, for
+   * the `cards=tree` scene's daemon (it advertises the editor): a catalog of
+   * the deck's defaults that applies each edit for the rest of the session
+   * ({@link createFixtureCardCatalog}). Any other deck or scene is refused, as
+   * a daemon without the editor is.
+   */
+  private readonly cardCatalog = createFixtureCardCatalog();
+  /** PR #2491 — the `cards=fleet` scene's second daemon keeps a catalog of its own. */
+  private readonly remoteCardCatalog = createFixtureCardCatalog();
+  /*
+   * PR #2491 re-audit (F2): bound to a daemon process as the production
+   * bridge and backend bind it — a read or an edit naming none is refused in
+   * their words, and one naming a process other than the one whose cards the
+   * deck shows is refused as a replaced daemon is; an edit adds that nothing
+   * was saved.
+   */
+  private cardCatalogFor(deckId: string, instanceId: string | undefined, edits: boolean) {
+    const unsent = edits ? "; nothing was saved" : "";
+    if (!instanceId) throw new Error(`${CARD_CATALOG_DAEMON_UNNAMED}${unsent}`);
+    const cards = this.sceneCardsFor(deckId);
+    if (!cards || cards.deckId !== deckId || cards.catalogEdit !== true) throw new Error("this deck's daemon is from a release whose card actions cannot be edited from the app");
+    if (cards.instanceId !== instanceId) throw new Error(`${CARD_CATALOG_DAEMON_REPLACED}${unsent}`);
+    return deckId === FIXTURE_REMOTE_DAEMON_ID ? this.remoteCardCatalog : this.cardCatalog;
+  }
+  async readCardCatalog(deckId: string, instanceId: string | undefined): Promise<EditableCardCatalog> {
+    return this.cardCatalogFor(deckId, instanceId, false).read();
+  }
+  async editCardCatalog(deckId: string, edit: CardCatalogEdit, instanceId: string | undefined): Promise<EditableCardCatalog> {
+    return this.cardCatalogFor(deckId, instanceId, true).edit(edit);
+  }
+  /**
+   * Issue #2399 — the preview answers a batch as a daemon would, from the
+   * cards it shows: a preview includes each card offering the action enabled,
+   * with that card's own exact text, and skips the rest with a reason; an
+   * execution queues the text for every confirmed entry, as a daemon answers
+   * it (`state: "queued"`), except the one agent the `cards=batch` scene's
+   * daemon refuses, so its results show a partial failure. Nothing changes in
+   * the fixture's state.
+   */
+  async invokeCardActionBatch(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult> {
+    const shown = this.fleetCardsScene() ? this.sceneCardsFor(deckId) : this.treeCards ?? this.sceneCards();
+    const cards = shown && shown.deckId === deckId ? shown.entries : [];
+    const entries = options.entries.map((target): CardBatchOutcome => {
+      const card = cards.find((candidate) => candidate.pane_id === target.pane_id && candidate.agent_id === target.agent_id);
+      const base = { pane_id: target.pane_id, agent_id: target.agent_id, ...(card ? { name: card.name } : {}) };
+      if (options.mode === "execute") {
+        const refused = card && new URLSearchParams(window.location.search).get("cards") === "batch" ? docsBatchExecuteFailure(card.agent_id) : undefined;
+        if (refused) return { ...base, outcome: "failed", ...refused };
+        return card ? { ...base, outcome: "delivered", message_id: `m-fixture-batch-${target.agent_id}`, state: "queued" } : { ...base, outcome: "failed", code: "unknown_entry", message: "there is no such card" };
+      }
+      const action = card?.actions.find((candidate) => candidate.id === actionId);
+      if (!card) return { ...base, outcome: "skipped", code: "unknown_entry", message: "there is no such card" };
+      if (!action) return { ...base, outcome: "skipped", code: "unknown_action", message: `${card.name}'s card does not offer this action` };
+      if (!action.enabled) return { ...base, outcome: "skipped", code: action.disabled_reason ?? "action_disabled", message: "the agent is not running" };
+      return { ...base, outcome: "included", label: action.label, kind: action.kind, ...(action.prompt ? { prompt: action.prompt, prompt_source: action.prompt_source ?? "catalog" } : {}), action_token: action.token, instance_id: shown?.instanceId ?? card.instance_id };
+    });
+    return { request_id: options.requestId, entries };
   }
   /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
   async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
@@ -3891,7 +4025,7 @@ class FixtureDeckBridge implements DeckBridge {
   /* The preview's directory rows (the Filter box's two) and its Command row
      need only to know a listing or a live form is showing; the rows
      themselves feed nothing here. */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, _dashboard?: VoiceDashboardDto): void {
     this.voiceScreen = screen;
     this.voiceDirectoryListing = directories !== undefined;
     this.voiceNewAgentForm = newAgent?.form !== undefined;
@@ -4503,6 +4637,30 @@ export function terminalAttachFailure(cause: unknown): string {
   const text = cause instanceof Error ? cause.message : String(cause);
   return text === AGENT_GONE_AFTER_RESTART || text === AGENT_IDENTITY_UNKNOWN ? text : TERMINAL_ATTACH_FAILED;
 }
+
+/**
+ * Issue #2399 review 8 — the words the desktop backend's
+ * `agent_card_catalog_edit` puts in its reason when an edit's answer was lost
+ * after the edit was sent (`CARD_CATALOG_EDIT_MAY_HAVE_SAVED` in
+ * `desktop/src-tauri/src/lib.rs`; a test holds the two to one text).
+ */
+export const CARD_CATALOG_EDIT_MAY_HAVE_SAVED = "it may have been saved";
+
+/**
+ * PR #2491 audit (A1) — why a Card actions editor read or edit naming no
+ * daemon process is refused unsent: the backend's
+ * `CARD_CATALOG_DAEMON_UNNAMED` (`desktop/src-tauri/src/lib.rs`), word for
+ * word, so the editor says the same whichever side refused.
+ */
+export const CARD_CATALOG_DAEMON_UNNAMED = "the app did not say which of the deck's daemon processes its card actions were read from";
+
+/**
+ * PR #2491 re-audit (F2) — why a Card actions editor read or edit bound to a
+ * daemon process that another has replaced is refused: the backend's
+ * `CARD_CATALOG_DAEMON_REPLACED` (`desktop/src-tauri/src/lib.rs`), word for
+ * word, so the fixture refuses a wrong process as the backend does.
+ */
+export const CARD_CATALOG_DAEMON_REPLACED = "the deck's daemon was restarted since its cards were read";
 
 export class TauriDeckBridge implements DeckBridge {
   readonly mode = "live" as const;
@@ -5968,9 +6126,12 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceDictation: VoiceDictationTargetDto | undefined;
   /** PRD #1497 — reading mode and the app's speech, as declared. */
   private voiceReading: VoiceReadingStateDto | undefined;
+  /** PR #2491 — the agent dashboard's view and Needs you only, as declared. */
+  private voiceDashboard: VoiceDashboardDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, dashboard?: VoiceDashboardDto): void {
     this.voiceReading = reading;
+    this.voiceDashboard = dashboard;
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
@@ -6014,7 +6175,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null, reading: this.voiceReading ?? null }));
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null, reading: this.voiceReading ?? null, dashboard: this.voiceDashboard ?? null }));
   }
 
   /**
@@ -6310,6 +6471,50 @@ export class TauriDeckBridge implements DeckBridge {
       const snapshot = normalizeAgentCards(event.payload);
       if (snapshot) listener(snapshot);
     });
+  }
+
+  async invokeCardActionBatch(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult> {
+    const invoke = await this.getInvoke();
+    return invoke<CardBatchResult>("agent_card_invoke_batch", {
+      deckId,
+      instanceId: options.instanceId ?? "",
+      actionId,
+      mode: options.mode,
+      requestId: options.requestId,
+      entries: options.entries,
+    });
+  }
+
+  async readCardCatalog(deckId: string, instanceId: string | undefined): Promise<EditableCardCatalog> {
+    return this.cardCatalogEdit(deckId, null, instanceId);
+  }
+
+  async editCardCatalog(deckId: string, edit: CardCatalogEdit, instanceId: string | undefined): Promise<EditableCardCatalog> {
+    return this.cardCatalogEdit(deckId, edit, instanceId);
+  }
+
+  /**
+   * `agent_card_catalog_edit`, its failure an Error carrying the backend's
+   * reason. An edit whose answer was lost after it was sent — the backend's
+   * reason then says {@link CARD_CATALOG_EDIT_MAY_HAVE_SAVED} — is marked
+   * `outcome: "unknown"`, so the editor says it may have been saved instead of
+   * that it was not (issue #2399 review 8); every other failure is a refusal,
+   * with nothing written. `instanceId` binds the request to that daemon
+   * process (PR #2491 review, Qodo 4). A request naming none (`undefined`, or
+   * the empty id a snapshot without one normalizes to) is refused here, with
+   * nothing invoked, in the backend's own words (PR #2491 audit, A1): missing
+   * identity never selects an unbound request.
+   */
+  private async cardCatalogEdit(deckId: string, edit: CardCatalogEdit | null, instanceId: string | undefined): Promise<EditableCardCatalog> {
+    if (!instanceId) throw new Error(edit === null ? CARD_CATALOG_DAEMON_UNNAMED : `${CARD_CATALOG_DAEMON_UNNAMED}; nothing was saved`);
+    const invoke = await this.getInvoke();
+    try {
+      return await invoke<EditableCardCatalog>("agent_card_catalog_edit", { deckId, instanceId, edit });
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (edit !== null && failure.message.includes(CARD_CATALOG_EDIT_MAY_HAVE_SAVED)) Object.assign(failure, { outcome: "unknown" });
+      throw failure;
+    }
   }
 
   async invokeCardAction(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceReadingStateDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceReadingStateDto, VoiceDashboardDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
 import type { ReadingSentenceDto, ReadingTarget } from "../lib/reading";
 import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey, boundAgentKey } from "../lib/agentKey";
@@ -19,7 +19,7 @@ import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } f
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
 import { useInterruptedWork } from "./useInterruptedWork";
-import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
+import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CardBatchOptions, type CardCatalogEdit, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -418,7 +418,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   /* Every declaration carries the New agent dialog's deck step, computed from
      the same `fleet` the dialog reads, so what voice says it preselected and
      what the dialog preselects are judged against one list. */
-  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints, dictation, reading), [bridge]);
+  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto, dashboard?: VoiceDashboardDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints, dictation, reading, dashboard), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
   const answerVoiceChoice = useCallback((utterance: string, action: string, offered: VoiceResolvedParamDto[]) => bridge.answerVoiceChoice(utterance, action, offered), [bridge]);
   const answerVoiceNumber = useCallback((utterance: string, heard: VoiceNumberedListDto, generation: number) => bridge.answerVoiceNumber(utterance, heard, generation), [bridge]);
@@ -676,6 +676,20 @@ export function useDeckRuntime(): DeckRuntimeState {
   const invokeCardAction = useMemo(() => (typeof bridge.invokeCardAction === "function"
     ? (target: AgentCardTarget, actionId: string, options: CardActionOptions) => bridge.invokeCardAction!(target, actionId, options)
     : undefined), [bridge]);
+  const invokeCardActionBatch = useMemo(() => (typeof bridge.invokeCardActionBatch === "function"
+    ? (deckId: string, actionId: string, options: CardBatchOptions) => bridge.invokeCardActionBatch!(deckId, actionId, options)
+    : undefined), [bridge]);
+  /* PR #2491 audit (A2) — the Card actions editor names the daemon process
+     each read and edit is bound to: the one whose list the user saw, which
+     the editor holds with that list. It is passed on as given, never looked
+     up from whichever process is current when Save is pressed; a daemon that
+     replaced it, or no process named, is sent nothing (the bridge, A1). */
+  const readCardCatalog = useMemo(() => (typeof bridge.readCardCatalog === "function"
+    ? (deckId: string, instanceId: string | undefined) => bridge.readCardCatalog!(deckId, instanceId)
+    : undefined), [bridge]);
+  const editCardCatalog = useMemo(() => (typeof bridge.editCardCatalog === "function"
+    ? (deckId: string, edit: CardCatalogEdit, instanceId: string | undefined) => bridge.editCardCatalog!(deckId, edit, instanceId)
+    : undefined), [bridge]);
 
   return {
     appliedGeometry,
@@ -698,6 +712,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(agentOpened ? { agentOpened } : {}),
     ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
     ...(invokeCardAction ? { invokeCardAction } : {}),
+    ...(invokeCardActionBatch ? { invokeCardActionBatch } : {}),
+    ...(readCardCatalog ? { readCardCatalog } : {}),
+    ...(editCardCatalog ? { editCardCatalog } : {}),
     ...(interruptedWork ? { interruptedWork } : {}),
     sendTerminalInput,
     resizeTerminal,

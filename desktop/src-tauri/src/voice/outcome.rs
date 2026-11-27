@@ -1043,7 +1043,9 @@ pub async fn handle_utterance(
 ///
 /// **The request**: the backend is handed no agents, no decks and neither
 /// dialog declaration, so `prompt::data_turn` is `None` and the request is the
-/// instructions and response schema, the command table and the transcript —
+/// instructions and response schema, the command table (with the agent
+/// dashboard's state beside it when declared, which names nothing observed)
+/// and the transcript —
 /// plus what every request carries, the model name, the token ceiling and, for
 /// an off-machine endpoint, the key. **The table**: every
 /// row that [`needs_labels`] is `callable: false` with
@@ -1128,6 +1130,7 @@ pub async fn handle_utterance_with_dictation(
         new_agent,
         dictation,
         VoiceReadingState::default(),
+        None,
         transcript,
         labels,
         show_deck,
@@ -1136,7 +1139,9 @@ pub async fn handle_utterance_with_dictation(
 }
 
 /// [`handle_utterance_with_dictation`], with reading mode and the app's own
-/// speech declared too (PRD #1497) — which is what `desktop_voice_resolve`
+/// speech declared too (PRD #1497), and the agent dashboard's state (PR
+/// #2491, 2026-11-25: [`super::VoiceDashboard`], which the command model and
+/// the meaning check are both told) — which is what `desktop_voice_resolve`
 /// calls.
 ///
 /// Reading's switches and the way of silencing the app are answered by
@@ -1144,7 +1149,7 @@ pub async fn handle_utterance_with_dictation(
 /// and while the app was speaking (`reading.speaking`), nothing else is
 /// answered at all: every other utterance is [`VoiceOutcome::Dropped`], with
 /// no backend call (D8).
-// Twelve: each piece of live state from its own owner, for
+// Thirteen: each piece of live state from its own owner, for
 // `handle_utterance_with`'s reason.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_utterance_with_modes(
@@ -1157,6 +1162,7 @@ pub async fn handle_utterance_with_modes(
     new_agent: Option<&VoiceNewAgent>,
     dictation: Option<&VoiceDictationTarget>,
     reading: VoiceReadingState,
+    dashboard: Option<&super::VoiceDashboard>,
     transcript: Transcript,
     labels: LabelSharing,
     show_deck: bool,
@@ -1206,6 +1212,7 @@ pub async fn handle_utterance_with_modes(
         decks,
         directories,
         new_agent,
+        dashboard,
         transcript,
         labels,
         show_deck,
@@ -1246,6 +1253,7 @@ pub async fn handle_utterance_after_local_intercepts(
         decks,
         directories,
         new_agent,
+        None,
         transcript,
         LabelSharing::Shared,
         true,
@@ -1256,7 +1264,7 @@ pub async fn handle_utterance_after_local_intercepts(
 /// Everything [`handle_utterance_with_modes`] does once no intercept answered
 /// the utterance; [`handle_utterance_after_local_intercepts`] is its door for
 /// tests.
-// Ten: `handle_utterance_with`'s reason.
+// Eleven: `handle_utterance_with`'s reason.
 #[allow(clippy::too_many_arguments)]
 async fn after_local_intercepts(
     resolver: &dyn IntentResolver,
@@ -1266,6 +1274,7 @@ async fn after_local_intercepts(
     decks: &[VoiceDeck],
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
+    dashboard: Option<&super::VoiceDashboard>,
     transcript: Transcript,
     labels: LabelSharing,
     show_deck: bool,
@@ -1278,7 +1287,10 @@ async fn after_local_intercepts(
         backend,
     };
 
-    let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
+    let mut commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
+    // PR #2491 (2026-11-25): the rows whose meaning the dashboard's state
+    // changes say what it is right now.
+    super::schema::annotate_dashboard(&mut commands, dashboard);
     // Every deck, including the ones a new agent cannot start on (issue
     // #1491): the Daemon selector switches to any of them, so the model has
     // to see them all to answer `switch_deck` with the one the user meant.
@@ -1308,7 +1320,8 @@ async fn after_local_intercepts(
         screen,
         directories,
         new_agent,
-    ));
+    )
+    .dashboard(dashboard));
     let mut ballot = Ballot::new([
         resolver.judge_meaning(classification.clone()),
         resolver.judge_meaning(classification),
@@ -1323,6 +1336,8 @@ async fn after_local_intercepts(
             decks: if withheld { &[] } else { decks },
             directories: directories.filter(|_| !withheld),
             new_agent: new_agent.filter(|_| !withheld),
+            // App state in its own words, never a label: sent either way.
+            dashboard,
         }))
         .await;
     // Taken before anything is rendered: what the user waited for is the
@@ -20202,6 +20217,7 @@ mod tests {
             None,
             typing.then_some(&target),
             reading,
+            None,
             Transcript::new(said),
             LabelSharing::Shared,
             true,

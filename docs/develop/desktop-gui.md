@@ -2035,7 +2035,11 @@ The build itself still goes to `desktop/dist`, which belongs to the checkout, so
 
 **The `webkit-warm-up` project.** Every run that includes the `webkit` project first runs `e2e/webkit-warm-up.setup.ts`, because `webkit` depends on it, so the list shows one more test than the specs hold. It loads the fixture, enters the deck and opens an agent pane, and asserts nothing. It is there because the first WebKit test on a CI runner pays the runner's first use of WebKit. That took 5.1–19.0s across 21 green runs, against 1–2.5s for each WebKit test after it, and twice it ran past the 30-second test budget and reddened `agent-pane-modal.spec.ts`, which sorts first. The warm-up pays that cost under a three-minute budget instead and logs how long it took. `--project=chromium` does not run it. The file's header has the traces this was read from.
 
-**One devbox gotcha.** Inside a `devbox shell` or `devbox run`, nix's `glibc-bin` puts its own `ldconfig` ahead of the system one on `PATH`, and that `ldconfig` reads a cache file that does not exist. Playwright's host-requirement check then reports every shared library as missing — `libglib-2.0.so.0` included, on a machine that plainly has it — and refuses to launch WebKit. The libraries are fine; the lookup is not. Put the system one first for the run:
+**One devbox gotcha, handled by the config.** Before it launches WebKit, Playwright checks the host for the browser's libraries by running `ldd` — whichever one is first on `PATH` — on each of the browser's binaries (`/sbin/ldconfig`, which it also reads, is called by absolute path). Inside a `devbox shell` or `devbox run` the first `ldd` is nix glibc's, whose loader does not read the host's library cache, so the check reports `libglib-2.0.so.0`, `libgtk-4.so.1`, `libicudata.so.78` and dozens more as missing on a machine that has them, and every WebKit project fails before a test with `browserType.launch: Host system is missing dependencies to run browsers`. The libraries are fine; the lookup is not. Since issue #2399, `playwright.config.ts` handles it: on Linux, when the `ldd` on `PATH` resolves into `/nix/store` and `/usr/bin/ldd` exists, it puts `desktop/scripts/host-ldd` — one script that runs `/usr/bin/ldd` — first on `PATH`, for the runner and the workers it starts. Nothing else on `PATH` moves, and where `ldd` is not nix's (CI, a shell outside devbox) the config changes nothing. Measured 2026-11-23 with Playwright 1.65.1 inside devbox and the validation marker cleared: the WebKit warm-up failed with the missing-dependencies error without the script and passed with it.
+
+**Why it came and went.** A check that passes writes a `DEPENDENCIES_VALIDATED` marker in the browser's directory under `~/.cache/ms-playwright/`, and Playwright skips the check for 30 days after it. So one run outside devbox (or with the workaround below) hides the problem for a month on that machine, and a fresh browser download, a Playwright bump, or the marker aging out brings it back.
+
+For a run the config does not cover — another config, or `playwright` invoked from outside `desktop/` — put the system tools first for the run:
 
 ```sh
 env PATH="/usr/bin:/bin:$PATH" pnpm test:browser
@@ -2048,6 +2052,29 @@ env PATH="/usr/bin:/bin:$PATH" pnpm test:browser
 **JUnit reports (issue #1981 M10).** Under CI, all three desktop tiers write a JUnit report to `desktop/junit/` (gitignored): `vitest.xml` from `pnpm test`, `playwright.xml` from `pnpm test:browser`, and `driver.xml` from `pnpm test:driver`, which writes it locally too, through `desktop/scripts/junit-reporter.mjs` so that its cases sit inside a `<testsuite>`, where RWX reads them. GitHub Actions uploads the reports that exist, on passing and failing test runs, as `vitest-attempt-<n>`, `playwright-junit-attempt-<n>` and `desktop-driver-junit-attempt-<n>`: a job that fails before its tests start, at dependency installation for example, has no report to upload, and a skipped job uploads nothing. RWX collects them as the `desktop-web`, `desktop-browser` and `desktop-driver` tasks' `test-results`.
 
 **Its relationship to the palette guards.** They are not redundant and neither replaces the other. `xtask/linkage-check/src/desktop_palette.rs` reads the stylesheet as text — no hard-coded colour outside the palette, the three `:root` blocks agreeing — and runs in the **required** `build` job. This tier resolves colours in an engine and runs in an advisory one. PRD #743's 399-declaration comparison in `chrome-headless-shell` was a one-off measurement rather than a checked-in gate, and nothing here reimplements it.
+
+### Fonts: why a layout test passes locally and fails in CI
+
+Several browser specs measure text: whether a label fits, whether a row wraps, whether a list needs a page marker. Text width depends on which fonts the browser finds, and on Linux both engines find them through fontconfig. The `desktop-browser` job's `ubuntu-latest` image has a different set of font packages from a developer machine, so a layout that fits locally can overflow in CI, and the reverse. A machine with extra fonts installed under the home directory is the common case.
+
+[`desktop/e2e/fonts/ci-fonts.conf`](../../desktop/e2e/fonts/ci-fonts.conf) is a fontconfig file that loads only the font directories that match CI. Run the suite under it from `desktop/`:
+
+```sh
+FONTCONFIG_FILE="$PWD/e2e/fonts/ci-fonts.conf" pnpm test:browser
+```
+
+Measured on 2026-11-25 on PR #2491's branch, the run under it matched CI's measurements in both engines. The file expects the Debian/Ubuntu font paths under `/usr/share/fonts/` (`dejavu`, `liberation`, `freefont`, `noto`, `wqy`, `ipafont-gothic`, `tlwg`). Fontconfig skips a missing directory without a warning, so check that `FONTCONFIG_FILE="$PWD/e2e/fonts/ci-fonts.conf" fc-list` lists fonts from all seven before trusting a run. It does nothing on macOS, where the browsers do not use fontconfig.
+
+**A single-font config does not match CI.** A config with DejaVu alone looks like a reasonable stand-in for a minimal runner, and it misled two rounds of debugging on that PR. On the same commit, where the suite passed under both the developer fonts and `ci-fonts.conf` (712 passed, 1 skipped), these six failed under DejaVu alone. A failure in this list under a DejaVu-only config is the config, not a regression:
+
+- `[chromium] overview-grouping.spec.ts` › the fleet view (PRD #742 M4) › the counters button › shows every counter on hover or click and fits every width
+- `[webkit] agent-pane-overlay.spec.ts` › occupies the window over a still-mounted deck and closes on Escape
+- `[webkit] agent-pane-overlay.spec.ts` › keeps the overview mounted below the pane and returns there on Escape
+- `[webkit] decks.spec.ts` › the Daemons settings section › a bidi override in a settings-supplied host cannot reverse the daemon label
+- `[webkit] scroll-indicators.spec.ts` › an agent terminal's scrollbar is shown at rest only when it has output to scroll
+- `[webkit] voice-paged-lists.spec.ts` › visible pages for voice-selected lists › voice-on modes are visible or paged in a short window
+
+**Verify a layout fix under both font sets.** Run the specs it touches once with your own fonts and once with `FONTCONFIG_FILE` set as above, in both engines. A fix that passes only under one has not fixed the layout; it has fitted one set of glyph widths.
 
 ## The driver tier
 

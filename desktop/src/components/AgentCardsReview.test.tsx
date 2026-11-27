@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview, agentKey } from "./AgentOverview";
+import { OverviewWithCardPane } from "../test/cardPane";
 
 /*
  * PRD #2374 review round 1 — what a user is shown before a card sends
@@ -118,14 +119,15 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(first.invokeCardAction).toHaveBeenCalledWith(expect.anything(), "go", expect.objectContaining({ actionToken: "tok-go-2" }));
   });
 
-  /// Scenario: press an agent-written action in the overlay. Nothing is sent until the separate review step shows the exact prompt and its Send is pressed, using the same definition token.
-  it("an overlay button requires review of the agent-written action before sending its token (B2, A4, R2-A1)", async () => {
+  /// Scenario: press an agent-written action's icon in the agent's Card tab. Nothing is sent until the single-action review shows the exact prompt and its Send is pressed, using the same definition token.
+  it("a Card tab icon requires review of the agent-written action before sending its token (B2, A4, R2-A1)", async () => {
     const live = runtime([hostile("Run the tests.", "tok-shown")]);
-    render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+    render(<OverviewWithCardPane runtime={live} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
     fireEvent.click(screen.getByTestId("agent-card-details"));
-    expect(screen.getByTestId("agent-card-action-prompt").textContent).toBe("Run the tests.");
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-action-go")); });
+    const panel = screen.getByTestId("agent-card-panel");
+    expect(within(panel).getByRole("button", { name: "Go ahead" }).getAttribute("data-tip")).toContain("Run the tests.");
+    await act(async () => { fireEvent.click(within(panel).getByRole("button", { name: "Go ahead" })); });
     expect(live.invokeCardAction).not.toHaveBeenCalled();
     expect(screen.getByTestId("agent-card-confirm-prompt").textContent).toBe("Run the tests.");
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
@@ -138,8 +140,8 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     const live = runtime([hostile(prompt)]);
     render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
     fireEvent.click(within(row()).getByTestId("overview-row-menu"));
-    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
-    const shown = screen.getByTestId("agent-card-action-prompt");
+    fireEvent.click(within(row()).getByTestId("overview-row-primary"));
+    const shown = screen.getByTestId("agent-card-confirm-prompt");
     expect(shown.textContent).toBe("Use\u27E6tab\u27E7main.\u27E6U+2028\u27E7Then abc\u27E6U+202E\u27E7def\u27E6U+034F\u27E7ghi\u27E6U+FE0F\u27E7.\nDone.");
     const escapes = Array.from(shown.querySelectorAll(".exact-text-escape")).map((node) => node.textContent);
     expect(escapes).toEqual(["\u27E6tab\u27E7", "\u27E6U+2028\u27E7", "\u27E6U+202E\u27E7", "\u27E6U+034F\u27E7", "\u27E6U+FE0F\u27E7"]);
@@ -153,8 +155,8 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     const live = runtime([hostile(prompt)]);
     render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
     fireEvent.click(within(row()).getByTestId("overview-row-menu"));
-    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
-    const shown = screen.getByTestId("agent-card-action-prompt");
+    fireEvent.click(within(row()).getByTestId("overview-row-primary"));
+    const shown = screen.getByTestId("agent-card-confirm-prompt");
     const markers = Array.from(shown.querySelectorAll<HTMLElement>(".exact-text-escape"));
     // Only the real characters, and the typed marker's opener, are markers.
     expect(markers.map((node) => node.textContent)).toEqual(["\u27E6tab\u27E7", "\u27E6U+202E\u27E7", "\u27E6U+27E6\u27E7"]);
@@ -176,146 +178,59 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(marker.backgroundColor).not.toBe(text.backgroundColor);
   });
 
-  /// Scenario: review and send an action from the overlay, then let the agent replace the action's text and token. The new definition does not inherit the previous definition's sent result.
+  /// Scenario: review and send an action from the agent's Card tab, then let the agent replace the action's text and token. The review and the panel say the first send happened; the new definition does not inherit that sent result: the panel shows none for it, and the review keeps showing the text it sent with its result, not the new text (PR #2491 review J4).
   it("an answer belongs to the action's definition: a reused action id does not show the old text's answer (S1)", async () => {
     const first = runtime([hostile("Run the tests.", "tok-go-1")]);
-    const view = render(<AgentOverview runtime={first} onNavigate={vi.fn()} />);
+    const view = render(<OverviewWithCardPane runtime={first} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
     fireEvent.click(screen.getByTestId("agent-card-details"));
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-action-go")); });
+    await act(async () => { fireEvent.click(within(screen.getByTestId("agent-card-panel")).getByRole("button", { name: "Go ahead" })); });
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
-    expect(screen.getByTestId("agent-card-action-result").textContent).toContain("m-1");
-    view.rerender(<AgentOverview runtime={runtime([hostile("Something else.", "tok-go-2")], first.invokeCardAction as never)} onNavigate={vi.fn()} />);
-    expect(screen.queryByTestId("agent-card-action-result")).toBeNull();
+    for (const result of screen.getAllByTestId("agent-card-action-result")) expect(result.textContent).toContain("m-1");
+    expect(within(screen.getByTestId("agent-card-panel")).getByTestId("agent-card-action-result")).toBeInTheDocument();
+    view.rerender(<OverviewWithCardPane runtime={runtime([hostile("Something else.", "tok-go-2")], first.invokeCardAction as never)} />);
+    expect(within(screen.getByTestId("agent-card-panel")).queryByTestId("agent-card-action-result")).toBeNull();
+    const step = screen.getByTestId("agent-card-confirm");
+    expect(within(step).getByTestId("agent-card-confirm-prompt").textContent).toBe("Run the tests.");
+    expect(within(step).getByTestId("agent-card-action-result").textContent).toContain("m-1");
+    expect(step.textContent).not.toContain("Something else.");
   });
 
-  /// Scenario: read a compact card without a summary, then open its overlay. The compact card omits the primary action, and the overlay labels the agent's custom action and fields as the agent's.
-  it("a card without a summary keeps its custom action and labelled fields in the overlay (S2)", () => {
+  /// Scenario: read a compact card without a summary, then open its agent's Card tab. The compact card shows the agent's custom action only as an icon whose text is in its hover, never on the card, and the panel's icon says the agent suggested it, with its text in its hover, and shows the fields under the agent's label.
+  it("a card without a summary keeps its custom action's text and labelled fields in the Card tab (S2)", () => {
     const card = entry("7", "coder", {
       report: { source: "agent", status: "working", summary: null, published_at: "2026-11-17T00:00:00Z", revision: 1 },
       fields: [{ name: "risk", label: "Risk", description: null, type: "text", icon: null, placement: "card", custom: true, source: "agent", value: "low" }],
       actions: [action("go", { label: "Go ahead", prompt: "Go on.", custom: true, source: "agent" }), ...DECK_ACTIONS],
       primary_action_id: "go",
     });
-    render(<AgentOverview runtime={runtime([card])} onNavigate={vi.fn()} />);
+    render(<OverviewWithCardPane runtime={runtime([card])} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
-    expect(screen.queryByRole("button", { name: /Go ahead/ })).toBeNull();
-    // Issue #2418: the fields are the overlay's, under the agent's label.
+    // PRD #2374 decision 2026-11-24 (2): the action is an icon on the card; its text is only in its hover.
+    const icon = screen.getByRole("button", { name: "Go ahead" });
+    expect(icon).toHaveAttribute("data-testid", "agent-card-action-icon");
+    expect(icon.textContent).toBe("");
+    expect(icon.getAttribute("data-tip")).toContain("Go on.");
+    expect(screen.queryByText("Go on.")).toBeNull();
+    // Issue #2418: the fields are the Card tab's, under the agent's label.
     expect(screen.queryByText("low")).toBeNull();
     fireEvent.click(screen.getByTestId("agent-card-details"));
-    const overlay = screen.getByTestId("agent-card-overlay");
-    const go = within(overlay).getByTestId("agent-card-action-go");
-    expect(go).toHaveTextContent("custom");
-    expect(within(overlay).getByText("Go on.")).toBeInTheDocument();
-    // The field's own section carries the agent's label, whatever the primary action's attribution says.
-    const fields = within(overlay).getByRole("region", { name: "Fields" });
-    expect(within(fields).getByText("low")).toBeInTheDocument();
-    expect(within(fields).getByText("agent says")).toBeInTheDocument();
+    const panel = screen.getByTestId("agent-card-panel");
+    const go = within(panel).getByRole("button", { name: "Go ahead" });
+    expect(go.getAttribute("data-tip")).toContain("Suggested by the agent");
+    expect(go.getAttribute("data-tip")).toContain("Go on.");
+    // The fields sit in the part that carries the agent's label, whatever the action's attribution says.
+    const says = within(panel).getByRole("region", { name: "What the agent says" });
+    expect(within(within(says).getByLabelText("Fields")).getByText("low")).toBeInTheDocument();
+    expect(within(says).getByText("agent says")).toBeInTheDocument();
   });
 
-  /// Scenario: type a reply in the card overlay and press Send reply. While it is sending, a second press sends nothing; once the daemon has sent it the box is empty, so the same words cannot go twice, and a second reply typed after that empties the box again once sent.
-  it("Send reply empties the box once the reply is sent, and a press while sending sends nothing (issue #2418, Qodo)", async () => {
-    const answers: Array<(outcome: string) => void> = [];
-    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => new Promise((resolve) => { answers.push((outcome) => resolve({ request_id: options.requestId ?? "r", outcome, message_id: "m-1" })); }));
-    render(<AgentOverview runtime={runtime([entry("7", "coder")], invoke as never)} onNavigate={vi.fn()} />);
-    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
-    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
-    const box = screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
-    const send = () => screen.getByTestId("agent-card-reply-send");
-
-    fireEvent.change(box, { target: { value: "use main" } });
-    await act(async () => { fireEvent.click(send()); });
-    expect(invoke).toHaveBeenCalledTimes(1);
-    expect(send()).toBeDisabled();
-    await act(async () => { fireEvent.click(send()); });
-    expect(invoke).toHaveBeenCalledTimes(1);
-    await act(async () => { answers[0]("sent"); });
-    expect(box.value).toBe("");
-    expect(send()).toBeDisabled();
-    await act(async () => { fireEvent.click(send()); });
-    expect(invoke).toHaveBeenCalledTimes(1);
-
-    fireEvent.change(box, { target: { value: "and rebase" } });
-    await act(async () => { fireEvent.click(send()); });
-    expect(invoke).toHaveBeenCalledTimes(2);
-    expect(invoke).toHaveBeenLastCalledWith(expect.anything(), "reply", expect.objectContaining({ text: "and rebase" }));
-    await act(async () => { answers[1]("sent"); });
-    expect(box.value).toBe("");
-  });
-
-  /// Scenario: type a reply and press Send reply, and let the daemon refuse it, then let the send fail outright. Each time the words stay in the box and Send reply is enabled, so the user can send them again.
-  it("a reply the daemon refused, or that failed, stays in the box to be retried (issue #2418, Qodo)", async () => {
-    const invoke = vi.fn()
-      .mockResolvedValueOnce({ request_id: "r1", outcome: "refused", code: "busy", message: "the agent is busy" })
-      .mockRejectedValueOnce(new Error("the daemon went away"))
-      .mockResolvedValueOnce({ request_id: "r3", outcome: "sent", message_id: "m-3" });
-    render(<AgentOverview runtime={runtime([entry("7", "coder")], invoke as never)} onNavigate={vi.fn()} />);
-    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
-    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
-    const box = screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
-    const send = () => screen.getByTestId("agent-card-reply-send");
-    fireEvent.change(box, { target: { value: "use main" } });
-    for (const calls of [1, 2]) {
-      await act(async () => { fireEvent.click(send()); });
-      expect(invoke).toHaveBeenCalledTimes(calls);
-      expect(box.value).toBe("use main");
-      expect(send()).toBeEnabled();
-    }
-    await act(async () => { fireEvent.click(send()); });
-    expect(invoke).toHaveBeenCalledTimes(3);
-    expect(box.value).toBe("");
-  });
-
-  /// Scenario: type a reply and press Send reply, then change the words in the box while it is sending. Once the daemon has sent the first reply, the changed words stay in the box.
-  it("words typed while a reply is sending stay in the box once it is sent (issue #2418, Qodo)", async () => {
-    const answers: Array<(outcome: string) => void> = [];
-    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => new Promise((resolve) => { answers.push((outcome) => resolve({ request_id: options.requestId ?? "r", outcome, message_id: "m-1" })); }));
-    render(<AgentOverview runtime={runtime([entry("7", "coder")], invoke as never)} onNavigate={vi.fn()} />);
-    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
-    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
-    const box = screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
-    fireEvent.change(box, { target: { value: "use main" } });
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-reply-send")); });
-    fireEvent.change(box, { target: { value: "use main, then rebase" } });
-    await act(async () => { answers[0]("sent"); });
-    expect(box.value).toBe("use main, then rebase");
-  });
-
-  /// Scenario: send a reply on one card and keep it sending, move to the next card and type words there without sending, move back and type the same words into the first card's empty box. When the first card's reply is sent, those new words stay in its box, since they were never sent.
-  it("a reply sent before moving away does not empty a new draft typed on returning, even with the same words (issue #2418 review, merge P2)", async () => {
-    const answers: Array<(outcome: string) => void> = [];
-    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => new Promise((resolve) => { answers.push((outcome) => resolve({ request_id: options.requestId ?? "r", outcome, message_id: "m-1" })); }));
-    render(<AgentOverview runtime={runtime([entry("7", "coder"), entry("8", "tester")], invoke as never)} onNavigate={vi.fn()} />);
-    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
-    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
-    const overlay = () => screen.getByTestId("agent-card-overlay");
-    const box = () => screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
-    const first = overlay().getAttribute("data-card-key");
-
-    fireEvent.change(box(), { target: { value: "first reply" } });
-    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-reply-send")); });
-    expect(invoke).toHaveBeenCalledTimes(1);
-
-    fireEvent.click(screen.getByTestId("agent-card-next"));
-    expect(overlay().getAttribute("data-card-key")).not.toBe(first);
-    expect(box().value).toBe("");
-    fireEvent.change(box(), { target: { value: "yes" } });
-
-    fireEvent.click(screen.getByTestId("agent-card-previous"));
-    expect(overlay().getAttribute("data-card-key")).toBe(first);
-    expect(box().value).toBe("");
-    fireEvent.change(box(), { target: { value: "yes" } });
-
-    await act(async () => { answers[0]("sent"); });
-    expect(box().value).toBe("yes");
-    expect(invoke).toHaveBeenCalledTimes(1);
-  });
-
-  it("the overlay lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {
+  /// Scenario: open, from its table row's Show card, the Card tab of an agent whose card no longer offers an action it sent earlier. The panel lists what was sent from the card with the exact text, invisible characters marked, and how far it got.
+  it("the Card tab lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {
     const card = entry("7", "coder", {
       recent_deliveries: [{ action_id: "go", label: "Go ahead", text: "Run\tthe tests.", token: "tok-old", outcome: "sent", message_id: "m-42", state: "delivered", detail: null, at: "2026-11-17T10:00:00Z" }],
     });
-    render(<AgentOverview runtime={runtime([card])} onNavigate={vi.fn()} />);
+    render(<OverviewWithCardPane runtime={runtime([card])} />);
     fireEvent.click(within(row()).getByTestId("overview-row-menu"));
     fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
     const records = within(screen.getByTestId("agent-card-deliveries")).getAllByTestId("agent-card-delivery-record");
@@ -323,5 +238,40 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(records[0].textContent).toContain("Go ahead");
     expect(records[0].textContent).toContain("Run\u27E6tab\u27E7the tests.");
     expect(within(records[0]).getByTestId("agent-card-delivery-state").textContent).toBe("Delivered to the agent");
+  });
+
+  /// Scenario: Review and send an action, then the card changes under the open review: the agent is closed and its card goes, or the agent stops offering the action it was sent. The review keeps what was sent and says what became of it — sending, sent, closed — and never says nothing was sent; a review whose Send was never pressed still says nothing was sent when its card goes.
+  it.each([
+    { case: "a successful Close, then the card goes", id: "close", answer: { outcome: "closed" }, after: [] as AgentCardEntry[], says: "Closed." },
+    { case: "a sent prompt, then the action is withdrawn", id: "go", answer: { outcome: "sent", message_id: "m-106" }, after: [entry("7", "coder")], says: "Sent (message m-106)." },
+    { case: "a sent prompt, then the card goes", id: "go", answer: { outcome: "sent", message_id: "m-106" }, after: [] as AgentCardEntry[], says: "Sent (message m-106)." },
+    { case: "a press still pending, then the card goes", id: "go", answer: undefined, after: [] as AgentCardEntry[], says: "Sending…" },
+  ])("desktop/agent-cards/106: a sent review keeps its outcome after the card changes ($case)", async ({ id, answer, after, says }) => {
+    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => (answer === undefined ? new Promise(() => {}) : Promise.resolve({ request_id: options.requestId ?? "r", ...answer })));
+    // The row menu's most needed action is the one reviewed: Go ahead, or the card's Close.
+    const first = runtime([id === "close" ? entry("7", "coder", { primary_action_id: "close" }) : hostile("Run the tests.", "tok-go-1")], invoke as never);
+    const view = render(<AgentOverview runtime={first} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    await act(async () => { fireEvent.click(within(row()).getByTestId("overview-row-primary")); });
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    view.rerender(<AgentOverview runtime={runtime(after, invoke as never)} onNavigate={vi.fn()} />);
+    const step = screen.getByTestId("agent-card-confirm");
+    expect(step.textContent).not.toContain("Nothing was sent");
+    expect(within(step).getByTestId("agent-card-action-result")).toHaveTextContent(says);
+    if (id === "go") expect(within(step).getByTestId("agent-card-confirm-prompt").textContent).toBe("Run the tests.");
+    expect(within(step).getByTestId("agent-card-confirm-close")).toBeInTheDocument();
+  });
+
+  /// Scenario: Open the review of an action but do not press Send; the agent is closed and its card goes. The review says the agent was closed and nothing was sent.
+  it("desktop/agent-cards/106: a review never sent still says nothing was sent when its card goes", async () => {
+    const invoke = vi.fn();
+    const first = runtime([hostile("Run the tests.", "tok-go-1")], invoke as never);
+    const view = render(<AgentOverview runtime={first} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    await act(async () => { fireEvent.click(within(row()).getByTestId("overview-row-primary")); });
+    view.rerender(<AgentOverview runtime={runtime([], invoke as never)} onNavigate={vi.fn()} />);
+    expect(screen.getByTestId("agent-card-gone")).toHaveTextContent("This agent was closed. Nothing was sent.");
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

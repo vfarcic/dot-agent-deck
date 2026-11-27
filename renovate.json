@@ -110,9 +110,12 @@
     },
     {
       "customType": "regex",
-      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the Nix release the `nix-install` task installs (`NIX_VERSION: <X.Y.Z>`). Nothing else in the repository pins Nix. The task checks the tarball against a pinned SHA-256, so a bump PR also needs that checksum updated (the `.sha256` beside the tarball on releases.nixos.org); it fails until then, which is the point.",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the Nix release the `nix-install` task installs (`NIX_VERSION: <X.Y.Z>`). The task checks the tarball against a pinned SHA-256, so a bump PR also needs that checksum updated (the `.sha256` beside the tarball on releases.nixos.org); it fails until then, which is the point. The second matchString reads the same version out of the tool-cache names of the tasks built on `nix-install` (`ci-nix-<X.Y.Z>-v1`, `ci-devbox-nix-<X.Y.Z>-v1`), so one PR moves the pin and the names together (issue #2529): a tool cache written over one Nix release's layer and restored over another's can name store paths that are not there. `rwx_nix_cache_keys` in xtask/linkage-check runs these matchStrings over the real `.rwx/` files and requires exactly the `NIX_VERSION` line and every tool-cache line of a task that uses `nix-install`, all at one version.",
       "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
-      "matchStrings": ["NIX_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "matchStrings": [
+        "NIX_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "tool-cache:\\s*ci-(?:[a-z0-9]+-)*?nix-(?<currentValue>\\d+\\.\\d+\\.\\d+)-v\\d+"
+      ],
       "datasourceTemplate": "github-tags",
       "depNameTemplate": "NixOS/nix"
     },

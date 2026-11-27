@@ -162,6 +162,107 @@ fn harness_clears_inherited_deck_endpoints() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #2531 — no test process resolves the developer's real state directory
+// ---------------------------------------------------------------------------
+
+/// Set only on the re-executed child of
+/// [`harness_test_process_never_resolves_the_real_state_dir`].
+#[cfg(unix)]
+const STATE_DIR_CHILD_ENV: &str = "DAD_TEST_HARNESS_STATE_DIR_CHILD";
+
+/// What that child prints once its check has passed.
+#[cfg(unix)]
+const STATE_DIR_CHILD_DONE: &str = "harness-state-dir-child-checked";
+
+/// Fail unless the state directory this process resolves lies beneath
+/// `/dev/null`, where nothing can be created, so a test that reaches the
+/// default writes nothing at all.
+#[cfg(unix)]
+fn assert_state_dir_is_unreachable(context: &str) {
+    let resolved = dot_agent_deck::config::state_dir();
+    assert!(
+        resolved.starts_with("/dev/null"),
+        "{context}: this test process resolves the state directory to {} — a daemon or \
+         journal it opens there writes into the developer's real deck (issue #2531)",
+        resolved.display()
+    );
+}
+
+/// Scenario: Read the state directory this test process resolves, then start a
+/// fresh copy of this test binary as if it had been launched from a deck pane
+/// whose `DOT_AGENT_DECK_STATE_DIR` names the developer's real state directory,
+/// and read it there too. Both must resolve beneath `/dev/null`, so an
+/// in-process daemon, work journal or launch-record store that a test opens
+/// without choosing its own directory writes nothing, instead of filling the
+/// developer's Interrupted work list with fixture agents.
+#[cfg(unix)]
+#[test]
+fn harness_test_process_never_resolves_the_real_state_dir() {
+    if std::env::var_os(STATE_DIR_CHILD_ENV).is_some() {
+        assert_state_dir_is_unreachable("with an inherited DOT_AGENT_DECK_STATE_DIR");
+        println!("{STATE_DIR_CHILD_DONE}");
+        return;
+    }
+    assert_state_dir_is_unreachable("with no override in the environment");
+
+    // A value the child would inherit from a deck pane: the developer's own
+    // state directory. It is only a string here; the child resolves it and
+    // must not use it, and nothing in either process opens it.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/test-user".into());
+    let real = format!("{home}/.local/state/dot-agent-deck");
+    let name = "harness_test_process_never_resolves_the_real_state_dir";
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(STATE_DIR_CHILD_ENV, "1")
+        .env("DOT_AGENT_DECK_STATE_DIR", &real)
+        .env("XDG_STATE_HOME", format!("{home}/.local/state"))
+        .output()
+        .expect("re-execute the test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the child resolved a real state directory:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(STATE_DIR_CHILD_DONE),
+        "the child did not run {name}:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Scenario: Start an in-process daemon through the harness, the way
+/// `tests/pane_spawn.rs` and `tests/pane_restart.rs` do, and read where its
+/// work journal lives. The journal must be open, and under the daemon's own
+/// state directory inside its tempdir, so the orchestrations and agents a test
+/// spawns into it are journalled there and never reach the developer's
+/// Interrupted work list (issue #2531).
+#[cfg(unix)]
+#[tokio::test]
+async fn harness_inprocess_daemon_journals_into_its_own_state_dir() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let journal = daemon
+        .registry
+        .work()
+        .journal()
+        .expect("the daemon installed its work journal before it accepted attaches");
+    assert!(
+        journal.is_enabled(),
+        "the in-process daemon's journal did not open: {:?}",
+        journal.disabled_reason()
+    );
+    assert_eq!(
+        journal.state_dir(),
+        Some(daemon.state_dir.as_path()),
+        "the in-process daemon journals outside the state directory the harness gave it"
+    );
+    assert!(
+        daemon.state_dir.starts_with(common::harness_temp_root()),
+        "the harness gave the daemon a state directory outside its own temp root: {}",
+        daemon.state_dir.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #2132 — `DAD_AGENT_BIN` pins the agent a test runs, whatever PATH said
 // ---------------------------------------------------------------------------
 

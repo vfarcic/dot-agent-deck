@@ -1,5 +1,5 @@
 {
-  "about": "The automated review apps whose reviews pr-create, issue-queue, prd-queue, land-prs, code-cleanup, verify-pr and the orchestrator in .dot-agent-deck.toml wait for, read by wait-reviews.sh beside this file (issue #1256). Adding, dropping or replacing a reviewer is an edit here, not in those skills. Each entry says how to tell that the app has finished reviewing a pull request: `comment` is an issue comment by `login` whose body contains `contains`, and with `names_head` it must also contain the head commit's SHA; `check_run` is a completed check-run named `name` on the head, created by the GitHub App whose slug is `app`; `review` is a submitted PR review by `login` whose commit_id is the head. A `comment` without `names_head` marks an app that reviews once, when the PR opens: its `timeout_minutes` counts from the PR's creation. Every other signal marks an app that reviews every push: its `timeout_minutes` counts from when wait-reviews.sh starts, and again whenever the head moves. docs/develop/governance.md, 'The automated reviewer', has the measurements behind each entry.",
+  "about": "The automated review apps whose reviews pr-create, issue-queue, prd-queue, land-prs, code-cleanup, verify-pr and the orchestrator in .dot-agent-deck.toml wait for, read by wait-reviews.sh beside this file (issue #1256). Adding, dropping or replacing a reviewer is an edit here, not in those skills. Each entry says how to tell that the app has finished reviewing a pull request: `comment` is an issue comment by `login` whose body contains `contains`, and with `names_head` it must also contain the head commit's SHA; with `settle_minutes` as well, a comment naming the head counts only once `login` has posted an inline finding (not a reply) written on the head, or the comment was never edited and is `first_review_settle_minutes` old, or its last edit is `settle_minutes` old; `check_run` is a completed check-run named `name` on the head, created by the GitHub App whose slug is `app`; `review` is a submitted PR review by `login` whose commit_id is the head. A `comment` without `names_head` marks an app that reviews once, when the PR opens: its `timeout_minutes` counts from the PR's creation. Every other signal marks an app that reviews every push: its `timeout_minutes` counts from when wait-reviews.sh starts, and again whenever the head moves. docs/develop/governance.md, 'The automated reviewer', has the measurements behind each entry.",
   "reviewers": [
     {
       "name": "Qodo",
@@ -7,10 +7,12 @@
       "signal": {
         "kind": "comment",
         "contains": "Code Review by Qodo",
-        "names_head": true
+        "names_head": true,
+        "settle_minutes": 15,
+        "first_review_settle_minutes": 1
       },
-      "timeout_minutes": 20,
-      "note": "Reviews every push and creates no check-run. It edits its one 'Code Review by Qodo' comment in place, and the body ends with <!-- https://github.com/<repo>/commit/<sha> --> naming the commit it reviewed. Over 45 PRs (#1756-#1856) the review landed a median 150 s after the PR opened and at most 1008 s, and its reviews of later pushes at most 869 s after the push, so 20 minutes covers every case seen."
+      "timeout_minutes": 40,
+      "note": "Reviews every push and creates no check-run. It edits its one 'Code Review by Qodo' comment in place, and the body ends with <!-- https://github.com/<repo>/commit/<sha> --> naming the commit it reviewed. On a later push that marker moves to the new head usually within a minute, before Qodo has finished reviewing it (issue #2507): over the 150 PRs opened 2026-11-01 to 2026-11-26 (513 heads), 130 of Qodo's 340 inline findings were posted 47 s to 714 s after the comment first named their head. Each head's findings came in one batch (no head had two, and a batch's comments were at most 1 s apart), within 5 s of the edit that finished the review, so a finding written on the head means the review is done. A PR's first review is posted in one step, the comment created with it and its findings 1-4 s later, hence the 1-minute grace on a comment never edited. Otherwise the comment must sit unedited for 15 minutes: the longest quiet gap seen between its edits before a head's findings was 664 s. Replaying this rule at a 30 s poll over those 150 PRs missed no finding and decided a median 15 minutes and at most 29.5 minutes after the comment first named the head, hence the 40-minute bound. A push that brings no finding therefore costs about 15 minutes of waiting."
     },
     {
       "name": "Greptile",

@@ -41,7 +41,7 @@ export function inboxNothingToRetry(name: string, count: number): string {
 }
 
 /** The messages a verb covers on one agent's tile: Retry is not offered on a message out of attempts. */
-export function inboxItemsFor(verb: InboxActionVerb, items: readonly InboxAttentionItem[]): InboxAttentionItem[] {
+function inboxItemsFor(verb: InboxActionVerb, items: readonly InboxAttentionItem[]): InboxAttentionItem[] {
   return verb === "retry" ? items.filter((item) => item.kind !== "out_of_attempts") : [...items];
 }
 

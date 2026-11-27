@@ -294,12 +294,19 @@ impl Fixture {
     }
 
     /// Canned `gh pr list --head <branch>` reply: one pull request from a
-    /// branch of the repository itself.
+    /// branch of the repository itself, whose head is the branch's tip now.
     fn set_pr_state(&self, branch: &str, state: &str) {
-        self.set_pr_entries(
-            branch,
-            &format!(r#"{{"state":"{state}","headRefName":"{branch}","isCrossRepository":false}}"#),
-        );
+        self.set_pr_entries(branch, &own_pr_entry(state, branch, &self.tip(branch)));
+    }
+
+    /// The commit `branch` points at.
+    fn tip(&self, branch: &str) -> String {
+        let out = fixture_git(&self.repo)
+            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+            .output()
+            .expect("git rev-parse");
+        assert!(out.status.success(), "no branch {branch}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// Canned `gh pr list --head <branch>` reply holding exactly `entries`, a
@@ -1270,8 +1277,10 @@ fn worktree_reclaim_012_a_merged_fork_pr_with_the_same_branch_name_is_not_this_b
     // and not some other gate's.
     fx.set_pr_entries(
         "feat/namesake",
-        r#"{"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":true},
-           {"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":false}"#,
+        &format!(
+            r#"{{"state":"MERGED","headRefName":"feat/namesake","isCrossRepository":true}},{}"#,
+            own_pr_entry("MERGED", "feat/namesake", &fx.tip("feat/namesake"))
+        ),
     );
     let control = verdict_entry(&fx, "wt-fork-namesake");
     assert_eq!(
@@ -1307,9 +1316,11 @@ fn worktree_reclaim_013_a_merged_pr_from_the_fork_the_branch_is_pushed_to_is_thi
             "git@github.com:contributor/test-repo.git",
         ],
     );
+    let tip = fx.tip("feat/own-fork");
     let from = |owner: &str| {
         format!(
             r#"{{"state":"MERGED","headRefName":"feat/own-fork","isCrossRepository":true,
+                "headRefOid":"{tip}","commits":[{{"oid":"{tip}"}}],
                 "headRepository":{{"id":"R_1","name":"test-repo"}},
                 "headRepositoryOwner":{{"id":"U_1","login":"{owner}"}}}}"#
         )
@@ -1455,6 +1466,107 @@ fn worktree_reclaim_014_a_worktree_holding_another_repositorys_worktree_is_kept(
         text.contains("holds other worktrees") && text.contains("other-child"),
         "the report says why, naming the nested worktree:\n{text}"
     );
+}
+
+/// Scenario: A branch name was used before: its earlier branch had a pull
+/// request that MERGED and was then deleted. A new deck-owned worktree is
+/// created on a branch of the same name, cut from `main`, with no commit of its
+/// own yet. `gh pr list --head` lists the old merged pull request for the name,
+/// but `worktree list` must not read it as this branch's (`no_pr`, `keep`), and
+/// `worktree reclaim --yes` must leave the live worktree on disk.
+#[spec("worktree/reclaim/015")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_015_a_merged_pr_of_an_earlier_branch_with_the_same_name_is_not_this_branchs() {
+    let fx = Fixture::new();
+    // The earlier branch of this name: one commit, squash-merged as its pull
+    // request, then deleted the way GitHub and a cleanup delete a merged
+    // branch. Its commit object stays in the repository, as it does after a
+    // real deletion until git collects it.
+    let earlier = fx.add_worktree_with_commit("wt-earlier", "agent/dispatch-reused");
+    let earlier_head = fx.tip("agent/dispatch-reused");
+    git(
+        &fx.repo,
+        &["worktree", "remove", "--force", &earlier.to_string_lossy()],
+    );
+    git(&fx.repo, &["branch", "-D", "agent/dispatch-reused"]);
+
+    // The new unit: same name, cut from `main`, nothing written yet.
+    let wt = fx.add_worktree_at_main("wt-reused", "agent/dispatch-reused");
+    fx.mark_owned(&wt); // clean by construction, owned: only PR state decides the verdict
+    fx.set_pr_entries(
+        "agent/dispatch-reused",
+        &own_pr_entry("MERGED", "agent/dispatch-reused", &earlier_head),
+    );
+
+    let entry = verdict_entry(&fx, "wt-reused");
+    assert_eq!(
+        (
+            entry.get("owned").and_then(|o| o.as_bool()),
+            entry.get("clean").and_then(|c| c.as_bool()),
+        ),
+        (Some(true), Some(true)),
+        "fixture precondition: the worktree must be owned and clean, so that PR state is the \
+         only gate deciding its verdict; got entry:\n{entry}"
+    );
+    assert_eq!(
+        (
+            entry.get("pr_state").and_then(|p| p.as_str()),
+            entry.get("verdict").and_then(|v| v.as_str()),
+        ),
+        (Some("no_pr"), Some("keep")),
+        "a merged pull request whose commits are not this branch's is an earlier branch's of \
+         the same name, so this live worktree has no pull request and is kept; got entry:\n{entry}"
+    );
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.is_dir(),
+        "a live worktree whose only merged pull request is an earlier branch's must survive \
+         `reclaim --yes` — {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+
+    // Control: once the new branch's own pull request has merged, with its tip
+    // as the head, `gh` lists both and the worktree is reclaimable, so the
+    // `keep` above is the history check's doing and not some other gate's.
+    fx.set_pr_entries(
+        "agent/dispatch-reused",
+        &format!(
+            "{},{}",
+            own_pr_entry("MERGED", "agent/dispatch-reused", &earlier_head),
+            own_pr_entry(
+                "MERGED",
+                "agent/dispatch-reused",
+                &fx.tip("agent/dispatch-reused")
+            ),
+        ),
+    );
+    let control = verdict_entry(&fx, "wt-reused");
+    assert_eq!(
+        (
+            control.get("pr_state").and_then(|p| p.as_str()),
+            control.get("verdict").and_then(|v| v.as_str()),
+        ),
+        (Some("merged"), Some("remove")),
+        "control: with the branch's own merged pull request listed too, the worktree is \
+         reclaimable; got entry:\n{control}"
+    );
+}
+
+/// A `gh pr list` entry for a pull request from a branch of the repository
+/// itself, in `state`, whose head commit, and only commit, is `head`.
+fn own_pr_entry(state: &str, branch: &str, head: &str) -> String {
+    format!(
+        r#"{{"state":"{state}","headRefName":"{branch}","isCrossRepository":false,"headRefOid":"{head}","commits":[{{"oid":"{head}"}}]}}"#
+    )
 }
 
 /// The `worktree list --json` entry whose `path` contains `needle`, panicking

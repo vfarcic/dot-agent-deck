@@ -417,6 +417,13 @@ impl Default for DaemonLinks {
 }
 
 impl DaemonLinks {
+    /// The gate [`DaemonLinks::trusted`] waits on for `endpoint`, so a test
+    /// can hold it and make acquiring the link slow.
+    #[cfg(test)]
+    pub(crate) fn establishment_gate_for_test(&self, endpoint: &Endpoint) -> Arc<AsyncMutex<()>> {
+        self.gate(&endpoint.identity())
+    }
+
     #[cfg(test)]
     pub(crate) fn pin_cache_age_for_test(&self, age: Duration) {
         *self.test_cache_age.lock().unwrap() = Some(age);

@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentCardAction, AgentCardEntry, AgentCardsSnapshot, AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { AgentCardAction, AgentCardEntry, AgentCardsSnapshot, CardActionInput, CardCatalogEdit, EditableCardAction, EditableCardCatalog, AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
 import type { ProjectTrustRole } from "../lib/projectTrust";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
@@ -783,6 +783,25 @@ const DOCS_IMPL_TRANSCRIPT = [
   "Next: wire it into CheckoutView and cover the failed-payment path.",
   "",
 ].join("\r\n");
+/*
+ * PR #2491 review J7 — Contract review's terminal in the `cards=tree` scenes,
+ * whose Card tab screenshots show it: the reviewer comparing the payment
+ * API's responses and running the checkout tests, as its card reports, so the
+ * pane beside the panel reads as an agent at work rather than one that failed
+ * to load. Deterministic: no clock, no paths outside the scene's project.
+ */
+const DOCS_REVIEW_TRANSCRIPT = [
+  "\u001b[1m›\u001b[0m Check the payment API for breaking changes.",
+  "\u001b[36m•\u001b[0m Compared v2 and v3 responses",
+  "    \u001b[33m~ payment.status\u001b[0m  new value \"retrying\"",
+  "    \u001b[32m= payment.amount\u001b[0m  unchanged",
+  "\u001b[36m•\u001b[0m Ran cargo test checkout_retry",
+  "    \u001b[32mok\u001b[0m  14 passed; 1 ignored",
+  "",
+  "One breaking change: the new status.",
+  "Asked on the card: ship it behind a flag?",
+  "",
+].join("\r\n");
 const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "1", displayName: "Plan / architecture", role: "Claude code", cli: "claude", status: "idle", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Map the checkout flow and propose a retry design.", tab: { kind: "dashboard" } }),
   { ...crowdedAgent({ id: "2", displayName: "Desktop implementation", role: "Codex", cli: "codex", status: "running", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.impl, quietForMinutes: DOCS_QUIET_MINUTES, activeTool: "Edit", activeToolDetail: "src/components/RetryPayment.tsx", lastUserPrompt: "Add the retry action to the checkout view.", tab: { kind: "dashboard" } }), transcript: DOCS_IMPL_TRANSCRIPT },
@@ -865,7 +884,7 @@ const DOCS_QUESTION_TRANSCRIPT = [
   "",
   "  Press enter to confirm or esc to cancel",
 ].join("\r\n");
-export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
+const DOCS_PENDING_QUESTION: PendingQuestionDto = {
   id: "q-docs-question",
   kind: "permission",
   channel: "keys",
@@ -982,6 +1001,71 @@ export function docsAgentCards(): AgentCardsSnapshot {
   return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 12, entries, catalogErrors: [], tree: true };
 }
 
+/*
+ * Issue #2399 — the `agent-cards-select`, `agent-card-panel`,
+ * `agent-cards-batch` and `agent-cards-batch-results` docs scenes
+ * (`/?fixture=1&state=docs&cards=batch`): the `agent-cards` scene's cards from
+ * a daemon that does batch actions, with the deck's default Go ahead
+ * (`go-ahead`, `default_actions` in `src/card_catalog.rs`) offered by the
+ * orchestration's three cards and not by the standalone agent's, so a batch
+ * to all four previews three included agents and one skipped. Every card
+ * keeps the deck's Close, so the selection offers Go ahead and Close. Its
+ * execution fails for one agent, as a daemon refuses a press on an agent that
+ * stopped after the preview, so the results show a partial failure. PR #2491
+ * review: the reviewer (Contract review), whose pull request is open, also
+ * offers the deck's Merge it, so the cards show both kinds of icon. Served
+ * only for `cards=batch`, so no other scene shows a checkbox.
+ */
+const DOCS_BATCH_OFFERED = new Set(["1", "2", "3"]);
+const DOCS_BATCH_MERGE = "3";
+/** The agent whose press the scene's daemon refuses at Send, and the sentence it refuses with (the daemon's `action_disabled` wording, `invoke_once` in `src/agent_cards.rs`). */
+const DOCS_BATCH_EXECUTE_FAILURES: Readonly<Record<string, { code: string; message: string }>> = {
+  "2": { code: "action_disabled", message: "Go ahead is disabled: the agent is not running" },
+};
+
+/** Issue #2399 — the `cards=batch` scene's cards: `docsAgentCards()` from a daemon that does batches. */
+export function docsBatchAgentCards(): AgentCardsSnapshot {
+  const snapshot = docsAgentCards();
+  const merge = docsCardAction("merge", { label: "Merge it", prompt: "Merge it, following this project's own merge procedure, then update your card.", prompt_source: "catalog", icon: "git-merge" });
+  const entries = snapshot.entries.map((entry) => {
+    const goAhead = DOCS_BATCH_OFFERED.has(entry.agent_id) && !entry.actions.some((action) => action.id === "go-ahead")
+      ? [docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", prompt_source: "catalog", icon: "play" })]
+      : [];
+    const merging = entry.agent_id === DOCS_BATCH_MERGE ? [merge] : [];
+    return goAhead.length + merging.length > 0 ? { ...entry, actions: [...goAhead, ...merging, ...entry.actions] } : entry;
+  });
+  return { ...snapshot, entries, batch: true };
+}
+
+/**
+ * PR #2491 (2026-11-25) — the `cards=fleet` scene
+ * (`/?fixture=1&state=docs-fleet&cards=fleet`): the two daemons of the
+ * `docs-fleet` state both show cards and do batches, so a selection can span
+ * them. The local daemon's are the `cards=batch` scene's; the build box's
+ * are its two agents, each offering Go ahead. Both advertise the Card
+ * actions editor. `undefined` for any other deck.
+ */
+export function fleetAgentCards(deckId: string): AgentCardsSnapshot | undefined {
+  if (deckId === FIXTURE_DAEMON_ID) return { ...docsBatchAgentCards(), catalogEdit: true };
+  if (deckId !== FIXTURE_REMOTE_DAEMON_ID) return undefined;
+  const instance = "docs-fleet-cards";
+  const goAhead = () => docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", prompt_source: "catalog", icon: "play" });
+  const card = (agentId: string, name: string, overrides: Partial<AgentCardEntry>): AgentCardEntry => docsCard(agentId, name, {
+    key: `remote-pane-${agentId}/${agentId}`, pane_id: `remote-pane-${agentId}`, instance_id: instance,
+    actions: [goAhead(), ...docsDeckActions()], primary_action_id: "go-ahead", ...overrides,
+  });
+  const entries = [
+    card("1", "API implementation", { agent_type: "codex", status: "working" }),
+    card("2", "API review", { status: "idle", needs_you: true, needs_you_reasons: ["done"] }),
+  ];
+  return { deckId: FIXTURE_REMOTE_DAEMON_ID, instanceId: instance, revision: 3, entries, catalogErrors: [], tree: true, batch: true, catalogEdit: true };
+}
+
+/** Issue #2399 — how the `cards=batch` scene's daemon refuses `agentId` at Send, if it does. */
+export function docsBatchExecuteFailure(agentId: string): { code: string; message: string } | undefined {
+  return DOCS_BATCH_EXECUTE_FAILURES[agentId];
+}
+
 /** Issue #2418 — one card of the `cards=tree` scene: its name, status and kind, and the cards it started. */
 interface TreeSceneCard {
   name: string;
@@ -1065,7 +1149,7 @@ export function treeAgentCards(scene: "tree" | "tree-nested" = "tree"): AgentCar
     return [entry, ...below];
   };
   for (const root of scene === "tree-nested" ? TREE_NESTED_SCENE : TREE_SCENE) add(root, undefined, undefined, undefined);
-  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 1, entries, catalogErrors: [], tree: true };
+  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 1, entries, catalogErrors: [], tree: true, catalogEdit: true };
 }
 
 const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
@@ -1554,7 +1638,19 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
 
   const messagingParam = state === "docs" && typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("messaging") : null;
   const messaging = messagingParam === "1" || messagingParam === "attention";
-  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
+  /* PR #2491 decision 2026-11-25 — a card opens its agent's pane, so the tree
+     scenes list an agent for each of their cards, under the card's id. */
+  const treeScene = state === "docs" && typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("cards") : null;
+  const treeAgents = treeScene === "tree" || treeScene === "tree-nested"
+    ? treeAgentCards(treeScene).entries.map((entry) => crowdedAgent({ id: entry.agent_id, displayName: entry.name, role: "Claude code", cli: "claude", status: "idle", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.plan, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: `Work as ${entry.name}.`, tab: { kind: "dashboard" } }))
+    : [];
+  /* PR #2491 review J7: in the card scenes, whose Card tab screenshots show
+     an agent's pane, the agents carry the project as their worktree, and
+     Contract review its terminal, so the pane is not read as a failed one. */
+  const docsInScene = treeScene !== null
+    ? [...docsAgents, ...treeAgents].map((agent) => ({ ...agent, worktree: "storefront", ...(agent.displayName === "Contract review" ? { transcript: DOCS_REVIEW_TRANSCRIPT } : {}) }))
+    : docsAgents;
+  const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsInScene : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
   const docs = state === "docs" || state === "docs-question" || state === "docs-restart";
@@ -1637,7 +1733,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
  * the voice surface as a peer dialog, so the question is askable and the row is
  * here to answer it.
  */
-export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
+const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   readonly phrases: readonly string[];
   readonly action: string;
   readonly invoke: string;
@@ -2425,7 +2521,7 @@ function fixtureTrailingSend(utterance: string): string | undefined {
 
 /** The first of `actions`, in order, whose row's phrases the whole utterance is. */
 /** `outcome::DROPPED_WHILE_SPEAKING`. */
-export const FIXTURE_DROPPED_WHILE_SPEAKING = "only “stop” or “quiet” works while the app is speaking";
+const FIXTURE_DROPPED_WHILE_SPEAKING = "only “stop” or “quiet” works while the app is speaking";
 
 /**
  * PRD #1497 — the preview's copy of `outcome::reading_intercept`: "quiet"
@@ -2624,8 +2720,8 @@ export function fixtureVoiceHeard(transcript: string = FIXTURE_VOICE_UTTERANCE):
  * Issue #1635 — the versions the `?selfupgrade=1` preview plays: the copies on
  * this machine, and the newer release they are behind.
  */
-export const FIXTURE_SELF_CURRENT_VERSION = "0.46.0";
-export const FIXTURE_SELF_LATEST_VERSION = "0.47.0";
+const FIXTURE_SELF_CURRENT_VERSION = "0.46.0";
+const FIXTURE_SELF_LATEST_VERSION = "0.47.0";
 
 const line = (text: string) => ({ text, command: null });
 
@@ -2700,4 +2796,88 @@ export function fixtureSelfUpgradeApi(search: string = window.location.search): 
     }, FIXTURE_UPGRADE_STEP_MS)),
     relaunch: async () => undefined,
   };
+}
+
+/**
+ * PRD #2374 decision 2026-11-24 — the preview's card actions editor for the
+ * `cards=tree` scene: a catalog holding the deck's two defaults (Go ahead and
+ * Merge it, as the deck ships them) that applies each edit as a daemon would —
+ * an add, an update (an override for a default), a removal of the user's own,
+ * hiding and restoring a default — refusing what the daemon refuses with its
+ * words. It lives for the page's session; nothing is written anywhere.
+ */
+export function createFixtureCardCatalog(userConfig = "~/.config/dot-agent-deck/config.toml") {
+  type Action = EditableCardAction;
+  const deck = (name: string, label: string, prompt: string, icon: string, description: string): Action => ({
+    name, label, description, prompt, icon, placement: "card", confirm: false, always: false, source: "default", default: true, overridden: false, hidden: false,
+  });
+  const defaults: Action[] = [
+    deck("go-ahead", "Go ahead", "Go ahead.", "play", "Offer when you are waiting for the user's approval to continue."),
+    deck("merge", "Merge it", "Merge it, following this project's own merge procedure, then update your card.", "git-merge", "Offer when your work is ready to merge."),
+  ];
+  const overrides = new Map<string, Action>();
+  const hidden = new Set<string>();
+  const own: Action[] = [];
+  const isDefault = (name: string) => defaults.some((action) => action.name === name);
+  const read = (): EditableCardCatalog => ({
+    actions: [
+      ...defaults.map((action) => {
+        if (hidden.has(action.name)) return { ...action, hidden: true };
+        const override = overrides.get(action.name);
+        return override ? { ...override, default: true, overridden: true, hidden: false } : { ...action };
+      }),
+      ...own.map((action) => ({ ...action })),
+    ],
+    errors: [],
+    user_config: userConfig,
+  });
+  const entry = (input: CardActionInput): Action => {
+    const where = `catalog.actions ${JSON.stringify(input.name)}`;
+    if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(input.name)) throw new Error(`${where}: bad name; use 1 to 40 lowercase letters, digits and '-', starting with a letter or digit`);
+    if (["open", "reply", "close", "close-keep-worktree"].includes(input.name) || input.name.startsWith("question")) throw new Error(`${where}: ${JSON.stringify(input.name)} is a reserved name`);
+    if (!input.description.trim()) throw new Error(`${where}: "description" is empty`);
+    if (!input.prompt.trim()) throw new Error(`${where}: "prompt" is empty`);
+    if (input.icon !== undefined && !/^[a-z0-9-]{1,32}$/.test(input.icon)) throw new Error(`${where}: bad icon ${JSON.stringify(input.icon)}; use 1 to 32 lowercase letters, digits and '-'`);
+    return {
+      name: input.name, label: input.label?.trim() ? input.label : input.name.replace(/-/g, " ").replace(/^./, (first) => first.toUpperCase()),
+      description: input.description, prompt: input.prompt, icon: input.icon ?? null, placement: input.placement ?? "card",
+      confirm: input.confirm, always: input.always, source: "user", default: false, overridden: false, hidden: false,
+    };
+  };
+  const edit = (change: CardCatalogEdit): EditableCardCatalog => {
+    const at = (name: string) => own.findIndex((action) => action.name === name);
+    switch (change.kind) {
+      case "add": {
+        const added = entry(change.action);
+        if (isDefault(added.name)) throw new Error(`${JSON.stringify(added.name)} is a deck default; edit it instead of adding it`);
+        if (at(added.name) >= 0) throw new Error(`an action named ${JSON.stringify(added.name)} already exists; edit it instead`);
+        own.push(added);
+        break;
+      }
+      case "update": {
+        const updated = entry(change.action);
+        if (isDefault(updated.name)) { hidden.delete(updated.name); overrides.set(updated.name, updated); break; }
+        const index = at(updated.name);
+        if (index < 0) throw new Error(`no action named ${JSON.stringify(updated.name)} in your catalog to edit`);
+        own[index] = updated;
+        break;
+      }
+      case "remove": {
+        if (isDefault(change.name)) throw new Error(`${JSON.stringify(change.name)} is a deck default; hide it instead of removing it`);
+        const index = at(change.name);
+        if (index < 0) throw new Error(`no action named ${JSON.stringify(change.name)} in your catalog to remove`);
+        own.splice(index, 1);
+        break;
+      }
+      case "hide":
+      case "restore": {
+        if (!isDefault(change.name)) throw new Error(`${JSON.stringify(change.name)} is not a deck default; only a deck default can be ${change.kind === "hide" ? "hidden" : "restored"}`);
+        overrides.delete(change.name);
+        if (change.kind === "hide") hidden.add(change.name); else hidden.delete(change.name);
+        break;
+      }
+    }
+    return read();
+  };
+  return { read, edit };
 }

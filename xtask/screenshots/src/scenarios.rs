@@ -43,10 +43,57 @@ impl Client {
     }
 }
 
+/// One of the two themes a screenshot is taken in (PR #2491): a PR shows
+/// every changed screen in both, side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 2] = [Theme::Light, Theme::Dark];
+
+    /// The spelling used on the command line, in file names and in the
+    /// Playwright test titles.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Theme> {
+        Theme::ALL.into_iter().find(|t| t.as_str() == text)
+    }
+}
+
+/// How a run names its images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Naming {
+    /// `<scenario>-<client>-<theme>.png`, one file per theme: the default, and
+    /// what a pull request's screenshots use.
+    Paired,
+    /// `<scenario>-<client>.png` in one theme: the names the landing page and
+    /// `docs/installation.md` already reference (`--single-theme`).
+    Single,
+}
+
+impl Naming {
+    /// The spelling `cargo docs-screenshots` hands the rasterizer.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Naming::Paired => "paired",
+            Naming::Single => "single",
+        }
+    }
+}
+
 /// A named screenshot, captured from one or both clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scenario {
-    /// Kebab-case; the image is `docs/img/<name>-<client>.png`.
+    /// Kebab-case; the images are `<name>-<client>-<theme>.png`, or
+    /// `<name>-<client>.png` in a single-theme run.
     pub name: &'static str,
     /// One line for `--list`.
     pub description: &'static str,
@@ -58,9 +105,18 @@ impl Scenario {
         self.clients.contains(&client)
     }
 
-    /// The PNG this scenario produces for `client`.
+    /// The PNG this scenario produces for `client` in a single-theme run.
     pub fn image_file(&self, client: Client) -> String {
         format!("{}-{}.png", self.name, client.as_str())
+    }
+
+    /// The PNG this scenario produces for `client` in `theme`, named as
+    /// `naming` says.
+    pub fn themed_image_file(&self, client: Client, theme: Theme, naming: Naming) -> String {
+        match naming {
+            Naming::Single => self.image_file(client),
+            Naming::Paired => format!("{}-{}-{}.png", self.name, client.as_str(), theme.as_str()),
+        }
     }
 
     /// The name of the test function holding the TUI capture.
@@ -103,7 +159,97 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "agent-cards",
-        description: "The desktop Dashboard's Cards view as a tree: an orchestrator opened to show its two roles beside a standalone agent, three needing you (PRD #2374, issue #2418).",
+        description: "The desktop Dashboard's Cards view as a tree: an orchestrator opened to show its two roles beside a standalone agent, three needing you, every card with its checkbox and its action icons in a tinted group, Go ahead on three and Merge it on one (PRD #2374, issue #2418, PR #2491 review).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-action-hover",
+        description: "A card's Merge it icon hovered in the desktop Cards view: its tooltip with the action's label and the exact text it sends (PR #2491 review).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-select",
+        description: "The desktop Cards view selecting agents for a batch: the orchestrator root (which selects its two roles) and a standalone agent ticked, and the selection bar at the foot of the Dashboard with its count, Go ahead, Close and Merge it in the action group, and Clear (issue #2399, PR #2491 review).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-select-edit",
+        description: "The desktop selection bar with two cards on one daemon ticked: after the action group and set apart from it, the Edit card actions sliders button under the pointer (PR #2491, 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-select-edit-menu",
+        description: "The desktop selection bar with a card ticked on each of two daemons: Edit card actions open on its menu naming both daemons (PR #2491, 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-card-tab-terminal",
+        description: "An agent's pane opened from its card in the desktop Cards view, on its Terminal tab: the agent at work in its terminal, and beside Terminal the Card tab with its bell, because the agent needs you (PR #2491 decision 2026-11-26).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-card-tab",
+        description: "The same agent pane on its Card tab, in the terminal's place: the deck-checked status and pull request, the agent's summary, why it needs you, its question with two answers, and its action icons (PR #2491 decision 2026-11-26).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-card-tab-narrow",
+        description: "The same Card tab in a 375-pixel window, scrolled to its Actions with Edit beside the heading (PR #2491 decision 2026-11-26).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch",
+        description: "The desktop Cards view's batch confirmation of Go ahead for four selected agents: three included, each with the exact text it gets, and one skipped with its reason (issue #2399).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-many",
+        description: "A batch confirmation over every agent of a large tree: the included agents' first names and +N more, and the skipped agents folded into one line counting them by reason (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-texts",
+        description: "The same large batch with two agents that worded their own Go ahead: each distinct text quoted with its source mark (catalog, agent says), the catalog text's long list of names folded behind +N more, and the heading counting the agents and the 3 different texts (PR #2491 audit K1).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-texts-unseen",
+        description: "The same confirmation in a 1440 by 500 window, the two texts the agents wrote below the fold: Send disabled with \"Scroll to see all 3 texts\" and Show next text beside it, until each text has been in view (PR #2491 audit K1).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-many-expanded",
+        description: "The same confirmation with the skipped line pressed: the skipped agents listed, grouped by reason (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-batch-results",
+        description: "The same batch after Send: each agent's outcome, two queued for the agent and one failed with the daemon's reason (issue #2399).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-actions-editor",
+        description: "The desktop Card actions editor, opened from the daemon's ⋯ menu and titled with its name: the form for a new action, Deploy it, with its text over two lines and its icon grid open on the rocket; the listed actions are below it (PRD #2374 decision 2026-11-24, PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-wrapped",
+        description: "The desktop Cards view with two trees open in one row, each in its own box captioned with its root: a dispatcher whose orchestration is opened inside it, and one whose seven agents wrap into two rows, each row hanging from the spine by its own line (issue #2533).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "agent-cards-daemon-menu",
+        description: "A daemon's ⋯ menu on the desktop Dashboard, open on Card actions, with the cards right under the top bar (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "dashboard-more-menu",
+        description: "The desktop Dashboard's ⋯ menu, right of Refresh, open on Needs you only, with the count of agents that need you on the ⋯ (PR #2491 decision 2026-11-25).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "dashboard-needs-you-chip",
+        description: "Needs you only on in the desktop Dashboard's Table view: the Needs you only chip beside Filter, and only the agents that need you with the agents above them (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],
     },
     Scenario {
@@ -313,6 +459,28 @@ mod tests {
         assert_eq!(s.tui_test_name(), "docs_screenshot_dashboard_empty");
         assert_eq!(Client::parse("tui"), Some(Client::Tui));
         assert_eq!(Client::parse("gui"), None);
+    }
+
+    #[test]
+    fn a_paired_run_names_one_file_per_theme_and_a_single_run_keeps_the_old_name() {
+        let s = find("dashboard").unwrap();
+        assert_eq!(
+            s.themed_image_file(Client::Tui, Theme::Light, Naming::Paired),
+            "dashboard-tui-light.png"
+        );
+        assert_eq!(
+            s.themed_image_file(Client::Desktop, Theme::Dark, Naming::Paired),
+            "dashboard-desktop-dark.png"
+        );
+        for theme in Theme::ALL {
+            assert_eq!(
+                s.themed_image_file(Client::Desktop, theme, Naming::Single),
+                "dashboard-desktop.png"
+            );
+        }
+        assert_eq!(Theme::parse("light"), Some(Theme::Light));
+        assert_eq!(Theme::parse("dark"), Some(Theme::Dark));
+        assert_eq!(Theme::parse("system"), None);
     }
 
     #[test]

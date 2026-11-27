@@ -1261,6 +1261,42 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
     }
 }
 
+/// A connection to a daemon that advertised the card-action editor, from
+/// [`DaemonClient::card_catalog_edit_connection`], on which nothing has been
+/// written yet. [`Self::send`] writes the one request it carries.
+pub struct CardCatalogEditConnection {
+    rd: TransportReadHalf,
+    wr: TransportWriteHalf,
+}
+
+impl CardCatalogEditConnection {
+    /// Write `edit` (or, with none, the read) and wait for the daemon's
+    /// answer. A refused edit is [`ClientError::Server`] with the daemon's
+    /// reason, nothing written; every other failure, from the request's first
+    /// byte on, is [`ClientError::Unanswered`]: an edit may have been written
+    /// whatever became of the reply.
+    pub async fn send(
+        mut self,
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
+    ) -> Result<crate::card_catalog::EditableCardCatalog, ClientError> {
+        let resp = issue_command(
+            &mut self.rd,
+            &mut self.wr,
+            &AttachRequest::CardCatalogEdit { edit },
+        )
+        .await
+        .map_err(|error| ClientError::Unanswered(error.to_string()))?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "card-catalog-edit failed".into()),
+            ));
+        }
+        resp.card_catalog_edit
+            .ok_or_else(|| ClientError::Unanswered("card-catalog-edit answered no catalog".into()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PRD #819 M5: the client's reading of the daemon's advertised capability set.
 // ---------------------------------------------------------------------------
@@ -1559,6 +1595,16 @@ pub struct AgentCardsAnswer {
     /// the list is in the tree's order. `false` for an older daemon, whose
     /// cards a client draws as roots with no roll-up.
     pub tree: bool,
+    /// Issue #2399: the daemon advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS_BATCH`], so a client may offer
+    /// batch actions on these cards. `false` for an older daemon, which is
+    /// never sent a batch ([`DaemonClient::invoke_card_action_batch`]).
+    pub batch: bool,
+    /// Issue #2399 (PR #2491 scope extension): the daemon advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT`], so a client
+    /// may edit its card actions ([`DaemonClient::card_catalog_edit`]).
+    /// `false` for an older daemon, which is never sent the request.
+    pub catalog_edit: bool,
 }
 
 /// Issue #2418: the client side of the tree's gate. Against a daemon whose
@@ -1579,7 +1625,14 @@ pub fn tree_gate(
             entry.checked_refs.clear();
         }
     }
-    AgentCardsAnswer { list, tree }
+    let batch = capabilities.supports(crate::daemon_protocol::CAP_AGENT_CARDS_BATCH);
+    let catalog_edit = capabilities.supports(crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT);
+    AgentCardsAnswer {
+        list,
+        tree,
+        batch,
+        catalog_edit,
+    }
 }
 
 /// PRD #1790 stage 2 (verification finding A): an interrupted work request a
@@ -4630,6 +4683,105 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Malformed("invoke-card-action answered no result".into()))
     }
 
+    /// Issue #2399: preview or execute one action on many cards in one
+    /// request. `instance_id` is the daemon process that listed the cards:
+    /// the connection is bound to it, as [`Self::invoke_card_action`]'s is, so
+    /// a successor is sent nothing and the call fails with
+    /// [`ClientError::DaemonRestarted`]. An execution's entries carry the
+    /// `action_token` and `instance_id` their preview answered, and the
+    /// daemon checks each as a single press. **Withheld unless the daemon's
+    /// `Hello` on the same connection advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS_BATCH`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    ///
+    /// What a failure means depends on when it happened, as for
+    /// [`Self::restart_daemon`]. Up to and including the `Hello` on the
+    /// connection the request goes out on, the request was not sent: those
+    /// failures are themselves. From the first byte of the request on, the
+    /// daemon may run it whatever becomes of the reply, so a broken connection
+    /// and a cut-off, unreadable or empty reply are all
+    /// [`ClientError::Unanswered`]. A daemon's refusal of the whole request
+    /// ([`ClientError::Server`]) is an answer that no entry ran: the daemon
+    /// refuses a batch whole only before it runs any entry, and once an
+    /// execution starts it answers per entry, an entry it cannot account for
+    /// being [`crate::agent_cards::BATCH_UNKNOWN`].
+    pub async fn invoke_card_action_batch(
+        &self,
+        instance_id: &str,
+        mode: crate::agent_cards::CardBatchMode,
+        action_id: &str,
+        request_id: &str,
+        entries: Vec<crate::agent_cards::CardBatchEntry>,
+    ) -> Result<GatedQuery<crate::agent_cards::CardBatchResult>, ClientError> {
+        let bound = self.bound_to(Incarnation::from(Some(instance_id.to_string())));
+        let Some((mut rd, mut wr, _)) = bound
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS_BATCH)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::InvokeCardActionBatch {
+                mode,
+                action_id: action_id.to_string(),
+                request_id: request_id.to_string(),
+                entries,
+            },
+        )
+        .await
+        .map_err(|error| ClientError::Unanswered(error.to_string()))?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "invoke-card-action-batch failed".into()),
+            ));
+        }
+        resp.card_action_batch
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| {
+                ClientError::Unanswered("invoke-card-action-batch answered no result".into())
+            })
+    }
+
+    /// Issue #2399 (PR #2491 scope extension): the desktop's card-action
+    /// editor. With no `edit`, read the daemon's user catalog actions with
+    /// where each came from; with one, apply it to the daemon's own user
+    /// config and answer the catalog afterwards. A refused edit is
+    /// [`ClientError::Server`] with the daemon's reason, nothing written.
+    /// **Withheld unless the daemon's `Hello` on the same connection
+    /// advertised [`crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT`]**,
+    /// answering [`GatedQuery::Unsupported`] without sending anything.
+    ///
+    /// As for [`Self::invoke_card_action_batch`], every failure from the first
+    /// byte of the request on is [`ClientError::Unanswered`]: an edit may have
+    /// been written whatever became of the reply.
+    pub async fn card_catalog_edit(
+        &self,
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
+    ) -> Result<GatedQuery<crate::card_catalog::EditableCardCatalog>, ClientError> {
+        let Some(connection) = self.card_catalog_edit_connection().await? else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        connection.send(edit).await.map(GatedQuery::Answered)
+    }
+
+    /// [`Self::card_catalog_edit`]'s first step: the connection whose `Hello`
+    /// advertised [`crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT`],
+    /// with nothing of the request written yet, or `None` when the daemon
+    /// does not advertise it. A caller that bounds the exchange can tell a
+    /// failure or a timeout here, where nothing was sent, from one after
+    /// [`CardCatalogEditConnection::send`] began writing (PR #2491 review).
+    pub async fn card_catalog_edit_connection(
+        &self,
+    ) -> Result<Option<CardCatalogEditConnection>, ClientError> {
+        Ok(self
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT)
+            .await?
+            .map(|(rd, wr, _)| CardCatalogEditConnection { rd, wr }))
+    }
+
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
     /// admitted on its own connection (PRD #1666 part 2): agent ids are a
     /// per-daemon counter, so a replacement the client would refuse may hold an
@@ -7428,6 +7580,257 @@ mod tests {
         });
     }
 
+    /// Issue #2399 — the daemon advertises `agent-cards-batch`, and a batch
+    /// goes only on a connection whose `Hello` named it and
+    /// `hello-follow-on`: against a daemon that lists cards but does not,
+    /// nothing follows the Hello and its list is not read as batch-capable.
+    #[cfg(unix)]
+    #[test]
+    fn a_card_batch_is_sent_only_to_a_daemon_that_advertises_it() {
+        use crate::daemon_protocol::{
+            CAP_AGENT_CARDS, CAP_AGENT_CARDS_BATCH, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON,
+            DAEMON_CAPABILITIES,
+        };
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS_BATCH));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON][..]),
+                Some(&[CAP_AGENT_CARDS_BATCH][..]),
+            ] {
+                assert_eq!(
+                    agent_card_request_inner(advertised, 4).await,
+                    (false, 0),
+                    "{advertised:?}: Unsupported, and nothing follows the Hello"
+                );
+            }
+            let tree = Some(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON][..]);
+            assert_eq!(
+                agent_card_request_inner(tree, 5).await,
+                (false, 1),
+                "listed, but not batch-capable"
+            );
+            let batch = Some(
+                &[
+                    CAP_AGENT_CARDS,
+                    CAP_AGENT_CARDS_TREE,
+                    CAP_AGENT_CARDS_BATCH,
+                    CAP_HELLO_FOLLOW_ON,
+                ][..],
+            );
+            assert_eq!(agent_card_request_inner(batch, 4).await, (true, 1));
+            assert_eq!(agent_card_request_inner(batch, 5).await, (true, 1));
+        });
+    }
+
+    /// Issue #2399 (PR #2491 scope extension) — the daemon advertises
+    /// `agent-cards-catalog-edit`, and the card-action editor's request (a
+    /// read or an edit) goes only on a connection whose `Hello` named it and
+    /// `hello-follow-on`: against a daemon that names neither, only one, or
+    /// the cards capabilities without it, the call answers
+    /// [`GatedQuery::Unsupported`] itself — not some other error — and nothing
+    /// follows the Hello. Against one that names both, exactly the one
+    /// `card-catalog-edit` request follows, carrying the edit as given, and
+    /// the daemon's populated answer comes back whole: each action's source
+    /// and flags, the catalog's problems and the file it names. A refusal
+    /// comes back as [`ClientError::Server`] carrying the daemon's reason
+    /// unchanged (issue #2399 review, finding 12).
+    #[cfg(unix)]
+    #[test]
+    fn a_catalog_edit_is_sent_only_to_a_daemon_that_advertises_it() {
+        use crate::card_catalog::{CatalogActionEdit, CatalogActionInput, CatalogSource};
+        use crate::daemon_protocol::{
+            CAP_AGENT_CARDS, CAP_AGENT_CARDS_BATCH, CAP_AGENT_CARDS_CATALOG_EDIT,
+            CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON, DAEMON_CAPABILITIES,
+        };
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS_CATALOG_EDIT));
+        let add = CatalogActionEdit::Add {
+            action: CatalogActionInput {
+                name: "ship".into(),
+                description: "Offer when it is ready.".into(),
+                prompt: "Ship it.".into(),
+                icon: Some("rocket".into()),
+                ..Default::default()
+            },
+        };
+        const REASON: &str =
+            "catalog.actions \"Ship It\": bad name; use 1 to 40 lowercase letters, digits and '-'";
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(
+                    &[
+                        CAP_AGENT_CARDS,
+                        CAP_AGENT_CARDS_TREE,
+                        CAP_AGENT_CARDS_BATCH,
+                        CAP_HELLO_FOLLOW_ON,
+                    ][..],
+                ),
+                Some(&[CAP_AGENT_CARDS_CATALOG_EDIT][..]),
+            ] {
+                for edit in [None, Some(add.clone())] {
+                    let (result, sent) = catalog_edit_request(advertised, edit, None).await;
+                    assert!(
+                        matches!(result, Ok(GatedQuery::Unsupported)),
+                        "{advertised:?}: Unsupported, not {result:?}"
+                    );
+                    assert!(
+                        sent.is_empty(),
+                        "{advertised:?}: nothing follows the Hello: {sent:?}"
+                    );
+                }
+            }
+            let both = Some(&[CAP_AGENT_CARDS_CATALOG_EDIT, CAP_HELLO_FOLLOW_ON][..]);
+            let (result, sent) = catalog_edit_request(both, None, None).await;
+            let Ok(GatedQuery::Answered(catalog)) = result else {
+                panic!("a read is answered: {result:?}");
+            };
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(sent[0]["op"], "card-catalog-edit");
+            assert!(
+                sent[0].get("edit").is_none_or(|edit| edit.is_null()),
+                "a read carries no edit: {sent:?}"
+            );
+            // The populated answer, read whole.
+            assert_eq!(
+                catalog
+                    .actions
+                    .iter()
+                    .map(|a| (
+                        a.action.name.as_str(),
+                        a.action.source,
+                        a.default,
+                        a.overridden,
+                        a.hidden
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    ("go-ahead", CatalogSource::User, true, true, false),
+                    ("merge", CatalogSource::Default, true, false, true),
+                    ("ship", CatalogSource::User, false, false, false),
+                ]
+            );
+            let ship = &catalog.actions[2].action;
+            assert_eq!(ship.label, "Ship it");
+            assert_eq!(ship.prompt, "Ship it.\nThen update your card.");
+            assert_eq!(ship.icon.as_deref(), Some("rocket"));
+            assert!(ship.confirm && !ship.always);
+            assert_eq!(catalog.errors, ["catalog.fields \"risk\": an unknown type"]);
+            assert_eq!(
+                catalog.user_config.as_deref(),
+                Some("/srv/deck/config.toml")
+            );
+
+            let (result, sent) = catalog_edit_request(both, Some(add.clone()), None).await;
+            assert!(matches!(result, Ok(GatedQuery::Answered(_))), "{result:?}");
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(sent[0]["op"], "card-catalog-edit");
+            assert_eq!(sent[0]["edit"], serde_json::to_value(&add).unwrap());
+
+            let (result, sent) = catalog_edit_request(both, Some(add.clone()), Some(REASON)).await;
+            match result {
+                Err(ClientError::Server(reason)) => assert_eq!(reason, REASON),
+                other => panic!("a refusal is the daemon's reason: {other:?}"),
+            }
+            assert_eq!(sent.len(), 1, "the edit was sent once: {sent:?}");
+        });
+    }
+
+    /// The card-action editor's request against a fake daemon whose `Hello`
+    /// advertises `advertised`: what the call returned, and every request
+    /// that followed the Hello. The daemon answers a populated catalog, or
+    /// refuses with `refuse`. The answer is written as raw JSON, so the fake
+    /// pins the wire the daemon sends, not the client's own types.
+    #[cfg(unix)]
+    async fn catalog_edit_request(
+        advertised: Option<&'static [&'static str]>,
+        edit: Option<crate::card_catalog::CatalogActionEdit>,
+        refuse: Option<&'static str>,
+    ) -> (
+        Result<GatedQuery<crate::card_catalog::EditableCardCatalog>, ClientError>,
+        Vec<serde_json::Value>,
+    ) {
+        let (_dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("catalog-edit-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = sent.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let mut frames = 0usize;
+                while let Ok(Ok(Some((_kind, payload)))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut stream))
+                        .await
+                {
+                    frames += 1;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).unwrap_or_default();
+                    let op = request.get("op").and_then(|op| op.as_str()).unwrap_or("");
+                    let response = if frames == 1 && op == "hello" {
+                        serde_json::to_value(AttachResponse {
+                            capabilities: advertised
+                                .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                            instance_id: Some("test-instance".to_string()),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        })
+                        .unwrap()
+                    } else {
+                        recorded.lock().unwrap().push(request.clone());
+                        if let Some(reason) = refuse.filter(|_| op == "card-catalog-edit") {
+                            serde_json::to_value(AttachResponse::err(reason)).unwrap()
+                        } else {
+                            let mut ok = serde_json::to_value(AttachResponse::ok()).unwrap();
+                            if op == "card-catalog-edit" {
+                                ok["card_catalog_edit"] = serde_json::json!({
+                                    "actions": [
+                                        {"name": "go-ahead", "label": "Go ahead", "description": "Offer when you may continue.", "prompt": "Proceed.", "icon": "play", "placement": "card", "confirm": false, "always": false, "source": "user", "default": true, "overridden": true, "hidden": false},
+                                        {"name": "merge", "label": "Merge it", "description": "Offer when your work is ready to merge.", "prompt": "Merge it.", "icon": "git-merge", "placement": "card", "confirm": false, "always": false, "source": "default", "default": true, "overridden": false, "hidden": true},
+                                        {"name": "ship", "label": "Ship it", "description": "Offer when it is ready.", "prompt": "Ship it.\nThen update your card.", "icon": "rocket", "placement": "card", "confirm": true, "always": false, "source": "user", "default": false, "overridden": false, "hidden": false},
+                                    ],
+                                    "errors": ["catalog.fields \"risk\": an unknown type"],
+                                    "user_config": "/srv/deck/config.toml",
+                                });
+                            }
+                            ok
+                        }
+                    };
+                    let bytes = serde_json::to_vec(&response).unwrap();
+                    if crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &bytes,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let client = DaemonClient::new(path);
+        let result = client.card_catalog_edit(edit).await;
+        server.abort();
+        let sent = sent.lock().unwrap().clone();
+        (result, sent)
+    }
+
     /// Issue #2418 (T8) — [`tree_gate`] keeps the tree fields from a daemon
     /// that advertises the tree and drops them from one that does not, so a
     /// client never draws a parent or roll-up the daemon did not vouch for.
@@ -7615,6 +8018,13 @@ mod tests {
                                 )),
                                 ..AttachResponse::ok()
                             },
+                            "invoke-card-action-batch" => AttachResponse {
+                                card_action_batch: Some(crate::agent_cards::CardBatchResult {
+                                    request_id: "b".into(),
+                                    entries: Vec::new(),
+                                }),
+                                ..AttachResponse::ok()
+                            },
                             _ => AttachResponse::err("malformed request"),
                         }
                     };
@@ -7638,6 +8048,27 @@ mod tests {
             1 => matches!(
                 client.agent_card_catalog().await,
                 Ok(GatedQuery::Answered(_))
+            ),
+            // Issue #2399: a batch, and a list read as batch-capable.
+            4 => matches!(
+                client
+                    .invoke_card_action_batch(
+                        "test-instance",
+                        crate::agent_cards::CardBatchMode::Preview,
+                        "merge",
+                        "b",
+                        vec![crate::agent_cards::CardBatchEntry {
+                            pane_id: "p".into(),
+                            agent_id: "1".into(),
+                            ..Default::default()
+                        }],
+                    )
+                    .await,
+                Ok(GatedQuery::Answered(_))
+            ),
+            5 => matches!(
+                client.list_agent_cards_tree().await,
+                Ok(GatedQuery::Answered(AgentCardsAnswer { batch: true, .. }))
             ),
             _ => matches!(
                 client

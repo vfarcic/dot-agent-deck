@@ -547,6 +547,56 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
     expect(held()).toMatchObject({ instanceId: "docs-after", revision: 1 });
   });
 
+  /*
+   * PR #2491 audit (A2) — the Card actions editor names the daemon process
+   * each read and edit is bound to, the one whose list the user saw; the
+   * runtime hands the bridge exactly that, never the process whose cards
+   * happen to be shown when Save is pressed, and passes a missing one on for
+   * the bridge to refuse (A1) rather than filling it in.
+   */
+  it("passes the Card actions editor's daemon process to the bridge as given", async () => {
+    type CatalogBridge = { readCardCatalog?: (deckId: string, instanceId: string | undefined) => Promise<unknown>; editCardCatalog?: (deckId: string, edit: unknown, instanceId: string | undefined) => Promise<unknown> };
+    const catalogBridge = bridge as unknown as CatalogBridge;
+    const catalog = { actions: [], errors: [], user_config: "/home/user/.config/dot-agent-deck/config.toml" };
+    catalogBridge.readCardCatalog = vi.fn(async () => catalog);
+    catalogBridge.editCardCatalog = vi.fn(async () => catalog);
+    try {
+      let onFleet: ((fleet: DeckFleet) => void) | undefined;
+      bridge.subscribe.mockImplementation(async (fleetListener) => {
+        onFleet = fleetListener as (fleet: DeckFleet) => void;
+        return () => {};
+      });
+      let push: ((snapshot: AgentCardsSnapshot) => void) | undefined;
+      cardsBridge.subscribeAgentCards = vi.fn(async (listener) => {
+        push = listener;
+        return () => {};
+      });
+      cardsBridge.agentCards = vi.fn(async () => null);
+      bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
+      const { result } = renderConsuming();
+      await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
+      await waitFor(() => expect(push).toBeDefined());
+      act(() => push!(cards("docs-before", 1)));
+      const removal = { kind: "remove" as const, name: "ship" };
+      await result.current.readCardCatalog!(FIXTURE_DAEMON_ID, "docs-before");
+      expect(catalogBridge.readCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "docs-before");
+
+      /* The deck's daemon restarts: an edit made from the old process's list still names the old process. */
+      act(() => push!(cards("docs-after", 1)));
+      act(() => onFleet!([restartedFixtureSnapshot()]));
+      expect(result.current.agentCards?.[FIXTURE_DAEMON_ID]).toMatchObject({ instanceId: "docs-after" });
+      await result.current.editCardCatalog!(FIXTURE_DAEMON_ID, removal, "docs-before");
+      expect(catalogBridge.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, removal, "docs-before");
+      await result.current.readCardCatalog!(FIXTURE_DAEMON_ID, undefined);
+      expect(catalogBridge.readCardCatalog, "a missing process is not filled in from the cards shown").toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, undefined);
+      await result.current.editCardCatalog!(FIXTURE_DAEMON_ID, removal, undefined);
+      expect(catalogBridge.editCardCatalog).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, removal, undefined);
+    } finally {
+      delete catalogBridge.readCardCatalog;
+      delete catalogBridge.editCardCatalog;
+    }
+  });
+
   it("drops a deck's cards when the daemon is replaced and shows nothing until the successor's arrive", async () => {
     let onFleet: ((fleet: DeckFleet) => void) | undefined;
     bridge.subscribe.mockImplementation(async (fleetListener) => {

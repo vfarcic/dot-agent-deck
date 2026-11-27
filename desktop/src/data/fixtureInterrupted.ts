@@ -11,7 +11,7 @@ const KEPT_TS = 1_795_687_200_000;
  * agent (listed under "Other agents"). The same three items the TUI's tests
  * list, so both clients' screenshots read alike.
  */
-export function fixtureInterruptedItems(): InterruptedItem[] {
+function fixtureInterruptedItems(): InterruptedItem[] {
   return [
     {
       id: "w-abcdefgh-0000000000000003",
@@ -50,7 +50,7 @@ export function fixtureInterruptedItems(): InterruptedItem[] {
  * whose Claude Code agent can be restored with its conversation, and a plain
  * Pi agent that can only start over.
  */
-export function fixtureRestoreItems(): InterruptedItem[] {
+function fixtureRestoreItems(): InterruptedItem[] {
   return [
     {
       id: "w-abcdefgh-0000000000000001",
@@ -107,7 +107,7 @@ function extraUnits(count: number): InterruptedItem[] {
  * shortened, as any long value is), for the restore question's presentation
  * check (audit S4/F9, `interrupted=restore-long`).
  */
-export const FIXTURE_LONG_AGENT_NAME = `fix-login ${Array.from({ length: 300 }, (_, at) => `part${at}`).join(" ")}`;
+const FIXTURE_LONG_AGENT_NAME = `fix-login ${Array.from({ length: 300 }, (_, at) => `part${at}`).join(" ")}`;
 
 /** {@link fixtureRestoreItems}, with the restorable agent's name {@link FIXTURE_LONG_AGENT_NAME}. */
 function fixtureRestoreItemsLong(): InterruptedItem[] {

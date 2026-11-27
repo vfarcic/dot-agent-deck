@@ -121,8 +121,10 @@ Each unit builds its own `target/` tree, so `/issue-queue` step 5's disk rule ap
 Name it `cleanup-<mode>-<MMDD>`, for example `cleanup-code-1004`, and check the name is free:
 
 ```bash
-git show-ref --verify --quiet "refs/heads/agent/dispatch-cleanup-code-1004" && echo TAKEN || echo FREE
+.claude/skills/issue-queue/unit-name-free.sh "cleanup-code-1004" "$OWNER/$REPO"
 ```
+
+It prints `FREE`, `TAKEN: <why>` or `UNKNOWN: <why>` (read `UNKNOWN` as taken), checking the local branch, `origin` and every pull request that has had the branch as its head (issue #2509, `/issue-queue` step 6).
 
 A second run on the same day takes `cleanup-<mode>-<MMDD>-<HHMM>`. **Never delete a branch to free a name**, for the reason `/issue-queue` step 6 gives.
 

@@ -43,7 +43,7 @@ export function endedRoleOfCard(endedRoles: readonly EndedRole[] | undefined, en
 /**
  * Issue #1965 on the compact card (issue #2418): an exited role's reason and
  * last output as one line of text, to sit on the card's status line, which
- * truncates rather than wraps; the overlay shows them in full.
+ * truncates rather than wraps; the Card tab shows them in full.
  */
 export function endedRoleLine(role: EndedRole): string {
   const reason = `${ENDED_ROLE_WORDS.status}: ${displayText(role.reason, DISPLAY_LIMITS.title)}`;

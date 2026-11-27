@@ -129,7 +129,7 @@ const COLUMN_FILTER_STATUS: Partial<Record<AgentStatus, DashboardStatus>> = {
  * the status of the column the dashboard shows it in, so a filter never
  * leaves out an agent its column shows.
  */
-export function dashboardStatusOf(status: string | undefined): DashboardStatus | undefined {
+function dashboardStatusOf(status: string | undefined): DashboardStatus | undefined {
   if (status === undefined) return undefined;
   const word = normalize(status);
   return DASHBOARD_STATUSES.find((option) => option.id === word)?.id ?? COLUMN_FILTER_STATUS[statusFromDaemon(word)];
@@ -153,7 +153,7 @@ function searchable(agent: DashboardFilterFacts): string[] {
 }
 
 /** Whether `agent` matches every active facet of `filter`. */
-export function matchesDashboardFilter(agent: DashboardFilterFacts, filter: DashboardFilter): boolean {
+function matchesDashboardFilter(agent: DashboardFilterFacts, filter: DashboardFilter): boolean {
   if (filter.kinds.length) {
     const kind = kindOf(agent);
     if (!kind || !filter.kinds.includes(kind)) return false;
@@ -183,7 +183,7 @@ export function filterDashboardAgents<T>(agents: readonly T[], filter: Dashboard
   return agents.filter((agent) => matchesDashboardFilter(facts(agent), filter));
 }
 
-export interface DashboardFilterChip {
+interface DashboardFilterChip {
   facet: DashboardFilterFacet;
   /** What the filter line says for this facet: "Working", "Dispatchers or Schedule". */
   label: string;

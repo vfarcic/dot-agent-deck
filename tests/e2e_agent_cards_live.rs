@@ -19,6 +19,209 @@ use dot_agent_deck::event::AgentType;
 use serde_json::Value;
 use spec::spec;
 
+/// Issue #2399's additive batch verb, using the same contract as the desktop.
+/// Decode at runtime so this lane-2 test remains compile-ready in RED.
+fn live_batch(deck: &TuiDeck, mode: &str, entries: Vec<Value>, request_id: &str) -> Value {
+    let request: AttachRequest = serde_json::from_value(serde_json::json!({
+        "op": "invoke-card-action-batch", "mode": mode, "action_id": "batch-sentinel",
+        "request_id": request_id, "entries": entries,
+    }))
+    .expect("the batch request variant must exist");
+    let response =
+        common::attach_request_on(deck.attach_socket_path(), &request).expect("batch response");
+    assert!(response.ok, "batch {mode}: {response:?}");
+    serde_json::to_value(response).unwrap()["card_action_batch"].clone()
+}
+
+/// Scenario: Start an interactive Haiku and a stand-in card that does not offer the batch action, then have Haiku publish the action. Preview skips the other card without creating a file; executing the reviewed entry makes the visible Haiku create a unique sentinel and records that delivery on its card.
+#[spec("agent-report/live/003")]
+#[test]
+fn live_003_a_batch_action_makes_an_interactive_agent_write_its_sentinel() {
+    skip_unless!(common::check_claude_available());
+    const PANE: &str = "agent-card-batch-live";
+    const SKIPPED_PANE: &str = "agent-card-batch-skipped";
+    const FILE: &str = "AGENT_CARD_BATCH_LIVE_A71C39.sentinel";
+    let scratch = common::harness_tempdir().expect("batch live scratch");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let repo = repo.canonicalize().unwrap();
+    let bin = common::contained_deck_binary().display().to_string();
+    let prompt = format!(
+        "Use Bash to create an empty file named {FILE} in the current directory, then stop and wait without doing anything else."
+    );
+    let config = scratch.path().join("config.toml");
+    std::fs::write(&config, format!(
+        "[[catalog.actions]]\nname = \"batch-sentinel\"\ndescription = \"Create the batch sentinel when asked.\"\nlabel = \"Create sentinel\"\nprompt = {}\n",
+        toml::Value::String(prompt.clone())
+    )).unwrap();
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .with_imported_claude_credentials()
+        .with_claude_project_trust(repo.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let events = deck.subscribe_events();
+    let start = |pane: &str, command: &str, agent_type| {
+        let response = common::attach_request_on(
+            deck.attach_socket_path(),
+            &AttachRequest::StartAgent {
+                command: Some(command.into()),
+                cwd: Some(repo.to_string_lossy().into_owned()),
+                rows: 36,
+                cols: 156,
+                env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane.into())],
+                display_name: Some(pane.into()),
+                tab_membership: None,
+                agent_type,
+                seed: None,
+                authoring_kind: None,
+                client_seeded_kind: None,
+                remember_command: false,
+            },
+        )
+        .expect("start batch fixture agent");
+        assert!(response.ok, "StartAgent: {response:?}");
+        response.id.unwrap()
+    };
+    phase("starting batch Haiku");
+    let agent = start(
+        PANE,
+        "claude --ax-screen-reader --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write",
+        Some(AgentType::ClaudeCode),
+    );
+    events.wait_for_session_start_on_pane(PANE, &agent, START);
+    let skipped_agent = start(SKIPPED_PANE, "cat", None);
+    deck.wait_for_absence("No active agents");
+    deck.send_keys(b"1");
+    assert!(
+        common::wait_until_panes_settled(
+            deck.attach_socket_path(),
+            std::slice::from_ref(&agent),
+            Duration::from_millis(1500),
+            Duration::from_secs(8),
+            SETTLE
+        ),
+        "Haiku startup must settle:\n{}",
+        deck.snapshot_grid()
+    );
+    if deck
+        .snapshot_grid()
+        .lines()
+        .any(|line| line.starts_with(" COMMAND "))
+    {
+        deck.send_keys(b"\x04");
+    }
+    deck.wait_until_grid("interactive batch Haiku typing mode", |grid| {
+        grid.lines().any(|line| line.starts_with(" TYPING "))
+    });
+    deck.submit_claude_prompt(&events, &agent, &format!(
+        "BATCH_CARD_PUBLISH. Use Bash to run exactly this command, then stop and wait without creating any files: {bin} card publish --status waiting --summary 'Ready for a batch' --action batch-sentinel"
+    ), "BATCH_CARD_PUBLISH");
+    let key = format!("{PANE}/{agent}");
+    wait_card(&deck, &key, "offered its batch action", TURN, |entry| {
+        entry["actions"].as_array().is_some_and(|actions| {
+            actions
+                .iter()
+                .any(|action| action["id"] == "batch-sentinel")
+        })
+    });
+    let skipped_key = format!("{SKIPPED_PANE}/{skipped_agent}");
+    wait_card(
+        &deck,
+        &skipped_key,
+        "appeared without the batch action",
+        FOLLOW_UP,
+        |entry| {
+            entry["actions"].as_array().is_some_and(|actions| {
+                actions
+                    .iter()
+                    .all(|action| action["id"] != "batch-sentinel")
+            })
+        },
+    );
+    phase("previewing live batch");
+    let preview = live_batch(
+        &deck,
+        "preview",
+        vec![
+            serde_json::json!({"pane_id":PANE,"agent_id":agent}),
+            serde_json::json!({"pane_id":SKIPPED_PANE,"agent_id":skipped_agent}),
+        ],
+        "live-batch-preview-003",
+    );
+    let entries = preview["entries"].as_array().expect("preview entries");
+    assert_eq!(entries.len(), 2, "{preview:#}");
+    let included = entries
+        .iter()
+        .find(|entry| entry["agent_id"] == agent)
+        .unwrap();
+    assert_eq!(included["outcome"], "included", "{preview:#}");
+    assert_eq!(included["prompt"], prompt);
+    let skipped = entries
+        .iter()
+        .find(|entry| entry["agent_id"] == skipped_agent)
+        .unwrap();
+    assert_eq!(skipped["outcome"], "skipped", "{preview:#}");
+    assert_eq!(skipped["code"], "unknown_action");
+    assert!(!skipped["message"].as_str().unwrap_or_default().is_empty());
+    assert!(
+        !repo.join(FILE).exists(),
+        "preview must not make the agent act"
+    );
+    phase("executing live batch");
+    let result = live_batch(
+        &deck,
+        "execute",
+        vec![serde_json::json!({
+            "pane_id":included["pane_id"], "agent_id":included["agent_id"],
+            "action_token":included["action_token"], "instance_id":included["instance_id"],
+        })],
+        "live-batch-execute-003",
+    );
+    let outcomes = result["entries"].as_array().expect("execute entries");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["outcome"], "delivered", "{result:#}");
+    let message_id = outcomes[0]["message_id"]
+        .as_str()
+        .expect("batch message id");
+    assert!(
+        common::wait_for_path(&repo.join(FILE), TURN),
+        "Haiku never created {FILE}:\n{}",
+        deck.snapshot_grid()
+    );
+    wait_card(
+        &deck,
+        &key,
+        "recorded its batch delivery",
+        FOLLOW_UP,
+        |entry| {
+            entry["recent_deliveries"]
+                .as_array()
+                .is_some_and(|deliveries| {
+                    deliveries.iter().any(|delivery| {
+                        delivery["action_id"] == "batch-sentinel"
+                            && delivery["message_id"] == message_id
+                            && delivery["state"] == "delivered"
+                    })
+                })
+        },
+    );
+    assert!(
+        deck.wait_for_grid_string_within(FILE, SHOWN),
+        "the attached pane must show Haiku acting on the batch:\n{}",
+        deck.snapshot_grid()
+    );
+    let skipped = card(&deck, &skipped_key).expect("the skipped card remains");
+    assert!(
+        skipped["recent_deliveries"]
+            .as_array()
+            .is_none_or(|deliveries| deliveries.is_empty()),
+        "skipped card has no delivery: {skipped:#}"
+    );
+}
+
 const SENTINEL: &str = "AGENT_CARD_LIVE_3E91D7_SENTINEL.sentinel";
 /// What the agent's own suggested action creates: its text is the agent's,
 /// so it reaches the agent framed as untrusted (audit S1).

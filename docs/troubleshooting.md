@@ -797,8 +797,9 @@ The pull request badge, on a TUI card and on the desktop app's rows and panes, c
 2. **The repository is on GitHub:** `git remote get-url origin` is a github.com address. A repository whose `origin` is elsewhere, or that has no `origin`, gets no badge.
 3. **The agent is on the pull request's branch:** `git branch --show-current` names the branch the pull request was opened from. The repository's default branch (usually `main`), and a checkout of a commit rather than a branch, get no badge.
 4. **GitHub has a pull request for that branch:** `gh pr list --head "$(git branch --show-current)" --state all` lists it. A pull request opened from a fork's branch of the same name is someone else's and gets no badge.
+5. **A merged or closed pull request holds the branch's latest commit:** `git rev-parse HEAD` is one of the commits `gh pr view <number> --json commits` lists. One that does not belongs to an earlier branch with the same name, or the branch has commits added after it merged, and it gets no badge.
 
-When all four hold, the badge appears without restarting anything: the deck looks again when the agent finishes its next turn, and otherwise within about a minute. If a lookup fails, the daemon's log says `pull request lookup failed` with the reason (see [Enabling Debug Logs](#enabling-debug-logs) for where the log is), and the deck tries again a few minutes later.
+When all of these hold, the badge appears without restarting anything: the deck looks again when the agent finishes its next turn, and otherwise within about a minute. If a lookup fails, the daemon's log says `pull request lookup failed` with the reason (see [Enabling Debug Logs](#enabling-debug-logs) for where the log is), and the deck tries again a few minutes later.
 
 ### Card borders or right edges look misaligned in the TUI
 

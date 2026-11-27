@@ -399,8 +399,143 @@ pub fn tool_schema(table: &CommandTable, screen: Screen) -> Value {
     })
 }
 
+/// PR #2491 (2026-11-25) — the rows whose meaning the agent dashboard's state
+/// changes, and what each is told about it while the dashboard is declared.
+const NEEDS_YOU_ROW: &str = "filter_needs_you_cards";
+const OVERVIEW_MODE_ROW: &str = "set_overview_mode";
+const CLEAR_DASHBOARD_FILTER_ROW: &str = "clear_dashboard_filter";
+
+/// PR #2491 (2026-11-25) — with the agent dashboard declared, each row whose
+/// meaning its state changes ends with a sentence saying what that state is
+/// right now and what the words it shares with another row therefore mean.
+///
+/// **Why on the rows and not only beside them.** With the state only as
+/// `dashboard` beside the table ([`super::prompt::commands_state`]), the
+/// model still read "show all cards" said with Needs you only on as
+/// `set_overview_mode` in 5 of 5 runs on the Table view, and "show every
+/// agent" as `clear_dashboard_filter` in 5 of 5 (2026-11-25, the shipping
+/// model): it reads a row's own description more than a field after the
+/// table. The sentences are the app's own words about its own state, so they
+/// travel in the trusted table like the `callable` flags.
+pub fn annotate_dashboard(
+    commands: &mut [AnnotatedCommand],
+    dashboard: Option<&super::VoiceDashboard>,
+) {
+    let Some(dashboard) = dashboard else { return };
+    for command in commands.iter_mut() {
+        let note = match (
+            command.id.as_str(),
+            dashboard.needs_you_only,
+            dashboard.view,
+        ) {
+            (NEEDS_YOU_ROW, true, _) => Some(
+                "RIGHT NOW Needs you only is ON: the dashboard lists only the agents that need the \
+                 user. So \"show all cards\", \"show all\", \"show every card\" and \"show every \
+                 agent\" are THIS row with `needs_you` = \"off\", whichever view shows.",
+            ),
+            (OVERVIEW_MODE_ROW, true, _) => Some(
+                "RIGHT NOW Needs you only is ON. So \"show all cards\", \"show every card\" and \
+                 \"show all\" are NOT this row: they are `filter_needs_you_cards` with `needs_you` = \
+                 \"off\". Only words that name a view without asking for all of them (\"show the \
+                 cards\", \"switch to cards\", \"show the table\") are this row.",
+            ),
+            (OVERVIEW_MODE_ROW, false, super::DashboardView::Table) => Some(
+                "RIGHT NOW the Table view shows and Needs you only is off. So \"show all cards\" is \
+                 THIS row with `view` = \"cards\".",
+            ),
+            (CLEAR_DASHBOARD_FILTER_ROW, true, _) => Some(
+                "RIGHT NOW Needs you only is ON. So \"show every agent\", \"show all\" and \"show \
+                 all cards\" are NOT this row: they are `filter_needs_you_cards` with `needs_you` = \
+                 \"off\".",
+            ),
+            _ => None,
+        };
+        if let Some(note) = note {
+            command.description = format!("{}\n\n{note}", command.description);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Scenario: with the agent dashboard declared with Needs you only on, the
+    /// Needs you only row says "show all cards", "show all" and "show every
+    /// agent" are it with "off", and the view row and the clear-filter row
+    /// say those words are not theirs; with it off on the Table view, the
+    /// view row says "show all cards" is it; with nothing declared, no row
+    /// changes (PR #2491, 2026-11-25: `desktop/agent-cards/120`).
+    #[test]
+    fn schema_annotate_dashboard_tells_the_three_rows_what_the_state_means() {
+        use crate::voice::{DashboardView, VoiceDashboard};
+        let table = crate::voice::table::table();
+        let plain = annotate(table, Screen::Overview);
+        let description = |commands: &[AnnotatedCommand], id: &str| {
+            commands
+                .iter()
+                .find(|command| command.id == id)
+                .expect(id)
+                .description
+                .clone()
+        };
+        let mut undeclared = plain.clone();
+        annotate_dashboard(&mut undeclared, None);
+        assert_eq!(undeclared, plain);
+
+        let mut on = plain.clone();
+        annotate_dashboard(
+            &mut on,
+            Some(&VoiceDashboard {
+                view: DashboardView::Table,
+                needs_you_only: true,
+            }),
+        );
+        let needs_you = description(&on, "filter_needs_you_cards");
+        assert!(
+            needs_you.ends_with("are THIS row with `needs_you` = \"off\", whichever view shows."),
+            "{needs_you}"
+        );
+        assert!(needs_you.contains("\"show every agent\""), "{needs_you}");
+        assert!(
+            description(&on, "set_overview_mode")
+                .contains("RIGHT NOW Needs you only is ON. So \"show all cards\"")
+        );
+        assert!(description(&on, "clear_dashboard_filter").contains(
+            "\"show every agent\", \"show all\" and \"show all cards\" are NOT this row"
+        ));
+        let changed = on
+            .iter()
+            .zip(&plain)
+            .filter(|(after, before)| after.description != before.description)
+            .count();
+        assert_eq!(changed, 3, "only the three rows change");
+
+        let mut off = plain.clone();
+        annotate_dashboard(
+            &mut off,
+            Some(&VoiceDashboard {
+                view: DashboardView::Table,
+                needs_you_only: false,
+            }),
+        );
+        assert!(
+            description(&off, "set_overview_mode")
+                .ends_with("So \"show all cards\" is THIS row with `view` = \"cards\".")
+        );
+        assert_eq!(
+            description(&off, "filter_needs_you_cards"),
+            description(&plain, "filter_needs_you_cards")
+        );
+        let mut cards_off = plain.clone();
+        annotate_dashboard(
+            &mut cards_off,
+            Some(&VoiceDashboard {
+                view: DashboardView::Cards,
+                needs_you_only: false,
+            }),
+        );
+        assert_eq!(cards_off, plain);
+    }
+
     use super::*;
     use crate::voice::table::{CommandTable, table};
 
@@ -484,13 +619,30 @@ mod tests {
                 "previous_agent_card".to_string(),
                 "next_needs_you_card".to_string(),
                 "filter_needs_you_cards".to_string(),
-                "close_agent_card".to_string(),
+                "show_card_tab".to_string(),
+                "show_terminal_tab".to_string(),
                 "open_card_tree".to_string(),
                 "close_card_tree".to_string(),
                 "open_card_pull_request".to_string(),
                 "open_card_issue".to_string(),
                 "run_card_action".to_string(),
-                "reply_to_agent_card".to_string(),
+                "run_card_action_batch".to_string(),
+                "select_agent_card".to_string(),
+                "unselect_agent_card".to_string(),
+                "clear_card_selection".to_string(),
+                "run_card_action_on_selection".to_string(),
+                "open_card_actions_editor".to_string(),
+                "add_card_action".to_string(),
+                "edit_card_action".to_string(),
+                "remove_card_action".to_string(),
+                "refresh_card_actions".to_string(),
+                "choose_card_action_icon".to_string(),
+                "ask_before_sending_card_action".to_string(),
+                "send_card_action_without_asking".to_string(),
+                "offer_card_action_on_every_card".to_string(),
+                "offer_card_action_when_agents_choose".to_string(),
+                "show_card_action_on_the_card".to_string(),
+                "show_card_action_only_in_the_card_tab".to_string(),
                 "none".to_string(),
             ]
         );
@@ -612,13 +764,30 @@ mod tests {
                 "previous_agent_card",
                 "next_needs_you_card",
                 "filter_needs_you_cards",
-                "close_agent_card",
+                "show_card_tab",
+                "show_terminal_tab",
                 "open_card_tree",
                 "close_card_tree",
                 "open_card_pull_request",
                 "open_card_issue",
                 "run_card_action",
-                "reply_to_agent_card",
+                "run_card_action_batch",
+                "select_agent_card",
+                "unselect_agent_card",
+                "clear_card_selection",
+                "run_card_action_on_selection",
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_card_tab",
                 "none"
             ]
         );
@@ -864,13 +1033,30 @@ mod tests {
                 ("previous_agent_card".to_string(), false),
                 ("next_needs_you_card".to_string(), false),
                 ("filter_needs_you_cards".to_string(), false),
-                ("close_agent_card".to_string(), false),
+                ("show_card_tab".to_string(), false),
+                ("show_terminal_tab".to_string(), false),
                 ("open_card_tree".to_string(), false),
                 ("close_card_tree".to_string(), false),
                 ("open_card_pull_request".to_string(), false),
                 ("open_card_issue".to_string(), false),
                 ("run_card_action".to_string(), false),
-                ("reply_to_agent_card".to_string(), false),
+                ("run_card_action_batch".to_string(), false),
+                ("select_agent_card".to_string(), false),
+                ("unselect_agent_card".to_string(), false),
+                ("clear_card_selection".to_string(), false),
+                ("run_card_action_on_selection".to_string(), false),
+                ("open_card_actions_editor".to_string(), false),
+                ("add_card_action".to_string(), false),
+                ("edit_card_action".to_string(), false),
+                ("remove_card_action".to_string(), false),
+                ("refresh_card_actions".to_string(), false),
+                ("choose_card_action_icon".to_string(), false),
+                ("ask_before_sending_card_action".to_string(), false),
+                ("send_card_action_without_asking".to_string(), false),
+                ("offer_card_action_on_every_card".to_string(), false),
+                ("offer_card_action_when_agents_choose".to_string(), false),
+                ("show_card_action_on_the_card".to_string(), false),
+                ("show_card_action_only_in_the_card_tab".to_string(), false),
             ]
         );
         assert_eq!(
@@ -960,17 +1146,34 @@ mod tests {
                 // PRD #2374: the agent cards, on the dashboard only.
                 ("set_overview_mode".to_string(), true),
                 ("show_agent_card".to_string(), true),
-                ("next_agent_card".to_string(), true),
-                ("previous_agent_card".to_string(), true),
+                ("next_agent_card".to_string(), false),
+                ("previous_agent_card".to_string(), false),
                 ("next_needs_you_card".to_string(), true),
                 ("filter_needs_you_cards".to_string(), true),
-                ("close_agent_card".to_string(), true),
+                ("show_card_tab".to_string(), false),
+                ("show_terminal_tab".to_string(), false),
                 ("open_card_tree".to_string(), true),
                 ("close_card_tree".to_string(), true),
                 ("open_card_pull_request".to_string(), true),
                 ("open_card_issue".to_string(), true),
                 ("run_card_action".to_string(), true),
-                ("reply_to_agent_card".to_string(), true),
+                ("run_card_action_batch".to_string(), true),
+                ("select_agent_card".to_string(), true),
+                ("unselect_agent_card".to_string(), true),
+                ("clear_card_selection".to_string(), true),
+                ("run_card_action_on_selection".to_string(), true),
+                ("open_card_actions_editor".to_string(), true),
+                ("add_card_action".to_string(), true),
+                ("edit_card_action".to_string(), true),
+                ("remove_card_action".to_string(), true),
+                ("refresh_card_actions".to_string(), true),
+                ("choose_card_action_icon".to_string(), true),
+                ("ask_before_sending_card_action".to_string(), true),
+                ("send_card_action_without_asking".to_string(), true),
+                ("offer_card_action_on_every_card".to_string(), true),
+                ("offer_card_action_when_agents_choose".to_string(), true),
+                ("show_card_action_on_the_card".to_string(), true),
+                ("show_card_action_only_in_the_card_tab".to_string(), true),
             ]
         );
         assert_eq!(
@@ -1052,18 +1255,35 @@ mod tests {
                 ("retry_inbox_message".to_string(), false),
                 ("cancel_inbox_message".to_string(), false),
                 ("set_overview_mode".to_string(), false),
-                ("show_agent_card".to_string(), false),
-                ("next_agent_card".to_string(), false),
-                ("previous_agent_card".to_string(), false),
-                ("next_needs_you_card".to_string(), false),
+                ("show_agent_card".to_string(), true),
+                ("next_agent_card".to_string(), true),
+                ("previous_agent_card".to_string(), true),
+                ("next_needs_you_card".to_string(), true),
                 ("filter_needs_you_cards".to_string(), false),
-                ("close_agent_card".to_string(), false),
+                ("show_card_tab".to_string(), true),
+                ("show_terminal_tab".to_string(), true),
                 ("open_card_tree".to_string(), false),
                 ("close_card_tree".to_string(), false),
                 ("open_card_pull_request".to_string(), false),
                 ("open_card_issue".to_string(), false),
-                ("run_card_action".to_string(), false),
-                ("reply_to_agent_card".to_string(), false),
+                ("run_card_action".to_string(), true),
+                ("run_card_action_batch".to_string(), false),
+                ("select_agent_card".to_string(), false),
+                ("unselect_agent_card".to_string(), false),
+                ("clear_card_selection".to_string(), false),
+                ("run_card_action_on_selection".to_string(), false),
+                ("open_card_actions_editor".to_string(), true),
+                ("add_card_action".to_string(), true),
+                ("edit_card_action".to_string(), true),
+                ("remove_card_action".to_string(), true),
+                ("refresh_card_actions".to_string(), true),
+                ("choose_card_action_icon".to_string(), true),
+                ("ask_before_sending_card_action".to_string(), true),
+                ("send_card_action_without_asking".to_string(), true),
+                ("offer_card_action_on_every_card".to_string(), true),
+                ("offer_card_action_when_agents_choose".to_string(), true),
+                ("show_card_action_on_the_card".to_string(), true),
+                ("show_card_action_only_in_the_card_tab".to_string(), true),
             ]
         );
     }

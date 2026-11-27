@@ -5,6 +5,540 @@
 # representative phrase is repeated on a screen where that action is not
 # callable so a typo in `commands.toml`'s `screens` column is observable.
 
+# Issue #2399: opening an agent, selecting its card and acting on a selection
+# are separate requests. Use the generated run's single coder so these cases
+# measure command selection rather than the default fleet's two-coder tie.
+[[fixtures]]
+name = "card-selection-bare-select-opens-agent"
+utterance = "select the coder"
+screen = "overview"
+generated_run = true
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-selection-select-coders-card"
+utterance = "select the coder's card"
+screen = "overview"
+generated_run = true
+action = "select_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-selection-unselect-testers-card"
+utterance = "unselect the tester's card"
+screen = "overview"
+action = "unselect_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+# PR #2491 review: every card's checkbox is always shown, so the selection is
+# cleared rather than switched off.
+[[fixtures]]
+name = "card-selection-clear-the-selection"
+utterance = "clear the selection"
+screen = "overview"
+action = "clear_card_selection"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-selection-deselect-all-cards"
+utterance = "deselect all the cards"
+screen = "overview"
+action = "clear_card_selection"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-selection-clear-unavailable-on-agent"
+utterance = "clear the selection"
+screen = "agent"
+action = "clear_card_selection"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "card-selection-go-ahead-on-selected-agents"
+utterance = "go ahead on the selected agents"
+screen = "overview"
+action = "run_card_action_on_selection"
+outcome = "dispatch"
+resolved_card_action = "go ahead"
+
+[[fixtures]]
+name = "card-selection-close-selected-ones"
+utterance = "close the selected ones"
+screen = "overview"
+action = "run_card_action_on_selection"
+outcome = "dispatch"
+resolved_card_action = "close"
+
+[[fixtures]]
+name = "card-selection-single-tree-batch-control"
+utterance = "go ahead on everything under the coder"
+screen = "overview"
+generated_run = true
+action = "run_card_action_batch"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+resolved_card_action = "go ahead"
+
+# PR #2491 decision 2026-11-25: the card overlay is gone. A card opens its
+# agent's pane; the pane's header moves between agents. Decision 2026-11-26:
+# the Card panel became the pane's Card tab, beside its Terminal tab, and
+# voice switches between the two.
+[[fixtures]]
+name = "card-panel-show-coders-card-from-dashboard"
+utterance = "show the coder's card"
+screen = "overview"
+generated_run = true
+action = "show_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-panel-show-coders-card-from-a-pane"
+utterance = "show the coder's card"
+screen = "agent"
+generated_run = true
+action = "show_agent_card"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+
+[[fixtures]]
+name = "card-tab-show-the-card"
+utterance = "show the card"
+screen = "agent"
+action = "show_card_tab"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-tab-close-the-card"
+utterance = "close the card"
+screen = "agent"
+action = "show_terminal_tab"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-tab-show-the-terminal"
+utterance = "show the terminal"
+screen = "agent"
+action = "show_terminal_tab"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-tab-back-to-the-terminal"
+utterance = "back to the terminal"
+screen = "agent"
+action = "show_terminal_tab"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-tab-close-the-card-unavailable-on-dashboard"
+utterance = "hide the card"
+screen = "overview"
+action = "show_terminal_tab"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "card-panel-next-agent"
+utterance = "next agent"
+screen = "agent"
+action = "next_agent_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-previous-agent"
+utterance = "previous agent"
+screen = "agent"
+action = "previous_agent_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-next-needing-me-from-a-pane"
+utterance = "next one that needs me"
+screen = "agent"
+action = "next_needs_you_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-next-needing-me-from-dashboard"
+utterance = "next one that needs me"
+screen = "overview"
+action = "next_needs_you_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-panel-press-go-ahead-on-coders-card"
+utterance = "press go ahead on the coder's card"
+screen = "overview"
+generated_run = true
+action = "run_card_action"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+resolved_card_action = "go ahead"
+
+[[fixtures]]
+name = "card-panel-answer-main-to-the-coder"
+utterance = "answer main to the coder"
+screen = "overview"
+generated_run = true
+action = "run_card_action"
+outcome = "dispatch"
+resolved_agent = "agent-gen-coder"
+resolved_card_action = "main"
+
+# PRD #2374 decision 2026-11-24 (issue #2399 on PR #2491): the card actions
+# editor opens by voice from the agent dashboard, and so does its form for a
+# new action (CLAUDE.md rule 23). TDD (RED): these name commands that do not
+# exist yet, so `voice_desktop_phrases_010` fails until they do.
+[[fixtures]]
+name = "card-actions-editor-open"
+utterance = "open the card actions editor"
+screen = "overview"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-add"
+utterance = "add a new card action"
+screen = "overview"
+action = "add_card_action"
+outcome = "dispatch"
+
+# Issue #2399 review (finding 9): editing and removing name the action by its
+# label, which resolves from the editor's catalog — Ship it and Deploy it are
+# actions no card offers in the planted world.
+[[fixtures]]
+name = "card-actions-editor-edit-by-label"
+utterance = "edit the ship it card action"
+screen = "overview"
+action = "edit_card_action"
+outcome = "dispatch"
+resolved_card_action = "ship it"
+
+[[fixtures]]
+name = "card-actions-editor-remove-by-label"
+utterance = "remove the deploy it card action"
+screen = "overview"
+action = "remove_card_action"
+outcome = "dispatch"
+resolved_card_action = "deploy it"
+
+# PR #2491 decision 2026-11-25: the editor belongs to one daemon, opened from
+# that daemon's ⋯ menu, so naming the daemon is `open_card_actions_editor`'s
+# optional `deck` (the retired Daemon picker's `choose_card_actions_daemon`
+# row is gone). A bare "open card actions" dispatches with no deck: the app
+# opens the only daemon showing cards, or asks which.
+[[fixtures]]
+name = "card-actions-editor-open-bare"
+utterance = "open card actions"
+screen = "overview"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-open-on-named-daemon"
+utterance = "open card actions on the build box"
+screen = "overview"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "card-actions-editor-daemon-by-name"
+utterance = "show the build box daemon's card actions"
+screen = "overview"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+# PR #2491 decision 2026-11-25: Needs you only moved to the dashboard's ⋯ menu
+# and applies to the Table view too; its spoken forms keep working.
+[[fixtures]]
+name = "needs-you-only-on"
+utterance = "only the ones that need me"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = false
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "on"
+
+# PR #2491, 2026-11-25: "show all cards" means two things, told apart by the
+# dashboard's state the voice panel declares with the utterance. While Needs
+# you only is on, it and "show all" / "show every agent" turn the filter off,
+# in either view; while it is off on the Table view, "show all cards" switches
+# to the Cards view.
+[[fixtures]]
+name = "needs-you-only-off-show-all-cards"
+utterance = "show all cards"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-show-all-cards-on-cards"
+utterance = "show all cards"
+screen = "overview"
+dashboard_view = "cards"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-show-all"
+utterance = "show all"
+screen = "overview"
+dashboard_view = "cards"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-show-every-agent"
+utterance = "show every agent"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+# PR #2491 review T2: the user docs give "turn off needs you only" as a way
+# back to every agent while Needs you only is on, in either view.
+[[fixtures]]
+name = "needs-you-only-off-turn-off-needs-you-only"
+utterance = "turn off needs you only"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+[[fixtures]]
+name = "needs-you-only-off-turn-off-needs-you-only-on-cards"
+utterance = "turn off needs you only"
+screen = "overview"
+dashboard_view = "cards"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+# The user docs say "show everything" turns Needs you only off while it is on.
+[[fixtures]]
+name = "needs-you-only-off-show-everything"
+utterance = "show everything"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "filter_needs_you_cards"
+outcome = "dispatch"
+resolved_needs_you = "off"
+
+# The words the rows above do not take keep their own rows while Needs you only
+# is on: "clear the filter" still clears the dashboard's filter, and a view
+# named without "all" still switches views. ("Show everything" said while Needs
+# you only is on turns Needs you only off: 5 of 5 runs, 2026-11-25.)
+[[fixtures]]
+name = "needs-you-only-on-clear-the-filter"
+utterance = "clear the filter"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "needs-you-only-on-switch-to-cards"
+utterance = "switch to cards"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = true
+action = "set_overview_mode"
+outcome = "dispatch"
+resolved_view = "cards"
+
+[[fixtures]]
+name = "show-all-cards-filter-off-switches-to-cards"
+utterance = "show all cards"
+screen = "overview"
+dashboard_view = "table"
+needs_you_only = false
+action = "set_overview_mode"
+outcome = "dispatch"
+resolved_view = "cards"
+
+# Issue #2399 review 12: the editor's choices that write nothing — reading the
+# list again, the form's icon (by the icon's name, held to the transcript like
+# the directory filter) and its two checkboxes, one row per state, so each state
+# is its own fixture and a spoken "send without asking" can never land on the
+# tick.
+
+[[fixtures]]
+name = "card-actions-editor-refresh"
+utterance = "refresh the card actions"
+screen = "overview"
+action = "refresh_card_actions"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-icon-by-name"
+utterance = "set the icon to rocket"
+screen = "overview"
+action = "choose_card_action_icon"
+outcome = "dispatch"
+resolved_filter = "rocket"
+
+[[fixtures]]
+name = "card-actions-editor-ask-before-sending"
+utterance = "ask me before sending it"
+screen = "overview"
+action = "ask_before_sending_card_action"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-send-without-asking"
+utterance = "send it without asking"
+screen = "overview"
+action = "send_card_action_without_asking"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-on-every-card"
+utterance = "offer it on every card"
+screen = "overview"
+action = "offer_card_action_on_every_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-when-agents-suggest"
+utterance = "only offer it when agents suggest it"
+screen = "overview"
+action = "offer_card_action_when_agents_choose"
+outcome = "dispatch"
+
+# Issue #2399 re-review N4: the form's Placement choice, one row per choice.
+[[fixtures]]
+name = "card-actions-editor-placement-on-the-card"
+utterance = "put it on the card as an icon"
+screen = "overview"
+action = "show_card_action_on_the_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-placement-only-in-the-card-tab"
+utterance = "only show it in the card tab"
+screen = "overview"
+action = "show_card_action_only_in_the_card_tab"
+outcome = "dispatch"
+
+# PR #2491 review T1 (2026-11-25): the Card panel's (now Card tab's) Edit opens the editor over
+# an agent's pane, so its rows run on the agent screen too, where typing to
+# the agent (`dictate_to_agent`) competes for the same words. The same
+# phrases as on the dashboard, over a pane with typing mode off.
+[[fixtures]]
+name = "card-actions-editor-open-bare-over-pane"
+utterance = "open card actions"
+screen = "agent"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-open-on-named-daemon-over-pane"
+utterance = "open card actions on the build box"
+screen = "agent"
+action = "open_card_actions_editor"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "card-actions-editor-add-over-pane"
+utterance = "add a new card action"
+screen = "agent"
+action = "add_card_action"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-edit-by-label-over-pane"
+utterance = "edit the ship it card action"
+screen = "agent"
+action = "edit_card_action"
+outcome = "dispatch"
+resolved_card_action = "ship it"
+
+[[fixtures]]
+name = "card-actions-editor-remove-by-label-over-pane"
+utterance = "remove the deploy it card action"
+screen = "agent"
+action = "remove_card_action"
+outcome = "dispatch"
+resolved_card_action = "deploy it"
+
+[[fixtures]]
+name = "card-actions-editor-refresh-over-pane"
+utterance = "refresh the card actions"
+screen = "agent"
+action = "refresh_card_actions"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-icon-by-name-over-pane"
+utterance = "set the icon to rocket"
+screen = "agent"
+action = "choose_card_action_icon"
+outcome = "dispatch"
+resolved_filter = "rocket"
+
+[[fixtures]]
+name = "card-actions-editor-ask-before-sending-over-pane"
+utterance = "ask me before sending it"
+screen = "agent"
+action = "ask_before_sending_card_action"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-send-without-asking-over-pane"
+utterance = "send it without asking"
+screen = "agent"
+action = "send_card_action_without_asking"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-on-every-card-over-pane"
+utterance = "offer it on every card"
+screen = "agent"
+action = "offer_card_action_on_every_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-offer-when-agents-suggest-over-pane"
+utterance = "only offer it when agents suggest it"
+screen = "agent"
+action = "offer_card_action_when_agents_choose"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-placement-on-the-card-over-pane"
+utterance = "put it on the card as an icon"
+screen = "agent"
+action = "show_card_action_on_the_card"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "card-actions-editor-placement-only-in-the-card-tab-over-pane"
+utterance = "only show it in the card tab"
+screen = "agent"
+action = "show_card_action_only_in_the_card_tab"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "open-agent-zoom"
 utterance = "zoom the tester"

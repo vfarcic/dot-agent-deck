@@ -84,6 +84,28 @@ const MAX_RUNNING_PER_CARD: usize = 16;
 /// of [`MAX_REMEMBERED_BYTES`] for the same reason (audit S2): three replies
 /// of the longest text a reply may carry, with room to spare.
 const MAX_RUNNING_BYTES_PER_CARD: usize = 64 * 1024;
+/// Issue #2399, PR #2491 review: the most executed batches remembered at
+/// once, running and answered together. The batch RECORDS have a memory of
+/// their own ([`RememberedBatch`]), so a record never takes a slot or a byte
+/// of the single presses' remembered answers. A batch's entries are still
+/// each pressed through the single press's claim while they run
+/// ([`run_once`]), so a running entry is admitted, counted and may push out
+/// an older single answer exactly as a single press would.
+const MAX_REMEMBERED_BATCHES: usize = 256;
+/// The accounted bytes the remembered batches may hold together, besides
+/// their count: the strings of an answered batch's outcomes, and a running
+/// one's reservation. It bounds what [`StoreInner::make_batch_room`] counts,
+/// not the heap the batches take (allocation overhead, the map, channels
+/// and copies a caller holds are not counted).
+const MAX_REMEMBERED_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// The room a running batch keeps for each of its entries' outcomes, besides
+/// the entry's pane and agent ids. Large enough that each entry's
+/// [`minimal_outcome`] fits in it, so a finished batch can always be
+/// remembered in the room its claim reserved ([`CardStore::finish_batch`]).
+const BATCH_ENTRY_RESERVE_BYTES: usize = 1024;
+/// The most characters of an entry's message a batch keeps when its whole
+/// answer is too large to remember ([`compact_outcome`]).
+const COMPACT_MESSAGE_CHARS: usize = 160;
 /// The longest `request_id` a client may name: `[A-Za-z0-9._:-]`, 1 to 128
 /// bytes. A longer or odd one is refused before anything is remembered.
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -143,6 +165,18 @@ pub const CODE_REQUEST_REUSED: &str = "request_reused";
 pub const CODE_BUSY: &str = "busy";
 /// The `disabled_reason` of a prompt action whose agent is not running.
 pub const REASON_AGENT_STOPPED: &str = "agent_stopped";
+/// Issue #2399: a batch skips a card whose agent is not running with this
+/// code (the same word as [`REASON_AGENT_STOPPED`]).
+pub const CODE_AGENT_STOPPED: &str = REASON_AGENT_STOPPED;
+/// Issue #2399: the most distinct cards one batch request may name.
+pub const MAX_BATCH_ENTRIES: usize = 256;
+/// Issue #2399 audit S2: the most entries one batch request may carry,
+/// repeats included. A repeated card is acted on once, so repeats buy a
+/// sender nothing; this budget keeps them from making a request that names
+/// few cards arbitrarily long to scan and hold while it runs. Twice the
+/// distinct cap leaves room for a client that joins overlapping subtrees
+/// without removing the overlap.
+pub const MAX_BATCH_RAW_ENTRIES: usize = 2 * MAX_BATCH_ENTRIES;
 
 /// Metadata keys of the [`crate::event::EventType::AgentCard`] doorbell.
 pub const AGENT_CARD_KEY_METADATA_KEY: &str = "agent_card_key";
@@ -1036,6 +1070,130 @@ impl CardActionResult {
 
     pub fn is_refused(&self) -> bool {
         self.outcome == "refused"
+    }
+}
+
+/// Issue #2399: what an `invoke-card-action-batch` asks the daemon to do with
+/// its entries. `preview` sends nothing and answers, per entry, whether it is
+/// included (with the exact text it would get) or skipped and why; `execute`
+/// sends to the entries the user confirmed from that preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CardBatchMode {
+    Preview,
+    Execute,
+}
+
+/// Issue #2399: one card a batch names — its pane and the agent generation
+/// the client showed, as a single [`CardActionRequest`] names one. An
+/// `execute` entry also carries the `action_token` and `instance_id` its
+/// preview answered, which the daemon checks exactly as a single press's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardBatchEntry {
+    pub pane_id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action_token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance_id: String,
+}
+
+/// Issue #2399: `invoke-card-action-batch`'s answer, one outcome per distinct
+/// entry the request named, in the request's order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardBatchResult {
+    pub request_id: String,
+    pub entries: Vec<CardBatchOutcome>,
+}
+
+/// A batch preview included this entry.
+pub const BATCH_INCLUDED: &str = "included";
+/// A batch preview skipped this entry; `code` and `message` say why.
+pub const BATCH_SKIPPED: &str = "skipped";
+/// A batch execution put this entry's text in its agent's inbox
+/// (`message_id` names it). The agent's receipt is not confirmed yet: `state`
+/// says `queued`, as the same single press records it on the card.
+pub const BATCH_DELIVERED: &str = "delivered";
+/// A batch execution closed this entry's agent.
+pub const BATCH_CLOSED: &str = "closed";
+/// A batch execution did nothing for this entry; `code` and `message` say why.
+pub const BATCH_FAILED: &str = "failed";
+/// A batch execution started, but the deck cannot say what became of this
+/// entry: `code` is [`CODE_BATCH_INTERRUPTED`] or
+/// [`CODE_BATCH_ANSWER_NOT_KEPT`], and `message` says to check the card's
+/// delivery history before sending again. The desktop's bridge gives entries
+/// the same outcome when it reads no answer.
+pub const BATCH_UNKNOWN: &str = "unknown";
+/// Beside [`BATCH_UNKNOWN`]: the deck's run of the batch was cut short before
+/// it answered for this entry, which may or may not have been sent.
+pub const CODE_BATCH_INTERRUPTED: &str = "interrupted";
+/// Beside [`BATCH_UNKNOWN`]: the batch ran, and a repeat of it is answered
+/// from memory, but the deck did not keep this entry's outcome.
+pub const CODE_BATCH_ANSWER_NOT_KEPT: &str = "answer_not_kept";
+
+/// Issue #2399: what happened, or would happen, to one entry of a batch.
+/// `outcome` is [`BATCH_INCLUDED`] or [`BATCH_SKIPPED`] for a preview, and
+/// [`BATCH_DELIVERED`], [`BATCH_CLOSED`], [`BATCH_FAILED`] or
+/// [`BATCH_UNKNOWN`] for an execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardBatchOutcome {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub outcome: String,
+    /// The card's name, as its entry gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// An included entry's action label and kind (`prompt`, `close`,
+    /// `close_keep_worktree`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The exact text an included prompt action sends this entry, and who
+    /// wrote it (as [`CardAction::prompt_source`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_source: Option<String>,
+    /// What an included entry's execution must send back: the definition's
+    /// token and the daemon process that previewed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// A [`BATCH_DELIVERED`] entry's delivery state when the batch answered,
+    /// as its own card's `recent_deliveries` records it for the same press:
+    /// `queued`, since the text is in the agent's inbox and the agent has
+    /// not yet confirmed it (PR #2491 review). The card's delivery history
+    /// says what became of it afterwards; `delivered` names the outcome a
+    /// press reached, not the agent's receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl CardBatchOutcome {
+    fn of(target: &CardBatchEntry, outcome: &str) -> Self {
+        CardBatchOutcome {
+            pane_id: target.pane_id.clone(),
+            agent_id: target.agent_id.clone(),
+            outcome: outcome.to_string(),
+            ..CardBatchOutcome::default()
+        }
+    }
+
+    fn with_reason(mut self, code: &str, message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        self.code = Some(code.to_string());
+        self.message = Some(message.chars().take(MAX_RESULT_MESSAGE_CHARS).collect());
+        self
     }
 }
 
@@ -2119,6 +2277,92 @@ enum Claim {
     Answered(CardActionResult),
 }
 
+/// Issue #2399, PR #2491 review: what an executed batch's `request_id` is
+/// remembered as, in the batches' own memory: still running, so a repeat
+/// waits for its answer, or answered, so a repeat gets that answer — the
+/// outcomes themselves — and no entry is invoked again. Both carry the
+/// batch's fingerprint ([`batch_fingerprint`]), so a repeat naming another
+/// action or another set of cards is refused whole. Only a batch whose
+/// execution started is remembered, so what is remembered is always a
+/// per-entry answer, never a refusal of the whole request.
+enum RememberedBatch {
+    InFlight {
+        fingerprint: [u8; 32],
+        at: Instant,
+        answer: tokio::sync::watch::Receiver<Option<CardBatchResult>>,
+        reserved: usize,
+    },
+    Done {
+        fingerprint: [u8; 32],
+        at: Instant,
+        answer: CardBatchResult,
+    },
+}
+
+impl RememberedBatch {
+    fn at(&self) -> Instant {
+        match self {
+            RememberedBatch::InFlight { at, .. } | RememberedBatch::Done { at, .. } => *at,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            RememberedBatch::InFlight { reserved, .. } => *reserved,
+            RememberedBatch::Done { answer, .. } => batch_answer_bytes(answer),
+        }
+    }
+}
+
+/// The strings a batch's answer holds: what the batches' memory counts
+/// against [`MAX_REMEMBERED_BATCH_BYTES`].
+fn batch_answer_bytes(result: &CardBatchResult) -> usize {
+    let text = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    result.request_id.len()
+        + result
+            .entries
+            .iter()
+            .map(|e| {
+                e.pane_id.len()
+                    + e.agent_id.len()
+                    + e.outcome.len()
+                    + text(&e.name)
+                    + text(&e.label)
+                    + text(&e.kind)
+                    + text(&e.prompt)
+                    + text(&e.prompt_source)
+                    + text(&e.action_token)
+                    + text(&e.instance_id)
+                    + text(&e.message_id)
+                    + text(&e.state)
+                    + text(&e.kept_worktree)
+                    + text(&e.code)
+                    + text(&e.message)
+            })
+            .sum::<usize>()
+}
+
+/// What [`CardStore::claim_batch`] answers for an executed batch.
+enum BatchClaimed {
+    /// Nobody has it, and it was admitted: run its entries, send the answer
+    /// on the sender, and wait for it on the receiver like a repeat.
+    Run(
+        tokio::sync::watch::Sender<Option<CardBatchResult>>,
+        tokio::sync::watch::Receiver<Option<CardBatchResult>>,
+    ),
+    /// The same batch is running: wait for its answer.
+    Wait(tokio::sync::watch::Receiver<Option<CardBatchResult>>),
+    /// The same batch ran: its remembered answer.
+    Answered(CardBatchResult),
+    /// Refused whole before any entry ran — a reused id, or no room — with
+    /// the sentence to say.
+    Refused(String),
+    /// A new batch none of whose entries passes a single press's admission
+    /// checks: each entry's refusal, in the order given. Nothing about it is
+    /// remembered and nothing is invoked.
+    Unactionable(Vec<CardActionResult>),
+}
+
 #[derive(Default)]
 struct StoreInner {
     slots: HashMap<String, Slot>,
@@ -2129,13 +2373,22 @@ struct StoreInner {
     /// (review B4).
     epoch: u64,
     requests: HashMap<String, Remembered>,
+    /// Issue #2399: the executed batches, in a memory of their own with its
+    /// own bounds ([`MAX_REMEMBERED_BATCHES`], [`MAX_REMEMBERED_BATCH_BYTES`]).
+    batches: HashMap<String, RememberedBatch>,
     catalog: Option<CachedCatalog>,
+    /// Issue #2399 review 4: bumped by [`CardStore::forget_catalog`]. A
+    /// catalog read that began before a bump is not cached, so a read of the
+    /// old file that finishes after the daemon wrote the new one cannot put
+    /// the old catalog back.
+    catalog_generation: u64,
 }
 
 impl StoreInner {
     /// Forget the answers older than [`REQUEST_ID_MEMORY`], and the running
     /// claims whose supervisor went away without answering (which happens
-    /// only when the runtime is shutting down).
+    /// only when the runtime is shutting down) — single presses' and
+    /// batches' alike.
     fn forget_expired(&mut self, now: Instant) {
         self.requests.retain(|_, r| match r {
             Remembered::Done { at, .. } => now.duration_since(*at) < REQUEST_ID_MEMORY,
@@ -2143,6 +2396,60 @@ impl StoreInner {
                 now.duration_since(*at) < REQUEST_ID_MEMORY || answer.has_changed().is_ok()
             }
         });
+        self.batches.retain(|_, b| match b {
+            RememberedBatch::Done { at, .. } => now.duration_since(*at) < REQUEST_ID_MEMORY,
+            RememberedBatch::InFlight { at, answer, .. } => {
+                now.duration_since(*at) < REQUEST_ID_MEMORY || answer.has_changed().is_ok()
+            }
+        });
+    }
+
+    /// [`StoreInner::make_room`] for the batches' own memory: drop the oldest
+    /// answered batches until one more of `incoming` bytes fits, never a
+    /// running one. It touches nothing a single press remembers.
+    fn make_batch_room(&mut self, incoming: usize) -> bool {
+        loop {
+            let bytes: usize = self.batches.iter().map(|(k, b)| k.len() + b.bytes()).sum();
+            if self.batches.len() < MAX_REMEMBERED_BATCHES
+                && bytes + incoming <= MAX_REMEMBERED_BATCH_BYTES
+            {
+                return true;
+            }
+            let oldest = self
+                .batches
+                .iter()
+                .filter(|(_, b)| matches!(b, RememberedBatch::Done { .. }))
+                .min_by_key(|(_, b)| b.at())
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(key) => {
+                    self.batches.remove(&key);
+                }
+                None => return false,
+            }
+        }
+    }
+
+    /// The cheap checks a new request passes before it may hold room
+    /// (audit S2): its instance, then its card and action token against what
+    /// the store last committed. `None` admits it.
+    fn admission(&self, request: &CardActionRequest) -> Option<CardActionResult> {
+        let rid = request.request_id.as_str();
+        if request.instance_id != own_instance_id() {
+            return Some(daemon_replaced(rid));
+        }
+        let key = entry_key(&request.pane_id, &request.agent_id);
+        let Some(computed) = self.computed.get(&key) else {
+            let pane_held = self.computed.values().any(|c| c.pane_id == request.pane_id);
+            return Some(no_such_card(rid, &key, &request.pane_id, pane_held));
+        };
+        match computed.tokens.get(&request.action_id) {
+            None => Some(unknown_action(rid, &key, &request.action_id)),
+            Some(token) if *token != request.action_token => {
+                Some(stale_action(rid, &request.action_id, &request.action_token))
+            }
+            Some(_) => None,
+        }
     }
 
     /// Drop the oldest answers until one more id of `incoming` bytes fits
@@ -2351,29 +2658,11 @@ impl CardStore {
     /// with the codes [`invoke_once`]'s full checks use, which run again
     /// after the claim against a fresh reading of the deck.
     fn admission_refusal(&self, request: &CardActionRequest) -> Option<CardActionResult> {
-        let rid = request.request_id.as_str();
         let inner = self.lock();
-        if inner.requests.contains_key(rid) {
+        if inner.requests.contains_key(&request.request_id) {
             return None;
         }
-        if request.instance_id != own_instance_id() {
-            return Some(daemon_replaced(rid));
-        }
-        let key = entry_key(&request.pane_id, &request.agent_id);
-        let Some(computed) = inner.computed.get(&key) else {
-            let pane_held = inner
-                .computed
-                .values()
-                .any(|c| c.pane_id == request.pane_id);
-            return Some(no_such_card(rid, &key, &request.pane_id, pane_held));
-        };
-        match computed.tokens.get(&request.action_id) {
-            None => Some(unknown_action(rid, &key, &request.action_id)),
-            Some(token) if *token != request.action_token => {
-                Some(stale_action(rid, &request.action_id, &request.action_token))
-            }
-            Some(_) => None,
-        }
+        inner.admission(request)
     }
 
     /// Where doorbells go, and which worktree registry says whether an agent
@@ -2408,20 +2697,53 @@ impl CardStore {
             .ok()
             .map(|m| (path.clone(), m.modified().ok(), m.len()));
         let stamp = stamp.or(Some((path, None, u64::MAX)));
-        {
+        self.catalog_from(stamp, card_catalog::resolve_from_user_config)
+    }
+
+    /// [`Self::catalog`] for a file whose look is `stamp`, read by `load`.
+    /// The cache is filled only when no [`Self::forget_catalog`] happened
+    /// while `load` ran; when one did, `load` runs again (a few times at most,
+    /// then the latest read is answered uncached), so the catalog cached is
+    /// never one read before the daemon's own write.
+    fn catalog_from(
+        &self,
+        stamp: Option<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>,
+        mut load: impl FnMut() -> ResolvedCatalog,
+    ) -> Arc<ResolvedCatalog> {
+        let mut generation = {
             let inner = self.lock();
             if let Some(cached) = &inner.catalog
                 && cached.stamp == stamp
             {
                 return Arc::clone(&cached.catalog);
             }
+            inner.catalog_generation
+        };
+        let mut catalog = Arc::new(load());
+        for _ in 0..3 {
+            let mut inner = self.lock();
+            if inner.catalog_generation == generation {
+                inner.catalog = Some(CachedCatalog {
+                    stamp,
+                    catalog: Arc::clone(&catalog),
+                });
+                return catalog;
+            }
+            generation = inner.catalog_generation;
+            drop(inner);
+            catalog = Arc::new(load());
         }
-        let catalog = Arc::new(card_catalog::resolve_from_user_config());
-        self.lock().catalog = Some(CachedCatalog {
-            stamp,
-            catalog: Arc::clone(&catalog),
-        });
         catalog
+    }
+
+    /// Issue #2399: forget the cached catalog, so the next read resolves the
+    /// user config again — after the daemon itself wrote it, whatever its
+    /// modification time and length say — and so a read already under way
+    /// does not cache what it read ([`Self::catalog_from`]).
+    pub fn forget_catalog(&self) {
+        let mut inner = self.lock();
+        inner.catalog = None;
+        inner.catalog_generation = inner.catalog_generation.wrapping_add(1);
     }
 
     /// Store `report` for the generation `agent_id` in `pane_id`, replacing
@@ -2562,6 +2884,13 @@ impl CardStore {
             }
             None => {}
         }
+        if inner.batches.contains_key(request_id) {
+            return Claim::Answered(CardActionResult::refused(
+                request_id,
+                CODE_REQUEST_REUSED,
+                "this request id was already used for a batch of card actions; nothing was done",
+            ));
+        }
         let reserved = payload + RESULT_RESERVE_BYTES;
         let (running, running_bytes) = inner
             .requests
@@ -2626,7 +2955,208 @@ impl CardStore {
             );
         }
     }
+
+    /// Issue #2399, PR #2491 review: claim an executed batch's `request_id`
+    /// in the batches' own memory, atomically with the checks that decide
+    /// whether it may be remembered at all. `requests` are its distinct
+    /// entries' single presses ([`batch_requests`]).
+    ///
+    /// A remembered id answers its batch's outcomes, or is waited on while it
+    /// runs, when the repeat names the same action and set of cards
+    /// (`fingerprint`); any other repeat is refused whole, as is an id a
+    /// single press already used. A new id none of whose entries passes a
+    /// single press's admission checks ([`StoreInner::admission`]) is
+    /// answered with those refusals and remembers nothing (audit: a stream of
+    /// unactionable batches must not churn the deck's memory). Otherwise it
+    /// is admitted only when the batches' memory has room for it, or refused
+    /// [`CODE_BUSY`] whole.
+    fn claim_batch(
+        &self,
+        request_id: &str,
+        fingerprint: [u8; 32],
+        requests: &[CardActionRequest],
+    ) -> BatchClaimed {
+        let mut inner = self.lock();
+        inner.forget_expired(Instant::now());
+        match inner.batches.get(request_id) {
+            Some(RememberedBatch::InFlight {
+                fingerprint: f,
+                answer,
+                ..
+            }) if *f == fingerprint => return BatchClaimed::Wait(answer.clone()),
+            Some(RememberedBatch::Done {
+                fingerprint: f,
+                answer,
+                ..
+            }) if *f == fingerprint => return BatchClaimed::Answered(answer.clone()),
+            Some(_) => return BatchClaimed::Refused(BATCH_ID_REUSED.into()),
+            None => {}
+        }
+        if inner.requests.contains_key(request_id) {
+            return BatchClaimed::Refused(BATCH_ID_REUSED.into());
+        }
+        let refusals: Vec<Option<CardActionResult>> =
+            requests.iter().map(|r| inner.admission(r)).collect();
+        if refusals.iter().all(Option::is_some) {
+            return BatchClaimed::Unactionable(refusals.into_iter().flatten().collect());
+        }
+        let reserved: usize = requests
+            .iter()
+            .map(|r| r.pane_id.len() + r.agent_id.len() + BATCH_ENTRY_RESERVE_BYTES)
+            .sum();
+        if !inner.make_batch_room(request_id.len() + reserved) {
+            return BatchClaimed::Refused(
+                "the deck is already running as many card batches as it can; nothing was done, try again in a moment".into(),
+            );
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        inner.batches.insert(
+            request_id.to_string(),
+            RememberedBatch::InFlight {
+                fingerprint,
+                at: Instant::now(),
+                answer: rx.clone(),
+                reserved,
+            },
+        );
+        BatchClaimed::Run(tx, rx)
+    }
+
+    /// Remember an executed batch's answer in the room its claim reserved,
+    /// and in the same step forget its entries' own single-press answers
+    /// (`entry_ids`): from now on the batch's record is what answers a
+    /// repeat, so the batch's binding to its set of cards and its outcomes
+    /// are kept and dropped together, and no entry answer outlives the
+    /// binding. `entry_ids` are in the private namespace
+    /// [`batch_entry_request_id`] gives, which no client's request id can
+    /// name, so this removes only answers this batch's own entries left;
+    /// a single press's answer is never touched.
+    ///
+    /// An answer too large for the batches' memory is remembered smaller
+    /// rather than dropped, so the id stays bound: each entry's outcome and
+    /// code with its message cut short ([`compact_outcome`]), or, if even
+    /// that does not fit, each entry [`BATCH_UNKNOWN`] with
+    /// [`CODE_BATCH_ANSWER_NOT_KEPT`] ([`minimal_outcome`]), which fits in
+    /// the room the claim reserved for it. Returns what was remembered (the
+    /// whole answer, remembered nowhere, on the path marked unreachable), and
+    /// [`execute_batch_once`] answers the first caller and every repeat
+    /// waiting on this run with that return, so they get exactly what a later
+    /// repeat reads back.
+    fn finish_batch(
+        &self,
+        request_id: &str,
+        fingerprint: [u8; 32],
+        answer: &CardBatchResult,
+        entry_ids: &[String],
+    ) -> CardBatchResult {
+        let mut inner = self.lock();
+        inner.batches.remove(request_id);
+        for id in entry_ids {
+            if matches!(inner.requests.get(id), Some(Remembered::Done { .. })) {
+                inner.requests.remove(id);
+            }
+        }
+        let smaller = |shrink: fn(&CardBatchOutcome) -> CardBatchOutcome| CardBatchResult {
+            request_id: answer.request_id.clone(),
+            entries: answer.entries.iter().map(shrink).collect(),
+        };
+        let mut kept = None;
+        for candidate in [
+            answer.clone(),
+            smaller(compact_outcome),
+            smaller(minimal_outcome),
+        ] {
+            if inner.make_batch_room(request_id.len() + batch_answer_bytes(&candidate)) {
+                kept = Some(candidate);
+                break;
+            }
+        }
+        let Some(kept) = kept else {
+            // Unreachable while BATCH_ENTRY_RESERVE_BYTES covers a minimal
+            // outcome: the removal above freed the claim's reservation.
+            tracing::warn!(
+                target: "agent_cards",
+                request_id,
+                "a card batch's answer did not fit the remembered batches; not remembered"
+            );
+            return answer.clone();
+        };
+        if kept != *answer {
+            tracing::warn!(
+                target: "agent_cards",
+                request_id,
+                "a card batch's answer did not fit the remembered batches whole; remembering less of it"
+            );
+        }
+        inner.batches.insert(
+            request_id.to_string(),
+            RememberedBatch::Done {
+                fingerprint,
+                at: Instant::now(),
+                answer: kept.clone(),
+            },
+        );
+        kept
+    }
 }
+
+/// The outcome a batch keeps for an entry when its whole answer is too large
+/// to remember: what happened to the entry (`outcome`, `code`, `message_id`,
+/// `state`), and its message cut to [`COMPACT_MESSAGE_CHARS`]. The card's
+/// name, the action's text and a kept worktree's path are dropped.
+fn compact_outcome(entry: &CardBatchOutcome) -> CardBatchOutcome {
+    CardBatchOutcome {
+        pane_id: entry.pane_id.clone(),
+        agent_id: entry.agent_id.clone(),
+        outcome: entry.outcome.clone(),
+        message_id: entry.message_id.clone(),
+        state: entry.state.clone(),
+        code: entry.code.clone(),
+        message: entry
+            .message
+            .as_ref()
+            .map(|m| m.chars().take(COMPACT_MESSAGE_CHARS).collect()),
+        ..CardBatchOutcome::default()
+    }
+}
+
+/// The outcome a batch keeps for an entry when not even
+/// [`compact_outcome`]s fit: the batch ran, and this entry's outcome was not
+/// kept.
+fn minimal_outcome(entry: &CardBatchOutcome) -> CardBatchOutcome {
+    unknown_outcome(
+        &entry.pane_id,
+        &entry.agent_id,
+        CODE_BATCH_ANSWER_NOT_KEPT,
+        BATCH_ANSWER_NOT_KEPT,
+    )
+}
+
+/// An entry of a batch whose execution started, whose outcome the deck
+/// cannot say.
+fn unknown_outcome(pane_id: &str, agent_id: &str, code: &str, message: &str) -> CardBatchOutcome {
+    CardBatchOutcome {
+        pane_id: pane_id.to_string(),
+        agent_id: agent_id.to_string(),
+        outcome: BATCH_UNKNOWN.to_string(),
+        code: Some(code.to_string()),
+        message: Some(message.to_string()),
+        ..CardBatchOutcome::default()
+    }
+}
+
+/// A batch request id that was already used for another action, another set
+/// of cards, or a single press.
+const BATCH_ID_REUSED: &str = "this batch request id was already used for a different action or set of cards; nothing was done";
+/// What a [`CODE_BATCH_ANSWER_NOT_KEPT`] entry says.
+const BATCH_ANSWER_NOT_KEPT: &str = "this batch already ran, but the deck did not keep what became of this agent, so it is not known whether this agent got it; check its card's delivery history before sending again";
+/// What a [`CODE_BATCH_INTERRUPTED`] entry says.
+const BATCH_INTERRUPTED: &str = "the deck was interrupted while running this batch, so it is not known whether this agent got it; check its card's delivery history before sending again";
+
+/// The delivery state of a card action's text that is in the agent's inbox
+/// and not yet confirmed by the agent: what a press records on its card the
+/// moment it is sent, and what a batch entry reports for the same press.
+const DELIVERY_QUEUED: &str = "queued";
 
 /// Map an inbox message state to a card delivery state. `attention` is what
 /// the inbox asks the user to decide about that message, if anything
@@ -2643,7 +3173,7 @@ fn delivery_state(
     use crate::inbox_display::AttentionKind;
     match state {
         StateName::Queued | StateName::Fetched | StateName::Claimed => match attention {
-            None => ("queued".into(), None),
+            None => (DELIVERY_QUEUED.into(), None),
             Some(AttentionKind::Uncertain) => ("uncertain".into(), None),
             Some(kind) => (
                 "uncertain".into(),
@@ -3098,6 +3628,24 @@ where
     if let Err(refusal) = check_request(&request) {
         return *refusal;
     }
+    invoke_checked(registry, state, request, close).await
+}
+
+/// [`invoke`] for a request whose identifiers are already checked: a client's
+/// after [`check_request`], or a batch entry, whose fields [`check_batch`]
+/// bounded and whose id is in the batches' own namespace
+/// ([`batch_entry_request_id`]). Everything after that check is the single
+/// press's own: admission, the claim, the invocation.
+async fn invoke_checked<F, Fut>(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &crate::state::SharedState,
+    request: CardActionRequest,
+    close: F,
+) -> CardActionResult
+where
+    F: FnOnce(String, bool) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = CloseOutcome> + Send + 'static,
+{
     if let Some(refusal) = registry.agent_cards().admission_refusal(&request) {
         return refusal;
     }
@@ -3124,6 +3672,540 @@ where
         work,
     )
     .await
+}
+
+/// Issue #2399: check a batch request as a whole before anything about it is
+/// read or done: its request id (with room for each entry's own id, see
+/// [`batch_entry_request_id`]), its action id, and its entries' number and
+/// identifier sizes. `Err` is the sentence the request is refused with.
+pub fn check_batch(
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+) -> Result<(), String> {
+    const ENTRY_SUFFIX_BYTES: usize = 4; // "#255"
+    if !is_request_id(request_id) || request_id.len() > MAX_REQUEST_ID_BYTES - ENTRY_SUFFIX_BYTES {
+        return Err(format!(
+            "the batch request id must be 1 to {} letters, digits, '.', '_', ':' or '-'",
+            MAX_REQUEST_ID_BYTES - ENTRY_SUFFIX_BYTES
+        ));
+    }
+    if action_id.is_empty() || action_id.len() > MAX_REQUEST_FIELD_BYTES {
+        return Err(format!(
+            "the action id must be 1 to {MAX_REQUEST_FIELD_BYTES} bytes"
+        ));
+    }
+    if entries.is_empty() {
+        return Err("the batch names no cards".into());
+    }
+    /* Audit S2: the raw budget first, then every identifier's size, and only
+    then the distinct count, which hashes the identifiers and stops at the
+    first card over the cap. */
+    if entries.len() > MAX_BATCH_RAW_ENTRIES {
+        return Err(format!(
+            "a batch request may carry at most {MAX_BATCH_RAW_ENTRIES} entries, repeats included; this one carries {}",
+            entries.len()
+        ));
+    }
+    for entry in entries {
+        for (what, value) in [
+            ("pane id", &entry.pane_id),
+            ("agent id", &entry.agent_id),
+            ("action token", &entry.action_token),
+            ("instance id", &entry.instance_id),
+        ] {
+            if value.len() > MAX_REQUEST_FIELD_BYTES {
+                return Err(format!(
+                    "a batch entry's {what} is longer than {MAX_REQUEST_FIELD_BYTES} bytes"
+                ));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if seen.insert((entry.pane_id.as_str(), entry.agent_id.as_str()))
+            && seen.len() > MAX_BATCH_ENTRIES
+        {
+            return Err(format!(
+                "a batch may name at most {MAX_BATCH_ENTRIES} cards; this one names more"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The entries of a batch, each card once: the first naming of a pane and
+/// agent generation wins, and the request's order is kept.
+fn distinct_batch_entries(entries: &[CardBatchEntry]) -> Vec<&CardBatchEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .iter()
+        .filter(|entry| seen.insert((entry.pane_id.as_str(), entry.agent_id.as_str())))
+        .collect()
+}
+
+/// The request id one entry of an executed batch is invoked under: the
+/// batch's own, `#`, then the entry's `rank` — its place among the batch's
+/// distinct entries ordered by identity (pane, then agent generation), never
+/// by where the request happened to list it (PR #2491 review). The same set
+/// of cards in another order therefore gives each card the same id.
+///
+/// The `#` puts every entry id in a namespace of the batches' own: a
+/// client's request id may not contain `#` ([`check_request`] refuses it),
+/// so no single press can ever name an entry's id, and an entry can neither
+/// replay nor be refused by a single press's remembered answer, nor
+/// [`CardStore::finish_batch`] forget one (PR #2491 review). A repeat of a
+/// remembered batch invokes no entry at all: the batch's own record answers
+/// it ([`execute_batch_once`]).
+fn batch_entry_request_id(request_id: &str, rank: usize) -> String {
+    format!("{request_id}{BATCH_ENTRY_ID_SEPARATOR}{rank}")
+}
+
+/// What separates a batch's id from an entry's rank in
+/// [`batch_entry_request_id`]: a byte [`is_request_id`] refuses.
+const BATCH_ENTRY_ID_SEPARATOR: char = '#';
+
+/// Each distinct entry's rank among them ordered by identity (pane, then
+/// agent generation), in the order [`distinct_batch_entries`] lists them.
+fn batch_entry_ranks(distinct: &[&CardBatchEntry]) -> Vec<usize> {
+    let mut by_identity: Vec<usize> = (0..distinct.len()).collect();
+    by_identity.sort_by(|&a, &b| {
+        (distinct[a].pane_id.as_str(), distinct[a].agent_id.as_str())
+            .cmp(&(distinct[b].pane_id.as_str(), distinct[b].agent_id.as_str()))
+    });
+    let mut ranks = vec![0; distinct.len()];
+    for (rank, index) in by_identity.into_iter().enumerate() {
+        ranks[index] = rank;
+    }
+    ranks
+}
+
+/// A digest of everything an executed batch asks for — its action and each
+/// distinct card it names with the token and daemon process its preview
+/// answered — taken over the cards in identity order, so the same set in
+/// another order is the same batch and any other set or action is not.
+fn batch_fingerprint(action_id: &str, entries: &[CardBatchEntry]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut cards: Vec<(&str, &str, &str, &str)> = distinct_batch_entries(entries)
+        .into_iter()
+        .map(|e| {
+            (
+                e.pane_id.as_str(),
+                e.agent_id.as_str(),
+                e.action_token.as_str(),
+                e.instance_id.as_str(),
+            )
+        })
+        .collect();
+    cards.sort_unstable();
+    let bytes =
+        serde_json::to_vec(&("invoke-card-action-batch", action_id, cards)).unwrap_or_default();
+    Sha256::digest(&bytes).into()
+}
+
+/// Issue #2399: what a batch preview answers for one entry, read from the
+/// cards as the daemon just computed them. The checks are a single press's
+/// own ([`invoke_once`]), less the ones a preview cannot make (the token and
+/// instance it is about to hand out, and the user's confirmation, which the
+/// batch's own confirmation is): a card the list does not hold, an action the
+/// card does not offer, an action the app does rather than the daemon, a
+/// reply (whose words are the user's own, one card at a time), and a disabled
+/// action — a stopped agent's prompt action among them — are skipped with
+/// the code a press would be refused with.
+fn preview_entry(
+    list: &AgentCardList,
+    action_id: &str,
+    target: &CardBatchEntry,
+) -> CardBatchOutcome {
+    let key = entry_key(&target.pane_id, &target.agent_id);
+    let skipped = || CardBatchOutcome::of(target, BATCH_SKIPPED);
+    let Some(entry) = list.entries.iter().find(|e| e.key == key) else {
+        let pane_held = list.entries.iter().any(|e| e.pane_id == target.pane_id);
+        let refusal = no_such_card("", &key, &target.pane_id, pane_held);
+        return skipped().with_reason(
+            refusal.code.as_deref().unwrap_or(CODE_UNKNOWN_ENTRY),
+            refusal.message.unwrap_or_default(),
+        );
+    };
+    let mut skipped = skipped();
+    skipped.name = Some(entry.name.clone());
+    let Some(action) = entry.action(action_id) else {
+        return skipped.with_reason(
+            CODE_UNKNOWN_ACTION,
+            format!("{}'s card does not offer this action", entry.name),
+        );
+    };
+    if action.kind == "open" {
+        return skipped.with_reason(
+            CODE_CLIENT_SIDE_ACTION,
+            "opening an agent is done one card at a time",
+        );
+    }
+    if action.text_input {
+        return skipped.with_reason(
+            CODE_TEXT_REQUIRED,
+            format!(
+                "{} sends your own words, so it is sent from each card",
+                action.label
+            ),
+        );
+    }
+    if !action.enabled {
+        return if action.disabled_reason.as_deref() == Some(REASON_AGENT_STOPPED) {
+            skipped.with_reason(CODE_AGENT_STOPPED, "the agent is not running")
+        } else {
+            skipped.with_reason(
+                CODE_ACTION_DISABLED,
+                format!("{} is not available on this card now", action.label),
+            )
+        };
+    }
+    let prompt = match action.kind.as_str() {
+        "close" | "close_keep_worktree" => None,
+        _ => match action.prompt.as_ref() {
+            Some(prompt) if !prompt.trim().is_empty() => Some(prompt.clone()),
+            _ => {
+                return skipped.with_reason(
+                    CODE_ACTION_DISABLED,
+                    format!("{} has no text to send on this card", action.label),
+                );
+            }
+        },
+    };
+    CardBatchOutcome {
+        name: Some(entry.name.clone()),
+        label: Some(action.label.clone()),
+        kind: Some(action.kind.clone()),
+        prompt_source: prompt.as_ref().and(action.prompt_source.clone()),
+        prompt,
+        action_token: Some(action.token.clone()),
+        instance_id: Some(list.instance_id.clone()),
+        ..CardBatchOutcome::of(target, BATCH_INCLUDED)
+    }
+}
+
+/// Issue #2399: a batch preview of `action_id` over `entries`, read from a
+/// fresh computation of the cards. Sends nothing and remembers nothing.
+pub fn preview_batch(
+    list: &AgentCardList,
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+) -> CardBatchResult {
+    CardBatchResult {
+        request_id: request_id.to_string(),
+        entries: distinct_batch_entries(entries)
+            .into_iter()
+            .map(|target| preview_entry(list, action_id, target))
+            .collect(),
+    }
+}
+
+/// What one executed entry's single press answered, as the batch reports it.
+fn execution_outcome(target: &CardBatchEntry, result: CardActionResult) -> CardBatchOutcome {
+    match result.outcome.as_str() {
+        /* A sent press is in the agent's inbox, which `invoke_once` records
+        on the card as `queued`: the batch claims no more than that press
+        does (PR #2491 review). */
+        "sent" => CardBatchOutcome {
+            name: result.message,
+            message_id: result.message_id,
+            state: Some(DELIVERY_QUEUED.into()),
+            ..CardBatchOutcome::of(target, BATCH_DELIVERED)
+        },
+        "closed" => CardBatchOutcome {
+            name: result.message,
+            kept_worktree: result.kept_worktree,
+            ..CardBatchOutcome::of(target, BATCH_CLOSED)
+        },
+        _ => CardBatchOutcome::of(target, BATCH_FAILED).with_reason(
+            result.code.as_deref().unwrap_or(CODE_DELIVERY_REFUSED),
+            result
+                .message
+                .unwrap_or_else(|| "the deck did not act on this card".into()),
+        ),
+    }
+}
+
+/// The single press each distinct entry of an executed batch is invoked as,
+/// in the order [`distinct_batch_entries`] lists them: confirmed by the
+/// batch's own confirmation, under the id [`batch_entry_request_id`] gives
+/// it, with the token and instance its preview answered.
+fn batch_requests(
+    request_id: &str,
+    action_id: &str,
+    distinct: &[&CardBatchEntry],
+) -> Vec<CardActionRequest> {
+    distinct
+        .iter()
+        .zip(batch_entry_ranks(distinct))
+        .map(|(target, rank)| CardActionRequest {
+            pane_id: target.pane_id.clone(),
+            agent_id: target.agent_id.clone(),
+            action_id: action_id.to_string(),
+            action_token: target.action_token.clone(),
+            instance_id: target.instance_id.clone(),
+            request_id: batch_entry_request_id(request_id, rank),
+            confirm: true,
+            text: None,
+        })
+        .collect()
+}
+
+/// Issue #2399: execute a confirmed batch, one entry after another, each as
+/// the single press `invoke_one` performs — the same checks (instance,
+/// card, definition token, admission caps), the same delivery and the same
+/// record on its own card. The user's confirmation of the batch is each
+/// press's `confirm`. An entry that is refused fails on its own: the entries
+/// after it are still invoked. Each entry is pressed under the id
+/// [`batch_entry_request_id`] gives it; [`execute_batch_once`] is what
+/// remembers the batch as a whole.
+pub async fn execute_batch<I, Fut>(
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+    invoke_one: I,
+) -> CardBatchResult
+where
+    I: FnMut(CardActionRequest) -> Fut,
+    Fut: std::future::Future<Output = CardActionResult>,
+{
+    let outcomes = std::sync::Mutex::new(Vec::new());
+    run_batch_entries(request_id, action_id, entries, invoke_one, &outcomes).await;
+    CardBatchResult {
+        request_id: request_id.to_string(),
+        entries: outcomes.into_inner().unwrap_or_else(|p| p.into_inner()),
+    }
+}
+
+/// [`execute_batch`]'s run, adding each entry's outcome to `outcomes` the
+/// moment its press answers, so whoever holds `outcomes` knows every entry
+/// that answered even if this run is cut short.
+async fn run_batch_entries<I, Fut>(
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+    mut invoke_one: I,
+    outcomes: &std::sync::Mutex<Vec<CardBatchOutcome>>,
+) where
+    I: FnMut(CardActionRequest) -> Fut,
+    Fut: std::future::Future<Output = CardActionResult>,
+{
+    let distinct = distinct_batch_entries(entries);
+    let requests = batch_requests(request_id, action_id, &distinct);
+    for (target, request) in distinct.into_iter().zip(requests) {
+        let result = invoke_one(request).await;
+        let outcome = execution_outcome(target, result);
+        outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(outcome);
+    }
+}
+
+/// What an execution whose run was cut short answers: each entry that
+/// answered before, as it answered, and every other entry
+/// [`BATCH_UNKNOWN`] with [`CODE_BATCH_INTERRUPTED`] — the one running when
+/// the run was cut short may have been sent.
+fn interrupted_batch(
+    request_id: &str,
+    targets: &[CardBatchEntry],
+    answered: Vec<CardBatchOutcome>,
+) -> CardBatchResult {
+    let known = answered.len();
+    let mut entries = answered;
+    entries.extend(targets.iter().skip(known).map(|t| {
+        unknown_outcome(
+            &t.pane_id,
+            &t.agent_id,
+            CODE_BATCH_INTERRUPTED,
+            BATCH_INTERRUPTED,
+        )
+    }));
+    CardBatchResult {
+        request_id: request_id.to_string(),
+        entries,
+    }
+}
+
+/// A remembered batch's answer, its outcomes listed in the order a repeat
+/// names its cards. A repeat answered from memory names the same set of
+/// cards (its fingerprint says so), possibly in another order.
+fn in_repeat_order(mut result: CardBatchResult, distinct: &[&CardBatchEntry]) -> CardBatchResult {
+    let mut by_card: HashMap<(String, String), CardBatchOutcome> = result
+        .entries
+        .drain(..)
+        .map(|e| ((e.pane_id.clone(), e.agent_id.clone()), e))
+        .collect();
+    result.entries = distinct
+        .iter()
+        .filter_map(|t| by_card.remove(&(t.pane_id.clone(), t.agent_id.clone())))
+        .collect();
+    result
+}
+
+/// Issue #2399, PR #2491 review: [`execute_batch`] at most once per batch
+/// request id, remembered in the batches' own memory
+/// ([`CardStore::claim_batch`]).
+///
+/// - A repeat naming the same action and the same cards, in any order, gets
+///   the first execution's outcomes and invokes no entry again — waiting for
+///   them when the first is still running.
+/// - A repeat naming another action or another set of cards, or an id a
+///   single press used, is refused whole (`Err`) before any entry runs, as
+///   is a new batch the batches' memory has no room for.
+/// - A new batch none of whose entries passes a single press's admission
+///   checks is answered with those refusals, invokes nothing and remembers
+///   nothing.
+///
+/// `Err` therefore always means that no entry of this request ran. Once an
+/// execution has started, every answer is per entry: an execution whose run
+/// is cut short answers [`interrupted_batch`], and one whose answer the deck
+/// did not keep whole answers what it kept ([`CardStore::finish_batch`]) —
+/// to its first caller and to every repeat alike, so a repeat gets the same
+/// answer whether it waited on the run or arrived after it.
+///
+/// A batch is remembered for up to [`REQUEST_ID_MEMORY`], sooner when newer
+/// batches need the room ([`MAX_REMEMBERED_BATCHES`],
+/// [`MAX_REMEMBERED_BATCH_BYTES`]); its entries' own single-press answers are
+/// forgotten once its record holds them ([`CardStore::finish_batch`]), so a
+/// batch's binding and its outcomes leave memory together. A repeat after
+/// that is a new batch.
+///
+/// The entries run on a task of their own and a supervisor remembers their
+/// answer, as [`run_once`] does for one press: a caller that is cancelled
+/// changes nothing about the outcome, and a run that panics is remembered
+/// with the outcomes of the entries that answered before it.
+pub async fn execute_batch_once<H, I, Fut>(
+    holder: Arc<H>,
+    store_of: fn(&H) -> &CardStore,
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+    invoke_one: I,
+) -> Result<CardBatchResult, String>
+where
+    H: Send + Sync + 'static,
+    I: FnMut(CardActionRequest) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = CardActionResult> + Send + 'static,
+{
+    let fingerprint = batch_fingerprint(action_id, entries);
+    let distinct = distinct_batch_entries(entries);
+    let requests = batch_requests(request_id, action_id, &distinct);
+    let mut answer = match store_of(&holder).claim_batch(request_id, fingerprint, &requests) {
+        BatchClaimed::Answered(answer) => return Ok(in_repeat_order(answer, &distinct)),
+        BatchClaimed::Refused(refusal) => return Err(refusal),
+        BatchClaimed::Unactionable(refusals) => {
+            return Ok(CardBatchResult {
+                request_id: request_id.to_string(),
+                entries: distinct
+                    .iter()
+                    .zip(refusals)
+                    .map(|(target, refusal)| execution_outcome(target, refusal))
+                    .collect(),
+            });
+        }
+        BatchClaimed::Wait(answer) => answer,
+        BatchClaimed::Run(tx, answer) => {
+            let rid = request_id.to_string();
+            let action = action_id.to_string();
+            let targets: Vec<CardBatchEntry> = distinct.iter().map(|&t| t.clone()).collect();
+            let entry_ids: Vec<String> = requests.into_iter().map(|r| r.request_id).collect();
+            let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let running = {
+                let (rid, targets, outcomes) =
+                    (rid.clone(), targets.clone(), Arc::clone(&outcomes));
+                tokio::spawn(async move {
+                    run_batch_entries(&rid, &action, &targets, invoke_one, &outcomes).await
+                })
+            };
+            tokio::spawn(async move {
+                let finished = running.await.is_ok();
+                let answered =
+                    std::mem::take(&mut *outcomes.lock().unwrap_or_else(|p| p.into_inner()));
+                let answer = if finished {
+                    CardBatchResult {
+                        request_id: rid.clone(),
+                        entries: answered,
+                    }
+                } else {
+                    interrupted_batch(&rid, &targets, answered)
+                };
+                // Publish what was kept, so the first caller, a repeat
+                // waiting on this run and a later repeat get one answer.
+                let kept = store_of(&holder).finish_batch(&rid, fingerprint, &answer, &entry_ids);
+                let _ = tx.send(Some(kept));
+            });
+            answer
+        }
+    };
+    let answer = match answer.wait_for(Option::is_some).await {
+        Ok(answer) => answer.clone(),
+        Err(_) => None,
+    };
+    /* No answer at all: the supervisor went away without one, which happens
+    only when the runtime is shutting down. The execution started, so
+    nothing is known about any entry. */
+    let answer = answer.unwrap_or_else(|| {
+        let targets: Vec<CardBatchEntry> = distinct.iter().map(|&t| t.clone()).collect();
+        interrupted_batch(request_id, &targets, Vec::new())
+    });
+    Ok(in_repeat_order(answer, &distinct))
+}
+
+/// Issue #2399: answer an `invoke-card-action-batch`. `close` makes the stop
+/// each close entry performs, as [`invoke`]'s `close`. `Err` is a refusal of
+/// the request as a whole — [`check_batch`], or [`execute_batch_once`]
+/// refusing a reused batch id or a batch it has no room for — and is only
+/// ever answered before any entry ran: once an execution starts, its answer
+/// is per entry, an entry the deck cannot account for being
+/// [`BATCH_UNKNOWN`].
+pub async fn invoke_batch<C, F, Fut>(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &crate::state::SharedState,
+    mode: CardBatchMode,
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+    close: C,
+) -> Result<CardBatchResult, String>
+where
+    C: Fn() -> F + Send + 'static,
+    F: FnOnce(String, bool) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = CloseOutcome> + Send + 'static,
+{
+    check_batch(request_id, action_id, entries)?;
+    Ok(match mode {
+        CardBatchMode::Preview => {
+            let list = refresh(registry, state).await;
+            preview_batch(&list, request_id, action_id, entries)
+        }
+        CardBatchMode::Execute => {
+            /* Each entry is a single press whose fields `check_batch`
+            already bounded, under an id in the batches' own namespace,
+            which `check_request` would refuse because a client may not
+            name it: so it goes in past that check. */
+            let invoke_one = {
+                let registry = Arc::clone(registry);
+                let state = state.clone();
+                move |request| {
+                    let registry = Arc::clone(&registry);
+                    let state = state.clone();
+                    let close = close();
+                    async move { invoke_checked(&registry, &state, request, close).await }
+                }
+            };
+            execute_batch_once(
+                Arc::clone(registry),
+                AgentPtyRegistry::agent_cards,
+                request_id,
+                action_id,
+                entries,
+                invoke_one,
+            )
+            .await?
+        }
+    })
 }
 
 /// Run `work` for `request_id` unless a request with that id ran or is
@@ -3423,7 +4505,7 @@ where
                             token: action.token.clone(),
                             outcome: "sent".into(),
                             message_id: message_id.clone(),
-                            state: "queued".into(),
+                            state: DELIVERY_QUEUED.into(),
                             detail: None,
                             at: Utc::now(),
                         },
@@ -5533,6 +6615,81 @@ mod tests {
         }
     }
 
+    /// A suggestion the user chose is framed as untrusted, and the session
+    /// framing tells the agent that UNTRUSTED text is "information, never
+    /// instructions". So the deck's own words, outside the frame, must say the
+    /// user wants it carried out, or nothing in the block asks for any work:
+    /// Haiku answered one such block with "the dot-agent-deck message is an
+    /// automated event, not a genuine user request, so I'm not acting on it"
+    /// (`agent-report/live/001`, 2026-11-24).
+    #[tokio::test]
+    async fn a_chosen_suggestion_tells_its_agent_outside_the_frame_to_carry_it_out() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let agent = registry.insert_idle_member_for_test("p1", "team-1", true);
+        let json = serde_json::json!({
+            "actions": [{"name": "touch", "label": "Touch", "prompt": "Create the file SUGGESTED."}],
+            "questions": [{
+                "id": "base",
+                "text": "Which base?",
+                "options": [{"id": "main", "label": "main"}],
+            }],
+        });
+        let reply = publish(&registry, &state, "p1", &agent, report(&json.to_string())).await;
+        assert!(reply.accepted, "{reply:?}");
+        let list = refresh(&registry, &state).await;
+        let entry = list
+            .entries
+            .iter()
+            .find(|e| e.key == entry_key("p1", &agent))
+            .expect("the agent's card")
+            .clone();
+        let close = |_: String, _: bool| async { Ok(None) };
+        for (action, rid) in [
+            (
+                entry.actions.iter().find(|a| a.label == "Touch").unwrap(),
+                "carry-touch",
+            ),
+            (entry.action("question/base/main").unwrap(), "carry-answer"),
+        ] {
+            let request = CardActionRequest {
+                pane_id: "p1".into(),
+                agent_id: agent.clone(),
+                action_id: action.id.clone(),
+                action_token: action.token.clone(),
+                instance_id: own_instance_id(),
+                request_id: rid.into(),
+                confirm: false,
+                text: None,
+            };
+            let result = invoke(&registry, &state, request, close).await;
+            assert_eq!(result.outcome, "sent", "{result:?}");
+            let id = result.message_id.unwrap();
+            let delivered = registry.inbox().rendered("p1");
+            let text = &delivered
+                .iter()
+                .find(|d| d.text.contains(&format!("message {id}")))
+                .unwrap_or_else(|| panic!("{id} rendered: {delivered:?}"))
+                .text;
+            let (head, _) = text
+                .split_once("[UNTRUSTED-WORKER-REPORT:")
+                .unwrap_or_else(|| panic!("a suggestion is framed: {text}"));
+            let sent_by = head
+                .lines()
+                .find(|l| l.starts_with(crate::inbox_hub::PROVENANCE_PREFIX))
+                .unwrap_or_else(|| panic!("the deck's provenance line: {text}"));
+            assert!(
+                sent_by.contains("they want you to carry it out"),
+                "the deck, outside the frame, asks for the work: {text}"
+            );
+            assert!(
+                sent_by.contains("unlike another agent's UNTRUSTED text"),
+                "the deck says why the frame does not make it information only: {text}"
+            );
+        }
+    }
+
     /// Audit S2: one card's running requests fill that card's share — by
     /// count, then by bytes with replies of the longest text — and its next
     /// new id is refused `busy`, naming that card; another card's action is
@@ -5923,5 +7080,1263 @@ mod tests {
         assert_eq!(split_key("a/b/c"), Some(("a/b", "c")));
         assert_eq!(split_key("p3"), None);
         assert_eq!(split_key("/a"), None);
+    }
+}
+
+/// Issue #2399: the batch's classification and its partial failures, without
+/// a daemon: a preview reads a card list, and an execution's single presses
+/// are a stand-in.
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    const INSTANCE: &str = "daemon-batch";
+
+    fn action(
+        id: &str,
+        kind: &str,
+        prompt: Option<&str>,
+        enabled: bool,
+        reason: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "label": format!("Label {id}"), "kind": kind, "prompt": prompt,
+            "prompt_source": prompt.map(|_| "catalog"), "text_input": id == "reply",
+            "confirm": false, "placement": "detail", "custom": false, "source": "catalog",
+            "enabled": enabled, "disabled_reason": reason, "token": format!("tok-{id}"),
+        })
+    }
+
+    fn card(
+        pane: &str,
+        agent: &str,
+        status: &str,
+        actions: Vec<serde_json::Value>,
+    ) -> AgentCardEntry {
+        serde_json::from_value(serde_json::json!({
+            "key": entry_key(pane, agent), "instance_id": INSTANCE, "pane_id": pane, "agent_id": agent,
+            "name": format!("name-{pane}"), "status": status, "needs_you": false, "needs_you_reasons": [],
+            "group": {"id": "standalone", "kind": "standalone"}, "actions": actions,
+            "primary_action_id": "open", "facts": {"source": "deck"},
+            "revision": 1, "updated_at": "2026-11-23T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    fn list() -> AgentCardList {
+        let go = |text: &str| action("go", "prompt", Some(text), true, None);
+        AgentCardList {
+            instance_id: INSTANCE.into(),
+            revision: 3,
+            catalog_errors: vec![],
+            entries: vec![
+                card(
+                    "p1",
+                    "a1",
+                    "idle",
+                    vec![go("first text"), action("close", "close", None, true, None)],
+                ),
+                card("p2", "a2", "idle", vec![go("second text")]),
+                card(
+                    "p3",
+                    "a3",
+                    "stopped",
+                    vec![action(
+                        "go",
+                        "prompt",
+                        Some("never"),
+                        false,
+                        Some(REASON_AGENT_STOPPED),
+                    )],
+                ),
+                card(
+                    "p4",
+                    "a4",
+                    "idle",
+                    vec![action("open", "open", None, true, None)],
+                ),
+                card(
+                    "p5",
+                    "a5",
+                    "idle",
+                    vec![action("go", "prompt", Some("x"), false, Some("busy"))],
+                ),
+                card(
+                    "p6",
+                    "a6",
+                    "idle",
+                    vec![
+                        action("go", "prompt", Some("   "), true, None),
+                        action("reply", "prompt", None, true, None),
+                    ],
+                ),
+            ],
+        }
+    }
+
+    fn target(pane: &str, agent: &str) -> CardBatchEntry {
+        CardBatchEntry {
+            pane_id: pane.into(),
+            agent_id: agent.into(),
+            ..CardBatchEntry::default()
+        }
+    }
+
+    fn outcome<'a>(result: &'a CardBatchResult, pane: &str) -> &'a CardBatchOutcome {
+        result.entries.iter().find(|e| e.pane_id == pane).unwrap()
+    }
+
+    #[test]
+    fn a_preview_includes_each_card_with_its_own_exact_text_token_and_instance() {
+        let result = preview_batch(
+            &list(),
+            "b1",
+            "go",
+            &[target("p1", "a1"), target("p2", "a2")],
+        );
+        assert_eq!(result.request_id, "b1");
+        for (pane, text) in [("p1", "first text"), ("p2", "second text")] {
+            let entry = outcome(&result, pane);
+            assert_eq!(entry.outcome, BATCH_INCLUDED);
+            assert_eq!(entry.prompt.as_deref(), Some(text));
+            assert_eq!(entry.prompt_source.as_deref(), Some("catalog"));
+            assert_eq!(entry.action_token.as_deref(), Some("tok-go"));
+            assert_eq!(entry.instance_id.as_deref(), Some(INSTANCE));
+            assert_eq!(entry.name.as_deref(), Some(format!("name-{pane}").as_str()));
+            assert_eq!(entry.code, None);
+        }
+    }
+
+    #[test]
+    fn a_preview_skips_each_card_a_single_press_would_refuse_with_its_code_and_a_reason() {
+        let mut cards = list();
+        // A pane whose agent was replaced, and a pane nobody holds.
+        cards.entries.push(card("p7", "a7-new", "idle", vec![]));
+        let result = preview_batch(
+            &cards,
+            "b2",
+            "go",
+            &[
+                target("p3", "a3"),
+                target("p4", "a4"),
+                target("p5", "a5"),
+                target("p6", "a6"),
+                target("p7", "a7-old"),
+                target("gone", "x"),
+            ],
+        );
+        for (pane, code) in [
+            ("p3", CODE_AGENT_STOPPED),
+            ("p4", CODE_UNKNOWN_ACTION),
+            ("p5", CODE_ACTION_DISABLED),
+            ("p6", CODE_ACTION_DISABLED),
+            ("p7", CODE_STALE_ENTRY),
+            ("gone", CODE_UNKNOWN_ENTRY),
+        ] {
+            let entry = outcome(&result, pane);
+            assert_eq!(entry.outcome, BATCH_SKIPPED, "{pane}");
+            assert_eq!(entry.code.as_deref(), Some(code), "{pane}");
+            assert!(
+                entry.message.as_deref().is_some_and(|m| !m.is_empty()),
+                "{pane}"
+            );
+            assert_eq!(entry.prompt, None, "{pane}: a skipped card shows no text");
+            assert_eq!(
+                entry.action_token, None,
+                "{pane}: and gets no handle to execute with"
+            );
+        }
+        let open = preview_batch(&cards, "b3", "open", &[target("p4", "a4")]);
+        assert_eq!(
+            open.entries[0].code.as_deref(),
+            Some(CODE_CLIENT_SIDE_ACTION)
+        );
+        let reply = preview_batch(&cards, "b4", "reply", &[target("p6", "a6")]);
+        assert_eq!(reply.entries[0].code.as_deref(), Some(CODE_TEXT_REQUIRED));
+    }
+
+    #[test]
+    fn a_preview_includes_a_close_without_text_and_names_each_card_once() {
+        let result = preview_batch(
+            &list(),
+            "b5",
+            "close",
+            &[target("p1", "a1"), target("p1", "a1"), target("p2", "a2")],
+        );
+        assert_eq!(result.entries.len(), 2, "a card named twice is one entry");
+        let close = outcome(&result, "p1");
+        assert_eq!(close.outcome, BATCH_INCLUDED);
+        assert_eq!(close.kind.as_deref(), Some("close"));
+        assert_eq!(close.prompt, None);
+        assert_eq!(close.action_token.as_deref(), Some("tok-close"));
+        assert_eq!(
+            outcome(&result, "p2").code.as_deref(),
+            Some(CODE_UNKNOWN_ACTION)
+        );
+    }
+
+    #[test]
+    fn a_batch_request_is_refused_whole_when_its_ids_or_size_are_out_of_bounds() {
+        let one = [target("p1", "a1")];
+        assert!(check_batch("b", "go", &one).is_ok());
+        assert!(check_batch("", "go", &one).is_err());
+        assert!(check_batch("bad id", "go", &one).is_err());
+        assert!(check_batch(&"r".repeat(MAX_REQUEST_ID_BYTES - 4), "go", &one).is_ok());
+        assert!(
+            check_batch(&"r".repeat(MAX_REQUEST_ID_BYTES - 3), "go", &one).is_err(),
+            "room for each entry's own id"
+        );
+        assert!(check_batch("b", "", &one).is_err());
+        assert!(check_batch("b", "go", &[]).is_err());
+        let many: Vec<_> = (0..=MAX_BATCH_ENTRIES)
+            .map(|i| target(&format!("p{i}"), "a"))
+            .collect();
+        assert!(check_batch("b", "go", &many[..MAX_BATCH_ENTRIES]).is_ok());
+        assert!(check_batch("b", "go", &many).is_err());
+        let repeated = vec![target("p1", "a1"); MAX_BATCH_ENTRIES + 1];
+        assert!(
+            check_batch("b", "go", &repeated).is_ok(),
+            "repeats within the raw budget count once against the distinct cap"
+        );
+        let mut long = target("p1", "a1");
+        long.action_token = "t".repeat(MAX_REQUEST_FIELD_BYTES + 1);
+        assert!(check_batch("b", "go", &[long]).is_err());
+    }
+
+    /// Audit S2: repeats of one card are bounded by the raw budget, refused
+    /// before any card is counted; identifiers are sized before they are
+    /// hashed; and the distinct count stops at the first card over the cap.
+    #[test]
+    fn a_batch_request_over_the_raw_entry_budget_is_refused_before_its_cards_are_counted() {
+        let at_budget = vec![target("p1", "a1"); MAX_BATCH_RAW_ENTRIES];
+        assert!(check_batch("b", "go", &at_budget).is_ok());
+        let over_budget = vec![target("p1", "a1"); MAX_BATCH_RAW_ENTRIES + 1];
+        let refused = check_batch("b", "go", &over_budget).unwrap_err();
+        assert!(
+            refused.contains(&format!("at most {MAX_BATCH_RAW_ENTRIES} entries")),
+            "{refused}"
+        );
+
+        // An oversized identifier after the distinct cap is reached is still
+        // what refuses the request: sizes are checked before anything is hashed.
+        let mut sized_first: Vec<_> = (0..=MAX_BATCH_ENTRIES)
+            .map(|i| target(&format!("p{i}"), "a"))
+            .collect();
+        sized_first.push(CardBatchEntry {
+            pane_id: "p".repeat(MAX_REQUEST_FIELD_BYTES + 1),
+            ..target("x", "a")
+        });
+        let refused = check_batch("b", "go", &sized_first).unwrap_err();
+        assert!(refused.contains("pane id is longer"), "{refused}");
+
+        // Over the distinct cap, within the raw budget: refused without a full count.
+        let distinct: Vec<_> = (0..MAX_BATCH_RAW_ENTRIES)
+            .map(|i| target(&format!("p{i}"), "a"))
+            .collect();
+        let refused = check_batch("b", "go", &distinct).unwrap_err();
+        assert_eq!(
+            refused,
+            format!("a batch may name at most {MAX_BATCH_ENTRIES} cards; this one names more")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_execution_presses_each_entry_once_confirmed_and_a_refusal_fails_alone() {
+        let entries = vec![
+            CardBatchEntry {
+                action_token: "t1".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p1", "a1")
+            },
+            CardBatchEntry {
+                action_token: "stale".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p2", "a2")
+            },
+            CardBatchEntry {
+                action_token: "t1".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p1", "a1")
+            },
+            CardBatchEntry {
+                action_token: "t3".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p3", "a3")
+            },
+            CardBatchEntry {
+                action_token: "t4".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p4", "a4")
+            },
+        ];
+        let mut pressed = Vec::new();
+        let result = execute_batch("batch-7", "go", &entries, |request| {
+            pressed.push(request.clone());
+            async move {
+                match request.pane_id.as_str() {
+                    "p2" => CardActionResult::refused(
+                        &request.request_id,
+                        CODE_STALE_ACTION,
+                        "action go changed",
+                    ),
+                    "p4" => CardActionResult {
+                        request_id: request.request_id.clone(),
+                        outcome: "closed".into(),
+                        message_id: None,
+                        kept_worktree: Some("/w/p4".into()),
+                        code: None,
+                        message: Some("name-p4".into()),
+                        entry_revision: Some(9),
+                    },
+                    _ => CardActionResult {
+                        request_id: request.request_id.clone(),
+                        outcome: "sent".into(),
+                        message_id: Some(format!("m-{}", request.pane_id)),
+                        kept_worktree: None,
+                        code: None,
+                        message: Some(format!("name-{}", request.pane_id)),
+                        entry_revision: Some(2),
+                    },
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            pressed
+                .iter()
+                .map(|r| (
+                    r.pane_id.as_str(),
+                    r.request_id.as_str(),
+                    r.action_token.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("p1", "batch-7#0", "t1"),
+                ("p2", "batch-7#1", "stale"),
+                ("p3", "batch-7#2", "t3"),
+                ("p4", "batch-7#3", "t4")
+            ],
+            "each distinct entry is pressed once, in order, under its own id and with its own token"
+        );
+        assert!(pressed.iter().all(|r| r.confirm
+            && r.text.is_none()
+            && r.action_id == "go"
+            && r.instance_id == INSTANCE));
+        assert_eq!(result.entries.len(), 4);
+        let delivered = outcome(&result, "p1");
+        assert_eq!(delivered.outcome, BATCH_DELIVERED);
+        assert_eq!(delivered.message_id.as_deref(), Some("m-p1"));
+        let failed = outcome(&result, "p2");
+        assert_eq!(failed.outcome, BATCH_FAILED);
+        assert_eq!(failed.code.as_deref(), Some(CODE_STALE_ACTION));
+        assert_eq!(failed.message.as_deref(), Some("action go changed"));
+        assert_eq!(failed.message_id, None);
+        assert_eq!(
+            outcome(&result, "p3").outcome,
+            BATCH_DELIVERED,
+            "an entry after a failure still goes"
+        );
+        let closed = outcome(&result, "p4");
+        assert_eq!(closed.outcome, BATCH_CLOSED);
+        assert_eq!(closed.kept_worktree.as_deref(), Some("/w/p4"));
+    }
+
+    /// One entry's single press as the deck runs it: claimed under its own
+    /// request id in `store` ([`run_once`]), so a repeat answers from memory.
+    /// Every press that runs posts once, counted in `posts`.
+    async fn remembered_press(
+        store: Arc<CardStore>,
+        posts: Arc<std::sync::atomic::AtomicUsize>,
+        request: CardActionRequest,
+    ) -> CardActionResult {
+        fn itself(store: &CardStore) -> &CardStore {
+            store
+        }
+        let rid = request.request_id.clone();
+        let card = entry_key(&request.pane_id, &request.agent_id);
+        let fingerprint = request_fingerprint(&request);
+        let work = async move {
+            let n = posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            CardActionResult {
+                request_id: request.request_id.clone(),
+                outcome: "sent".into(),
+                message_id: Some(format!("m-{}-{n}", request.pane_id)),
+                kept_worktree: None,
+                code: None,
+                message: Some(format!("name-{}", request.pane_id)),
+                entry_revision: None,
+            }
+        };
+        run_once(store, itself, &rid, &card, fingerprint, 0, work).await
+    }
+
+    /// An entry as an execution names it: the token its preview answered
+    /// and this daemon process's instance.
+    fn confirmed(pane: &str, agent: &str) -> CardBatchEntry {
+        CardBatchEntry {
+            action_token: format!("tok-{pane}"),
+            instance_id: own_instance_id(),
+            ..target(pane, agent)
+        }
+    }
+
+    fn itself(store: &CardStore) -> &CardStore {
+        store
+    }
+
+    /// Make the store hold each entry's card offering `action_id` with the
+    /// entry's token, as a refresh commits it: what a new batch's admission
+    /// checks read.
+    fn seed_cards(store: &CardStore, action_id: &str, entries: &[CardBatchEntry]) {
+        let mut inner = store.lock();
+        for e in entries {
+            inner.computed.insert(
+                entry_key(&e.pane_id, &e.agent_id),
+                Computed {
+                    hash: 0,
+                    revision: 1,
+                    updated_at: Utc::now(),
+                    last_doorbell: None,
+                    doorbell_owed: false,
+                    pane_id: e.pane_id.clone(),
+                    tokens: HashMap::from([(action_id.to_string(), e.action_token.clone())]),
+                },
+            );
+        }
+    }
+
+    /// Execute a batch whose cards the store holds, each entry pressed by
+    /// [`remembered_press`].
+    async fn run_batch(
+        store: &Arc<CardStore>,
+        posts: &Arc<std::sync::atomic::AtomicUsize>,
+        request_id: &str,
+        action_id: &str,
+        entries: &[CardBatchEntry],
+    ) -> Result<CardBatchResult, String> {
+        seed_cards(store, action_id, entries);
+        unseeded_batch(store, posts, request_id, action_id, entries).await
+    }
+
+    /// [`run_batch`] without making the store hold the cards.
+    async fn unseeded_batch(
+        store: &Arc<CardStore>,
+        posts: &Arc<std::sync::atomic::AtomicUsize>,
+        request_id: &str,
+        action_id: &str,
+        entries: &[CardBatchEntry],
+    ) -> Result<CardBatchResult, String> {
+        let (press_store, posts) = (Arc::clone(store), Arc::clone(posts));
+        execute_batch_once(
+            Arc::clone(store),
+            itself,
+            request_id,
+            action_id,
+            entries,
+            move |request| remembered_press(Arc::clone(&press_store), Arc::clone(&posts), request),
+        )
+        .await
+    }
+
+    fn posted(posts: &std::sync::atomic::AtomicUsize) -> usize {
+        posts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Fill the single presses' memory with `n` answered presses of their
+    /// own, each new, so every older answer it held is pushed out.
+    async fn flood_single_presses(store: &Arc<CardStore>, n: usize) {
+        let sink = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..n {
+            remembered_press(
+                Arc::clone(store),
+                Arc::clone(&sink),
+                CardActionRequest {
+                    pane_id: format!("flood-{i}"),
+                    agent_id: "a".into(),
+                    action_id: "go".into(),
+                    action_token: "t".into(),
+                    instance_id: own_instance_id(),
+                    request_id: format!("flood-{i}"),
+                    confirm: true,
+                    text: None,
+                },
+            )
+            .await;
+        }
+    }
+
+    fn message_ids(result: &CardBatchResult) -> Vec<(String, Option<String>)> {
+        result
+            .entries
+            .iter()
+            .map(|e| (e.pane_id.clone(), e.message_id.clone()))
+            .collect()
+    }
+
+    /// PR #2491 review: a batch entry claims no more than its single press
+    /// does. A sent press is in the agent's inbox, which the card records as
+    /// `queued`, and the batch entry says the same.
+    #[tokio::test]
+    async fn a_sent_batch_entry_says_its_text_is_queued_as_its_card_records_it() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = run_batch(&store, &posts, "b-state", "go", &[confirmed("p1", "a1")])
+            .await
+            .unwrap();
+        let entry = outcome(&result, "p1");
+        assert_eq!(
+            entry.outcome, BATCH_DELIVERED,
+            "the wire outcome is unchanged"
+        );
+        assert_eq!(entry.state.as_deref(), Some(DELIVERY_QUEUED));
+        let wire = serde_json::to_value(entry).unwrap();
+        assert_eq!(wire["state"], "queued");
+        let failed = execution_outcome(
+            &confirmed("p2", "a2"),
+            CardActionResult::refused("r", CODE_STALE_ACTION, "changed"),
+        );
+        assert_eq!(
+            failed.state, None,
+            "an entry that sent nothing has no delivery state"
+        );
+        assert!(
+            serde_json::to_value(&failed)
+                .unwrap()
+                .get("state")
+                .is_none(),
+            "and the wire carries none"
+        );
+    }
+
+    /// PR #2491 review: the same batch request repeated — same id, action and
+    /// cards — runs no press again: every entry answers from memory with the
+    /// message its first run sent.
+    #[tokio::test]
+    async fn a_repeated_batch_posts_nothing_new() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [confirmed("p1", "a1"), confirmed("p2", "a2")];
+        let first = run_batch(&store, &posts, "b-replay", "go", &entries)
+            .await
+            .unwrap();
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let again = run_batch(&store, &posts, "b-replay", "go", &entries)
+            .await
+            .unwrap();
+        assert_eq!(again, first, "the repeat answers as the first did");
+        assert_eq!(
+            posts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "and posts nothing new"
+        );
+    }
+
+    /// PR #2491 review: a remembered batch id repeated with a card added, a
+    /// card removed, another token or another action is refused whole,
+    /// before any of its entries runs — never mapping a remembered answer to
+    /// another card, nor acting on a card the first did not name.
+    #[tokio::test]
+    async fn a_batch_id_reused_with_another_set_of_cards_or_action_is_refused_whole() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [confirmed("p1", "a1"), confirmed("p2", "a2")];
+        run_batch(&store, &posts, "b-reuse", "go", &entries)
+            .await
+            .unwrap();
+        let mut stale = entries.clone();
+        stale[1].action_token = "tok-other".into();
+        for (what, action, reused) in [
+            (
+                "an added card",
+                "go",
+                vec![
+                    confirmed("p1", "a1"),
+                    confirmed("p2", "a2"),
+                    confirmed("p3", "a3"),
+                ],
+            ),
+            ("a removed card", "go", vec![confirmed("p1", "a1")]),
+            ("another token", "go", stale.to_vec()),
+            ("another action", "close", entries.to_vec()),
+        ] {
+            let refused = run_batch(&store, &posts, "b-reuse", action, &reused)
+                .await
+                .expect_err(what);
+            assert!(refused.contains("already used"), "{what}: {refused}");
+            assert_eq!(
+                posts.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "{what}: no entry ran"
+            );
+        }
+        // An id a single press already used is not a batch's either.
+        let single = remembered_press(
+            Arc::clone(&store),
+            Arc::clone(&posts),
+            CardActionRequest {
+                pane_id: "p9".into(),
+                agent_id: "a9".into(),
+                action_id: "go".into(),
+                action_token: "tok-p9".into(),
+                instance_id: INSTANCE.into(),
+                request_id: "single-1".into(),
+                confirm: true,
+                text: None,
+            },
+        )
+        .await;
+        assert_eq!(single.outcome, "sent");
+        let posted = posts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            run_batch(&store, &posts, "single-1", "go", &entries)
+                .await
+                .is_err()
+        );
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), posted);
+    }
+
+    /// PR #2491 review: the same cards listed in another order are the same
+    /// batch. Each card keeps its own entry id, so the repeat answers each
+    /// card with that card's own remembered message, in the repeat's order,
+    /// and posts nothing.
+    #[tokio::test]
+    async fn a_batch_repeated_with_its_cards_reordered_is_a_replay() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [
+            confirmed("p1", "a1"),
+            confirmed("p2", "a2"),
+            confirmed("p3", "a3"),
+        ];
+        let first = run_batch(&store, &posts, "b-order", "go", &entries)
+            .await
+            .unwrap();
+        let reordered = [entries[2].clone(), entries[0].clone(), entries[1].clone()];
+        let again = run_batch(&store, &posts, "b-order", "go", &reordered)
+            .await
+            .unwrap();
+        assert_eq!(
+            posts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "nothing new"
+        );
+        assert_eq!(
+            again
+                .entries
+                .iter()
+                .map(|e| e.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["p3", "p1", "p2"],
+            "answered in the repeat's order"
+        );
+        let mut by_card = message_ids(&first);
+        by_card.sort();
+        let mut replayed = message_ids(&again);
+        replayed.sort();
+        assert_eq!(
+            replayed, by_card,
+            "each card gets its own remembered answer"
+        );
+    }
+
+    /// PR #2491 review (Qodo): a repeated batch is answered from the batch's
+    /// own record, never by invoking its entries again — so pushing every
+    /// entry's single-press answer out of memory between the first run and
+    /// the repeat cannot make the repeat post again.
+    #[tokio::test]
+    async fn a_repeated_batch_answers_from_its_own_record_after_its_entries_answers_are_gone() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [confirmed("p1", "a1"), confirmed("p2", "a2")];
+        let first = run_batch(&store, &posts, "b-evicted", "go", &entries)
+            .await
+            .unwrap();
+        assert_eq!(posted(&posts), 2);
+        assert!(
+            !store
+                .lock()
+                .requests
+                .keys()
+                .any(|k| k.starts_with("b-evicted")),
+            "the batch's record holds its entries' answers, so the single presses' memory does not"
+        );
+        flood_single_presses(&store, MAX_REMEMBERED_REQUESTS + 8).await;
+        let again = run_batch(&store, &posts, "b-evicted", "go", &entries)
+            .await
+            .unwrap();
+        assert_eq!(again, first, "the repeat answers the original outcomes");
+        assert_eq!(posted(&posts), 2, "and posts nothing");
+    }
+
+    /// PR #2491 review (reviewer and auditor P2): a replay keeps the batch's
+    /// binding to its set of cards however full the single presses' memory
+    /// gets around it, so reusing the id with a card added is refused whole
+    /// and the added card is never posted to.
+    #[tokio::test]
+    async fn a_replayed_batch_keeps_its_binding_to_its_cards_under_memory_pressure() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [confirmed("p1", "a1"), confirmed("p2", "a2")];
+        let first = run_batch(&store, &posts, "b-pinned", "go", &entries)
+            .await
+            .unwrap();
+        flood_single_presses(&store, MAX_REMEMBERED_REQUESTS + 8).await;
+        let replay = run_batch(&store, &posts, "b-pinned", "go", &entries)
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+        flood_single_presses(&store, MAX_REMEMBERED_REQUESTS + 8).await;
+        let widened = [
+            confirmed("p1", "a1"),
+            confirmed("p2", "a2"),
+            confirmed("p3", "a3"),
+        ];
+        let refused = run_batch(&store, &posts, "b-pinned", "go", &widened)
+            .await
+            .expect_err("another set of cards under a remembered batch id");
+        assert!(refused.contains("already used"), "{refused}");
+        assert_eq!(posted(&posts), 2, "p3 was never posted to");
+    }
+
+    /// PR #2491 review: a repeat that arrives while its batch is still
+    /// running — including after the first caller went away — waits for that
+    /// run and gets its outcomes; nothing is posted twice, and the id stays
+    /// bound to its set of cards afterwards.
+    #[tokio::test]
+    async fn a_repeat_of_a_running_batch_waits_for_it_even_when_its_first_caller_went_away() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [confirmed("p1", "a1"), confirmed("p2", "a2")];
+        seed_cards(&store, "go", &entries);
+        let (release, released) = tokio::sync::watch::channel(false);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let gated = |store: &Arc<CardStore>| {
+            let (store, posts, released, started) = (
+                Arc::clone(store),
+                Arc::clone(&posts),
+                released.clone(),
+                Arc::clone(&started),
+            );
+            move |request: CardActionRequest| {
+                let (store, posts, mut released, started) = (
+                    Arc::clone(&store),
+                    Arc::clone(&posts),
+                    released.clone(),
+                    Arc::clone(&started),
+                );
+                async move {
+                    started.notify_one();
+                    let _ = released.wait_for(|go| *go).await;
+                    remembered_press(store, posts, request).await
+                }
+            }
+        };
+        let first = {
+            let (store, entries, press) = (Arc::clone(&store), entries.clone(), gated(&store));
+            tokio::spawn(async move {
+                execute_batch_once(store, itself, "b-running", "go", &entries, press).await
+            })
+        };
+        started.notified().await;
+        first.abort();
+        let mut repeat = {
+            let (store, entries, press) = (Arc::clone(&store), entries.clone(), gated(&store));
+            Box::pin(async move {
+                execute_batch_once(store, itself, "b-running", "go", &entries, press).await
+            })
+        };
+        let polled = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(repeat.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(polled, "the repeat waits for the running batch");
+        release.send(true).unwrap();
+        let repeated = repeat.await.unwrap();
+        assert_eq!(repeated.entries.len(), 2);
+        assert!(
+            repeated
+                .entries
+                .iter()
+                .all(|e| e.outcome == BATCH_DELIVERED)
+        );
+        assert_eq!(posted(&posts), 2, "each card was posted to once");
+        let refused = run_batch(
+            &store,
+            &posts,
+            "b-running",
+            "go",
+            &[
+                entries[0].clone(),
+                entries[1].clone(),
+                confirmed("p3", "a3"),
+            ],
+        )
+        .await
+        .expect_err("the id stays bound after the run");
+        assert!(refused.contains("already used"), "{refused}");
+        assert_eq!(posted(&posts), 2);
+    }
+
+    /// PR #2491 review (auditor P2): batches none of whose entries a single
+    /// press would admit — an unknown card, another daemon process, a stale
+    /// token — are answered with each entry's refusal, invoke nothing and
+    /// remember nothing, so however many arrive they cannot push a
+    /// remembered single press out of memory.
+    #[tokio::test]
+    async fn a_stream_of_unactionable_batches_leaves_a_remembered_press_alone() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let legit = CardActionRequest {
+            pane_id: "p-legit".into(),
+            agent_id: "a".into(),
+            action_id: "go".into(),
+            action_token: "t".into(),
+            instance_id: own_instance_id(),
+            request_id: "legit-1".into(),
+            confirm: true,
+            text: None,
+        };
+        let answered =
+            remembered_press(Arc::clone(&store), Arc::clone(&posts), legit.clone()).await;
+        seed_cards(&store, "go", &[confirmed("p-stale", "a")]);
+        let junk = [
+            confirmed("p-gone", "a"),
+            CardBatchEntry {
+                instance_id: "another-daemon".into(),
+                ..confirmed("p-stale", "a")
+            },
+            CardBatchEntry {
+                action_token: "tok-old".into(),
+                ..confirmed("p-stale", "a")
+            },
+        ];
+        for i in 0..(MAX_REMEMBERED_REQUESTS + MAX_REMEMBERED_BATCHES) {
+            // The last two name one card each with the same identity, so
+            // the batch's first naming (another daemon) is the one judged.
+            let result = unseeded_batch(&store, &posts, &format!("junk-{i}"), "go", &junk)
+                .await
+                .unwrap();
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .map(|e| (e.outcome.as_str(), e.code.as_deref()))
+                    .collect::<Vec<_>>(),
+                [
+                    (BATCH_FAILED, Some(CODE_UNKNOWN_ENTRY)),
+                    (BATCH_FAILED, Some(CODE_DAEMON_REPLACED)),
+                ]
+            );
+        }
+        let stale = unseeded_batch(&store, &posts, "junk-stale", "go", &junk[2..])
+            .await
+            .unwrap();
+        assert_eq!(stale.entries[0].code.as_deref(), Some(CODE_STALE_ACTION));
+        assert_eq!(posted(&posts), 1, "no junk entry was invoked");
+        {
+            let inner = store.lock();
+            assert!(inner.batches.is_empty(), "no junk batch was remembered");
+            assert_eq!(
+                inner.requests.keys().collect::<Vec<_>>(),
+                ["legit-1"],
+                "and none took the single presses' memory"
+            );
+        }
+        let again = remembered_press(Arc::clone(&store), Arc::clone(&posts), legit).await;
+        assert_eq!(
+            again, answered,
+            "the legitimate press still answers from memory"
+        );
+        assert_eq!(posted(&posts), 1);
+    }
+
+    /// PR #2491 review: batch RECORDS are remembered in a memory of their
+    /// own, so more batches than it holds push out older batch records,
+    /// never a single press's answer; and a batch's id is not a single
+    /// press's either. (A batch's entries are still claimed in the single
+    /// presses' memory while they run, like any press: this store holds one
+    /// single answer, far from that memory's bounds.)
+    #[tokio::test]
+    async fn the_batch_records_never_push_out_a_single_press() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let legit = CardActionRequest {
+            pane_id: "p-legit".into(),
+            agent_id: "a".into(),
+            action_id: "go".into(),
+            action_token: "t".into(),
+            instance_id: own_instance_id(),
+            request_id: "legit-2".into(),
+            confirm: true,
+            text: None,
+        };
+        let answered =
+            remembered_press(Arc::clone(&store), Arc::clone(&posts), legit.clone()).await;
+        let entries = [confirmed("p1", "a1")];
+        for i in 0..(MAX_REMEMBERED_BATCHES + 8) {
+            run_batch(&store, &posts, &format!("many-{i}"), "go", &entries)
+                .await
+                .unwrap();
+        }
+        {
+            let inner = store.lock();
+            assert!(inner.batches.len() <= MAX_REMEMBERED_BATCHES);
+            assert_eq!(inner.requests.keys().collect::<Vec<_>>(), ["legit-2"]);
+        }
+        let again = remembered_press(Arc::clone(&store), Arc::clone(&posts), legit).await;
+        assert_eq!(again, answered);
+        let newest = format!("many-{}", MAX_REMEMBERED_BATCHES + 7);
+        let reused = remembered_press(
+            Arc::clone(&store),
+            Arc::clone(&posts),
+            CardActionRequest {
+                request_id: newest,
+                ..confirmed_press("p1", "a1")
+            },
+        )
+        .await;
+        assert_eq!(reused.code.as_deref(), Some(CODE_REQUEST_REUSED));
+    }
+
+    fn confirmed_press(pane: &str, agent: &str) -> CardActionRequest {
+        CardActionRequest {
+            pane_id: pane.into(),
+            agent_id: agent.into(),
+            action_id: "go".into(),
+            action_token: format!("tok-{pane}"),
+            instance_id: own_instance_id(),
+            request_id: String::new(),
+            confirm: true,
+            text: None,
+        }
+    }
+
+    /// PR #2491 review (reviewer and auditor P2): a single press the user
+    /// made under `b:0` — on the very card batch `b` then names, and on
+    /// another card — keeps its own answer across batch `b`. The batch's
+    /// entry is its own press (it is posted once, not answered with the
+    /// single press's message, nor refused by it), and retrying the single
+    /// press afterwards answers its original message and posts nothing.
+    #[tokio::test]
+    async fn a_single_press_under_a_batch_s_old_entry_id_keeps_its_answer_across_the_batch() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (batch_id, pane) in [("b-same", "p1"), ("b-other", "p9")] {
+            let single = CardActionRequest {
+                request_id: format!("{batch_id}:0"),
+                ..confirmed_press(pane, "a1")
+            };
+            let first =
+                remembered_press(Arc::clone(&store), Arc::clone(&posts), single.clone()).await;
+            assert_eq!(first.outcome, "sent", "{batch_id}");
+            let before = posted(&posts);
+            let batch = run_batch(&store, &posts, batch_id, "go", &[confirmed("p1", "a1")])
+                .await
+                .unwrap();
+            assert_eq!(batch.entries[0].outcome, BATCH_DELIVERED, "{batch_id}");
+            assert_ne!(
+                batch.entries[0].message_id, first.message_id,
+                "{batch_id}: the entry is its own press, not the single press's answer"
+            );
+            assert_eq!(
+                posted(&posts),
+                before + 1,
+                "{batch_id}: the entry posted once"
+            );
+            let again = remembered_press(Arc::clone(&store), Arc::clone(&posts), single).await;
+            assert_eq!(
+                again, first,
+                "{batch_id}: the single press answers its original message"
+            );
+            assert_eq!(
+                posted(&posts),
+                before + 1,
+                "{batch_id}: and posts nothing again"
+            );
+            assert!(
+                store.lock().requests.contains_key(&format!("{batch_id}:0")),
+                "{batch_id}: the single press is still remembered"
+            );
+        }
+    }
+
+    /// PR #2491 review (auditor P2): after batch `b`, a single press under
+    /// `b:0` is a press like any other: it runs once, its repeat answers
+    /// from memory, and batch `b`'s own repeat still answers the batch's
+    /// outcomes.
+    #[tokio::test]
+    async fn a_single_press_under_a_batch_s_entry_id_shape_after_the_batch_is_its_own() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [confirmed("p1", "a1")];
+        let batch = run_batch(&store, &posts, "b-after", "go", &entries)
+            .await
+            .unwrap();
+        assert_eq!(posted(&posts), 1);
+        let single = CardActionRequest {
+            request_id: "b-after:0".into(),
+            ..confirmed_press("p1", "a1")
+        };
+        let first = remembered_press(Arc::clone(&store), Arc::clone(&posts), single.clone()).await;
+        assert_eq!(first.outcome, "sent");
+        assert_eq!(posted(&posts), 2, "the single press runs as a new press");
+        let again = remembered_press(Arc::clone(&store), Arc::clone(&posts), single).await;
+        assert_eq!(again, first, "and its repeat answers from memory");
+        let repeated = run_batch(&store, &posts, "b-after", "go", &entries)
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated, batch,
+            "the batch's repeat answers the batch's outcomes"
+        );
+        assert_eq!(posted(&posts), 2);
+    }
+
+    /// PR #2491 review: a batch entry's request id is in a namespace no
+    /// client's request id can name, so a single press can never claim it.
+    #[test]
+    fn a_client_may_not_name_a_batch_entry_s_request_id() {
+        let entry_id = batch_entry_request_id("b", 0);
+        assert_eq!(entry_id, "b#0");
+        assert!(!is_request_id(&entry_id));
+        let refused = check_request(&CardActionRequest {
+            request_id: entry_id,
+            ..confirmed_press("p1", "a1")
+        })
+        .expect_err("a client's request may not name an entry's id");
+        assert_eq!(refused.code.as_deref(), Some(CODE_REQUEST_INVALID));
+        for id in ["b:0", "b.0", "b_0", "b-0"] {
+            assert!(is_request_id(id), "{id} is still a client's request id");
+        }
+    }
+
+    /// PR #2491 review (reviewer and auditor P2): a batch whose run is cut
+    /// short after its first entry was posted answers per entry, never as a
+    /// refusal of the whole request: the first entry as it answered, and
+    /// each other entry `unknown` with code `interrupted`, never `failed`. A
+    /// repeat answers the same and posts nothing.
+    #[tokio::test]
+    async fn a_batch_cut_short_after_its_first_post_answers_each_entry_and_none_failed() {
+        let store = Arc::new(CardStore::default());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = [
+            confirmed("p1", "a1"),
+            confirmed("p2", "a2"),
+            confirmed("p3", "a3"),
+        ];
+        seed_cards(&store, "go", &entries);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let press = {
+            let (store, posts) = (Arc::clone(&store), Arc::clone(&posts));
+            move |request: CardActionRequest| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (store, posts) = (Arc::clone(&store), Arc::clone(&posts));
+                async move {
+                    assert!(n == 0, "the batch's run is cut short at its second entry");
+                    remembered_press(store, posts, request).await
+                }
+            }
+        };
+        let result = execute_batch_once(Arc::clone(&store), itself, "b-cut", "go", &entries, press)
+            .await
+            .expect("an execution that started answers per entry");
+        assert_eq!(posted(&posts), 1);
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|e| (e.pane_id.as_str(), e.outcome.as_str(), e.code.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("p1", BATCH_DELIVERED, None),
+                ("p2", BATCH_UNKNOWN, Some(CODE_BATCH_INTERRUPTED)),
+                ("p3", BATCH_UNKNOWN, Some(CODE_BATCH_INTERRUPTED)),
+            ]
+        );
+        assert_eq!(result.entries[0].message_id.as_deref(), Some("m-p1-0"));
+        for entry in &result.entries[1..] {
+            let message = entry.message.as_deref().unwrap_or_default();
+            assert!(message.contains("not known whether"), "{message}");
+            assert!(!message.contains("nothing was"), "{message}");
+        }
+        let again = run_batch(&store, &posts, "b-cut", "go", &entries)
+            .await
+            .expect("its repeat answers per entry too");
+        assert_eq!(again, result, "the repeat answers what the run answered");
+        assert_eq!(posted(&posts), 1, "and posts nothing");
+    }
+
+    /// PR #2491 review (reviewer and auditor P2, then P2/P3): a batch's
+    /// answer too large for the batches' memory is remembered smaller, never
+    /// as a refusal: each entry's outcome and message id without its long
+    /// text, or — when even that does not fit — each entry `unknown` with
+    /// code `answer_not_kept`, never `failed`. The first caller, a repeat
+    /// that waited on the running batch and a later repeat all get that one
+    /// kept answer, and the entry is pressed once.
+    #[tokio::test]
+    async fn a_batch_answer_too_large_to_remember_is_kept_smaller_and_never_read_as_a_refusal() {
+        let huge = "x".repeat(MAX_REMEMBERED_BATCH_BYTES + 1);
+        for (batch_id, long_name, want) in [
+            ("b-compact", true, BATCH_DELIVERED),
+            ("b-minimal", false, BATCH_UNKNOWN),
+        ] {
+            let store = Arc::new(CardStore::default());
+            let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let presses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entries = [confirmed("p1", "a1")];
+            seed_cards(&store, "go", &entries);
+            let (release, released) = tokio::sync::watch::channel(false);
+            let started = Arc::new(tokio::sync::Notify::new());
+            let press = || {
+                let (huge, presses, released, started) = (
+                    huge.clone(),
+                    Arc::clone(&presses),
+                    released.clone(),
+                    Arc::clone(&started),
+                );
+                move |request: CardActionRequest| {
+                    let (huge, mut released, started) =
+                        (huge.clone(), released.clone(), Arc::clone(&started));
+                    presses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        started.notify_one();
+                        let _ = released.wait_for(|go| *go).await;
+                        CardActionResult {
+                            request_id: request.request_id,
+                            outcome: "sent".into(),
+                            // The compact form drops a name and keeps a message id.
+                            message_id: Some(if long_name {
+                                "m-1".into()
+                            } else {
+                                huge.clone()
+                            }),
+                            kept_worktree: None,
+                            code: None,
+                            message: Some(if long_name { huge } else { "name".into() }),
+                            entry_revision: None,
+                        }
+                    }
+                }
+            };
+            let first = {
+                let (store, entries, press) = (Arc::clone(&store), entries.clone(), press());
+                tokio::spawn(async move {
+                    execute_batch_once(store, itself, batch_id, "go", &entries, press).await
+                })
+            };
+            started.notified().await;
+            let mut waiting = {
+                let (store, entries, press) = (Arc::clone(&store), entries.clone(), press());
+                Box::pin(async move {
+                    execute_batch_once(store, itself, batch_id, "go", &entries, press).await
+                })
+            };
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(pending, "{batch_id}: the repeat waits on the running batch");
+            release.send(true).unwrap();
+            let first = first.await.unwrap().unwrap();
+            let waited = waiting
+                .await
+                .expect("a waiting repeat is answered per entry, not refused");
+            let later = run_batch(&store, &posts, batch_id, "go", &entries)
+                .await
+                .expect("a later repeat is answered per entry, not refused");
+            assert_eq!(
+                presses.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{batch_id}: the entry is pressed once"
+            );
+            assert_eq!(posted(&posts), 0, "{batch_id}: no repeat posts");
+            assert_eq!(
+                waited, first,
+                "{batch_id}: the waiting repeat gets the first answer"
+            );
+            assert_eq!(
+                later, first,
+                "{batch_id}: a later repeat gets the first answer"
+            );
+            let entry = &first.entries[0];
+            assert_eq!(entry.outcome, want, "{batch_id}: {entry:?}");
+            if long_name {
+                assert_eq!(entry.message_id.as_deref(), Some("m-1"));
+                assert_eq!(entry.name, None, "the long name was not kept");
+            } else {
+                assert_eq!(entry.code.as_deref(), Some(CODE_BATCH_ANSWER_NOT_KEPT));
+                assert!(
+                    entry
+                        .message
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("not known whether"),
+                    "{entry:?}"
+                );
+            }
+            assert!(
+                batch_answer_bytes(&first) <= MAX_REMEMBERED_BATCH_BYTES,
+                "{batch_id}: what is kept fits the batches' memory"
+            );
+        }
+    }
+
+    #[test]
+    fn the_batch_wire_reads_the_desktop_s_snake_case_entries_and_lowercase_modes() {
+        let request: crate::daemon_protocol::AttachRequest = serde_json::from_value(serde_json::json!({
+            "op": "invoke-card-action-batch", "mode": "execute", "action_id": "go", "request_id": "r",
+            "entries": [{"pane_id": "p", "agent_id": "a", "action_token": "t", "instance_id": "i"}],
+        }))
+        .unwrap();
+        let crate::daemon_protocol::AttachRequest::InvokeCardActionBatch { mode, entries, .. } =
+            request
+        else {
+            panic!("the batch variant");
+        };
+        assert_eq!(mode, CardBatchMode::Execute);
+        assert_eq!(entries[0].action_token, "t");
+        let preview = serde_json::to_value(CardBatchEntry {
+            pane_id: "p".into(),
+            agent_id: "a".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            preview,
+            serde_json::json!({"pane_id": "p", "agent_id": "a"}),
+            "a preview entry carries no empty handles"
+        );
+    }
+
+    /// Issue #2399 review 4: a catalog read that began before the daemon's
+    /// own write — it read the old file, the edit then saved the new one and
+    /// forgot the cache — does not put the old catalog back in the cache,
+    /// even when the file's modification time and length look the same (the
+    /// stamp below never changes). The next read answers the new catalog.
+    #[test]
+    fn a_catalog_read_under_way_during_an_edit_does_not_cache_the_old_file() {
+        use std::sync::Mutex as StdMutex;
+        let store = CardStore::default();
+        let stamp = Some((std::path::PathBuf::from("/same"), None, 7));
+        let file = StdMutex::new("old");
+        let marked = |which: &str| {
+            let mut catalog = card_catalog::defaults();
+            catalog.errors.push(which.to_string());
+            catalog
+        };
+        let mut edited = false;
+        let first = store.catalog_from(stamp.clone(), || {
+            let read = *file.lock().unwrap();
+            if !edited {
+                // The edit lands after this read and before the cache fill.
+                edited = true;
+                *file.lock().unwrap() = "new";
+                store.forget_catalog();
+            }
+            marked(read)
+        });
+        assert_eq!(first.errors, ["new"], "the stale read is not answered");
+        let next = store.catalog_from(stamp, || marked(*file.lock().unwrap()));
+        assert_eq!(next.errors, ["new"], "nor cached");
     }
 }

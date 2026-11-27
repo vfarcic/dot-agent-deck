@@ -359,8 +359,8 @@ export function referenceView(ref: AgentCardCheckedRef): ReferenceView {
 }
 
 /**
- * Issue #2418 review — one reported reference in words, for the card
- * overlay's list of every reference: what the deck's check found (a pull
+ * Issue #2418 review — one reported reference in words, for the agent
+ * pane's Card tab's list of every reference: what the deck's check found (a pull
  * request's state, review and CI, an issue's state, and the title GitHub
  * gave), how fresh that check is, or why there is no check yet or at all; and
  * what the agent wrote. Agent-written and GitHub-supplied text is returned as
@@ -401,8 +401,8 @@ export interface IssueLabelView {
  * issue, and the most characters of a label's name: the daemon's own caps
  * (`MAX_LABELS`, `MAX_LABEL_NAME_CHARS` in `src/reference_check.rs`).
  */
-export const MAX_ISSUE_LABELS = 20;
-export const MAX_ISSUE_LABEL_NAME_CHARS = 50;
+const MAX_ISSUE_LABELS = 20;
+const MAX_ISSUE_LABEL_NAME_CHARS = 50;
 /** How many entries of a `labels` array are looked at, unusable ones included, before the rest are ignored. */
 const MAX_ISSUE_LABEL_ENTRIES_SCANNED = MAX_ISSUE_LABELS * 5;
 
@@ -444,4 +444,21 @@ function cutLabelName(name: string): string {
   const start = name.length - name.trimStart().length;
   const head = name.slice(start, start + MAX_ISSUE_LABEL_NAME_CHARS * 4);
   return Array.from(head).slice(0, MAX_ISSUE_LABEL_NAME_CHARS).join("").trimEnd();
+}
+
+/**
+ * PR #2491 decision 2026-11-25 — Needs you only in the Table view: the cards
+ * whose rows it keeps, by placed key — the cards the daemon marked as needing
+ * the user and every card above them in their daemon's tree, so a row that
+ * needs the user is shown with the rows of the agents it sits under. The same
+ * path the Cards view keeps bright ({@link needsYouPath}); `cards` is every
+ * card on screen across the daemons, and each daemon's tree is built apart.
+ */
+export function needsYouRowKeys(cards: readonly PlacedCard[], treeFor: (deckId: string) => boolean): Set<string> {
+  const kept = new Set<string>();
+  const deckIds = [...new Set(cards.map((card) => card.deckId))];
+  for (const deckId of deckIds) {
+    for (const key of needsYouPath(cardTree(cards.filter((card) => card.deckId === deckId), treeFor(deckId))).path) kept.add(key);
+  }
+  return kept;
 }
