@@ -21,7 +21,7 @@ The Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboa
 
 ## The tree of cards
 
-Under each daemon's header, the Cards view shows a row of small cards of the same size, one for each agent nothing else started. Each card's top line has a checkbox for selecting it (on a daemon that can send one action to many agents), the agent's name, a bell when it needs you, an arrow when it has agents under it, and the **×** Close button at its right end. Under that line are what the agent is and its status, then its checked pull requests and issues, then an issue's labels. A closed card with agents under it also has a coloured bar and a line such as "4 under it · 1 needs you". When you open a card with its arrow, the cards of the agents under it appear in a row below it, joined to it by a line, and the cards in the top row stay where they were.
+Under each daemon's header, the Cards view shows a row of small cards of the same size, one for each agent nothing else started. Each card's top line has a checkbox for selecting it (on a daemon that can send one action to many agents), the agent's name, a bell when it needs you, an arrow when it has agents under it, and the **×** Close button at its right end. Under that line are what the agent is and its status, then its checked pull requests and issues, then an issue's labels. A closed card with agents under it also has a coloured bar and a line such as "4 under it · 1 needs you". When you open a card with its arrow, the cards of the agents under it appear below it in a box, joined to it by a line, and the cards in the top row stay where they were.
 
 The Cards view starts with the agents nothing else started: a dispatcher, an orchestration you started yourself (its orchestrator's card), and an agent you started on its own. The agents they started are under them:
 
@@ -31,7 +31,9 @@ The Cards view starts with the agents nothing else started: a dispatcher, an orc
 
 Press the arrow on a card to open it and see the agents under it, and press it again to close it. A card under another one opens the same way, as deep as the agents go. Only a card with agents under it has the arrow.
 
-The cards in the top row stay where they are. They fill a row and wrap to the next, in the order their agents started, and they do not move when a status changes, when an agent comes to need you, or when you open one. An open card's tree is drawn below its row, joined to it by a line; when you open more than one card in a row, each tree gets its own level below that row, in the cards' order, and the rows below move down to make room. A tree wider than the window scrolls sideways on its own, without moving the rest of the page.
+The cards in the top row stay where they are. They fill a row and wrap to the next, in the order their agents started, and they do not move when a status changes, when an agent comes to need you, or when you open one. An open card's tree is drawn below its row in a box of its own, with the card's name at its top left, and joined to the card by a line; when you open more than one card in a row, each tree gets its own box below that row, in the cards' order, and the rows below move down to make room. Every box has the same plain background, so the colour on a card always means its status.
+
+Inside a box, the cards under an open card sit side by side when they fit. When there are more than fit the window's width, they wrap into as many rows as needed, at every level: a line drops from the card above, and each row hangs from it by a line of its own, so you can still tell which card started which. A big tree grows downwards, and the Cards view does not scroll sideways in a window wide enough for one card.
 
 A closed card with agents under it tells you about them:
 
