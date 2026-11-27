@@ -636,7 +636,6 @@ fn claude_facts_admit_installed_release() -> Result<(), String> {
 /// Scenario: On the installed Claude Code release, capture the pid of the scratch pane's armed waiter and kill that process, then post a task after the waiter disconnects. The token-led doorbell must wake interactive Haiku, whose submit hook injects and acknowledges the task and shows an envelope label before the sentinel is written; if the deck's Claude Code facts are not Go the test reports SKIP saying so.
 #[spec("inbox/claude/014")]
 #[test]
-#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn claude_014_live_killed_waiter_falls_back_to_injection() {
     skip_unless!(common::check_claude_available());
@@ -744,7 +743,6 @@ fn claude_058_live_a_turn_ended_by_an_api_error_still_wakes_for_the_next_message
 /// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's waiter, and post a directive task naming a sentinel (SKIP when the deck's Claude Code facts are not Go). The doorbell rings and that prompt is blocked, so Claude runs no turn and puts the line back in its input box; the card must read Idle again with the doorbell held as awaiting a prompt. Pressing Enter in the pane sends the line, Haiku writes the sentinel once, and the task is acknowledged with two deliveries.
 #[spec("inbox/claude/053")]
 #[test]
-#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_over_again() {
     skip_unless!(common::check_claude_available());
@@ -1220,7 +1218,6 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
 /// Scenario: In a pane the deck installs its editor helper into, disable native delivery, leave a unique human draft in interactive Haiku's input box, and queue a sentinel task past the accelerated stall threshold. Repeat with a partly deleted draft: for both, a check reads the box non-empty, and for five seconds after it the draft is exact and unsent with zero deliveries, the deck has typed nothing but its check's byte, and the card shows the draft hold and a stall diagnostic. Repeat with a prompt recalled from history with Up: the deck refuses that screen, writes no check and types nothing, and the card says it cannot check the box. Each time the user then moves to the end and clears the whole draft; the next check reads the box empty and the doorbell delivers the original task once.
 #[spec("inbox/doorbell/010")]
 #[test]
-#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn doorbell_010_live_kept_draft_stays_held() {
     skip_unless!(installed::checkable());
@@ -2068,7 +2065,6 @@ fn ctrl_c_trial(claude: &Claude, trial: usize) -> bool {
 /// Scenario: In a pane the deck installs its editor helper into, complete a doorbell-delivered control task in real interactive Haiku, send a prompt of your own, then recall it with Up and press Enter, which submits it again, while native delivery is disabled. Once that turn ends, post another sentinel task: a check must read the box empty and the doorbell type the task without another keypress.
 #[spec("inbox/doorbell/010")]
 #[test]
-#[ignore = "quarantined: vfarcic, #2461"]
 #[cfg(target_os = "linux")]
 fn doorbell_010_live_history_enter_recovers_the_doorbell() {
     skip_unless!(installed::checkable());
