@@ -180,11 +180,14 @@ const APPROVAL_PEER_SELECTOR = `[data-modal-peer="${APPROVAL_PEER_PROPS["data-mo
  * earns the exemption: each X dismisses only its own notice, and the one
  * control that opens something — the restart notice's **Show** — opens the
  * dashboard and its "Interrupted work" dialog, which goes on the stack itself
- * and fences everything, the stack included. `Toast` disables that Show while
- * an overlay above the agent's pane is open ({@link useNoOverlayAbove}), so it
- * is never the way past a dialog the user is answering. Nothing else behind
- * the pane becomes reachable, the `DeckSelector` above all: the marker is
- * matched on the sibling itself, as the other two are.
+ * and fences the background like any overlay, leaving the peers — these
+ * notices among them — reachable over it. `Toast` disables that Show while an
+ * overlay above the agent's pane is open ({@link useNoOverlayAbove}), that
+ * dialog included, so it is never the way past a dialog on the stack.
+ * Nothing else behind the pane becomes reachable, the `DeckSelector` above
+ * all: the marker is matched on the sibling itself, as the other two are, so
+ * an overlay whose path to `<body>` does not pass beside the notices inerts
+ * the region that holds them, the notices with it.
  */
 export const NOTICE_PEER_PROPS = { "data-modal-peer": "notices" } as const;
 

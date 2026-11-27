@@ -3127,6 +3127,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   ];
 
   return (
+    <>
     <div className={`control-deck ${evidenceOpen && !allDecks ? "with-evidence" : ""}`}>
       <main className="deck-main">
         <header className="topbar">
@@ -3328,14 +3329,19 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {trustReview.shown && <ProjectTrustDialog review={trustReview.shown} onApprove={approveReviewed} onCancel={trustReview.cancel} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
+    </div>
       {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
           above the sentence — since issue #1234 from the runtime's own queue,
           whether the sentence is a notice or the runtime's error. The overview
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
+      {/* Issue #2555: a sibling of the deck rather than inside it, as the
+          overview's is, so the notices are a modal peer of every overlay: one
+          mounted by the shell (the pull request browser, Settings) inerts the
+          whole deck, which would take the notices with it if they were in it. */}
       <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} restartInterrupted={restartInterrupted} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} antigravity={antigravityNotice} onDismissAntigravity={onDismissAntigravityNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
-    </div>
+    </>
   );
 }
 

@@ -177,4 +177,22 @@ test.describe("a notice over the agent pane", () => {
     await expect(pane).toBeVisible();
     expect(await page.getByTestId("deck-selector-toggle").evaluate((node) => node.closest("[inert]") !== null)).toBe(true);
   });
+
+  /** Scenario: on the deck screen, open an agent's pane and from it a pull request, with the star notice in the corner. The notice is drawn over the pull request page, and its X dismisses it while the page stays open. */
+  test("dismisses a notice drawn over a page opened from the deck's pane", async ({ page }) => {
+    await page.goto("/?fixture=1&state=docs-pr&star=1&experimental=1");
+    await page.getByRole("alertdialog", { name: "Enjoying dot-agent-deck?" }).getByRole("button", { name: "s Star" }).click();
+    const toast = page.getByTestId("star-toast");
+    await expect(toast).toContainText("Thanks for starring!");
+    await enterDeck(page);
+    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    const pane = page.getByTestId("agent-pane-overlay");
+    await expect(pane).toBeVisible();
+    await pane.getByTestId("pr-badge-2").click();
+    const browser = page.getByTestId("pr-browser");
+    await expect(browser).toBeVisible();
+    await toast.getByRole("button", { name: "Dismiss star message" }).click({ timeout: 5_000 });
+    await expect(toast).toHaveCount(0);
+    await expect(browser).toBeVisible();
+  });
 });
