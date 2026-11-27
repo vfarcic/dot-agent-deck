@@ -160,13 +160,17 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
     // 2.x the provider is handed a key it rejects, which fails the turn with
     // a non-quota `provider.auth` 401 (measured: `finish: "error"`, idle
     // outcome `failed`) and spends nothing. The deck forwards no
-    // `OPENAI_API_KEY` to a pane (`INHERIT_PASS`).
+    // `OPENAI_API_KEY` to a pane (`INHERIT_PASS`). `enabled_providers` keeps
+    // OpenCode to that one provider: 2.4.2, given the rejected key, answered
+    // the turn on OpenCode's own free hosted model instead (measured, PR
+    // #2527), which the same switch turns off (`tests/e2e_opencode_real_binary.rs`).
     const UNSUPPORTED: &str = "openai/gpt-5.4-mini";
     let command = if common::opencode_test_is_v2() {
         std::fs::write(
             viewer.home_dir().join(".config/opencode/opencode.json"),
             serde_json::json!({
                 "model": UNSUPPORTED,
+                "enabled_providers": ["openai"],
                 "provider": {"openai": {"options": {"apiKey": "sk-rejected-status-blocked-023"}}},
             })
             .to_string(),
