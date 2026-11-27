@@ -99,6 +99,7 @@ use std::sync::Arc;
 pub fn start_for_daemon(
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
     registry: &Arc<crate::agent_pty::AgentPtyRegistry>,
+    config_dir: std::path::PathBuf,
 ) -> Arc<Telemetry> {
     let env = config::process_env();
     // Issue #1981 M8: the daemon's warnings and errors, when the binary
@@ -106,7 +107,7 @@ pub fn start_for_daemon(
     logs::start_for_daemon(&env);
     let telemetry = start_from(
         &env,
-        exporter::default_config_dir(),
+        config_dir,
         crate::platform::paths::executable_path().as_deref(),
         event_tx,
         registry,

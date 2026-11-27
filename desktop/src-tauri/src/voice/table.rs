@@ -1472,7 +1472,13 @@ mod tests {
                 (
                     "approve_project_commands",
                     "approveProjectCommands",
-                    vec!["deck", "overview"],
+                    vec!["deck", "overview", "agent", "pull_request"],
+                ),
+                // Issue #2511: the "approval waiting" marker's click.
+                (
+                    "show_approval_request",
+                    "showApprovalRequest",
+                    vec!["deck", "overview", "agent", "pull_request"],
                 ),
                 // PRD #2174: the star reminder's three buttons, on every
                 // screen the app opens on.
@@ -1522,18 +1528,27 @@ mod tests {
                     "cancel_inbox_message",
                     "confirmCancelInboxMessage",
                     vec!["deck"]
-                ), // PRD #2374: the agent cards, on the dashboard only.
+                ), // PRD #2374: the agent cards, on the dashboard and, since PR #2491, the agent pane.
                 ("set_overview_mode", "setOverviewMode", vec!["overview"]),
-                ("show_agent_card", "showAgentCard", vec!["overview"]),
-                ("next_agent_card", "nextAgentCard", vec!["overview"]),
-                ("previous_agent_card", "previousAgentCard", vec!["overview"]),
-                ("next_needs_you_card", "nextNeedsYouCard", vec!["overview"]),
+                (
+                    "show_agent_card",
+                    "showAgentCard",
+                    vec!["overview", "agent"]
+                ),
+                ("next_agent_card", "nextAgentCard", vec!["agent"]),
+                ("previous_agent_card", "previousAgentCard", vec!["agent"]),
+                (
+                    "next_needs_you_card",
+                    "nextNeedsYouCard",
+                    vec!["overview", "agent"]
+                ),
                 (
                     "filter_needs_you_cards",
                     "toggleNeedsYouFilter",
                     vec!["overview"]
                 ),
-                ("close_agent_card", "closeAgentCard", vec!["overview"]),
+                ("show_card_tab", "showCardTab", vec!["agent"]),
+                ("show_terminal_tab", "showTerminalTab", vec!["agent"]),
                 ("open_card_tree", "openCardTree", vec!["overview"]),
                 ("close_card_tree", "closeCardTree", vec!["overview"]),
                 (
@@ -1542,8 +1557,88 @@ mod tests {
                     vec!["overview"]
                 ),
                 ("open_card_issue", "openCardIssue", vec!["overview"]),
-                ("run_card_action", "runCardAction", vec!["overview"]),
-                ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
+                (
+                    "run_card_action",
+                    "runCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "run_card_action_batch",
+                    "runCardActionBatch",
+                    vec!["overview"]
+                ),
+                ("select_agent_card", "selectAgentCard", vec!["overview"]),
+                ("unselect_agent_card", "unselectAgentCard", vec!["overview"]),
+                (
+                    "clear_card_selection",
+                    "clearCardSelection",
+                    vec!["overview"]
+                ),
+                (
+                    "run_card_action_on_selection",
+                    "runSelectionBatch",
+                    vec!["overview"]
+                ),
+                (
+                    "open_card_actions_editor",
+                    "openCardActionsEditor",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "add_card_action",
+                    "addCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "edit_card_action",
+                    "editCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "remove_card_action",
+                    "removeCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "refresh_card_actions",
+                    "refreshCardActions",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "choose_card_action_icon",
+                    "chooseCardActionIcon",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "ask_before_sending_card_action",
+                    "askBeforeSendingCardAction",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "send_card_action_without_asking",
+                    "sendCardActionWithoutAsking",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "offer_card_action_on_every_card",
+                    "offerCardActionOnEveryCard",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "offer_card_action_when_agents_choose",
+                    "offerCardActionWhenAgentsChoose",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "show_card_action_on_the_card",
+                    "showCardActionOnCard",
+                    vec!["overview", "agent"]
+                ),
+                (
+                    "show_card_action_only_in_the_card_tab",
+                    "showCardActionOnlyInCardTab",
+                    vec!["overview", "agent"]
+                ),
             ]
         );
     }
@@ -2379,7 +2474,11 @@ mod tests {
                 "list_commands",
                 "reading_on",
                 "reading_off",
-                "hush_reading"
+                "hush_reading",
+                // Issue #2511: the "approval waiting" marker shows over every
+                // screen, and the review it opens is answered where it opens.
+                "approve_project_commands",
+                "show_approval_request"
             ]
         );
         // And every OTHER row still has both cases, which is what keeps the
@@ -2463,6 +2562,8 @@ mod tests {
                 // PRD #1885: the review dialog's approve, where it opens (the
                 // Runs screen); with none open the app says so.
                 "approve_project_commands",
+                // Issue #2511: the "approval waiting" marker's click.
+                "show_approval_request",
                 // PRD #2174: the star reminder's buttons; with none showing
                 // the app says so.
                 "star_repo",
@@ -2516,6 +2617,8 @@ mod tests {
                 "open_pr",
                 // PRD #1885: over the New agent dialog.
                 "approve_project_commands",
+                // Issue #2511: the "approval waiting" marker's click.
+                "show_approval_request",
                 // PRD #2174: the star reminder's buttons.
                 "star_repo",
                 "remind_star_later",
@@ -2528,20 +2631,35 @@ mod tests {
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",
-                // PRD #2374: the agent cards, on the dashboard only.
+                // PRD #2374: the agent cards, on the dashboard. PR #2491
+                // decision 2026-11-25: moving between agents and the Card
+                // panel are the agent pane's, below.
                 "set_overview_mode",
                 "show_agent_card",
-                "next_agent_card",
-                "previous_agent_card",
                 "next_needs_you_card",
                 "filter_needs_you_cards",
-                "close_agent_card",
                 "open_card_tree",
                 "close_card_tree",
                 "open_card_pull_request",
                 "open_card_issue",
                 "run_card_action",
-                "reply_to_agent_card"
+                "run_card_action_batch",
+                "select_agent_card",
+                "unselect_agent_card",
+                "clear_card_selection",
+                "run_card_action_on_selection",
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_card_tab"
             ]
         );
         assert_eq!(
@@ -2568,6 +2686,10 @@ mod tests {
                 "scroll_to_bottom",
                 // PRD #1401: the open pane's agent's pull request, or the named agent's.
                 "open_pr",
+                // Issue #2511: a review a deck asked for, opened over the pane
+                // from the "approval waiting" marker, and the marker's click.
+                "approve_project_commands",
+                "show_approval_request",
                 // PRD #2174: the star reminder's buttons, which the reminder
                 // follows to the agent screen when the app opens on one.
                 "star_repo",
@@ -2578,7 +2700,30 @@ mod tests {
                 // Issue #1402: ask to close the agent shown in the pane.
                 "stop_agent",
                 // PRD #2119: ask the pane's agent to generate the config.
-                "generate_config"
+                "generate_config",
+                // PR #2491 decision 2026-11-25: the pane's Card tab (2026-11-26), the
+                // moves between agents, another agent's card and its actions.
+                "show_agent_card",
+                "next_agent_card",
+                "previous_agent_card",
+                "next_needs_you_card",
+                "show_card_tab",
+                "show_terminal_tab",
+                "run_card_action",
+                // PR #2491 review T1: the Card actions editor, which the Card
+                // panel's Edit opens over the pane, and its form's rows.
+                "open_card_actions_editor",
+                "add_card_action",
+                "edit_card_action",
+                "remove_card_action",
+                "refresh_card_actions",
+                "choose_card_action_icon",
+                "ask_before_sending_card_action",
+                "send_card_action_without_asking",
+                "offer_card_action_on_every_card",
+                "offer_card_action_when_agents_choose",
+                "show_card_action_on_the_card",
+                "show_card_action_only_in_the_card_tab"
             ]
         );
         // PRD #1401 — over the pull request browser: the rows callable
@@ -2598,7 +2743,11 @@ mod tests {
                 "scroll_up",
                 "scroll_to_top",
                 "scroll_to_bottom",
-                "open_pr_in_browser"
+                "open_pr_in_browser",
+                // Issue #2511: the marker over the browser, and the review it
+                // opens over it.
+                "approve_project_commands",
+                "show_approval_request"
             ]
         );
     }

@@ -1,0 +1,27 @@
+---
+source: tests/render_upgrade_all_dialog.rs
+expression: text
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Upgrade all daemons ─────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                              │  
+  │ Checked 4 remote decks: 2 to upgrade.                                                        │  
+  │ mac-studio: Will be upgraded from 0.51.0 to 0.52.0.                                          │  
+  │ pi: Skipped: already runs 0.52.0.                                                            │  
+  │ build-box: Will be upgraded from 0.51.0 to 0.52.0.                                           │  
+  │ laptop: Failed: it could not be checked: ssh: connect to host laptop port 22: No route to    │  
+  │ host                                                                                         │  
+  │                                                                                              │  
+  │ Upgrade 2 daemons? Each daemon with agents or orchestration roles running asks before it     │  
+  │ stops any.                                                                                   │  
+  │                                                                                              │  
+  │ > Cancel                                                                                     │  
+  │   Upgrade                                                                                    │  
+  │                                                                                              │  
+  │ ↑/↓ choose · Enter confirms · PgUp/PgDn scroll · Esc closes                                  │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

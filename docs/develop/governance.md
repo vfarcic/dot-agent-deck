@@ -154,7 +154,15 @@ Its completion signal is its **"Code Review by Qodo"** issue comment:
 - The comment is created once per PR and **edited in place** on each review. Its body ends with `<!-- https://github.com/<repo>/commit/<full sha> -->`, naming the commit it reviewed, and on all 45 PRs that marker equalled the final head.
 - A push that changes no code, such as a merge of `main`, also gets a separate "No code changes since the last review — review skipped" comment within seconds (#1759, #1762, #1797), and the marker still moves to the new head.
 - From PR creation, over the 45 PRs, the review comment landed in a median of 150 s and a maximum of 1008 s (#1817); the separate "PR Summary by Qodo" comment lands sooner, at a median of 37 s, and is **not** the review.
-- After a push, the reviews Qodo submitted on later commits landed a median of 161 s after the push and at most 869 s. Hence the 20-minute bound in `reviewers.json`.
+- After a push, the reviews Qodo submitted on later commits landed a median of 161 s after the push and at most 869 s.
+
+**The marker names a new head before Qodo has finished reviewing it** (issue #2507, measured 2026-11-26 over the 150 pull requests opened 2026-11-01 to 2026-11-26, 513 heads). On a later push Qodo edits the comment, usually within a minute, to re-check its earlier findings and point the marker at the new head, and edits it again when the review of that head finishes. 130 of its 340 inline findings were posted 47 s to 714 s after the comment first named their head, so a wait that stopped at the marker handed off a head whose findings had not arrived yet (#2464 and #2476, three times in one `/issue-queue` run). The body has no marker that tells the two edits apart: the header categories, the "Review updated until commit" line and the "Previous reviews" fold all appeared in both kinds of edit. What the measurements did show:
+
+- A head's inline findings came in **one batch**: no head had two, a batch's comments were at most 1 s apart, and the batch came within 5 s of the edit that finished the review.
+- A PR's **first review** is posted in one step: the comment is created with it, and its findings follow 1–4 s later.
+- The longest gap between the comment's edits before a head's findings arrived was **664 s**.
+
+So `wait-reviews.sh` counts the comment naming the head only once Qodo has posted an inline finding (not a reply) whose `original_commit_id` is the head, or the comment was never edited and is a minute old, or it has sat unedited for 15 minutes (`settle_minutes` in `reviewers.json`). Replayed at a 30-second poll over the same 150 pull requests that rule missed no finding, and decided a median of 15 minutes and at most 29.5 minutes after the comment first named the head. Hence the 40-minute bound. The cost: a push that brings no finding waits about 15 minutes for Qodo, where the marker alone ended the wait within a minute or two.
 
 One quirk to expect: after `gh pr update-branch` merges `main` in, Qodo lists findings in code the PR did not touch as `⭐ New` summary items (seen on #1805, #1811, #1812, #1813, #1823, #1828 and #1836). They open no thread, but they are not the PR's.
 
@@ -162,7 +170,7 @@ Its three surfaces:
 
 | surface | how to read it |
 |---|---|
-| the **"Code Review by Qodo" issue comment** by `qodo-code-review[bot]` | `gh api repos/{owner}/{repo}/issues/<n>/comments`. It **edits this one comment in place** as new commits land rather than posting a new one, so `created_at` sits at the first review and is not the freshness signal. The body **names the head SHA it reviewed** — that is the signal `wait-reviews.sh` waits on, and what `independent_review_at` reads. It also carries the **informational** tier of findings, which appears nowhere else, and on a large PR it is trimmed ("Comment size exceeded", #1814), with the full list only in Qodo's web app. |
+| the **"Code Review by Qodo" issue comment** by `qodo-code-review[bot]` | `gh api repos/{owner}/{repo}/issues/<n>/comments`. It **edits this one comment in place** as new commits land rather than posting a new one, so `created_at` sits at the first review and is not the freshness signal. The body **names the head SHA it reviewed**, which `independent_review_at` reads, and which `wait-reviews.sh` requires but does not stop at, because the marker moves to a new head minutes before that head's review is finished (issue #2507, above). It also carries the **informational** tier of findings, which appears nowhere else, and on a large PR it is trimmed ("Comment size exceeded", #1814), with the full list only in Qodo's web app. |
 | a review object, usually `COMMENTED` | `gh pr view <n> --json reviews`. Its `commit_id` is the head at submission and does **not** move. Qodo submits one only when it has inline findings, so its absence says nothing about whether it reviewed. |
 | **the inline findings**, medium and above | `gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate`, beside Greptile's. `inline_comments_severity_threshold = 2` keeps the informational tier out of here. |
 

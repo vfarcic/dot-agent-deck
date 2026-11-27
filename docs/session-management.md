@@ -82,9 +82,10 @@ Background: 2 commands, 1 subagent · 3h 12m
 What the status reads depends on when the agent started the command:
 
 - **Waiting**, when a command it started in the turn that just ended is still running. The agent has handed that work off and its result is still to come, so the card does not read **Idle** yet. It turns **Idle** when those commands end.
+- A turn Claude Code starts by itself, to tell the agent that one of its background commands or subagents finished, is not a new turn here. If the agent started three background commands and the first two finish, the turns that report them leave the card on **Waiting** while the third still runs.
 - **Idle**, when everything still running was started in an earlier turn, or only subagents are still running.
 
-So a command keeps a card on **Waiting** only until the agent's next turn ends. For example:
+So a command keeps a card on **Waiting** only until the agent's next turn ends, not counting those reporting turns. For example:
 
 - A dev server the agent started in the background reads **Waiting** until it exits or the agent finishes another turn. If you do not want that, ask the agent to stop the server, or send it any prompt.
 - If you send the agent a prompt while a command from its last turn is still running, and that turn ends with the command still running, the card reads **Idle** with the `Background:` line.
@@ -107,6 +108,7 @@ What each agent reports:
 | **Waiting** while a command it started in its last turn runs | Yes | Yes | Yes | Yes | Yes | Yes |
 
 - On Windows, background commands are not counted for any agent; subagents still are. So no card reads **Waiting** on Windows.
+- OpenCode also starts a turn by itself when a background command finishes, and for OpenCode that turn still counts as a new turn: once it ends, a command the agent started before it reads as an earlier turn's, so the card reads **Idle** with the `Background:` line. Only Claude Code's reporting turns are left out of the count.
 - **Waiting** says only that the agent started the command in that turn and that it is still running, not that the agent will pick up its result by itself when it ends.
 - An OpenCode subagent counts while its session is working, and stops counting when that session finishes, fails or is deleted.
 - The deck's Pi extension and the Devin and Antigravity hooks do not report subagents, so a Pi, Devin or Antigravity card counts commands only.
@@ -191,7 +193,7 @@ The review glyph is drawn on a filled cell in its colour (green, red or yellow),
 
 A pull request without CI checks shows no CI glyph, and one with no review yet shows no review glyph. On a narrow card the badge drops its glyphs, the review first, then CI, then the state, and keeps the number; the `Last:`/`Tools:` text shortens or goes first.
 
-The badge appears by itself: an agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. It follows the pull request, so a review, a CI result or a merge shows up on the card within about a minute. Press `o` on the selected card to open the pull request in your system browser (the `open_pull_request` key in [Keyboard Shortcuts](keyboard-shortcuts.md)); if no browser can be opened there, as in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no badge, `o` says the agent has no pull request. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
+The badge appears by itself: an agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. A merged or closed pull request counts only when the branch's latest commit is one of its commits, so a new branch that reuses the name of an earlier, deleted branch does not show that branch's old pull request; it shows none until its own is opened. It follows the pull request, so a review, a CI result or a merge shows up on the card within about a minute. Press `o` on the selected card to open the pull request in your system browser (the `open_pull_request` key in [Keyboard Shortcuts](keyboard-shortcuts.md)); if no browser can be opened there, as in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no badge, `o` says the agent has no pull request. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
 
 The desktop app shows the same pull request as a badge with icons on the agent's row and in its pane, and opens it inside the app when you click it; see [Desktop app → Dashboard → Pull requests](desktop/dashboard.md#pull-requests).
 

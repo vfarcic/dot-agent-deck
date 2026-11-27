@@ -637,7 +637,7 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     const voice = microphone([]);
     setup(voice, noMatch, undefined, undefined, candidates, {
       listDirectories: vi.fn(async () => ({ kind: "listing" as const, path: "/home/dev", displayPath: "/home/dev", entries: [], truncated: false })),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: [] })),
     });
     fireEvent.click(screen.getByTestId("overview-new-agent"));
     const newAgent = screen.getByTestId("new-agent-dialog");
@@ -3080,7 +3080,7 @@ describe("closing what is on top", () => {
     const deck = runtime(closing(), voice, {
       runAction,
       listDirectories: vi.fn(async () => ({ kind: "listing" as const, path: "/home/dev", displayPath: "/home/dev", entries: [], truncated: false })),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: [] })),
     });
     return { deck, refuseStart: () => settle() };
   }
@@ -3194,7 +3194,7 @@ describe("opening the New agent dialog, as a command (PRD #1223)", () => {
       snapshot: fleet[0],
       fleet,
       listDirectories: vi.fn(async () => ({ kind: "listing" as const, path: "/home/dev", displayPath: "/home/dev", entries: [], truncated: false })),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: [] })),
     });
   }
 
@@ -3336,7 +3336,7 @@ describe("the New agent directory browser, by voice (PRD #1223)", () => {
       declareVoiceScreen,
       runAction,
       listDirectories,
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], experimental: false, authoringKinds: [] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, agents: [], authoringKinds: [] })),
     } as Partial<DeckRuntimeState>);
     return { deck, declarations, listDirectories };
   }
@@ -3775,14 +3775,14 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   }
 
   /** A deck whose options, listing and orchestrations the flow can load, recording each declaration. */
-  function formDeck(voice: VoiceControls, options: { forced?: boolean; during?: () => Promise<void>; experimental?: boolean } = {}) {
+  function formDeck(voice: VoiceControls, options: { forced?: boolean; during?: () => Promise<void>; authoringKinds?: string[] } = {}) {
     const declarations: (VoiceNewAgentDto | undefined)[] = [];
     const declareVoiceScreen = vi.fn((_screen: string, _directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => { declarations.push(newAgent); });
     const deck = runtime(formVoice(() => declarations.at(-1), options), voice, {
       declareVoiceScreen,
       runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
       listDirectories: vi.fn(async (_deckId: string, path?: string) => (path === "/home/dev/billing" ? BILLING : HOME)),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: AGENTS, experimental: options.experimental ?? false, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: AGENTS, authoringKinds: options.authoringKinds ?? ["schedule", "schedule-issues", "dispatcher"] })),
       newAgentOrchestrations: vi.fn(async (_deckId: string, path: string) => ({
         kind: "project" as const,
         path,
@@ -3824,7 +3824,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     voice.deliver("mode dispatcher");
     await completeUtterance();
 
-    expect(declarations.at(-1)?.form?.modes.map((mode) => mode.label)).toEqual(["No mode", "Orch: review", "schedule", "dispatcher"]);
+    expect(declarations.at(-1)?.form?.modes.map((mode) => mode.label)).toEqual(["No mode", "Orch: review", "schedule", "schedule: issues", "dispatcher"]);
     expect(pressedMode()).toBe("dispatcher");
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Mode: dispatcher.");
     expect(deck.runAction).not.toHaveBeenCalled();
@@ -3851,13 +3851,14 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   });
 
   /**
-   * Scenario: on a daemon whose experimental flag is off, `schedule: issues` is
-   * not a chip at all. It is absent from the declaration, so "mode schedule:
-   * issues" is refused as not offered and the Mode is left alone.
+   * Scenario: on a daemon that cannot compose the `schedule: issues` seed (it
+   * does not list the kind), that chip is not offered. It is absent from the
+   * declaration, so "mode schedule: issues" is refused as not offered and the
+   * Mode is left alone.
    */
   it("refuses a chip the form does not offer", async () => {
     const voice = microphone([]);
-    const { deck, declarations } = formDeck(voice, { experimental: false });
+    const { deck, declarations } = formDeck(voice, { authoringKinds: ["schedule", "dispatcher"] });
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnVoiceOn();
     await openForm();
@@ -3871,10 +3872,13 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     expect(pressedMode()).toBe("none");
   });
 
-  /** Scenario: with the flag ON, the same chip IS declared, and choosing it works. */
-  it("offers schedule: issues when the daemon's flag is on", async () => {
+  /**
+   * Scenario: on a daemon that lists the kind, the same chip IS declared with
+   * no experimental flag involved (issue #193), and choosing it works.
+   */
+  it("offers schedule: issues whenever the daemon can compose it", async () => {
     const voice = microphone([]);
-    const { deck, declarations } = formDeck(voice, { experimental: true });
+    const { deck, declarations } = formDeck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnVoiceOn();
     await openForm();
@@ -4291,7 +4295,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
       declareVoiceScreen: vi.fn((_screen: string, _directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => { declarations.push(newAgent); }),
       runAction,
       listDirectories: vi.fn(async (_deckId: string, path?: string) => (path === "/home/dev/billing" ? BILLING : HOME)),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "claude --model haiku", agents: [{ id: "claude", displayName: "Claude Code", defaultCommand: "claude" }], experimental: false, authoringKinds: ["dispatcher"] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "claude --model haiku", agents: [{ id: "claude", displayName: "Claude Code", defaultCommand: "claude" }], authoringKinds: ["dispatcher"] })),
       newAgentOrchestrations: vi.fn(async (_deckId: string, path: string) => ({
         kind: "project" as const,
         path,
@@ -4789,7 +4793,7 @@ describe("a pending answer and a New agent dialog that changed under it (PRD #12
     const deck = runtime(resolveVoice, voice, {
       runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
       listDirectories: vi.fn(async (_deckId: string, path?: string) => (path === "/home/dev/billing" ? BILLING : HOME)),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: [], experimental: false, authoringKinds: [] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: [], authoringKinds: [] })),
     } as Partial<DeckRuntimeState>);
     return { deck, release };
   }
@@ -4982,7 +4986,7 @@ describe("the New agent deck field and Discard, by voice (issues 1263 and 1247)"
       fleet,
       runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
       listDirectories: vi.fn(async (_deckId: string, path?: string) => (path === "/home/dev/billing" ? BILLING : HOME)),
-      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: [], experimental: false, authoringKinds: ["dispatcher"] })),
+      newAgentOptions: vi.fn(async () => ({ kind: "deck" as const, defaultCommand: "bash", agents: [], authoringKinds: ["dispatcher"] })),
     } as Partial<DeckRuntimeState>);
     return { deck, hold, release: () => release() };
   }

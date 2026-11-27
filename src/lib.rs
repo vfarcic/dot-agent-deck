@@ -62,6 +62,7 @@ pub mod daemon_start;
 pub mod daemon_status;
 pub mod daemon_stop;
 pub mod daemon_upgrade;
+pub mod daemon_upgrade_batch;
 pub mod deck_list;
 // PRD #1666 part 3 (Q105b.2): the test and `e2e` builds' writer and attach
 // controls; a release build has none.
@@ -284,6 +285,7 @@ pub mod unattended_pane;
 // Issue #670: the one implementation of the control-character / Unicode-bidi
 // filter applied to producer-supplied strings before they reach a terminal.
 pub mod untrusted_text;
+pub mod upgrade_all_dialog;
 pub mod upgrade_dialog;
 pub mod version;
 // vt100 0.18 sizes grids in `NonZeroU16`; the deck's `u16` geometry crosses here.

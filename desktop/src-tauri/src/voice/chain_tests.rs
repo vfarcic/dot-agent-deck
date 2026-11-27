@@ -324,6 +324,7 @@ fn voice_chain_the_rules_live_in_the_answer_schema_only() {
         decks: &[],
         directories: None,
         new_agent: None,
+        dashboard: None,
     };
 
     let openai = super::openai::request_body(

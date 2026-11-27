@@ -609,11 +609,11 @@ describe("TauriDeckBridge", () => {
     const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No daemon is listening on the configured socket." }];
     bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
     await bridge.resolveVoice("new agent on the build box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null, dictation: null, reading: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null, dictation: null, reading: null, dashboard: null });
 
     bridge.declareVoiceScreen("overview");
     await bridge.resolveVoice("new agent");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null, dashboard: null });
   });
 
   /**
@@ -630,7 +630,7 @@ describe("TauriDeckBridge", () => {
     const endpoints = { remote: [{ id: "newbox01", host: "new-box", port: 22 }], selection: "local" };
     bridge.declareVoiceScreen("deck", undefined, undefined, undefined, endpoints);
     await bridge.resolveVoice("switch deck to the new box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints, dictation: null, reading: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints, dictation: null, reading: null, dashboard: null });
   });
 
   /**
@@ -648,11 +648,11 @@ describe("TauriDeckBridge", () => {
     const dictation = { deckId: "deck-local", agentId: "coder" };
     bridge.declareVoiceScreen("agent", undefined, undefined, undefined, undefined, dictation);
     await bridge.resolveVoice("run the tests");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "run the tests", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation, reading: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "run the tests", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation, reading: null, dashboard: null });
 
     bridge.declareVoiceScreen("agent");
     await bridge.resolveVoice("type on");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "type on", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "type on", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null, dashboard: null });
   });
 
   /**
@@ -668,11 +668,27 @@ describe("TauriDeckBridge", () => {
     const reading = { reading: true, speaking: true };
     bridge.declareVoiceScreen("agent", undefined, undefined, undefined, undefined, undefined, reading);
     await bridge.resolveVoice("stop");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "stop", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "stop", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading, dashboard: null });
 
     bridge.declareVoiceScreen("agent");
     await bridge.resolveVoice("stop");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "stop", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "stop", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null, dashboard: null });
+  });
+
+  /** Scenario (PR #2491, 2026-11-25): the agent dashboard's view and Needs you only, declared with an utterance on it, are sent with that utterance, and not with the next one declared without them. */
+  it("sends the declared dashboard with the utterance it was declared for", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
+
+    const dashboard = { view: "table" as const, needsYouOnly: true };
+    bridge.declareVoiceScreen("overview", undefined, undefined, undefined, undefined, undefined, undefined, dashboard);
+    await bridge.resolveVoice("show all cards");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "show all cards", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null, dashboard });
+
+    bridge.declareVoiceScreen("overview");
+    await bridge.resolveVoice("show all cards");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "show all cards", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null, dashboard: null });
   });
 
   /**
@@ -2135,20 +2151,23 @@ describe("FixtureDeckBridge scenarios", () => {
   });
 
   /**
-   * Scenario (PRD #1223 M7): the fleet preview's remote deck has its own
-   * experimental flag on and the local deck's is off, and both list the three
-   * authoring kinds. An authoring start on the remote deck adds the agent and
+   * Scenario (PRD #1223 M7): both of the fleet preview's decks list the three
+   * authoring kinds, and neither reports a flag the dialog would read (issue
+   * #193). An authoring start on the remote deck adds the agent and
    * records its command; played as an older deck, the same start is refused
    * in the crate's own words and adds nothing.
    */
-  it("answers each fixture deck's own flag and refuses an authoring start on an older one", async () => {
+  it("lists every authoring kind on each fixture deck and refuses an authoring start on an older one", async () => {
     const { FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } = await import("../data/fixture");
     window.history.replaceState({}, "", "/?fixture=1&state=fleet");
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
     await bridge.connect();
-    expect(await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).toMatchObject({ experimental: true, authoringKinds: ["schedule", "schedule-issues", "dispatcher"] });
-    expect(await bridge.newAgentOptions(FIXTURE_DAEMON_ID)).toMatchObject({ experimental: false });
+    for (const deckId of [FIXTURE_REMOTE_DAEMON_ID, FIXTURE_DAEMON_ID]) {
+      const options = await bridge.newAgentOptions(deckId);
+      expect(options).toMatchObject({ authoringKinds: ["schedule", "schedule-issues", "dispatcher"] });
+      expect(options).not.toHaveProperty("experimental");
+    }
     const started = await bridge.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, command: "claude", cwd: "/home/build/scratch", displayName: "scratch", authoringKind: "dispatcher" });
     expect(started.agentId).toBeDefined();
     // Issue #1496: recorded on the agent, as the live daemon records it.

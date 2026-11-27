@@ -14,6 +14,17 @@
 //! The page is deterministic by construction: no timestamps, no randomness,
 //! and cells are emitted in row-major order with a fixed palette, so the same
 //! screen always produces the same bytes.
+//!
+//! **One page, two themes (PR #2491).** A cell drawn in the terminal's default
+//! colours or one of the sixteen ANSI colours — every colour the TUI itself
+//! chooses, since `src/palette.rs` allows named ANSI colours only — refers to a
+//! CSS variable rather than a hex value, and the page defines those variables
+//! twice: the dark palette by default, the light one under
+//! `prefers-color-scheme: light` (unless `data-theme="dark"` is set on the root)
+//! or `data-theme="light"`. The rasterizer screenshots the same page once per
+//! theme, so the TUI gets a light and a dark image of one frame. Colours that
+//! are not the terminal's to remap (the 256-colour cube, the grey ramp and
+//! truecolour) are written as hex in both.
 
 use std::fmt::Write as _;
 
@@ -28,9 +39,16 @@ pub struct Palette {
 }
 
 impl Default for Palette {
+    /// [`Palette::dark`], the theme the committed docs images are in.
+    fn default() -> Self {
+        Self::dark()
+    }
+}
+
+impl Palette {
     /// A dark theme close to the terminals the existing hand-taken docs images
     /// were captured in, so regenerated images sit beside them without a jump.
-    fn default() -> Self {
+    pub fn dark() -> Self {
         Self {
             foreground: (0xd4, 0xd7, 0xdc),
             background: (0x17, 0x1a, 0x1f),
@@ -54,9 +72,43 @@ impl Default for Palette {
             ],
         }
     }
-}
 
-impl Palette {
+    /// A light terminal theme (PR #2491), in the spirit of One Light, the light
+    /// sibling of [`Palette::dark`]'s One Dark. Every one of the sixteen ANSI
+    /// colours, normal and bright, reads at 4.5:1 or more on the background,
+    /// so a status word the TUI colours is as legible as on a light terminal a
+    /// user would pick. That includes white (7) and bright white (15), which
+    /// are mapped to greys darker than the background rather than kept light:
+    /// the TUI draws text in both — the project-trust prompt's labels in white
+    /// and the commands it asks the user to approve in bright white
+    /// (`src/trust_prompt.rs`) — so bright white is the darker of the two
+    /// (14.5:1, against white's 5.7:1), as it is the brighter on the dark
+    /// theme, and a light image shows what that screen asks.
+    pub fn light() -> Self {
+        Self {
+            foreground: (0x38, 0x3a, 0x42),
+            background: (0xfa, 0xfa, 0xfa),
+            ansi: [
+                (0x38, 0x3a, 0x42),
+                (0xc8, 0x38, 0x2c),
+                (0x2f, 0x7d, 0x32),
+                (0x8a, 0x61, 0x00),
+                (0x2f, 0x62, 0xd0),
+                (0xa0, 0x2b, 0xa0),
+                (0x0a, 0x7a, 0x8f),
+                (0x61, 0x64, 0x6d),
+                (0x6b, 0x6e, 0x78),
+                (0xb3, 0x26, 0x1e),
+                (0x25, 0x6b, 0x29),
+                (0x73, 0x4f, 0x00),
+                (0x24, 0x49, 0xad),
+                (0x86, 0x22, 0x8a),
+                (0x08, 0x69, 0x7a),
+                (0x24, 0x26, 0x2c),
+            ],
+        }
+    }
+
     /// The RGB value of one of the 256 indexed colours.
     pub fn indexed(&self, idx: u8) -> (u8, u8, u8) {
         match idx {
@@ -73,11 +125,71 @@ impl Palette {
         }
     }
 
-    fn resolve(&self, color: vt100::Color, default: (u8, u8, u8)) -> (u8, u8, u8) {
+    /// The CSS custom properties that define this palette, as declarations.
+    fn variables(&self) -> String {
+        let mut out = format!(
+            "--fg: {}; --bg: {};",
+            hex(self.foreground),
+            hex(self.background)
+        );
+        for (idx, rgb) in self.ansi.iter().enumerate() {
+            let _ = write!(out, " --a{idx}: {};", hex(*rgb));
+        }
+        out
+    }
+}
+
+/// A colour as the page paints it: one of the theme's (the default foreground
+/// or background, or an ANSI colour 0–15), which the page resolves through its
+/// palette variables, or a fixed RGB value that no theme remaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Paint {
+    Foreground,
+    Background,
+    Ansi(u8),
+    Fixed((u8, u8, u8)),
+}
+
+impl Paint {
+    fn of(color: vt100::Color, default: Paint) -> Paint {
         match color {
             vt100::Color::Default => default,
-            vt100::Color::Idx(idx) => self.indexed(idx),
-            vt100::Color::Rgb(r, g, b) => (r, g, b),
+            vt100::Color::Idx(idx) if idx < 16 => Paint::Ansi(idx),
+            // 16–255 are the xterm cube and grey ramp, the same in every theme.
+            vt100::Color::Idx(idx) => Paint::Fixed(Palette::dark().indexed(idx)),
+            vt100::Color::Rgb(r, g, b) => Paint::Fixed((r, g, b)),
+        }
+    }
+
+    fn css(self) -> String {
+        match self {
+            Paint::Foreground => "var(--fg)".to_string(),
+            Paint::Background => "var(--bg)".to_string(),
+            Paint::Ansi(idx) => format!("var(--a{idx})"),
+            Paint::Fixed(rgb) => hex(rgb),
+        }
+    }
+}
+
+/// A cell's text colour: a paint, or (SGR 2, dim) half way from one paint to
+/// another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ink {
+    Plain(Paint),
+    Dim(Paint, Paint),
+}
+
+impl Ink {
+    fn css(self) -> String {
+        match self {
+            Ink::Plain(paint) => paint.css(),
+            // Two fixed colours mix to a fixed colour, written as hex.
+            Ink::Dim(Paint::Fixed(fg), Paint::Fixed(bg)) => hex((
+                ((u16::from(fg.0) + u16::from(bg.0)) / 2) as u8,
+                ((u16::from(fg.1) + u16::from(bg.1)) / 2) as u8,
+                ((u16::from(fg.2) + u16::from(bg.2)) / 2) as u8,
+            )),
+            Ink::Dim(fg, bg) => format!("color-mix(in srgb, {} 50%, {})", fg.css(), bg.css()),
         }
     }
 }
@@ -85,7 +197,11 @@ impl Palette {
 /// How a frame is laid out on the page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderOptions {
+    /// The page's default theme, and the one under `data-theme="dark"`.
     pub palette: Palette,
+    /// The theme under `prefers-color-scheme: light` (without
+    /// `data-theme="dark"`) and under `data-theme="light"`.
+    pub light_palette: Palette,
     /// CSS font stack. The first family that is installed wins, so the
     /// maintainer doc names the one the committed images were made with.
     ///
@@ -124,7 +240,8 @@ pub fn font_family_or_default(stack: &str) -> &str {
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
-            palette: Palette::default(),
+            palette: Palette::dark(),
+            light_palette: Palette::light(),
             font_family: DEFAULT_FONT_FAMILY.to_string(),
             font_size_px: 14,
             line_height: 1.2,
@@ -137,27 +254,25 @@ impl Default for RenderOptions {
 /// one `<span>`, which keeps the page small without changing a pixel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CellStyle {
-    fg: (u8, u8, u8),
-    bg: (u8, u8, u8),
+    fg: Ink,
+    bg: Paint,
     bold: bool,
     italic: bool,
     underline: bool,
 }
 
-fn cell_style(cell: &vt100::Cell, palette: &Palette) -> CellStyle {
-    let mut fg = palette.resolve(cell.fgcolor(), palette.foreground);
-    let mut bg = palette.resolve(cell.bgcolor(), palette.background);
+fn cell_style(cell: &vt100::Cell) -> CellStyle {
+    let mut fg = Paint::of(cell.fgcolor(), Paint::Foreground);
+    let mut bg = Paint::of(cell.bgcolor(), Paint::Background);
     if cell.inverse() {
         std::mem::swap(&mut fg, &mut bg);
     }
-    if cell.dim() {
-        // Half way to the background, which is how most terminals draw SGR 2.
-        fg = (
-            ((u16::from(fg.0) + u16::from(bg.0)) / 2) as u8,
-            ((u16::from(fg.1) + u16::from(bg.1)) / 2) as u8,
-            ((u16::from(fg.2) + u16::from(bg.2)) / 2) as u8,
-        );
-    }
+    // Dim is half way to the background, which is how most terminals draw SGR 2.
+    let fg = if cell.dim() {
+        Ink::Dim(fg, bg)
+    } else {
+        Ink::Plain(fg)
+    };
     CellStyle {
         fg,
         bg,
@@ -183,18 +298,13 @@ fn push_escaped(out: &mut String, text: &str) {
     }
 }
 
-fn open_span(
-    out: &mut String,
-    style: &CellStyle,
-    default_fg: (u8, u8, u8),
-    default_bg: (u8, u8, u8),
-) {
+fn open_span(out: &mut String, style: &CellStyle) {
     let mut css = String::new();
-    if style.fg != default_fg {
-        let _ = write!(css, "color:{};", hex(style.fg));
+    if style.fg != Ink::Plain(Paint::Foreground) {
+        let _ = write!(css, "color:{};", style.fg.css());
     }
-    if style.bg != default_bg {
-        let _ = write!(css, "background:{};", hex(style.bg));
+    if style.bg != Paint::Background {
+        let _ = write!(css, "background:{};", style.bg.css());
     }
     if style.bold {
         css.push_str("font-weight:700;");
@@ -216,8 +326,10 @@ fn open_span(
 /// grouped into styled spans. Every cell is exactly one grid column wide; a
 /// wide character is emitted once, with a fixed two-column width, and its
 /// continuation cell is skipped. The cursor is not drawn — the TUI hides it on
-/// every screen a docs image shows, and a stray block would be noise.
-pub fn render_rows(screen: &vt100::Screen, palette: &Palette) -> String {
+/// every screen a docs image shows, and a stray block would be noise. Colours
+/// the theme owns are `var(--fg)`, `var(--bg)` and `var(--a0)`–`var(--a15)`,
+/// which [`render_page`] defines for both themes.
+pub fn render_rows(screen: &vt100::Screen) -> String {
     let (rows, cols) = screen.size();
     let (rows, cols) = (rows.get(), cols.get());
     let mut out = String::new();
@@ -231,12 +343,12 @@ pub fn render_rows(screen: &vt100::Screen, palette: &Palette) -> String {
             if cell.is_wide_continuation() {
                 continue;
             }
-            let style = cell_style(cell, palette);
+            let style = cell_style(cell);
             if current != Some(style) {
                 if current.is_some() {
                     out.push_str("</span>");
                 }
-                open_span(&mut out, &style, palette.foreground, palette.background);
+                open_span(&mut out, &style);
                 current = Some(style);
             }
             let text = if cell.has_contents() {
@@ -263,28 +375,38 @@ pub fn render_rows(screen: &vt100::Screen, palette: &Palette) -> String {
 /// A complete, self-contained HTML page showing `screen`. The grid sits in an
 /// element with id `terminal`, sized to exactly `cols × rows` character cells
 /// plus padding, so an element screenshot of it is the frame and nothing else.
+///
+/// The page is in [`RenderOptions::palette`] (dark) unless the viewer prefers a
+/// light colour scheme or the root carries `data-theme="light"`, when it is in
+/// [`RenderOptions::light_palette`]; `data-theme="dark"` keeps it dark on a
+/// light-preferring viewer. The rasterizer sets both, so the image does not
+/// depend on which one an engine honours.
 pub fn render_page(screen: &vt100::Screen, title: &str, options: &RenderOptions) -> String {
     let (rows, cols) = screen.size();
     let (rows, cols) = (rows.get(), cols.get());
-    let palette = &options.palette;
     let mut out = String::new();
     out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>");
     push_escaped(&mut out, title);
     out.push_str("</title>\n<style>\n");
+    let dark = options.palette.variables();
+    let light = options.light_palette.variables();
+    let _ = writeln!(out, ":root {{ color-scheme: dark; {dark} }}");
     let _ = writeln!(
         out,
-        "html, body {{ margin: 0; padding: 0; background: {bg}; }}",
-        bg = hex(palette.background)
+        "@media (prefers-color-scheme: light) {{ :root:not([data-theme=\"dark\"]) {{ color-scheme: light; {light} }} }}"
     );
     let _ = writeln!(
         out,
-        "#terminal {{ display: inline-block; padding: {pad}px; background: {bg}; color: {fg}; \
+        ":root[data-theme=\"light\"] {{ color-scheme: light; {light} }}"
+    );
+    out.push_str("html, body { margin: 0; padding: 0; background: var(--bg); }\n");
+    let _ = writeln!(
+        out,
+        "#terminal {{ display: inline-block; padding: {pad}px; background: var(--bg); color: var(--fg); \
          font-family: {font}; font-size: {size}px; line-height: {lh}; \
          font-variant-ligatures: none; font-kerning: none; \
          -webkit-font-smoothing: antialiased; }}",
         pad = options.padding_px,
-        bg = hex(palette.background),
-        fg = hex(palette.foreground),
         font = font_family_or_default(&options.font_family),
         size = options.font_size_px,
         lh = options.line_height,
@@ -304,7 +426,7 @@ pub fn render_page(screen: &vt100::Screen, title: &str, options: &RenderOptions)
         out,
         "<div id=\"terminal\" data-rows=\"{rows}\" data-cols=\"{cols}\">"
     );
-    out.push_str(&render_rows(screen, palette));
+    out.push_str(&render_rows(screen));
     out.push_str("</div>\n</body>\n</html>\n");
     out
 }
@@ -324,7 +446,7 @@ mod tests {
     #[test]
     fn renders_one_div_per_row_padded_to_the_full_width() {
         let parser = screen(3, 5, b"hi");
-        let rows = render_rows(parser.screen(), &Palette::default());
+        let rows = render_rows(parser.screen());
         assert_eq!(rows.matches("<div class=\"row\">").count(), 3);
         // Blank cells are spaces, so every row is exactly `cols` characters.
         assert!(rows.contains("<div class=\"row\"><span>hi   </span></div>"));
@@ -332,71 +454,76 @@ mod tests {
     }
 
     #[test]
-    fn indexed_rgb_and_default_colours_resolve_through_the_palette() {
-        let palette = Palette::default();
+    fn ansi_colours_are_the_themes_and_indexed_and_rgb_colours_are_fixed() {
         // SGR 31 (ANSI red), then 38;5;196 (cube red), then 38;2 (truecolour).
         let parser = screen(1, 3, b"\x1b[31mA\x1b[38;5;196mB\x1b[38;2;1;2;3mC");
-        let rows = render_rows(parser.screen(), &palette);
-        assert!(rows.contains(&format!("color:{};", hex(palette.ansi[1]))));
+        let rows = render_rows(parser.screen());
+        assert!(rows.contains("color:var(--a1);"), "{rows}");
         assert!(rows.contains("color:#ff0000;"));
         assert!(rows.contains("color:#010203;"));
+        let palette = Palette::default();
         assert_eq!(palette.indexed(16), (0, 0, 0));
         assert_eq!(palette.indexed(231), (255, 255, 255));
         assert_eq!(palette.indexed(232), (8, 8, 8));
         assert_eq!(palette.indexed(255), (238, 238, 238));
+        // The cube and the ramp are no theme's: the light palette agrees.
+        assert_eq!(Palette::light().indexed(196), palette.indexed(196));
     }
 
     #[test]
     fn background_colours_survive() {
-        let palette = Palette::default();
-        let parser = screen(1, 2, b"\x1b[44mX");
-        let rows = render_rows(parser.screen(), &palette);
-        assert!(rows.contains(&format!("background:{};", hex(palette.ansi[4]))));
+        let parser = screen(1, 2, b"\x1b[44mX\x1b[48;5;236mY");
+        let rows = render_rows(parser.screen());
+        assert!(rows.contains("background:var(--a4);"), "{rows}");
+        assert!(rows.contains("background:#303030;"), "{rows}");
     }
 
     #[test]
     fn inverse_swaps_foreground_and_background() {
-        let palette = Palette::default();
         let parser = screen(1, 1, b"\x1b[7mX");
-        let rows = render_rows(parser.screen(), &palette);
-        assert!(rows.contains(&format!(
-            "color:{};background:{};",
-            hex(palette.background),
-            hex(palette.foreground)
-        )));
+        let rows = render_rows(parser.screen());
+        assert!(
+            rows.contains("color:var(--bg);background:var(--fg);"),
+            "{rows}"
+        );
     }
 
     #[test]
     fn bold_italic_underline_and_dim_are_all_carried() {
-        let palette = Palette {
-            foreground: (200, 200, 200),
-            background: (0, 0, 0),
-            ..Palette::default()
-        };
         let parser = screen(
             1,
-            4,
-            b"\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[4mU\x1b[0m\x1b[2mD",
+            5,
+            b"\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[4mU\x1b[0m\x1b[2mD\x1b[0m\x1b[2;38;2;200;200;200;48;2;0;0;0mF",
         );
-        let rows = render_rows(parser.screen(), &palette);
+        let rows = render_rows(parser.screen());
         assert!(rows.contains("<span style=\"font-weight:700;\">B</span>"));
         assert!(rows.contains("<span style=\"font-style:italic;\">I</span>"));
         assert!(rows.contains("<span style=\"text-decoration:underline;\">U</span>"));
-        // Dim is half way from the foreground to the background.
-        assert!(rows.contains("<span style=\"color:#646464;\">D</span>"));
+        // Dim is half way from the foreground to the background: mixed by the
+        // page when either is the theme's, computed here when both are fixed.
+        assert!(
+            rows.contains(
+                "<span style=\"color:color-mix(in srgb, var(--fg) 50%, var(--bg));\">D</span>"
+            ),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("<span style=\"color:#646464;background:#000000;\">F</span>"),
+            "{rows}"
+        );
     }
 
     #[test]
     fn same_styled_cells_share_one_span() {
         let parser = screen(1, 6, b"\x1b[32mgreen\x1b[0m!");
-        let rows = render_rows(parser.screen(), &Palette::default());
+        let rows = render_rows(parser.screen());
         assert_eq!(rows.matches("<span").count(), 2);
     }
 
     #[test]
     fn markup_characters_are_escaped() {
         let parser = screen(1, 8, b"<a&b>\"");
-        let rows = render_rows(parser.screen(), &Palette::default());
+        let rows = render_rows(parser.screen());
         assert!(rows.contains("&lt;a&amp;b&gt;&quot;"));
         assert!(!rows.contains("<a"));
     }
@@ -404,7 +531,7 @@ mod tests {
     #[test]
     fn a_wide_character_is_emitted_once_at_two_columns() {
         let parser = screen(1, 4, "日x".as_bytes());
-        let rows = render_rows(parser.screen(), &Palette::default());
+        let rows = render_rows(parser.screen());
         assert_eq!(rows.matches('日').count(), 1);
         assert!(rows.contains("<span class=\"wide\">日</span>x "));
     }
@@ -412,8 +539,82 @@ mod tests {
     #[test]
     fn box_drawing_passes_through_untouched() {
         let parser = screen(1, 3, "┌─┐".as_bytes());
-        let rows = render_rows(parser.screen(), &Palette::default());
+        let rows = render_rows(parser.screen());
         assert!(rows.contains("┌─┐"));
+    }
+
+    /// WCAG 2 contrast ratio of two colours.
+    fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        let channel = |v: u8| {
+            let c = f64::from(v) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let lum = |(r, g, b): (u8, u8, u8)| {
+            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn the_page_defines_both_themes_dark_by_default() {
+        let parser = screen(1, 4, b"\x1b[32mok");
+        let options = RenderOptions::default();
+        let page = render_page(parser.screen(), "t", &options);
+        let dark = options.palette.variables();
+        let light = options.light_palette.variables();
+        assert_ne!(dark, light);
+        assert!(
+            page.contains(&format!(":root {{ color-scheme: dark; {dark} }}")),
+            "{page}"
+        );
+        assert!(page.contains(&format!(
+            "@media (prefers-color-scheme: light) {{ :root:not([data-theme=\"dark\"]) {{ color-scheme: light; {light} }} }}"
+        )));
+        assert!(page.contains(&format!(
+            ":root[data-theme=\"light\"] {{ color-scheme: light; {light} }}"
+        )));
+        // Every theme colour the page uses is one of the variables it defines.
+        for name in ["--fg", "--bg", "--a2"] {
+            assert!(dark.contains(&format!("{name}: ")), "{name}");
+            assert!(light.contains(&format!("{name}: ")), "{name}");
+        }
+        assert!(page.contains("color:var(--a2);"));
+        // The cells name the variable, never one theme's value.
+        let rows = render_rows(parser.screen());
+        assert!(!rows.contains(&hex(options.palette.ansi[2])), "{rows}");
+        assert!(
+            !rows.contains(&hex(options.light_palette.ansi[2])),
+            "{rows}"
+        );
+    }
+
+    #[test]
+    fn the_light_palette_is_light_and_legible() {
+        let light = Palette::light();
+        let dark = Palette::dark();
+        assert!(
+            contrast(light.background, (255, 255, 255)) < 1.1,
+            "a light ground"
+        );
+        assert!(contrast(dark.background, (0, 0, 0)) < 1.6, "a dark ground");
+        assert!(contrast(light.foreground, light.background) >= 7.0);
+        // All sixteen ANSI colours read at 4.5:1 or more, white (7) and bright
+        // white (15) included: the TUI draws text in both — the project-trust
+        // prompt's labels in white and its command values in bright white
+        // (`src/trust_prompt.rs`) — and a light image that hides them hides
+        // what the screen asks the user to approve (PR #2491 review).
+        for idx in 0..16 {
+            let ratio = contrast(light.ansi[idx], light.background);
+            assert!(
+                ratio >= 4.5,
+                "ANSI {idx} is {ratio:.2}:1 on the light ground"
+            );
+        }
     }
 
     #[test]

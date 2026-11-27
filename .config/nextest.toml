@@ -293,6 +293,16 @@ slow-timeout = { period = "60s", terminate-after = 40 }
 filter = 'test(=doorbell_010_live_history_enter_recovers_the_doorbell) | test(=claude_014_live_killed_waiter_falls_back_to_injection)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# Issue #2505: `status/waiting/008`'s task-notification case starts a real
+# Haiku Claude, waits out a 20-ping background command and the turn Claude Code
+# opens to report it, then a 150-ping one (about 150s) before its last checks.
+# Its first passing lane-2 run took 162s (2026-11-26), close enough to the 180s
+# default that a slow start would kill it before its own messages. 6 x 60s.
+# The filter tracks the test function name; update it with any rename.
+[[profile.default.overrides]]
+filter = 'test(=status_waiting_008_real_claude_task_notification_turn_keeps_waiting)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 # PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
 # `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
 # `io full` near 70%, its isolated retry spent over 120s in the preflight, ran
