@@ -1,0 +1,70 @@
+/* PRD 2557 milestone 1 — MOCK-UP styles, never merged. Only the app's own tokens. */
+.fleet-view { display: flex; flex-direction: column; gap: 14px; padding: 4px 2px 24px; color: var(--ink); }
+.fleet-head { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-strong); }
+.fleet-head-who { display: flex; align-items: center; gap: 8px; font-size: var(--text-lg); }
+.fleet-head-scope { color: var(--faint); font-size: var(--text-sm); }
+.fleet-fresh { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--text-sm); }
+.fleet-fresh svg { color: var(--green); }
+.fleet-fresh.is-asking svg { color: var(--teal); }
+.fleet-fresh.is-stale { color: var(--amber-ink); font-weight: 650; }
+.fleet-fresh.is-stale svg { color: var(--amber); }
+
+.fleet-stale-banner { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--amber-rim); border-radius: var(--radius); color: var(--amber-ink); background: var(--amber-soft); font-size: var(--text-base); line-height: 1.45; }
+.fleet-stale-banner svg { flex: none; margin-top: 2px; color: var(--amber); }
+.fleet-stale-body .fleet-item, .fleet-stale-body .fleet-rows, .fleet-stale-body .fleet-working { opacity: .62; }
+.fleet-stale-body .fleet-ref { opacity: 1; }
+
+.fleet-section { display: flex; flex-direction: column; gap: 8px; }
+.fleet-section + .fleet-section { margin-top: 6px; }
+.fleet-section-head { display: flex; align-items: center; gap: 10px; min-height: 30px; }
+.fleet-section-head h2 { margin: 0; display: flex; align-items: center; gap: 8px; font-size: var(--text-base); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.fleet-section.tone-needs .fleet-section-head h2 { color: var(--amber-ink); }
+.fleet-count { min-width: 20px; height: 20px; padding: 0 6px; display: inline-grid; place-items: center; border-radius: 10px; background: var(--paper-sunken-strong); color: var(--ink); font-size: var(--text-sm); letter-spacing: 0; }
+.fleet-section.tone-needs .fleet-count { background: var(--amber-soft); color: var(--amber-ink); border: 1px solid var(--amber-rim); }
+.fleet-section-actions { margin-left: auto; display: flex; gap: 8px; }
+
+.fleet-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 10px; }
+.fleet-item { cursor: default; gap: 7px; padding: 10px 12px; }
+.fleet-item-head { display: flex; align-items: baseline; gap: 8px; }
+.fleet-item-bell { flex: none; color: var(--amber); position: relative; top: 2px; }
+.fleet-item-title { font-size: var(--text-base); line-height: 1.35; }
+.fleet-item-text { margin: 0; color: var(--ink-soft); font-size: var(--text-base); line-height: 1.45; }
+.fleet-item code, .fleet-agent-text code, .fleet-working-chip code { padding: 0 4px; border-radius: 3px; background: var(--paper-sunken-strong); font-size: .92em; }
+.fleet-item-refs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.fleet-ref { display: inline-flex; align-items: center; gap: 6px; font-size: var(--text-sm); color: var(--muted); }
+.fleet-ref-words { white-space: nowrap; }
+.fleet-ref-alert { display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px; border: 1px solid var(--red-rim); border-radius: 9px; color: var(--red); background: var(--red-soft); font-weight: 700; }
+.fleet-checked { margin-left: auto; }
+
+.fleet-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 2px; }
+.fleet-actions-to { display: inline-flex; align-items: center; gap: 4px; margin-right: 2px; color: var(--faint); font-size: var(--text-sm); }
+.fleet-prompt { font-weight: 600; max-width: 100%; text-align: left; }
+.fleet-prompt span { white-space: normal; }
+.fleet-prompt svg { flex: none; color: var(--teal); }
+.fleet-reply { color: var(--muted); border-style: dashed; font-weight: 600; }
+
+.fleet-delivered { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid var(--teal-edge); border-radius: 5px; background: var(--teal-wash); color: var(--teal-wash-ink); font-size: var(--text-sm); }
+.fleet-delivered > svg { color: var(--green); }
+.fleet-delivered q { color: var(--ink); font-weight: 650; }
+.fleet-delivered-wait { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; color: var(--teal); font-weight: 650; }
+
+.fleet-rows { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-strong); }
+.fleet-agent-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 12px; font-size: var(--text-base); }
+.fleet-rows .fleet-agent-row + .fleet-agent-row { border-top: 1px solid var(--line); }
+.fleet-agent-name { font-weight: 750; }
+.fleet-agent-text { color: var(--ink-soft); }
+
+.fleet-working { display: flex; flex-wrap: wrap; gap: 8px; }
+.fleet-working-chip { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 15px; background: var(--paper-strong); font-size: var(--text-sm); font-weight: 700; }
+.fleet-working-chip small { color: var(--muted); font-weight: 500; font-size: var(--text-sm); }
+.fleet-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); }
+
+.fleet-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 10px; }
+.fleet-fact { cursor: default; padding: 4px 0 8px; gap: 0; }
+.fleet-fact .fleet-agent-row { padding-bottom: 2px; }
+.fleet-fact-report { margin: 0; padding: 0 12px; color: var(--ink-soft); font-size: var(--text-base); line-height: 1.45; }
+.fleet-fact-report.is-none { color: var(--faint); font-style: italic; }
+.fleet-fact-next { color: var(--muted); }
+
+/* The mock's third view in the dashboard's switch, and the label the side-by-side frames carry. */
+.overview-mode-switch .is-mock-fleet svg { color: var(--amber); }

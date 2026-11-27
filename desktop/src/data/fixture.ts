@@ -4,6 +4,7 @@ import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion
 import type { ProjectTrustRole } from "../lib/projectTrust";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
+import { LIVE_DECK, fleetMockState } from "./fleetMock";
 import { voicePagesFleet } from "./fixtureCrowded";
 
 /**
@@ -1650,6 +1651,17 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   const docsInScene = treeScene !== null
     ? [...docsAgents, ...treeAgents].map((agent) => ({ ...agent, worktree: "storefront", ...(agent.displayName === "Contract review" ? { transcript: DOCS_REVIEW_TRANSCRIPT } : {}) }))
     : docsAgents;
+  /* PRD 2557 milestone 1 MOCK-UP: this box's live agents, from `daemon status` as captured. */
+  const mockState = state === "docs" ? fleetMockState() : undefined;
+  if (mockState) {
+    const statusOf: Record<string, AgentStatus> = { Idle: "idle", Working: "running", Waiting: "waiting", "Needs input": "needs_input" };
+    const live = LIVE_DECK.daemon_status.map((row) => {
+      const busy = row.LABEL === "dispatcher" && (mockState === "first-open" || mockState === "delivered" || mockState === "stale");
+      const agent = crowdedAgent({ id: row.AGENT, displayName: row.LABEL, role: "Claude code", cli: "claude", status: busy ? "running" : statusOf[row.STATUS] ?? "idle", cwd: row.CWD, toolCount: 0, activeTool: row.TOOL === "-" ? undefined : row.TOOL, tab: { kind: "dashboard" } });
+      return { ...agent, paneId: row.PANE, model: "", worktree: row.CWD };
+    });
+    return { runId: "run_live", repo: "dot-agent-deck", branch: "main", worktree: "~/code/dot-agent-deck", connection, health: "healthy", elapsed: "—", spend: 0, currentNode: 0, totalNodes: 0, paused: false, stages: [], agents: live, handoffs: [], evidence: [], profiles: DEFAULT_PROFILES.map((profile) => ({ ...profile })) };
+  }
   const fleet = messagingParam === "attention" ? docsAttentionAgents : messaging ? docsMessagingAgents : state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsInScene : state === "docs-question" ? docsQuestionAgents : state === "docs-restart" ? docsRestartAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.

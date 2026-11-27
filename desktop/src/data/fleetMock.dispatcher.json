@@ -1,0 +1,130 @@
+{
+ "composed_at": "2026-11-27T13:00:00Z",
+ "needs_you": [
+  {
+   "id": "n1",
+   "title": "#2501, re-wake an idle pane whose waiter never takes its mail (#2385).",
+   "text": "The agent reviewer approved it on 2026-11-25 and CI is green, but the unit that opened it has been closed, so nobody is merging it.",
+   "refs": [
+    {
+     "kind": "pull_request",
+     "number": 2501
+    },
+    {
+     "kind": "issue",
+     "number": 2385
+    }
+   ],
+   "prompts": [
+    "Merge #2501 through merge-pr",
+    "Dispatch a unit to update the branch and merge #2501",
+    "Leave #2501 for prageethw"
+   ]
+  },
+  {
+   "id": "n2",
+   "title": "#2523, Renovate: devbox 0.23.0.",
+   "text": "Approved by the agent reviewer, but labelled `manual-review` and `needs-human-eye`: a person has to read it before it merges.",
+   "refs": [
+    {
+     "kind": "pull_request",
+     "number": 2523
+    }
+   ],
+   "prompts": [
+    "Summarise what devbox 0.23.0 changes for this repo",
+    "Merge #2523 through merge-pr"
+   ]
+  },
+  {
+   "id": "n3",
+   "title": "#2527, Renovate: @opencode/cli 2.4.2.",
+   "text": "`RWX: linux` fails. The same bump last time (#2500) needed the npm half of the pin updated in `scripts/opencode-pins/v2/` to match `scripts/box/bootstrap.sh`; probably the same here.",
+   "refs": [
+    {
+     "kind": "pull_request",
+     "number": 2527
+    }
+   ],
+   "prompts": [
+    "Fix the pin lockstep on #2527 as on #2500 and push",
+    "Read the failure first and tell me"
+   ]
+  },
+  {
+   "id": "n4",
+   "title": "#2528, Renovate: lucide-react 1.79.0.",
+   "text": "Checks green; waits for a review because the agent reviewer gives Renovate PRs no vote.",
+   "refs": [
+    {
+     "kind": "pull_request",
+     "number": 2528
+    }
+   ],
+   "prompts": [
+    "Approve #2528 as me and merge",
+    "Leave #2528 to Renovate"
+   ]
+  },
+  {
+   "id": "n5",
+   "title": "A question from the #2399 unit (batch actions):",
+   "text": "with both filters on, should \"clear the filter\" and \"show everything\" clear the text filter and Needs you only together? The unit recommends yes; not implemented.",
+   "refs": [
+    {
+     "kind": "issue",
+     "number": 2399
+    },
+    {
+     "kind": "issue",
+     "number": 2487
+    }
+   ],
+   "prompts": [
+    "Yes: record it on #2487",
+    "No: keep them separate"
+   ]
+  },
+  {
+   "id": "n6",
+   "title": "Two tests share the weakness the flaky-test fix (#2530) removed:",
+   "text": "`tests/idle_worker_detector.rs` near lines 2040 and 2136 send work-done after a fixed 300 ms sleep. They have not failed yet.",
+   "refs": [],
+   "prompts": [
+    "Dispatch a unit to make both wait for the task's acknowledgement",
+    "Skip"
+   ]
+  },
+  {
+   "id": "n7",
+   "title": "The cards work (PRD #2374) is paused for this view:",
+   "text": "#2486, #2487, #2395 and #2396 are held until you compare these mock-ups.",
+   "refs": [
+    {
+     "kind": "issue",
+     "number": 2374
+    }
+   ],
+   "prompts": [
+    "Resume the cards queue with #2486",
+    "Keep holding"
+   ]
+  }
+ ],
+ "safe_to_close": [
+  {
+   "agent": "dispatch-issue-2533",
+   "text": "PR #2550 merged (227fe2cf), `main`'s run 45990241668 green, #2533 closed."
+  }
+ ],
+ "working": [
+  {
+   "agent": "dispatch-prd-2557-mockups",
+   "text": "the fleet view mock-ups."
+  },
+  {
+   "agent": "dispatch-issue-2555",
+   "text": "a notice's X does nothing while an agent's pane is open."
+  }
+ ]
+}

@@ -1,0 +1,991 @@
+{
+ "captured_at": "2026-11-27T13:17:47Z",
+ "daemon_status": [
+  {
+   "PANE": "desktop-2cf44ffe8436d805-0",
+   "AGENT": "1",
+   "ROLE": "-",
+   "STATUS": "Idle",
+   "TOOL": "-",
+   "INBOX": "-",
+   "WAKE": "native",
+   "LABEL": "dispatcher",
+   "CWD": "~/code/dot-agent-deck"
+  },
+  {
+   "PANE": "sched-dispatch-issue-2533-17",
+   "AGENT": "189",
+   "ROLE": "-",
+   "STATUS": "Idle",
+   "TOOL": "-",
+   "INBOX": "-",
+   "WAKE": "native",
+   "LABEL": "dispatch-issue-2533",
+   "CWD": "~/code/dot-agent-deck-dispatch-issue-2533"
+  },
+  {
+   "PANE": "sched-dispatch-prd-2557-mockups-18",
+   "AGENT": "190",
+   "ROLE": "-",
+   "STATUS": "Working",
+   "TOOL": "Bash",
+   "INBOX": "-",
+   "WAKE": "doorbell",
+   "LABEL": "dispatch-prd-2557-mockups",
+   "CWD": "~/code/dot-agent-deck-dispatch-prd-2557-mockups"
+  },
+  {
+   "PANE": "sched-dispatch-issue-2555-19",
+   "AGENT": "191",
+   "ROLE": "-",
+   "STATUS": "Working",
+   "TOOL": "-",
+   "INBOX": "-",
+   "WAKE": "native",
+   "LABEL": "dispatch-issue-2555",
+   "CWD": "~/code/dot-agent-deck-dispatch-issue-2555"
+  }
+ ],
+ "cards": {
+  "instance_id": "f8eccdc2b92f14af0a485377add0d2be",
+  "revision": 32230,
+  "entries": [
+   {
+    "key": "desktop-2cf44ffe8436d805-0/1",
+    "instance_id": "f8eccdc2b92f14af0a485377add0d2be",
+    "pane_id": "desktop-2cf44ffe8436d805-0",
+    "agent_id": "1",
+    "agent_type": "claude_code",
+    "name": "dispatcher",
+    "status": "idle",
+    "needs_you": false,
+    "needs_you_reasons": [],
+    "group": {
+     "id": "dispatcher:desktop-2cf44ffe8436d805-0/1",
+     "kind": "dispatcher",
+     "label": "dispatcher"
+    },
+    "relations": {
+     "dispatcher": null,
+     "orchestration": null
+    },
+    "report": null,
+    "fields": [],
+    "questions": [],
+    "actions": [
+     {
+      "id": "reply",
+      "label": "Reply",
+      "kind": "prompt",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": true,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "message-square",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-21b360550590a78171017637bab1f897"
+     },
+     {
+      "id": "open",
+      "label": "Open",
+      "kind": "open",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "terminal",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-9cf44f0ac9a6fc09b976dccf9556d030"
+     },
+     {
+      "id": "close",
+      "label": "Close",
+      "kind": "close",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": true,
+      "confirm_detail": null,
+      "icon": "x",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-2e807f35a728769f641e6580c331d074"
+     }
+    ],
+    "primary_action_id": "open",
+    "facts": {
+     "source": "deck",
+     "pull_request": null
+    },
+    "kind": "dispatcher",
+    "rollup": {
+     "total": 3,
+     "worst": "working",
+     "counts": {
+      "idle": 1,
+      "working": 2
+     },
+     "needs_you": 0
+    },
+    "recent_deliveries": [],
+    "revision": 32225,
+    "updated_at": "2026-11-27T13:17:14.896343125Z"
+   },
+   {
+    "key": "sched-dispatch-issue-2533-17/189",
+    "instance_id": "f8eccdc2b92f14af0a485377add0d2be",
+    "pane_id": "sched-dispatch-issue-2533-17",
+    "agent_id": "189",
+    "agent_type": "claude_code",
+    "name": "dispatch-issue-2533",
+    "status": "idle",
+    "needs_you": false,
+    "needs_you_reasons": [],
+    "group": {
+     "id": "dispatcher:desktop-2cf44ffe8436d805-0/1",
+     "kind": "dispatcher",
+     "label": "dispatcher"
+    },
+    "relations": {
+     "dispatcher": {
+      "key": "desktop-2cf44ffe8436d805-0/1",
+      "name": "dispatcher"
+     },
+     "orchestration": null
+    },
+    "report": {
+     "source": "agent",
+     "status": "waiting",
+     "summary": "PR #2550 green, findings answered, review requested",
+     "published_at": "2026-11-27T00:53:15.777674057Z",
+     "revision": 4
+    },
+    "fields": [
+     {
+      "name": "progress",
+      "label": "Progress",
+      "description": "What you are doing now, in a few words.",
+      "type": "text",
+      "icon": "activity",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "Waiting for review"
+     },
+     {
+      "name": "next-step",
+      "label": "Next step",
+      "description": "What you will do next, or what you are waiting for.",
+      "type": "text",
+      "icon": "arrow-right",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "Merge when told to"
+     },
+     {
+      "name": "pull-request",
+      "label": "Pull request",
+      "description": "The pull request you opened or are working on.",
+      "type": "pull_request",
+      "icon": "git-pull-request",
+      "placement": "compact",
+      "custom": false,
+      "source": "agent",
+      "value": "https://github.com/vfarcic/dot-agent-deck/pull/2550"
+     },
+     {
+      "name": "issue",
+      "label": "Issue",
+      "description": "The issue you are working on.",
+      "type": "issue",
+      "icon": "circle-dot",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "https://github.com/vfarcic/dot-agent-deck/issues/2533"
+     }
+    ],
+    "questions": [],
+    "actions": [
+     {
+      "id": "merge",
+      "label": "Merge it",
+      "kind": "prompt",
+      "prompt": "Merge it, following this project's own merge procedure, then update your card.",
+      "prompt_source": "catalog",
+      "text_input": false,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "git-merge",
+      "placement": "card",
+      "custom": false,
+      "source": "catalog",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-6f12e1dbee88ba6359cbb09e8de41930"
+     },
+     {
+      "id": "reply",
+      "label": "Reply",
+      "kind": "prompt",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": true,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "message-square",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-e32c99800cab355d5c1fb30ccb7f4ea5"
+     },
+     {
+      "id": "open",
+      "label": "Open",
+      "kind": "open",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "terminal",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-a73431f19fbcacdc4f2709c68ac5d7f4"
+     },
+     {
+      "id": "close",
+      "label": "Close",
+      "kind": "close",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": true,
+      "confirm_detail": null,
+      "icon": "x",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-caaff3d25b6667ad1310968aaa469262"
+     },
+     {
+      "id": "close-keep-worktree",
+      "label": "Close, keep worktree",
+      "kind": "close_keep_worktree",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": true,
+      "confirm_detail": null,
+      "icon": "archive",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-07d389e2f829469075f8304d996769e3"
+     }
+    ],
+    "primary_action_id": "merge",
+    "facts": {
+     "source": "deck",
+     "pull_request": {
+      "number": 2556,
+      "url": "https://github.com/vfarcic/dot-agent-deck/pull/2556",
+      "state": "merged",
+      "review": "approved",
+      "checks": {
+       "state": "passing",
+       "passing": 6,
+       "failing": 0,
+       "pending": 0,
+       "skipped": 21
+      }
+     }
+    },
+    "parent": "desktop-2cf44ffe8436d805-0/1",
+    "kind": "agent",
+    "checked_refs": [
+     {
+      "field": "pull-request",
+      "kind": "pull_request",
+      "claim": "https://github.com/vfarcic/dot-agent-deck/pull/2550",
+      "repo": "vfarcic/dot-agent-deck",
+      "number": 2550,
+      "url": "https://github.com/vfarcic/dot-agent-deck/pull/2550",
+      "result": {
+       "status": "checked",
+       "state": "merged",
+       "ci": {
+        "state": "passing",
+        "passing": 6,
+        "failing": 0,
+        "pending": 0,
+        "skipped": 22
+       },
+       "review": "approved",
+       "title": "feat(desktop): an opened Cards tree wraps into rows in a captioned box (#2533)",
+       "checked_at": "2026-11-27T11:24:41.660583213Z",
+       "stale": false
+      }
+     },
+     {
+      "field": "issue",
+      "kind": "issue",
+      "claim": "https://github.com/vfarcic/dot-agent-deck/issues/2533",
+      "repo": "vfarcic/dot-agent-deck",
+      "number": 2533,
+      "url": "https://github.com/vfarcic/dot-agent-deck/issues/2533",
+      "result": {
+       "status": "checked",
+       "state": "closed",
+       "title": "Agent cards: an opened tree wraps into rows instead of scrolling sideways (PRD #2374)",
+       "checked_at": "2026-11-27T11:24:51.414459635Z",
+       "stale": false,
+       "labels": [
+        {
+         "name": "enhancement",
+         "color": "a2eeef"
+        },
+        {
+         "name": "size:medium",
+         "color": "FBCA04"
+        },
+        {
+         "name": "desktop",
+         "color": "5319E7"
+        },
+        {
+         "name": "in-progress",
+         "color": "FBCA04"
+        }
+       ]
+      }
+     }
+    ],
+    "recent_deliveries": [],
+    "revision": 32189,
+    "updated_at": "2026-11-27T13:05:07.380859093Z"
+   },
+   {
+    "key": "sched-dispatch-prd-2557-mockups-18/190",
+    "instance_id": "f8eccdc2b92f14af0a485377add0d2be",
+    "pane_id": "sched-dispatch-prd-2557-mockups-18",
+    "agent_id": "190",
+    "agent_type": "claude_code",
+    "name": "dispatch-prd-2557-mockups",
+    "status": "working",
+    "needs_you": false,
+    "needs_you_reasons": [],
+    "group": {
+     "id": "dispatcher:desktop-2cf44ffe8436d805-0/1",
+     "kind": "dispatcher",
+     "label": "dispatcher"
+    },
+    "relations": {
+     "dispatcher": {
+      "key": "desktop-2cf44ffe8436d805-0/1",
+      "name": "dispatcher"
+     },
+     "orchestration": null
+    },
+    "report": {
+     "source": "agent",
+     "status": "working",
+     "summary": "Building the fleet view mock-ups for PRD 2557, milestone 1",
+     "published_at": "2026-11-27T13:04:39.453962877Z",
+     "revision": 1
+    },
+    "fields": [
+     {
+      "name": "progress",
+      "label": "Progress",
+      "description": "What you are doing now, in a few words.",
+      "type": "text",
+      "icon": "activity",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "Live data gathered; building fixture + mock FleetView"
+     },
+     {
+      "name": "next-step",
+      "label": "Next step",
+      "description": "What you will do next, or what you are waiting for.",
+      "type": "text",
+      "icon": "arrow-right",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "Render both themes, post on #2557"
+     },
+     {
+      "name": "issue",
+      "label": "Issue",
+      "description": "The issue you are working on.",
+      "type": "issue",
+      "icon": "circle-dot",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "#2557"
+     }
+    ],
+    "questions": [],
+    "actions": [
+     {
+      "id": "reply",
+      "label": "Reply",
+      "kind": "prompt",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": true,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "message-square",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-0c2eaf5733a0de69b28da7490ec5fb1c"
+     },
+     {
+      "id": "open",
+      "label": "Open",
+      "kind": "open",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "terminal",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-fcedf16d468d04deb1fbe4176f09ec1c"
+     },
+     {
+      "id": "close",
+      "label": "Close",
+      "kind": "close",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": true,
+      "confirm_detail": null,
+      "icon": "x",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-16a10879198235c537310a9a2802c96c"
+     },
+     {
+      "id": "close-keep-worktree",
+      "label": "Close, keep worktree",
+      "kind": "close_keep_worktree",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": true,
+      "confirm_detail": null,
+      "icon": "archive",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-f7638f7e208991c4ae7693db73c3f056"
+     }
+    ],
+    "primary_action_id": "open",
+    "facts": {
+     "source": "deck",
+     "pull_request": null
+    },
+    "parent": "desktop-2cf44ffe8436d805-0/1",
+    "kind": "agent",
+    "checked_refs": [
+     {
+      "field": "issue",
+      "kind": "issue",
+      "claim": "#2557",
+      "repo": "vfarcic/dot-agent-deck",
+      "number": 2557,
+      "url": "https://github.com/vfarcic/dot-agent-deck/issues/2557",
+      "result": {
+       "status": "checked",
+       "state": "open",
+       "title": "PRD: Fleet view \u2014 what my agents did and what needs me",
+       "checked_at": "2026-11-27T13:17:36.293568527Z",
+       "stale": false,
+       "labels": [
+        {
+         "name": "PRD",
+         "color": "0052CC"
+        },
+        {
+         "name": "in-progress",
+         "color": "FBCA04"
+        }
+       ]
+      }
+     }
+    ],
+    "recent_deliveries": [],
+    "revision": 32230,
+    "updated_at": "2026-11-27T13:17:36.396634282Z"
+   },
+   {
+    "key": "sched-dispatch-issue-2555-19/191",
+    "instance_id": "f8eccdc2b92f14af0a485377add0d2be",
+    "pane_id": "sched-dispatch-issue-2555-19",
+    "agent_id": "191",
+    "agent_type": "claude_code",
+    "name": "dispatch-issue-2555",
+    "status": "working",
+    "needs_you": false,
+    "needs_you_reasons": [],
+    "group": {
+     "id": "dispatcher:desktop-2cf44ffe8436d805-0/1",
+     "kind": "dispatcher",
+     "label": "dispatcher"
+    },
+    "relations": {
+     "dispatcher": {
+      "key": "desktop-2cf44ffe8436d805-0/1",
+      "name": "dispatcher"
+     },
+     "orchestration": null
+    },
+    "report": {
+     "source": "agent",
+     "status": "working",
+     "summary": "Issue 2555: fix done, running gates",
+     "published_at": "2026-11-27T13:10:35.795973245Z",
+     "revision": 1
+    },
+    "fields": [
+     {
+      "name": "progress",
+      "label": "Progress",
+      "description": "What you are doing now, in a few words.",
+      "type": "text",
+      "icon": "activity",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "Reproduced (X inert over pane), fixed, running gates"
+     },
+     {
+      "name": "next-step",
+      "label": "Next step",
+      "description": "What you will do next, or what you are waiting for.",
+      "type": "text",
+      "icon": "arrow-right",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "Commit and open the PR"
+     },
+     {
+      "name": "issue",
+      "label": "Issue",
+      "description": "The issue you are working on.",
+      "type": "issue",
+      "icon": "circle-dot",
+      "placement": "card",
+      "custom": false,
+      "source": "agent",
+      "value": "#2555"
+     }
+    ],
+    "questions": [],
+    "actions": [
+     {
+      "id": "reply",
+      "label": "Reply",
+      "kind": "prompt",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": true,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "message-square",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-e9900f8398b81f2b7866101e3a5a333f"
+     },
+     {
+      "id": "open",
+      "label": "Open",
+      "kind": "open",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": false,
+      "confirm_detail": null,
+      "icon": "terminal",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-db425aa10642cc2f426dce6c178b101a"
+     },
+     {
+      "id": "close",
+      "label": "Close",
+      "kind": "close",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": true,
+      "confirm_detail": null,
+      "icon": "x",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-0c0569357f6cdfc6cd8a3c57f10cf4e3"
+     },
+     {
+      "id": "close-keep-worktree",
+      "label": "Close, keep worktree",
+      "kind": "close_keep_worktree",
+      "prompt": null,
+      "prompt_source": null,
+      "text_input": false,
+      "confirm": true,
+      "confirm_detail": null,
+      "icon": "archive",
+      "placement": "detail",
+      "custom": false,
+      "source": "deck",
+      "enabled": true,
+      "disabled_reason": null,
+      "last_delivery": null,
+      "token": "act-134e46110e3c5f35769195b14145276b"
+     }
+    ],
+    "primary_action_id": "open",
+    "facts": {
+     "source": "deck",
+     "pull_request": null
+    },
+    "parent": "desktop-2cf44ffe8436d805-0/1",
+    "kind": "agent",
+    "checked_refs": [
+     {
+      "field": "issue",
+      "kind": "issue",
+      "claim": "#2555",
+      "repo": "vfarcic/dot-agent-deck",
+      "number": 2555,
+      "url": "https://github.com/vfarcic/dot-agent-deck/issues/2555",
+      "result": {
+       "status": "checked",
+       "state": "open",
+       "title": "Desktop: a notice's X does nothing while an agent's pane is open",
+       "checked_at": "2026-11-27T13:17:06.350012185Z",
+       "stale": false,
+       "labels": [
+        {
+         "name": "bug",
+         "color": "d73a4a"
+        },
+        {
+         "name": "desktop",
+         "color": "5319E7"
+        },
+        {
+         "name": "in-progress",
+         "color": "FBCA04"
+        }
+       ]
+      }
+     }
+    ],
+    "recent_deliveries": [],
+    "revision": 32226,
+    "updated_at": "2026-11-27T13:17:14.896343125Z"
+   }
+  ],
+  "catalog_errors": []
+ },
+ "pull_requests": {
+  "2501": {
+   "number": 2501,
+   "title": "feat(doorbell): re-wake an idle agent whose registered waiter never takes its mail (#2385)",
+   "state": "open",
+   "review": "approved",
+   "mergeable": "dirty",
+   "labels": [
+    "documentation",
+    "source",
+    "dependencies",
+    "tests"
+   ],
+   "author": "vfarcic",
+   "mergedAt": null,
+   "mergeCommit": null,
+   "ci": {
+    "state": "passing",
+    "passing": 8,
+    "failing": 0,
+    "pending": 0,
+    "skipped": 22
+   },
+   "failing": []
+  },
+  "2523": {
+   "number": 2523,
+   "title": "chore(deps): update dependency jetify-com/devbox to v0.23.0",
+   "state": "open",
+   "review": "approved",
+   "mergeable": "clean",
+   "labels": [
+    "config",
+    "dependencies",
+    "manual-review",
+    "needs-human-eye"
+   ],
+   "author": "app/renovate",
+   "mergedAt": null,
+   "mergeCommit": null,
+   "ci": {
+    "state": "passing",
+    "passing": 4,
+    "failing": 0,
+    "pending": 0,
+    "skipped": 22
+   },
+   "failing": []
+  },
+  "2527": {
+   "number": 2527,
+   "title": "chore(deps): update dependency @opencode/cli to v2.4.2",
+   "state": "open",
+   "review": "review_required",
+   "mergeable": "blocked",
+   "labels": [
+    "dependencies",
+    "manual-review"
+   ],
+   "author": "app/renovate",
+   "mergedAt": null,
+   "mergeCommit": null,
+   "ci": {
+    "state": "failing",
+    "passing": 3,
+    "failing": 1,
+    "pending": 0,
+    "skipped": 22
+   },
+   "failing": [
+    "RWX: linux"
+   ]
+  },
+  "2528": {
+   "number": 2528,
+   "title": "chore(deps): update dependency lucide-react to v1.79.0",
+   "state": "open",
+   "review": "review_required",
+   "mergeable": "blocked",
+   "labels": [
+    "dependencies"
+   ],
+   "author": "app/renovate",
+   "mergedAt": null,
+   "mergeCommit": null,
+   "ci": {
+    "state": "passing",
+    "passing": 5,
+    "failing": 0,
+    "pending": 0,
+    "skipped": 22
+   },
+   "failing": []
+  },
+  "2550": {
+   "number": 2550,
+   "title": "feat(desktop): an opened Cards tree wraps into rows in a captioned box (#2533)",
+   "state": "merged",
+   "review": "approved",
+   "mergeable": "unknown",
+   "labels": [
+    "documentation",
+    "tests"
+   ],
+   "author": "vfarcic",
+   "mergedAt": "2026-11-27T11:24:34Z",
+   "mergeCommit": "227fe2cfeb9f5548a2ddd0016e4591104235d00d",
+   "ci": {
+    "state": "passing",
+    "passing": 6,
+    "failing": 0,
+    "pending": 0,
+    "skipped": 22
+   },
+   "failing": []
+  }
+ },
+ "issues": {
+  "2374": {
+   "number": 2374,
+   "title": "PRD: Agent cards \u2014 see and act on every live agent from the overview",
+   "state": "open",
+   "labels": [
+    "PRD",
+    "in-progress"
+   ]
+  },
+  "2385": {
+   "number": 2385,
+   "title": "Idle orchestrator or dispatcher pane is not woken when a report reaches its inbox (report recorded, delivered up to ~1 h 50 min later)",
+   "state": "open",
+   "labels": [
+    "in-progress"
+   ]
+  },
+  "2395": {
+   "number": 2395,
+   "title": "Agent cards 3/5: project catalog, each entry labelled by its source (PRD #2374)",
+   "state": "open",
+   "labels": [
+    "enhancement",
+    "size:medium",
+    "desktop",
+    "daemon"
+   ]
+  },
+  "2396": {
+   "number": 2396,
+   "title": "Agent cards 4/5: catalog fields marked compact as table columns (PRD #2374)",
+   "state": "open",
+   "labels": [
+    "enhancement",
+    "size:medium",
+    "desktop"
+   ]
+  },
+  "2399": {
+   "number": 2399,
+   "title": "Agent cards 2/5: batch actions on a group or a selection of cards (PRD #2374)",
+   "state": "closed",
+   "labels": [
+    "enhancement",
+    "size:high",
+    "desktop",
+    "daemon"
+   ]
+  },
+  "2486": {
+   "number": 2486,
+   "title": "Agent cards: every issue label on the card, and the worst status below it (PRD #2374)",
+   "state": "open",
+   "labels": [
+    "enhancement",
+    "size:medium",
+    "desktop"
+   ]
+  },
+  "2487": {
+   "number": 2487,
+   "title": "Agent cards: filter Cards by issue labels (PRD #2374)",
+   "state": "open",
+   "labels": [
+    "enhancement",
+    "size:medium",
+    "desktop"
+   ]
+  },
+  "2530": {
+   "number": 2530,
+   "title": "test(idle-worker): send 002's work-done once the worker has taken its task",
+   "state": "merged",
+   "labels": [
+    "tests"
+   ]
+  },
+  "2533": {
+   "number": 2533,
+   "title": "Agent cards: an opened tree wraps into rows instead of scrolling sideways (PRD #2374)",
+   "state": "closed",
+   "labels": [
+    "enhancement",
+    "size:medium",
+    "desktop"
+   ]
+  },
+  "2555": {
+   "number": 2555,
+   "title": "Desktop: a notice's X does nothing while an agent's pane is open",
+   "state": "open",
+   "labels": [
+    "bug",
+    "desktop",
+    "in-progress"
+   ]
+  },
+  "2557": {
+   "number": 2557,
+   "title": "PRD: Fleet view \u2014 what my agents did and what needs me",
+   "state": "open",
+   "labels": [
+    "PRD",
+    "in-progress"
+   ]
+  }
+ },
+ "main_run": {
+  "conclusion": "success",
+  "databaseId": 45990241668,
+  "headSha": "227fe2cfeb9f5548a2ddd0016e4591104235d00d",
+  "status": "completed"
+ }
+}

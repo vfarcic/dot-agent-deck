@@ -1,3 +1,5 @@
+import { fleetMockCards, fleetMockState } from "../data/fleetMock";
+import { FIXTURE_DAEMON_ID } from "../data/fixture";
 import { createFixtureCardCatalog, createFixtureFleet, docsAgentCards, docsBatchAgentCards, docsBatchExecuteFailure, fleetAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, FIXTURE_REMOTE_DAEMON_ID, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
@@ -3415,6 +3417,7 @@ class FixtureDeckBridge implements DeckBridge {
   private sceneCards(): AgentCardsSnapshot | null {
     const scene = new URLSearchParams(window.location.search).get("cards");
     if (this.fixtureState !== "docs") return null;
+    if (scene === "fleet-mock") return fleetMockCards(FIXTURE_DAEMON_ID, fleetMockState() ?? "composed");
     if (scene === "1") return docsAgentCards();
     if (scene === "batch") return docsBatchAgentCards();
     if (scene !== "tree" && scene !== "tree-nested") return null;

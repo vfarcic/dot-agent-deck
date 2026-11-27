@@ -45,6 +45,9 @@ import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import { needsYouSentence, placedCardKey, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
+import { FleetViewMock } from "./FleetViewMock";
+import { fleetMockState, fleetMockView } from "../data/fleetMock";
+import { FIXTURE_DAEMON_ID } from "../data/fixture";
 import { AgentCardsDeckBody, AgentCardsNotes, AgentCardsSelectionBar, NO_UNCOUNTED, needsYouCountDescription, type SelectionBarEditor, type UncountedDaemons } from "./AgentCardsGrid";
 import { needsYouRowKeys } from "../lib/agentCardsTree";
 import { MoreMenu, type MoreMenuItem } from "./MoreMenu";
@@ -2597,7 +2600,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               header, with the daemon's own controls; a deck whose daemon has
               cards shows them as the section's body, and one with no cards (or
               that is not answering) keeps its usual body. */}
-          {shownDecks.map((deck) => (
+          {fleetMockState() && fleetMockView() === "fleet" ? <FleetViewMock state={fleetMockState()!} deckId={FIXTURE_DAEMON_ID} /> : shownDecks.map((deck) => (
             <DeckGroup
               /*
                 PRD #742 M5: the KEY, not the label. `socketPath` is
