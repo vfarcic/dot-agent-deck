@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { layoutTreeLevel, TREE_CARD_MIN_WIDTH, TREE_CARD_WIDTH, TREE_ITEM_PAD, TREE_SPINE_LANE, type TreeLevelLayout } from "./cardTreeLayout";
+import { layoutTreeLevel, TREE_CARD_WIDTH, TREE_ITEM_PAD, TREE_SPINE_LANE, type TreeLevelLayout } from "./cardTreeLayout";
 
 /*
  * Issue #2533 (PRD #2374 decision 2026-11-26) — the cards under an opened card
@@ -88,7 +88,7 @@ describe("desktop/agent-cards/143 — the cards under a card wrap into rows unde
     expect(level.width).toBeLessThanOrEqual(width);
   });
 
-  /// Scenario: lay out a card open three levels deep in a narrow width. Every level fits inside the one above it, and a card is never drawn narrower than the least a card is shown at.
+  /// Scenario: lay out a card open three levels deep in a narrow width. Every level fits inside the one above it, and each card is as wide as a card is, or as the room it has when that is narrower.
   it("desktop/agent-cards/143: a deep tree grows downwards, each level inside the one above it", () => {
     const deep: Node = { key: "d1", children: [{ key: "d2", children: [{ key: "d3", children: leaves("x", 4) }] }] };
     const width = 400;
@@ -98,7 +98,7 @@ describe("desktop/agent-cards/143 — the cards under a card wrap into rows unde
     let depth = 0;
     while (level) {
       expect(level.width, `level ${depth} fits the room it was given`).toBeLessThanOrEqual(room);
-      for (const row of level.rows) for (const item of row.items) expect(item.cardWidth).toBeGreaterThanOrEqual(TREE_CARD_MIN_WIDTH);
+      for (const row of level.rows) for (const item of row.items) expect(item.cardWidth).toBeLessThanOrEqual(TREE_CARD_WIDTH);
       const open: TreeLevelLayout<Node>["rows"][number]["items"][number] | undefined = level.rows.flatMap((row) => row.items).find((item) => item.level);
       room = open ? open.width - 2 * TREE_ITEM_PAD : 0;
       level = open?.level;
@@ -114,4 +114,35 @@ describe("desktop/agent-cards/143 — the cards under a card wrap into rows unde
     const level = layout([loop], 1000, new Set(["loop"]));
     expect(rowKeys(level.rows[0].items[0].level!)).toEqual([["other"]]);
   });
+
+  /// Scenario: lay out a chain seven levels deep, each level an open card beside a closed one, in 300 pixels. Every level fits the room it was given, however narrow its cards have to be (PR #2550 review).
+  it("desktop/agent-cards/143: a deep tree never comes out wider than the room it is given", () => {
+    let chain: Node = { key: "end", children: leaves("e", 2) };
+    const open = new Set(["end"]);
+    for (let depth = 7; depth > 0; depth -= 1) {
+      chain = { key: `c${depth}`, children: [chain, leaf(`s${depth}`)] };
+      open.add(`c${depth}`);
+    }
+    for (const width of [300, 340, 600]) {
+      let level: TreeLevelLayout<Node> | undefined = layout([chain], width, open);
+      let room = width;
+      while (level) {
+        expect(level.width, `a level given ${room}px at a ${width}px start`).toBeLessThanOrEqual(room);
+        const inner: TreeLevelLayout<Node>["rows"][number]["items"][number] | undefined = level.rows.flatMap((row) => row.items).find((item) => item.level);
+        room = inner ? inner.width - 2 * TREE_ITEM_PAD : 0;
+        level = inner?.level;
+      }
+    }
+  });
+
+  /// Scenario: lay out a chain twenty levels deep whose every level wraps, counting how often the layout asks whether a card is open. The count grows with the tree, not doubling at each level (PR #2550 review).
+  it("desktop/agent-cards/143: a deep tree that wraps at every level is laid out without repeating the work below it", () => {
+    let chain: Node = leaf("end");
+    for (let depth = 20; depth > 0; depth -= 1) chain = { key: `c${depth}`, children: [chain, leaf(`s${depth}`)] };
+    let asked = 0;
+    const level = layoutTreeLevel([chain], 900, { keyOf: (node) => node.key, isOpen: () => { asked += 1; return true; } });
+    expect(level).not.toBeNull();
+    expect(asked, "questions asked of a 41-card tree").toBeLessThan(5000);
+  });
 });
+

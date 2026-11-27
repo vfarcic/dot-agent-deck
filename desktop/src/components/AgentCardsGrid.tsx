@@ -280,8 +280,15 @@ const NO_OPEN_CARDS: ReadonlySet<string> = new Set();
  * Issue #2533 — one level of an opened tree, laid out by
  * {@link layoutTreeLevel}: its cards in rows, each row hanging from the spine
  * by its own bus, each card a column holding the level under it when it is
- * open. The level's width and every line's place come from the layout; the
- * lines' heights follow the rows in CSS.
+ * open. The level's width and every line's place across come from the
+ * layout; the lines' heights follow the rows in CSS.
+ *
+ * Every card is a child of the level itself, keyed by the card, and a row
+ * ends at a break between two of them, so a card that moves to another row
+ * (opening it, or the window narrowing) stays mounted and keeps the keyboard
+ * (PR #2550 review). Each row's first card carries its row's bus and spine,
+ * placed from its own left edge; it is as tall as the row, so the spine runs
+ * down to where the next row starts.
  */
 function TreeLevel({ level, depth, top, view }: { level: TreeLevelLayout<CardNode>; depth: number; top?: boolean; view: TreeView }) {
   const classes = ["agent-cards-tree-level", top ? "is-top" : "", level.single ? "is-single" : ""].filter(Boolean).join(" ");
@@ -294,27 +301,29 @@ function TreeLevel({ level, depth, top, view }: { level: TreeLevelLayout<CardNod
       data-stem-x={level.stem}
       style={{ width: `${level.width}px`, "--stem-x": `${level.stem}px` } as CSSProperties}
     >
-      {level.rows.map((row, at) => (
-        <div className="agent-cards-tree-row" key={view.keyOf(row.items[0].node)} data-testid="agent-cards-tree-row" style={{ width: `${level.width}px` }}>
-          {row.bus && <span className="agent-cards-bus" aria-hidden="true" data-testid="agent-cards-bus" data-row={at} style={{ left: `${row.bus.left}px`, width: `${row.bus.right - row.bus.left}px` }} />}
-          {row.spine !== undefined && <span className="agent-cards-spine" aria-hidden="true" data-testid="agent-cards-spine" data-row={at} style={{ left: `${row.spine}px` }} />}
-          {row.items.map((item) => {
-            const open = item.node.children.length > 0 && view.openCards.has(view.keyOf(item.node));
-            return (
-              <div
-                className="agent-cards-tree-item"
-                role="listitem"
-                key={view.keyOf(item.node)}
-                data-center-x={item.center}
-                style={{ width: `${item.width}px`, "--tree-card-width": `${item.cardWidth}px` } as CSSProperties}
-              >
-                <AgentCard card={item.node.card} controls={view.controls} results={view.results?.(item.node.card)} place={view.place(item.node, depth, open)} ended={endedRoleOfCard(view.endedRoles, item.node.card.entry)} />
-                {item.level && <TreeLevel level={item.level} depth={depth + 1} view={view} />}
-              </div>
-            );
-          })}
-        </div>
-      ))}
+      {level.rows.flatMap((row, at) => {
+        const items = row.items.map((item, index) => {
+          const key = view.keyOf(item.node);
+          const open = item.node.children.length > 0 && view.openCards.has(key);
+          const first = index === 0;
+          return (
+            <div
+              className="agent-cards-tree-item"
+              role="listitem"
+              key={key}
+              data-row={at}
+              data-center-x={item.center}
+              style={{ width: `${item.width}px`, "--tree-card-width": `${item.cardWidth}px` } as CSSProperties}
+            >
+              {first && row.bus && <span className="agent-cards-bus" aria-hidden="true" data-testid="agent-cards-bus" data-row={at} style={{ left: `${row.bus.left - item.left}px`, width: `${row.bus.right - row.bus.left}px` }} />}
+              {first && row.spine !== undefined && <span className="agent-cards-spine" aria-hidden="true" data-testid="agent-cards-spine" data-row={at} style={{ left: `${row.spine - item.left}px` }} />}
+              <AgentCard card={item.node.card} controls={view.controls} results={view.results?.(item.node.card)} place={view.place(item.node, depth, open)} ended={endedRoleOfCard(view.endedRoles, item.node.card.entry)} />
+              {item.level && <TreeLevel level={item.level} depth={depth + 1} view={view} />}
+            </div>
+          );
+        });
+        return at === 0 ? items : [<span className="agent-cards-tree-break" aria-hidden="true" key={`row-break\u0000${view.keyOf(row.items[0].node)}`} />, ...items];
+      })}
     </div>
   );
 }

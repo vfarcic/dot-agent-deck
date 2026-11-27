@@ -843,12 +843,17 @@ describe("desktop/agent-cards/144 — an opened tree wraps into rows, in a capti
     return within(band).getByTestId("agent-cards-box");
   };
   /** A level's rows, each as the names of the cards in it. */
-  const rowsOf = (level: Element) => [...level.querySelectorAll(":scope > [data-testid='agent-cards-tree-row']")]
-    .map((row) => [...row.querySelectorAll(":scope > .agent-cards-tree-item > article")].map((card) => within(card as HTMLElement).getByTestId("agent-card-open-agent").textContent));
+  const itemsByRow = (level: Element) => {
+    const rows: Element[][] = [];
+    for (const item of level.querySelectorAll(":scope > .agent-cards-tree-item")) (rows[Number(item.getAttribute("data-row"))] ??= []).push(item);
+    return rows;
+  };
+  const rowsOf = (level: Element) => itemsByRow(level)
+    .map((row) => row.map((item) => within(item.querySelector(":scope > article") as HTMLElement).getByTestId("agent-card-open-agent").textContent));
   const topLevel = (root: AgentCardEntry) => boxOf(root).querySelector(":scope > [data-testid='agent-cards-tree-level']")!;
-  const lines = (level: Element) => [...level.querySelectorAll(":scope > [data-testid='agent-cards-tree-row']")].map((row) => ({
-    bus: row.querySelectorAll(":scope > [data-testid='agent-cards-bus']").length,
-    spine: row.querySelectorAll(":scope > [data-testid='agent-cards-spine']").length,
+  const lines = (level: Element) => itemsByRow(level).map((row) => ({
+    bus: row.flatMap((item) => [...item.querySelectorAll(":scope > [data-testid='agent-cards-bus']")]).length,
+    spine: row.flatMap((item) => [...item.querySelectorAll(":scope > [data-testid='agent-cards-spine']")]).length,
   }));
 
   /// Scenario: at a frame 1300 pixels wide, open a dispatcher with eight agents under it and a root with two beside it. Each tree is in its own box named after its root; the dispatcher's eight wrap into two rows, five and three, each row with its own line and one spine joining the first row to the second; the pair fits in one row and has no spine.
@@ -920,5 +925,20 @@ describe("desktop/agent-cards/144 — an opened tree wraps into rows, in a capti
     } finally {
       globalThis.ResizeObserver = realObserver;
     }
+  });
+
+  /// Scenario: at a 1300 pixel frame, open the dispatcher, put the keyboard on its orchestration's open arrow, which shares a row with two other agents, and press it. The orchestration's roles open under it and it moves to a row of its own, and the keyboard is still on its arrow (PR #2550 review).
+  it("desktop/agent-cards/144: opening a card that moves to another row keeps the keyboard on it", () => {
+    frameWidth = 1300;
+    cardsView(runtime(WIDE));
+    fireEvent.click(toggle(DISPATCHER));
+    expect(rowsOf(topLevel(DISPATCHER))[1]).toEqual(["unit-6", "unit-7", "team"]);
+    const arrow = toggle(TEAM);
+    arrow.focus();
+    fireEvent.click(arrow, { detail: 0 });
+    expect(rowsOf(topLevel(DISPATCHER)).find((row) => row.includes("team"))).toEqual(["team"]);
+    expect(toggle(TEAM).getAttribute("aria-expanded")).toBe("true");
+    expect(toggle(TEAM), "the same arrow is still on screen").toBe(arrow);
+    expect(document.activeElement).toBe(arrow);
   });
 });

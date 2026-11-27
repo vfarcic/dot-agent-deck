@@ -521,15 +521,20 @@ async function expectWrappedTrees(page: Page): Promise<{ cards: number; rows: nu
           single: level.classList.contains("is-single"),
           stem: at.left + Number(level.dataset.stemX),
           parent: parent ? rect(parent) : null,
-          rows: [...level.querySelectorAll(":scope > .agent-cards-tree-row")].map((row) => {
-            const bus = row.querySelector(":scope > .agent-cards-bus");
-            const spine = row.querySelector(":scope > .agent-cards-spine");
-            return {
-              bus: bus ? rect(bus) : null,
-              spine: spine ? rect(spine) : null,
-              cards: [...row.querySelectorAll(":scope > .agent-cards-tree-item > article")].map((card) => rect(card)),
-            };
-          }),
+          rows: (() => {
+            // A row is the level's items that carry its index; its bus and spine sit on its first item.
+            const byRow: Element[][] = [];
+            for (const item of level.querySelectorAll(":scope > .agent-cards-tree-item")) (byRow[Number(item.getAttribute("data-row"))] ??= []).push(item);
+            return byRow.map((items) => {
+              const bus = items.map((item) => item.querySelector(":scope > .agent-cards-bus")).find(Boolean);
+              const spine = items.map((item) => item.querySelector(":scope > .agent-cards-spine")).find(Boolean);
+              return {
+                bus: bus ? rect(bus) : null,
+                spine: spine ? rect(spine) : null,
+                cards: items.map((item) => rect(item.querySelector(":scope > article")!)),
+              };
+            });
+          })(),
         };
       }),
     };
@@ -718,8 +723,14 @@ for (const width of WIDTHS) {
       for (const other of [width + 300, Math.max(375, width - 200), width]) {
         await page.setViewportSize({ width: other, height: 900 });
         await expect.poll(() => page.evaluate(() => document.documentElement.clientWidth)).toBe(other);
-        // The trees are laid out again once the frame's resize is reported, a frame after the window's.
-        await expect.poll(() => page.evaluate(() => { const deck = document.querySelector(".agent-cards-deck")!; return deck.scrollWidth <= deck.clientWidth; })).toBe(true);
+        // The roots and trees are laid out again once the frame's resize is reported, a frame after the window's:
+        // wait until the roots' columns are the frame's and nothing overflows it, whichever way the window moved.
+        await expect.poll(() => page.evaluate(() => {
+          const deck = document.querySelector<HTMLElement>(".agent-cards-deck")!;
+          const grid = document.querySelector<HTMLElement>("[data-testid='agent-cards-roots']")!;
+          const columns = Number(/repeat\((\d+),/.exec(grid.style.gridTemplateColumns)?.[1] ?? 0);
+          return columns === Math.max(1, Math.floor((deck.clientWidth + 12) / 236)) && deck.scrollWidth <= deck.clientWidth;
+        })).toBe(true);
         await expectWrappedTrees(page);
         await expectNoSidewaysScroll(page);
       }

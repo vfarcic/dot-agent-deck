@@ -22,6 +22,12 @@
  * row is as tall as its tallest item, and the lines that run down a row (the
  * drops to its cards, the spine to the next row) stretch with it in CSS.
  *
+ * A level never comes out wider than the room it is given: a card in a level
+ * deeper than the width allows is drawn narrower than {@link TREE_CARD_WIDTH}
+ * rather than spilling out of its box (PR #2550 review), so the guarantee
+ * holds while the room is at least {@link TREE_SPINE_LANE} plus both sides'
+ * {@link TREE_ITEM_PAD}.
+ *
  * A level that fits in one row is laid out as it was before wrapping existed:
  * its items side by side, the parent centred over them, the bus from the first
  * card's middle to the last's.
@@ -29,8 +35,6 @@
 
 /** A card's width on the tree, in CSS pixels, when there is room for it. */
 export const TREE_CARD_WIDTH = 224;
-/** The narrowest a card on the tree is drawn, however little room a deep level has. */
-export const TREE_CARD_MIN_WIDTH = 160;
 /** Each item's space on either side of its card, so two cards side by side are twice this apart. */
 export const TREE_ITEM_PAD = 5;
 /** The room kept at a row's right end for the spine when the row holds a single item and the spine must pass it. */
@@ -92,9 +96,9 @@ interface Measured<T> {
 
 /**
  * Lays out the cards under one card in `available` pixels. `read.isOpen`
- * says whether a card's own level is drawn; `above` is every card on the way down
- * to this level, and a card met again below itself is not drawn, so even a
- * cyclic list ends. `null` when nothing is left to draw.
+ * says whether a card's own level is drawn; `above` is every card on the way
+ * down to this level, and a card met again below itself is not laid out, so
+ * even a cyclic list ends. `null` when nothing is left to draw.
  */
 export function layoutTreeLevel<T extends TreeLayoutNode<T>>(
   nodes: readonly T[],
@@ -102,9 +106,26 @@ export function layoutTreeLevel<T extends TreeLayoutNode<T>>(
   read: TreeLayoutReader<T>,
   above: ReadonlySet<string> = new Set(),
 ): TreeLevelLayout<T> | null {
-  const shown = nodes.filter((node) => !above.has(read.keyOf(node)));
+  return levelIn({ read, levels: new Map() }, nodes, available, [...above]);
+}
+
+/**
+ * One layout pass: what it reads the cards with, and every open card's level
+ * already laid out, by card, room and the path down to it. A level that wraps
+ * measures its cards a second time in a narrower room, which measures each
+ * open card's level again; without this, that doubles at every level that
+ * wraps (PR #2550 review).
+ */
+interface Pass<T> {
+  read: TreeLayoutReader<T>;
+  levels: Map<string, TreeLevelLayout<T> | null>;
+}
+
+function levelIn<T extends TreeLayoutNode<T>>(pass: Pass<T>, nodes: readonly T[], available: number, path: readonly string[]): TreeLevelLayout<T> | null {
+  const above = new Set(path);
+  const shown = nodes.filter((node) => !above.has(pass.read.keyOf(node)));
   if (shown.length === 0) return null;
-  const measure = (room: number) => shown.map((node) => measureItem(node, room, read, above));
+  const measure = (room: number) => shown.map((node) => measureItem(pass, node, room, path));
   let items = measure(available);
   let rows = pack(items, available);
   // A level that wraps keeps a lane at the right of its items, so the spine can pass a row that holds one wide item.
@@ -135,10 +156,19 @@ export function layoutTreeLevel<T extends TreeLayoutNode<T>>(
   return { width, stem, rows: laid, single };
 }
 
-function measureItem<T extends TreeLayoutNode<T>>(node: T, room: number, read: TreeLayoutReader<T>, above: ReadonlySet<string>): Measured<T> {
-  const inner = room - 2 * TREE_ITEM_PAD;
-  const cardWidth = Math.max(TREE_CARD_MIN_WIDTH, Math.min(TREE_CARD_WIDTH, inner));
-  const level = node.children.length > 0 && read.isOpen(node) ? layoutTreeLevel(node.children, inner, read, new Set([...above, read.keyOf(node)])) : null;
+function measureItem<T extends TreeLayoutNode<T>>(pass: Pass<T>, node: T, room: number, path: readonly string[]): Measured<T> {
+  const inner = Math.max(0, room - 2 * TREE_ITEM_PAD);
+  const cardWidth = Math.min(TREE_CARD_WIDTH, inner);
+  let level: TreeLevelLayout<T> | null = null;
+  if (node.children.length > 0 && pass.read.isOpen(node)) {
+    const key = pass.read.keyOf(node);
+    const id = `${inner}\u0000${path.join("\u0000")}\u0000${key}`;
+    if (pass.levels.has(id)) level = pass.levels.get(id) ?? null;
+    else {
+      level = levelIn(pass, node.children, inner, [...path, key]);
+      pass.levels.set(id, level);
+    }
+  }
   return { node, width: Math.max(cardWidth, level?.width ?? 0) + 2 * TREE_ITEM_PAD, cardWidth, ...(level ? { level } : {}) };
 }
 
