@@ -75,7 +75,7 @@ import { stopDaemonConfirmCopy, stopDaemonOffer } from "./lib/stopDaemon";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useQuestionNotifications } from "./hooks/useQuestionNotifications";
-import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
+import { NOTICE_PEER_PROPS, OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground, useNoOverlayAbove } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
@@ -3372,9 +3372,13 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
   }, [newestWarning, newestWorktree, message, restart, star, antigravity, trust]);
+  /* Issue #2555: the stack is a modal peer, reachable over the agent's pane.
+     Show navigates to the dashboard and opens a dialog there, which is the way
+     out of a pane but not of a dialog drawn above one, so it waits for those. */
+  const showReachable = useNoOverlayAbove(OVERLAY_LAYER.pane);
   if (!message && !warnings?.length && !restart && !worktrees?.length && !star && !antigravity && !trust) return null;
   return (
-    <div className="toast-stack" ref={stack}>
+    <div className="toast-stack" ref={stack} {...NOTICE_PEER_PROPS}>
       {worktrees?.map((kept) => (
         <div key={`worktree-${kept.id}`} className="toast toast-restart" data-testid="worktree-kept-toast" role="status">
           <AlertTriangle size={15} />
@@ -3404,7 +3408,7 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
             {restartInterrupted && (
               <span className="toast-hint" data-testid="restart-toast-interrupted">
                 {restartInterrupted.text}{" "}
-                <button type="button" className="button secondary compact" data-testid="restart-toast-interrupted-show" onClick={() => VOICE_ACTIONS.showInterruptedWork.run(restartInterrupted.context, {})}>Show</button>
+                <button type="button" className="button secondary compact" data-testid="restart-toast-interrupted-show" disabled={!showReachable} onClick={() => VOICE_ACTIONS.showInterruptedWork.run(restartInterrupted.context, {})}>Show</button>
               </span>
             )}
           </div>

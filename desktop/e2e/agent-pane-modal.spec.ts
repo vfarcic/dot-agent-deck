@@ -141,3 +141,40 @@ test.describe("the agent pane is a real modal", () => {
     await expect(page.getByTestId("deck-selector-menu")).toBeVisible();
   });
 });
+
+/**
+ * Issue #2555 — a notice in the corner is drawn over the agent pane (the toast
+ * stack paints above `.agent-pane-overlay`), so it has to be usable there: its
+ * X dismisses it with the pane open, as it does with none. Only a real engine
+ * can tell, since jsdom delivers a click to an `inert` button anyway.
+ */
+test.describe("a notice over the agent pane", () => {
+  /** Thanks the user for starring, so the star notice is in the corner. */
+  async function starNotice(page: import("@playwright/test").Page) {
+    await page.goto("/?fixture=1&state=docs&star=1");
+    await page.getByRole("alertdialog", { name: "Enjoying dot-agent-deck?" }).getByRole("button", { name: "s Star" }).click();
+    const toast = page.getByTestId("star-toast");
+    await expect(toast).toContainText("Thanks for starring!");
+    return toast;
+  }
+
+  /** Scenario: with no agent pane open, the star notice's X dismisses it — the control for the next test. */
+  test("dismisses a notice with no pane open", async ({ page }) => {
+    const toast = await starNotice(page);
+    await toast.getByRole("button", { name: "Dismiss star message" }).click({ timeout: 5_000 });
+    await expect(toast).toHaveCount(0);
+  });
+
+  /** Scenario: open an agent's pane while the star notice is in the corner, then click the notice's X. The notice goes away and the pane stays open; the deck selector behind the pane is still out of reach. */
+  test("dismisses a notice drawn over an open pane", async ({ page }) => {
+    const toast = await starNotice(page);
+    await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: ROW_EDGE });
+    const pane = page.getByTestId("agent-pane-overlay");
+    await expect(pane).toBeVisible();
+    await expect(toast).toBeVisible();
+    await toast.getByRole("button", { name: "Dismiss star message" }).click({ timeout: 5_000 });
+    await expect(toast).toHaveCount(0);
+    await expect(pane).toBeVisible();
+    expect(await page.getByTestId("deck-selector-toggle").evaluate((node) => node.closest("[inert]") !== null)).toBe(true);
+  });
+});
