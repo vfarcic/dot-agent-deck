@@ -242,7 +242,7 @@ export const CARD_ICON_LIMIT = 3;
  * which is offered only in the agent pane's Card tab. They are the panel's
  * actions, pressed the same way.
  */
-export function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
+function cardIconActions(entry: AgentCardEntry): AgentCardAction[] {
   const options = new Set(entry.questions.flatMap((question) => question.options.map((option) => option.action_id)));
   return entry.actions.filter((action) => action.kind === "prompt" && !action.text_input && !options.has(action.id) && action.placement !== "detail");
 }
@@ -287,7 +287,7 @@ export function CardActionIconRow({ card, actions, controls, label, children }: 
 }
 
 /** A card action's hover: its label, the exact text, whether it asks first, why it is disabled. */
-export function actionHover(action: AgentCardAction): string {
+function actionHover(action: AgentCardAction): string {
   return cardActionHover(action.label, action.prompt, [
     action.source === "agent" && "Suggested by the agent, not in the catalog",
     action.confirm && action.enabled && "Asks you to confirm first.",

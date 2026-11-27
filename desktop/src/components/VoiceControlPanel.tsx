@@ -173,7 +173,7 @@ const VOICE_CHAIN_POLL_MS = 16;
  * it was ("use claude" refused as if the orchestration chip were still
  * chosen). Several frames, so the render and its effects have both run.
  */
-export const VOICE_CHAIN_STEP_GAP_MS = 64;
+const VOICE_CHAIN_STEP_GAP_MS = 64;
 
 /**
  * PRD #1184 — what the voice row says when a chain's numbered choice ends
