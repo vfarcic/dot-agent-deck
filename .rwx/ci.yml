@@ -483,7 +483,9 @@ tasks:
   # (`desktop-driver`).
   - key: desktop-driver
     if: ${{ tasks.backend.values.rust == 'true' }}
-    use: [system-packages, desktop-driver-packages, code, rust, pnpm]
+    # `code` before `desktop-driver-packages`: RWX warns otherwise, since that
+    # task uses `code` itself (as `aarch64-crossbuild` lists `aarch64-packages`).
+    use: [system-packages, code, desktop-driver-packages, rust, pnpm]
     # v2: v1's cache held a deleted /etc/ssh/sshd_config, which failed
     # openssh-server's postinst when this task installed it.
     # v3: v2 was written by runs that installed the Ubuntu packages here, on
@@ -611,11 +613,14 @@ tasks:
     tool-cache: ci-devbox-nix-2.36.0-v1
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
-      DEVBOX_USE_VERSION: 0.22.0
+      DEVBOX_USE_VERSION: 0.23.0
     run: |
       scripts/check-pin-lockstep.sh
       # The release binary, checked against its published SHA-256 (the
       # release's checksums.txt), rather than the get.jetify.com script.
+      # renovate.json's jetify-com/devbox manager moves that checksum with
+      # `DEVBOX_USE_VERSION` in one PR (PR #2523), and xtask/linkage-check's
+      # rwx_devbox_checksum fails the build when the manager stops reading it.
       # Issue #2160: a single HTTP 504 from this download turned the run red.
       # `--retry 5 --retry-all-errors` makes up to six attempts on any failure
       # (5xx, connection reset, timeout) with curl's doubling backoff
@@ -628,7 +633,7 @@ tasks:
       # same flags.
       curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 -o /tmp/devbox.tar.gz \
         "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_USE_VERSION}/devbox_${DEVBOX_USE_VERSION}_linux_amd64.tar.gz"
-      echo "237516c29fafebf683492a7f2fce8a64b06f5032544d85ad26acfaa03fc863ed  /tmp/devbox.tar.gz" | sha256sum -c -
+      echo "c6a853f6b7b4bb3d575299528459a534d5a70fa5ff84210c39dfc1899c32a108  /tmp/devbox.tar.gz" | sha256sum -c -
       sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox
       devbox run -- bash scripts/devbox-smoke.sh
 
