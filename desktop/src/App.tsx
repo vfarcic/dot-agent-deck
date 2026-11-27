@@ -176,7 +176,7 @@ const PROJECT_STALE_TOKEN_CODE = "stale-token: ";
 const PROJECT_STALE_PREPARATION_CODE = "stale-preparation: ";
 const PROJECT_UNSUPPORTED_PLATFORM_CODE = "unsupported-platform: ";
 /** PRD #1401 — what opening a pull request answers when its agent is no longer listed. */
-export const PULL_REQUEST_AGENT_GONE = "That agent is no longer on its daemon.";
+const PULL_REQUEST_AGENT_GONE = "That agent is no longer on its daemon.";
 /** Issue #2418 — what opening a card's checked reference answers when its daemon no longer lists that card. */
 const CARD_REFERENCE_GONE = "That card is no longer on its daemon, so its page was not opened.";
 /** Issue #2418 — …when the card's daemon is not answering. */
@@ -184,7 +184,7 @@ const CARD_REFERENCE_DECK_SILENT = "That card's daemon is not answering, so its 
 /** Issue #2418 — …when the card no longer carries that reference as the deck checked it. */
 const cardReferenceChanged = (name: string, what: string) => `${name}'s card no longer shows that ${what} as the deck checked it, so it was not opened.`;
 /** PRD #1401 — "open it in the browser" with no pull request open. */
-export const PULL_REQUEST_NONE_OPEN = "No pull request is open.";
+const PULL_REQUEST_NONE_OPEN = "No pull request is open.";
 /** PRD #1401 — a spoken scroll while one of the app's dialogs is over the pull request. */
 export const PULL_REQUEST_COVERED = "Close what is in front of the pull request first.";
 /**

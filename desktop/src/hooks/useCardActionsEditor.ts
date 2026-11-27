@@ -19,7 +19,7 @@ export interface CardActionsDaemon {
 }
 
 /** Where the catalog places an action, as the form offers it. */
-export type CardActionPlacement = "compact" | "card" | "detail";
+type CardActionPlacement = "compact" | "card" | "detail";
 
 /** The form's fields, as typed. */
 export interface CardActionFormValues {
@@ -34,7 +34,7 @@ export interface CardActionFormValues {
 }
 
 /** The form: a new action, or one listed action being edited (its name fixed). */
-export interface CardActionForm {
+interface CardActionForm {
   /** Which form this is: a Save's answer changes only the form it was sent from (issue #2399 review 6). */
   generation: number;
   mode: "add" | "edit";
@@ -121,7 +121,7 @@ export interface CardActionsEditor {
 export const CARD_ACTIONS_NOT_AVAILABLE = "The Card actions editor is not available here: no daemon on screen shows cards.";
 const NOT_AVAILABLE = CARD_ACTIONS_NOT_AVAILABLE;
 /** PR #2491 review T1 — over an agent's pane, an opening naming no daemon means the pane's, and that daemon has no editor. */
-export const PANE_DAEMON_NO_EDITOR = "This agent's daemon shows no cards, so it has no Card actions editor.";
+const PANE_DAEMON_NO_EDITOR = "This agent's daemon shows no cards, so it has no Card actions editor.";
 const NOT_OPEN = "The Card actions editor is not open.";
 const NO_FORM = "No card action form is open.";
 const NOT_ASKING = "The editor is not asking to remove anything.";
@@ -313,7 +313,7 @@ const reason = (error: unknown) => displayText(error instanceof Error ? error.me
 const outcomeUnknown = (error: unknown) => typeof error === "object" && error !== null && (error as { outcome?: unknown }).outcome === "unknown";
 
 /** The icon a spoken or pressed name means: the name itself, its words joined by dashes, or the one icon whose name holds every word. */
-export function cardIconByName(said: string): string | undefined {
+function cardIconByName(said: string): string | undefined {
   const wanted = said.trim().toLowerCase();
   if (!wanted) return undefined;
   const dashed = wanted.replace(/\s+/g, "-");

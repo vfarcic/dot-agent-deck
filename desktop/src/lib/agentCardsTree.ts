@@ -401,8 +401,8 @@ export interface IssueLabelView {
  * issue, and the most characters of a label's name: the daemon's own caps
  * (`MAX_LABELS`, `MAX_LABEL_NAME_CHARS` in `src/reference_check.rs`).
  */
-export const MAX_ISSUE_LABELS = 20;
-export const MAX_ISSUE_LABEL_NAME_CHARS = 50;
+const MAX_ISSUE_LABELS = 20;
+const MAX_ISSUE_LABEL_NAME_CHARS = 50;
 /** How many entries of a `labels` array are looked at, unusable ones included, before the rest are ignored. */
 const MAX_ISSUE_LABEL_ENTRIES_SCANNED = MAX_ISSUE_LABELS * 5;
 

@@ -839,7 +839,7 @@ export type VoiceActionEntry = {
 
 /** PRD #1790 stage 2 — what voice says while a reclaim's dry run is checking, and once it has answered with nothing to read back. */
 export const INTERRUPTED_RECLAIM_CHECKING = "Checking what reclaiming it would do…";
-export const INTERRUPTED_RECLAIM_CHECKED = "Checked.";
+const INTERRUPTED_RECLAIM_CHECKED = "Checked.";
 
 /** PRD #1401 — what voice says while the system browser is being handed the page. */
 export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
@@ -851,18 +851,18 @@ export const PULL_REQUEST_CLOSING = "Closing the pull request…";
 export const PULL_REQUEST_CLOSED = "Closed.";
 
 /** PRD #2374 — what a card row says when the words named no mode, filter, action or reply it can use. */
-export const CARD_MODE_UNHEARD = "Say whether you want the table or the cards.";
-export const CARD_FILTER_UNHEARD = "Say whether you want only the cards that need you, or every card.";
-export const CARD_ACTION_UNHEARD = "Say which of the card's actions to press, by the label on its button.";
-export const CARD_BATCH_UNHEARD = "Say which action to send to the card and every card under it, by the label on its button.";
+const CARD_MODE_UNHEARD = "Say whether you want the table or the cards.";
+const CARD_FILTER_UNHEARD = "Say whether you want only the cards that need you, or every card.";
+const CARD_ACTION_UNHEARD = "Say which of the card's actions to press, by the label on its button.";
+const CARD_BATCH_UNHEARD = "Say which action to send to the card and every card under it, by the label on its button.";
 /** What the editor's voice members say when no action name was heard. */
-export const CARD_ACTION_EDIT_UNHEARD = "Say which card action, by its label in the Card actions editor.";
+const CARD_ACTION_EDIT_UNHEARD = "Say which card action, by its label in the Card actions editor.";
 /** PR #2491 review (Qodo 3): what voice says while a spoken edit or removal waits for the editor to read the list, and once it is done. */
-export const CARD_ACTIONS_READING = "Reading the card actions…";
+const CARD_ACTIONS_READING = "Reading the card actions…";
 export const CARD_ACTION_FORM_OPENED = "Opened the action's form.";
 export const CARD_ACTION_REMOVAL_ASKED = "Asking to confirm the removal.";
-export const CARD_ICON_UNHEARD = "Say which icon, by its name in the Card actions form's icon grid, such as rocket or git merge.";
-export const CARD_SELECTION_BATCH_UNHEARD = "Say which action to send to the selected cards, by the label on its button.";
+const CARD_ICON_UNHEARD = "Say which icon, by its name in the Card actions form's icon grid, such as rocket or git merge.";
+const CARD_SELECTION_BATCH_UNHEARD = "Say which action to send to the selected cards, by the label on its button.";
 
 /** The card a target names: its deck, agent and, where known, the daemon process that listed it. */
 function cardRefOf(target: AgentCardRef): AgentCardRef {
@@ -2420,7 +2420,7 @@ export const VOICE_ACTIONS = {
 } satisfies Record<string, VoiceActionEntry>;
 
 /** Every action id, as the guard and the command table spell them. */
-export type VoiceActionId = keyof typeof VOICE_ACTIONS;
+type VoiceActionId = keyof typeof VOICE_ACTIONS;
 
 /**
  * Compile-time proof that each entry's `needs` covers what its `run` requires.
@@ -2729,7 +2729,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * on the overview and over the Runs screen on the deck. Its Cancel is reached
  * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "choosePaneTab" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "showApprovalRequest" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
+type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "choosePaneTab" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "showApprovalRequest" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the
@@ -2748,7 +2748,7 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | "showInterruptedWork" | "hideInterruptedWork" | "interruptedDialog" | AgentCardMember>;
 
 /** PRD #2374 — the agent cards' members, served by the overview. */
-export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeCardReview" | "runCardAction" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
+type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeCardReview" | "runCardAction" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "clearCardSelection" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch" | CardActionsEditorMember;
 
 /** PRD #2374 decision 2026-11-24 — the card actions editor's members, served by the overview. */
 /** PR #2491 decision 2026-11-25 — "open card actions" with several daemons and none named: the sentence, and the daemons to choose from. */
@@ -2760,7 +2760,7 @@ export interface CardActionsWhich {
 export type CardActionsEditorMember = "openCardActionsEditor" | "closeCardActionsEditor" | "refreshCardActions" | "addCardAction" | "editCardAction" | "removeCardAction" | "confirmRemoveCardAction" | "hideCardAction" | "restoreCardAction" | "saveCardAction" | "cancelCardActionForm" | "chooseCardActionIcon" | "setCardActionFlag" | "setCardActionPlacement";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
-export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";
+type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";
 
 /**
  * What the New agent dialog publishes about its directory browser (PRD #1223),

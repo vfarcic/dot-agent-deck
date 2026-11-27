@@ -67,7 +67,7 @@ export const BATCH_NOT_KNOWN = "it is not known whether this agent got it. Check
  */
 export const BATCH_DAEMON_UNREACHABLE = "its daemon could not be reached or did not answer the preview, so nothing is sent to it";
 /** The code such a skipped agent carries. */
-export const CODE_BATCH_DAEMON_UNREACHABLE = "daemon_unreachable";
+const CODE_BATCH_DAEMON_UNREACHABLE = "daemon_unreachable";
 /** …when another batch is asked for while one is being sent. */
 export const ANOTHER_BATCH_SENDING = "A batch is still being sent; wait for its results before starting another.";
 
@@ -81,7 +81,7 @@ type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgent
  * The text is for the button's hover only: what each agent gets is the
  * daemon's preview, in the confirmation.
  */
-export interface CardBatchChoice {
+interface CardBatchChoice {
   id: string;
   label: string;
   icon?: string | null;
@@ -136,7 +136,7 @@ export interface CardSelection {
  * one card at a time) and an answer to one agent's own question. Whether each
  * card gets it is the daemon's call, in the preview.
  */
-export function batchChoices(cards: readonly PlacedCard[]): CardBatchChoice[] {
+function batchChoices(cards: readonly PlacedCard[]): CardBatchChoice[] {
   const choices = new Map<string, CardBatchChoice & { texts: Set<string> }>();
   for (const card of cards) {
     const options = new Set(card.entry.questions.flatMap((question) => question.options.map((option) => option.action_id)));
@@ -158,7 +158,7 @@ export function batchChoices(cards: readonly PlacedCard[]): CardBatchChoice[] {
  * in the daemon's order: what a batch from that card reaches, and what
  * selecting it while it is closed selects.
  */
-export function cardSubtree(listed: readonly PlacedCard[], card: PlacedCard, tree: boolean): PlacedCard[] {
+function cardSubtree(listed: readonly PlacedCard[], card: PlacedCard, tree: boolean): PlacedCard[] {
   const sameDaemon = listed.filter((other) => other.deckId === card.deckId && other.entry.instance_id === card.entry.instance_id);
   const wanted = placedCardKey(card);
   const found = (nodes: ReturnType<typeof cardTree>): ReturnType<typeof cardTree>[number] | undefined => {

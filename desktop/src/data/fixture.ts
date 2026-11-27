@@ -884,7 +884,7 @@ const DOCS_QUESTION_TRANSCRIPT = [
   "",
   "  Press enter to confirm or esc to cancel",
 ].join("\r\n");
-export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
+const DOCS_PENDING_QUESTION: PendingQuestionDto = {
   id: "q-docs-question",
   kind: "permission",
   channel: "keys",
@@ -1733,7 +1733,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
  * the voice surface as a peer dialog, so the question is askable and the row is
  * here to answer it.
  */
-export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
+const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   readonly phrases: readonly string[];
   readonly action: string;
   readonly invoke: string;
@@ -2521,7 +2521,7 @@ function fixtureTrailingSend(utterance: string): string | undefined {
 
 /** The first of `actions`, in order, whose row's phrases the whole utterance is. */
 /** `outcome::DROPPED_WHILE_SPEAKING`. */
-export const FIXTURE_DROPPED_WHILE_SPEAKING = "only “stop” or “quiet” works while the app is speaking";
+const FIXTURE_DROPPED_WHILE_SPEAKING = "only “stop” or “quiet” works while the app is speaking";
 
 /**
  * PRD #1497 — the preview's copy of `outcome::reading_intercept`: "quiet"
@@ -2720,8 +2720,8 @@ export function fixtureVoiceHeard(transcript: string = FIXTURE_VOICE_UTTERANCE):
  * Issue #1635 — the versions the `?selfupgrade=1` preview plays: the copies on
  * this machine, and the newer release they are behind.
  */
-export const FIXTURE_SELF_CURRENT_VERSION = "0.46.0";
-export const FIXTURE_SELF_LATEST_VERSION = "0.47.0";
+const FIXTURE_SELF_CURRENT_VERSION = "0.46.0";
+const FIXTURE_SELF_LATEST_VERSION = "0.47.0";
 
 const line = (text: string) => ({ text, command: null });
 
