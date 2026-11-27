@@ -2169,8 +2169,13 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-empty { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); font-size: var(--text-base); text-align: center; }
 /* Issue #2418 — the Cards tree: roots in a wrapping grid that never moves, and
    under each row the trees of the roots opened in it ("Row, wrapping, roots
-   stay put"). `layoutRow` in AgentCardsGrid.tsx places each tree and draws the
-   lines from the roots; the levels below are joined by these borders. */
+   stay put"). `layoutRow` in AgentCardsGrid.tsx draws the lines from the roots
+   to their trees' boxes. Issue #2533: each opened tree sits in its own box, one
+   neutral tint for every box (a card's colour means its status, so the boxes
+   carry none), captioned with its root's name; inside it the cards under each
+   card wrap into rows instead of scrolling sideways. `layoutTreeLevel`
+   (lib/cardTreeLayout.ts) places the rows, buses and spines across; their
+   heights follow the rows here. */
 .agent-cards-deck { display: grid; gap: 12px; min-width: 0; }
 .agent-cards-note { margin: 0; color: var(--muted); font-size: var(--text-sm); }
 .agent-cards-rows { display: grid; gap: 12px; min-width: 0; }
@@ -2179,23 +2184,23 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-lines path { fill: none; stroke: var(--line-strong); stroke-width: 1.5; }
 .agent-cards-roots { position: relative; z-index: 1; display: grid; gap: 12px; align-items: stretch; justify-content: start; }
 .agent-cards-band { position: relative; z-index: 1; padding-top: 22px; min-width: 0; }
-.agent-cards-block { position: relative; width: max-content; max-width: 100%; overflow-x: auto; }
-.agent-cards-tree-level { position: relative; width: max-content; margin: 0; padding: 16px 0 0; list-style: none; display: flex; justify-content: center; }
-.agent-cards-tree-level::before { content: ""; position: absolute; top: 0; left: 50%; height: 16px; border-left: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level.is-top { padding-top: 0; }
-.agent-cards-tree-level.is-top::before { display: none; }
-.agent-cards-tree-level > li { position: relative; flex: none; display: flex; flex-direction: column; align-items: center; padding: 16px 5px 0; }
-.agent-cards-tree-level > li::before, .agent-cards-tree-level > li::after { content: ""; position: absolute; top: 0; height: 16px; width: 50%; border-top: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level > li::before { right: 50%; }
-.agent-cards-tree-level > li::after { left: 50%; border-left: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level > li:first-child::before, .agent-cards-tree-level > li:last-child::after { border-top: 0; }
-.agent-cards-tree-level > li:last-child::before { border-right: 1.5px solid var(--line-strong); }
-.agent-cards-tree-level > li:last-child::after { border-left: 0; }
-.agent-cards-tree-level > li:only-child { padding-top: 0; }
-.agent-cards-tree-level > li:only-child::before, .agent-cards-tree-level > li:only-child::after { display: none; }
-.agent-cards-tree-level:has(> li:only-child) { padding-top: 16px; }
-.agent-cards-tree-level.is-top:has(> li:only-child) { padding-top: 0; }
-.agent-cards-tree-level .agent-card { width: 224px; }
+.agent-cards-box { position: relative; box-sizing: border-box; max-width: 100%; padding: 0 8px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper-sunken); }
+.agent-cards-box-caption { height: 24px; overflow: hidden; color: var(--muted); font-size: var(--text-xs); font-weight: 600; line-height: 24px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-cards-tree-level { --tree-line: 1.5px solid var(--line-strong); position: relative; box-sizing: border-box; display: flex; flex-wrap: wrap; align-items: stretch; padding-top: 16px; }
+/* The stem: from the parent card down to the first row's bus; a top level's comes in from the box's top edge, past the caption. */
+.agent-cards-tree-level::before { content: ""; position: absolute; top: 0; left: var(--stem-x); height: 16px; border-left: var(--tree-line); }
+.agent-cards-tree-level.is-top::before { top: -25px; height: 41px; }
+/* Where one row ends and the next starts: the cards stay children of the level, so one moving to another row is not drawn afresh. */
+.agent-cards-tree-break { flex: 0 0 100%; height: 0; }
+.agent-cards-tree-item { position: relative; box-sizing: border-box; flex: none; display: flex; flex-direction: column; align-items: center; padding: 16px 5px 0; }
+.agent-cards-tree-level.is-single > .agent-cards-tree-item { padding-top: 0; }
+/* A row's bus, on its first card's top edge, and the spine on from it to the next row: down the gap between two items, which runs the row's full height. */
+.agent-cards-bus { position: absolute; top: 0; height: 0; border-top: var(--tree-line); }
+.agent-cards-spine { position: absolute; top: 0; bottom: 0; border-left: var(--tree-line); }
+/* Each card's drop from its row's bus. */
+.agent-cards-tree-item::before { content: ""; position: absolute; top: 0; left: 50%; height: 16px; border-left: var(--tree-line); }
+.agent-cards-tree-level.is-single > .agent-cards-tree-item::before { display: none; }
+.agent-cards-tree-item .agent-card { width: var(--tree-card-width, 224px); }
 .agent-card { --tone: var(--line-strong); --tone-soft: var(--paper-strong); min-width: 0; max-width: 100%; padding: 9px 10px; display: flex; flex-direction: column; gap: 5px; border: 1px solid var(--line); border-left: 3px solid var(--tone); border-radius: 7px; background: var(--paper-strong); text-align: left; cursor: pointer; }
 .agent-card:hover { border-color: var(--line-strong); border-left-color: var(--tone); }
 /* Issue #2418 (D12): the wrapper that keeps a control's click from reaching the card adds no box of its own. */

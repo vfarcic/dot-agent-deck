@@ -121,10 +121,10 @@
     },
     {
       "customType": "regex",
-      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the devbox CLI version the `devbox` task installs (`DEVBOX_USE_VERSION: <X.Y.Z>`). The task checks the release tarball against a pinned SHA-256, so a bump PR also needs that checksum updated (the release's checksums.txt).",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the devbox CLI version the `devbox` task installs (`DEVBOX_USE_VERSION: <X.Y.Z>`) together with the SHA-256 that task checks the release tarball against, so one PR moves both. The datasource is `github-release-attachments`, not `github-releases`, because only it updates a `currentDigest`: it finds the current digest in a small asset of the current release (devbox's `checksums.txt`), learns the file name it belongs to, and reads that name with the version swapped out of the new release's `checksums.txt`. The 0.22.0 -> 0.23.0 bump (PR #2523), made under `github-releases`, moved the version and left the checksum behind, so the task failed at `sha256sum -c`. The one matchString spans from the `DEVBOX_USE_VERSION:` line to the `sha256sum -c` line for `/tmp/devbox.tar.gz`; `renovate_reads_the_devbox_pin_and_its_checksum` in xtask/linkage-check/src/rwx_devbox_checksum.rs runs it over the real `.rwx/` files and requires exactly one match there, carrying that version and checksum.",
       "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
-      "matchStrings": ["DEVBOX_USE_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
-      "datasourceTemplate": "github-releases",
+      "matchStrings": ["DEVBOX_USE_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)\\n[\\s\\S]*?echo \"(?<currentDigest>[0-9a-f]{64})  /tmp/devbox\\.tar\\.gz\" \\| sha256sum -c -"],
+      "datasourceTemplate": "github-release-attachments",
       "depNameTemplate": "jetify-com/devbox"
     },
     {

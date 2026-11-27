@@ -29,14 +29,14 @@ export interface InterruptedDeck {
  * request failed, or that its answer was not applied because the deck left
  * that process or a newer request replaced it.
  */
-export type InterruptedFetch =
+type InterruptedFetch =
   | { outcome: "listed"; count: number; incomplete: boolean }
   | { outcome: "unsupported" }
   | { outcome: "failed"; reason: string }
   | { outcome: "superseded" };
 
 /** The deck and daemon process the dialog was opened for. */
-export interface InterruptedDialog { deckId: string; instance: string }
+interface InterruptedDialog { deckId: string; instance: string }
 
 /** PRD #1790 stage 2 — the app's interrupted work, every deck's, and the calls that act on it. */
 export interface InterruptedWorkRuntime {

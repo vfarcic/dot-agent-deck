@@ -24,9 +24,9 @@ import { collidingChoiceEntry, ordinal, spokenWords } from "./voiceChoice";
 
 export type InterruptedItemKind = "unit" | "orchestration" | "issue_dispatch" | "agent";
 
-export interface InterruptedLastEntry { kind: string; ts_ms: number }
+interface InterruptedLastEntry { kind: string; ts_ms: number }
 
-export interface InterruptedItemReport {
+interface InterruptedItemReport {
   report_id: string;
   task_id?: string;
   unit_id?: string;
@@ -40,7 +40,7 @@ export interface InterruptedProgress {
   delegations_done: number;
 }
 
-export type PrFact = "open" | "merged" | "closed" | "none" | "unknown";
+type PrFact = "open" | "merged" | "closed" | "none" | "unknown";
 
 export interface InterruptedGitFacts {
   worktree_exists?: boolean | null;
@@ -135,7 +135,7 @@ export interface InterruptedList {
   omitted?: number;
 }
 
-export interface ShownReport {
+interface ShownReport {
   report_id: string;
   body?: string | null;
   cut?: boolean;
@@ -151,14 +151,14 @@ export interface InterruptedShow {
   next_reports_from?: number | null;
 }
 
-export type RefusalReason =
+type RefusalReason =
   | "agent-caller" | "bad-request" | "too-large" | "unreadable" | "incomplete-read" | "not-listed" | "ambiguous"
   | "plain-agent" | "no-worktree" | "not-linked-worktree" | "branch-mismatch" | "not-owned" | "newer-run"
   | "owner-unconfirmed" | "still-in-use" | "in-use-unknown" | "not-recorded" | "unknown";
 
-export interface Refusal { reason: RefusalReason | string; message: string }
+interface Refusal { reason: RefusalReason | string; message: string }
 
-export type ReclaimVerdict =
+type ReclaimVerdict =
   | "removed" | "would-remove" | "kept-dirty" | "kept-holds-worktrees" | "kept-could-not-check" | "remove-failed"
   | "timed-out" | "kept-changed" | "kept-busy" | "kept-could-not-lock" | "refused" | "unknown";
 
@@ -176,7 +176,7 @@ export interface ReclaimOutcome {
 }
 
 /** `DismissStopped`: why a dismissal sent in batches stopped, and how many of its ids it did not reach. */
-export interface DismissStopped {
+interface DismissStopped {
   reason: "replaced" | "refused" | "failed" | string;
   refusal?: string | null;
   not_sent: number;
@@ -592,7 +592,7 @@ export function dismissMessage(outcome: DismissOutcome): string {
 }
 
 /** `dismiss_stopped_sentence`: why a dismissal sent in batches stopped. A refused batch was not dismissed; one whose daemon was replaced, or that got no answer, may have been. */
-export function dismissStoppedSentence(stopped: DismissStopped): string {
+function dismissStoppedSentence(stopped: DismissStopped): string {
   const n = stopped.not_sent;
   const unsure = stopped.reason === "replaced" || stopped.reason === "failed";
   const [one, many] = unsure
@@ -620,12 +620,12 @@ export function startOverQuestion(name: string): string {
 }
 
 /** `restored_sentence`. */
-export function restoredSentence(name: string): string {
+function restoredSentence(name: string): string {
   return `Restored ${name} with its conversation.`;
 }
 
 /** `started_over_sentence`. */
-export function startedOverSentence(name: string): string {
+function startedOverSentence(name: string): string {
   return `Started ${name} over in this worktree.`;
 }
 

@@ -143,7 +143,7 @@ function closeWords(kind: string | undefined, label: string, several: boolean): 
  * the rest fold behind its own "+N more": the list stays readable with
  * hundreds of agents, and a press shows every one. Texts never fold (audit K1).
  */
-export const INCLUDED_SHOWN = 8;
+const INCLUDED_SHOWN = 8;
 /** Past this many agents in one text group, its names past {@link INCLUDED_SHOWN} fold. */
 const INCLUDED_FOLD_AFTER = 10;
 
@@ -157,7 +157,7 @@ const SEEN_SHARE = 0.9;
 const SEEN_THRESHOLDS = Array.from({ length: 21 }, (_, at) => at / 20);
 
 /** Whether a quotation at `quote` is shown enough inside a body at `root` to count as seen. */
-export function quotationInView(quote: Pick<DOMRectReadOnly, "top" | "bottom" | "height">, root: Pick<DOMRectReadOnly, "top" | "bottom" | "height">): boolean {
+function quotationInView(quote: Pick<DOMRectReadOnly, "top" | "bottom" | "height">, root: Pick<DOMRectReadOnly, "top" | "bottom" | "height">): boolean {
   if (quote.height <= 0 || root.height <= 0) return false;
   const shown = Math.min(quote.bottom, root.bottom) - Math.max(quote.top, root.top);
   return shown > 0 && shown >= Math.min(quote.height * SEEN_SHARE, root.height / 2);

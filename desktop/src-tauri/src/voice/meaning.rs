@@ -590,9 +590,12 @@ names that place or only describes it (some other one, a different one, a remote
 what matters is that a place is mentioned, not whether you can tell which one — or when it \
 contains any name at all: a word naming one particular thing rather than an ordinary word, \
 wherever it stands, even first in the sentence as if addressing someone, and whether or not you \
-know it. `no` only when the sentence is a bare \
-request to start, launch or go ahead, with at most words about when or how and words that only \
-point at what is already there (it, this, that). When you cannot tell, answer `yes`. Then \
+know it. `no` when the sentence is a bare \
+request to start, launch, activate or go ahead, with at most words about when or how (now, right \
+away, immediately, skip the confirmation), the ordinary words for what is started (agent, \
+orchestration), words that only point at what is already there (it, this, that) and words about \
+the user's own answer (I already said yes). Anything else such a sentence says that gives no \
+place and no name is for `only`. When you cannot tell, answer `yes`. Then \
 `only`: `yes` when the sentence is one request to the app and nothing else — \
 politeness (\"okay\", \"please\", \"now\") and words that only describe the request (\"from now \
 on\", \"again\") allowed — and `no` when it also says or asks anything else: a second request, a \
@@ -1187,9 +1190,16 @@ mod tests {
             "what matters is that a place is mentioned, not whether you can tell which one — or \
              when it contains any name at all:",
             "even first in the sentence as if addressing someone, and whether or not you know it.",
-            "`no` only when the sentence is a bare request to start, launch or go ahead, with at \
-             most words about when or how and words that only point at what is already there \
-             (it, this, that).",
+            "`no` when the sentence is a bare request to start, launch, activate or go ahead, \
+             with at most words about when or how (now, right away, immediately, skip the \
+             confirmation), the ordinary words for what is started (agent, orchestration), words \
+             that only point at what is already there (it, this, that) and words about the user's \
+             own answer (I already said yes).",
+            // Issue #1820: `gpt-6-luna` read a bare start's other words as a
+            // target ("start the agent right away" refused in 14 of 20 votes
+            // on the earlier wording); this sentence brought it to 0 of 20.
+            // It is conditional so a place or a name still answers `yes`.
+            "Anything else such a sentence says that gives no place and no name is for `only`.",
             "When you cannot tell, answer `yes`.",
         ] {
             assert!(instructions.contains(rule), "{rule}");

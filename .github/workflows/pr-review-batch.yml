@@ -66,10 +66,44 @@ permissions:
   contents: read
 
 concurrency:
-  # One sweep at a time. GitHub keeps at most one pending run per group, so a
-  # burst of schedule ticks collapses instead of stacking.
+  # One run of this workflow at a time, and every request waits its turn.
+  #
+  # Issue #2506: without `queue`, GitHub keeps at most one PENDING run per group
+  # and a newer arrival replaces it, so the replaced one ends `cancelled`. That
+  # was sized for a burst of schedule ticks, but per-PR dispatches
+  # (`-f pr_number=<n>`) from several units merging at once cancelled each other:
+  # 2026-11-22, fifteen requests for PR #2474 were cancelled before one ran.
+  # `queue: max` (GitHub changelog 2026-05-07) holds up to 100 pending runs per
+  # group, in order, and needs `cancel-in-progress: false`.
+  #
+  # Why one queued group and not a group per PR:
+  #
+  #   - Per-PR groups would buy almost no throughput. The reviewer's `agent` job
+  #     already queues on one repository-wide group (`gh-aw-claude-pr-review` in
+  #     pr-review.lock.yml), so agent reviews run one after another however many
+  #     runs of this workflow are in flight. Sweep run 45731620581's six agent
+  #     jobs each started about two seconds after the previous one finished.
+  #   - One run at a time keeps two invariants that parallel runs would lose. A
+  #     sweep and a per-PR dispatch never select the same pull request at once,
+  #     and the selector's "already reviewed at this head" skip only works
+  #     between runs, not within one, so overlapping runs could each pay for an
+  #     agent review of one head. Votes stay serial too, and
+  #     pr_review_vote.py's "already voted on this head" guard (issue #1050) is
+  #     a read-then-write that two concurrent vote jobs on one pull request
+  #     could both pass.
+  #
+  # What it costs: back-to-back sweeps, or a repeated request for one PR, now
+  # stack where they used to collapse. The two schedule ticks are twelve hours
+  # apart and the late-November 2026 sweeps took at most 40 minutes, so
+  # scheduled sweeps rarely meet each other; a stack is mostly manual sweeps or
+  # repeated per-PR requests. The stacked run normally finds the head already
+  # reviewed (the selector's verdict skip) and already voted on, so it costs
+  # runner minutes rather than a review; the exception is the one automatic
+  # retry of an INSUFFICIENT verdict (issue #1629), which a queued run can be
+  # the one to spend.
   group: agent-pr-review-${{ github.repository }}
   cancel-in-progress: false
+  queue: max
 
 env:
   # Whose pull requests get REVIEWED. Anyone not listed is never read by the

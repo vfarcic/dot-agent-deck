@@ -101,15 +101,19 @@
  * moving: it is one marked sibling containing the same two controls, so what the
  * walk skips is the same subtree it skipped before. The trigger and the Undo
  * inside the report are the complete set of controls reachable outside an
- * open pane while no approval is waiting, which `AgentPaneDeckIdentity.test.tsx`
- * asserts by equality rather than by a filter.
+ * open pane while no approval is waiting and no notice is shown, which
+ * `AgentPaneDeckIdentity.test.tsx` asserts by equality rather than by a filter
+ * (and, with a notice shown, that its dismiss is the one control added).
  *
  * So elements carrying {@link VOICE_PEER_PROPS} are skipped, and so, since
  * issue #2511, is the one element carrying {@link APPROVAL_PEER_PROPS}: the
  * marker saying an approval is waiting, whose only control opens that review.
- * It is an allow-list of two markers rather than a rule about roles or
- * dialogs: a third peer added later has to be exempted here deliberately,
- * which is the review this hook's audit asked for.
+ * Issue #2555 added the third, {@link NOTICE_PEER_PROPS}: the toast stack in the
+ * corner, which is drawn over every overlay here and whose controls are each
+ * safe to reach from behind one (see that constant). It is an allow-list of
+ * markers rather than a rule about roles or dialogs: a fourth peer added later
+ * has to be exempted here deliberately, which is the review this hook's audit
+ * asked for.
  *
  * **What the hook still guarantees is unchanged for everything else.** Every
  * element that is not an ancestor of the pane and does not carry one of those markers is
@@ -165,6 +169,30 @@ export const APPROVAL_PEER_PROPS = { "data-modal-peer": "approval" } as const;
 
 /** The same marker, as the selector the walk tests each sibling against. */
 const APPROVAL_PEER_SELECTOR = `[data-modal-peer="${APPROVAL_PEER_PROPS["data-modal-peer"]}"]`;
+
+/**
+ * Issue #2555 — the third peer: the toast stack, the notices in the corner
+ * (`.toast-stack`). It paints above every overlay on the stack, the agent's
+ * pane included, so while it was background it was a picture of a notice: its
+ * X looked clickable over an open pane and did nothing.
+ *
+ * Every control in it is safe to reach from behind a modal, which is what
+ * earns the exemption: each X dismisses only its own notice, and the one
+ * control that opens something — the restart notice's **Show** — opens the
+ * dashboard and its "Interrupted work" dialog, which goes on the stack itself
+ * and fences the background like any overlay, leaving the peers — these
+ * notices among them — reachable over it. `Toast` disables that Show while an
+ * overlay above the agent's pane is open ({@link useNoOverlayAbove}), that
+ * dialog included, so it is never the way past a dialog on the stack.
+ * Nothing else behind the pane becomes reachable, the `DeckSelector` above
+ * all: the marker is matched on the sibling itself, as the other two are, so
+ * an overlay whose path to `<body>` does not pass beside the notices inerts
+ * the region that holds them, the notices with it.
+ */
+export const NOTICE_PEER_PROPS = { "data-modal-peer": "notices" } as const;
+
+/** Every peer marker, as one selector: what the walk skips and where focus is left alone. */
+const PEER_SELECTOR = [VOICE_PEER_SELECTOR, APPROVAL_PEER_SELECTOR, `[data-modal-peer="${NOTICE_PEER_PROPS["data-modal-peer"]}"]`].join(", ");
 
 /**
  * Whether `element` is inside the voice surface ({@link VOICE_PEER_PROPS}).
@@ -344,9 +372,10 @@ function fence() {
     while (parent) {
       for (const sibling of Array.from(parent.children)) {
         if (sibling === child) continue;
-        // The two exemptions, and the only ones: the voice surface (see the
-        // note above) and the approval marker ({@link APPROVAL_PEER_PROPS}).
-        if (sibling.matches(VOICE_PEER_SELECTOR) || sibling.matches(APPROVAL_PEER_SELECTOR)) continue;
+        // The three exemptions, and the only ones: the voice surface (see the
+        // note above), the approval marker ({@link APPROVAL_PEER_PROPS}) and
+        // the notices ({@link NOTICE_PEER_PROPS}).
+        if (sibling.matches(PEER_SELECTOR)) continue;
         // Inert for a reason of its own, which is not ours to undo later.
         if (sibling.hasAttribute("inert") && !marked.has(sibling)) continue;
         next.add(sibling);
@@ -460,7 +489,14 @@ function useOverlay<T extends HTMLElement>(open: boolean, layer: number, fences:
   useEffect(() => {
     const node = ref.current;
     if (!open || !node) return;
-    entry.current.node = node;
+    // The stack was told this overlay opened before it had a node, and the
+    // readers count only overlays with one (`ordered`), so they hear again once
+    // it does: otherwise `useNoOverlayAbove` stays as it was until some other
+    // render asks (issue #2555, where the toast's Show read it).
+    if (entry.current.node !== node) {
+      entry.current.node = node;
+      stackChanged();
+    }
     fence();
     if (topmost() !== entry.current) return;
 
@@ -476,10 +512,11 @@ function useOverlay<T extends HTMLElement>(open: boolean, layer: number, fences:
     // Focus on a voice peer is left where it is: the numbered choice's dialog
     // takes focus while it is open (PRD #1261), and this walk runs on every
     // commit, so pulling focus back here would take it from the dialog mid-answer.
-    // The approval marker (issue #2511) is a peer for the same reason, so a
-    // keyboard user who tabbed to it keeps it through the pane's next commit.
+    // The approval marker (issue #2511) and the notices (issue #2555) are
+    // peers for the same reason, so a keyboard user who tabbed to one keeps it
+    // through the pane's next commit.
     const active = document.activeElement;
-    if (!node.contains(active) && !active?.closest(VOICE_PEER_SELECTOR) && !active?.closest(APPROVAL_PEER_SELECTOR)) node.focus();
+    if (!node.contains(active) && !active?.closest(PEER_SELECTOR)) node.focus();
   });
 
   /**

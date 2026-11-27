@@ -8,7 +8,7 @@ const EDGE = 8;
 const TIP_WIDTH = 320;
 
 /** What the tooltip says, under the text, when the window has no room for all of it. */
-export const TIP_CUT_NOTE = "Too long to show here in full: pressing it shows all of it before anything is sent.";
+const TIP_CUT_NOTE = "Too long to show here in full: pressing it shows all of it before anything is sent.";
 
 /**
  * The size `tip` takes drawn as the tooltip, at most `width` wide: measured
@@ -46,7 +46,7 @@ export interface TipLayout {
  * window's). `whole` is false when the text does not fit on either side,
  * however few characters it has: many line breaks count as much as length.
  */
-export function tipLayout(box: DOMRect, tip: string): TipLayout {
+function tipLayout(box: DOMRect, tip: string): TipLayout {
   const width = Math.min(TIP_WIDTH, window.innerWidth - 2 * EDGE);
   const drawn = tipSize(tip, width);
   const height = drawn.height;

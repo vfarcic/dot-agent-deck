@@ -259,7 +259,7 @@ export interface OverviewGroup {
  * Issue #1965 — `groups` with each orchestration's exited roles attached, from
  * the deck's own reply.
  */
-export function withEndedRoles(groups: OverviewGroup[], endedRoles: readonly EndedRole[] | undefined): OverviewGroup[] {
+function withEndedRoles(groups: OverviewGroup[], endedRoles: readonly EndedRole[] | undefined): OverviewGroup[] {
   if (!endedRoles?.length) return groups;
   const withRows = groups.map((group) => {
     if (group.kind !== "orchestration") return group;
@@ -662,7 +662,7 @@ export const OVERVIEW_CLOCK_TICK_MS = 10_000;
  * interval before correcting would show a time that is knowably wrong at the
  * one moment the user is looking straight at it.
  */
-export function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): number {
+function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     let timer: number | undefined;
@@ -713,7 +713,7 @@ const WRITE_LEASE_TITLE: Record<"read" | "none", string> = {
  * marker on one that is not (CLAUDE.md rule 22). Absence — a daemon that
  * reported no lease — prints nothing, and is not read as read-only.
  */
-export function shownWriteLease(writeLease: OverviewAgent["writeLease"]): "read" | "none" | undefined {
+function shownWriteLease(writeLease: OverviewAgent["writeLease"]): "read" | "none" | undefined {
   return writeLease === "read" || writeLease === "none" ? writeLease : undefined;
 }
 
@@ -860,13 +860,13 @@ function modalOtherThanInterruptedOpen(): boolean {
 const MAX_NUMBERED_ROWS = 1_000;
 
 /** Already at the bottom, for "scroll down". */
-export const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
+const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
 /** Already at the top, for "scroll up". */
-export const DASHBOARD_AT_TOP = "The dashboard is already at the top.";
+const DASHBOARD_AT_TOP = "The dashboard is already at the top.";
 /** A menu or dialog is in front of the dashboard, such as the open Daemon selector. */
 export const DASHBOARD_COVERED = "Something is open over the dashboard, so it was not scrolled. Close it first.";
 /** Nothing to scroll: every daemon and agent fits in the window. */
-export const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
+const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
 
 /**
  * Issue #2306 — where the dashboard's own smooth scroll is heading, by region:
@@ -973,14 +973,14 @@ export const STOP_TARGET_GONE = "That agent is not on the dashboard any more, so
  */
 export const STOP_TARGET_RESTARTED = `${AGENT_GONE_AFTER_RESTART[0].toUpperCase()}${AGENT_GONE_AFTER_RESTART.slice(1)}, so nothing was closed.`;
 /** The orchestration a spoken close named is no longer on the overview. */
-export const ORCHESTRATION_GONE = "That orchestration is not on the dashboard any more, so nothing was closed.";
+const ORCHESTRATION_GONE = "That orchestration is not on the dashboard any more, so nothing was closed.";
 /** A confirmation is already open; a second would replace it under the user's pointer. */
 export const CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — answer it first. Nothing else was stopped.";
 /** The New agent dialog is modal, so a stop's confirmation could not be reached behind it. */
 export const STOP_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was stopped.";
 
 /** What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role. */
-export function stopTargetName(agent: OverviewAgent): string {
+function stopTargetName(agent: OverviewAgent): string {
   const raw = agent.tab.kind === "orchestration" && agent.tab.roleName ? agent.tab.roleName : agent.displayName;
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
@@ -1082,20 +1082,20 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
   Yes/No. It asks an agent to write a file the user can review, so it is drawn
   neutral rather than as a stop.
 */
-export const GENERATE_CONFIG_TITLE = "Generate .dot-agent-deck.toml";
-export const GENERATE_CONFIG_BODY = "No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?";
+const GENERATE_CONFIG_TITLE = "Generate .dot-agent-deck.toml";
+const GENERATE_CONFIG_BODY = "No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?";
 /** PRD #2119 — the same question when the daemon reports the project already has a config: the TUI's words again. */
-export const UPDATE_CONFIG_TITLE = "Update .dot-agent-deck.toml";
-export const UPDATE_CONFIG_BODY = "This project already has an orchestration config. Want to instruct your agent to analyze the project and update the existing config?";
+const UPDATE_CONFIG_TITLE = "Update .dot-agent-deck.toml";
+const UPDATE_CONFIG_BODY = "This project already has an orchestration config. Want to instruct your agent to analyze the project and update the existing config?";
 /**
  * PR #2362 review — the question when the daemon could not tell whether the project has a config (or did not say):
  * it claims neither, since the request the daemon then sends is the conditional one. Titled Generate, like the
  * button. The TUI's words again (`render_config_gen_prompt`, CLAUDE.md rule 22).
  */
-export const UNKNOWN_CONFIG_BODY = "Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?";
+const UNKNOWN_CONFIG_BODY = "Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?";
 
 /** PRD #2119 — the confirmation's body for what the daemon reported: an existing config, none, or unknown. */
-export function configConfirmationBody(agent: Pick<OverviewAgent, "projectConfigExists">): string {
+function configConfirmationBody(agent: Pick<OverviewAgent, "projectConfigExists">): string {
   if (agent.projectConfigExists === true) return UPDATE_CONFIG_BODY;
   if (agent.projectConfigExists === false) return GENERATE_CONFIG_BODY;
   return UNKNOWN_CONFIG_BODY;
@@ -1113,7 +1113,7 @@ export const GENERATE_TARGET_RESTARTED = `${AGENT_GONE_AFTER_RESTART[0].toUpperC
 /** A confirmation is already open; a second would replace it under the user's pointer. */
 export const GENERATE_CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — answer it first. Nothing was sent.";
 /** The New agent dialog is modal, so the question could not be reached behind it. */
-export const GENERATE_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was sent.";
+const GENERATE_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was sent.";
 /** Prefix of the failure sentence, the TUI's (`daemon_client::CONFIG_GEN_FAILED_PREFIX`), for a request the app itself could not hand over. */
 const GENERATE_CONFIG_FAILED_PREFIX = "Failed to send config prompt";
 

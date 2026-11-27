@@ -233,6 +233,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards-wrapped",
+        description: "The desktop Cards view with two trees open in one row, each in its own box captioned with its root: a dispatcher whose orchestration is opened inside it, and one whose seven agents wrap into two rows, each row hanging from the spine by its own line (issue #2533).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "agent-cards-daemon-menu",
         description: "A daemon's ⋯ menu on the desktop Dashboard, open on Card actions, with the cards right under the top bar (PR #2491 decision 2026-11-25).",
         clients: &[Client::Desktop],

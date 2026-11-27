@@ -1080,6 +1080,11 @@ if 'session_v2' in have and 'session' not in have:
  out['session']=[dict(s) for s in out['session_v2']]
  by_session={s['id']:model(s.get('model')) for s in out['session_v2']}
  rows=sorted((m for m in out.get('session_message',[]) if m['type'] in ('user','assistant')),key=lambda m:(m['session_id'],m['seq']))
+ # 2.4.x leaves an assistant's `content` empty and keeps its items, in the
+ # same shape, as `session_part` rows (measured on 2.4.1 and 2.4.2).
+ split={}
+ for p in sorted(out.get('session_part',[]),key=lambda p:(p['message_id'],p['ordinal'])):
+  if isinstance(p.get('data'),dict): split.setdefault(p['message_id'],[]).append(p['data'])
  last_user={};messages=[];parts=[]
  for m in rows:
   d=m['data'] if isinstance(m['data'],dict) else {}
@@ -1093,7 +1098,7 @@ if 'session_v2' in have and 'session' not in have:
   if m['type']=='user':
    parts.append(dict(base,id=m['id']+'/0',data={'type':'text','text':d.get('text') or ''}))
    continue
-  for i,item in enumerate(d.get('content') or []):
+  for i,item in enumerate(d.get('content') or split.get(m['id']) or []):
    if not isinstance(item,dict): continue
    data=dict(item)
    if item.get('type')=='tool':
@@ -1376,9 +1381,14 @@ c.execute("insert into session_v2 values ('child','root',?,2)",(m,))
 rows=[('u1','root','user',4,{"text":"run it","files":[]}),
  ('a1','root','assistant',5,{"model":json.loads(m),"finish":"tool-calls","content":[{"type":"tool","id":"call_1","name":"shell","state":{"status":"completed","input":{"command":"echo hi"},"content":[{"type":"text","text":"hi\n"}]}}]}),
  ('a2','root','assistant',9,{"model":json.loads(m),"finish":"stop","content":[{"type":"text","text":"927"}]}),
- ('i1','root','idle',10,{"outcome":"succeeded"})]
+ ('i1','root','idle',10,{"outcome":"succeeded"}),
+ ('u2','root','user',11,{"text":"again","files":[]}),
+ ('a3','root','assistant',12,{"model":json.loads(m),"finish":"stop","content":[]})]
 for (i,s,t,q,d) in rows:
  c.execute('insert into session_message values (?,?,?,?,?,?,?)',(i,s,t,q,q,q,json.dumps(d)))
+# 2.4.x: a3's items live in session_part, inserted here out of ordinal order.
+c.execute("insert into session_part values ('a3','root',1,'text',?)",(json.dumps({"type":"text","text":"done"}),))
+c.execute("insert into session_part values ('a3','root',0,'tool',?)",(json.dumps({"type":"tool","id":"call_2","name":"shell","state":{"status":"completed","input":{"command":"echo again"},"content":[{"type":"text","text":"again\n"}]}}),))
 c.commit()
 "#;
         let output = Command::new("python3")
@@ -1398,7 +1408,13 @@ c.commit()
         let messages = transcript["message"].as_array().unwrap();
         assert_eq!(
             messages.iter().map(|m| m["id"].clone()).collect::<Vec<_>>(),
-            [json!("u1"), json!("a1"), json!("a2")],
+            [
+                json!("u1"),
+                json!("a1"),
+                json!("a2"),
+                json!("u2"),
+                json!("a3")
+            ],
             "only user and assistant rows are messages: {transcript}"
         );
         assert_eq!(messages[0]["data"]["role"], "user");
@@ -1423,6 +1439,17 @@ c.commit()
                 |p| p["message_id"] == "a2" && p["data"] == json!({"type":"text","text":"927"})
             )
         );
+        // 2.4.x: an assistant whose `content` is empty is read from
+        // `session_part`, in ordinal order.
+        assert_eq!(messages[4]["data"]["parentID"], "u2");
+        let split = parts
+            .iter()
+            .filter(|p| p["message_id"] == "a3")
+            .collect::<Vec<_>>();
+        assert_eq!(split.len(), 2, "{transcript}");
+        assert_eq!(split[0]["id"], "call_2");
+        assert_eq!(split[0]["data"]["state"]["output"], "again\n");
+        assert_eq!(split[1]["data"], json!({"type":"text","text":"done"}));
     }
 
     #[test]

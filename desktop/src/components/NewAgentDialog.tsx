@@ -177,7 +177,7 @@ export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${sa
   dialog that changed during the round trip.
 */
 /** A start is in flight, when the deck field is disabled. */
-export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the daemon was not changed.";
+const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the daemon was not changed.";
 /** The deck is not in the field's list any more. */
 export const DECK_NOT_LISTED = "That daemon is not in the New agent dialog's daemon list any more, so the daemon was not changed.";
 /**
@@ -188,9 +188,9 @@ export const DECK_NOT_LISTED = "That daemon is not in the New agent dialog's dae
  */
 export const deckCannotTakeAgent = (deck: string, reason: string) => `\u201c${deck}\u201d can't take a new agent: ${reason}.`;
 /** The deck field's one line when the fleet has no deck at all. */
-export const NO_DECK_CONFIGURED = "No daemon is configured.";
+const NO_DECK_CONFIGURED = "No daemon is configured.";
 /** The deck field's one line when every deck in the fleet cannot take a new agent (PR #1451 round 3). */
-export const NO_DECK_CAN_TAKE_AGENT = "No daemon can take a new agent now.";
+const NO_DECK_CAN_TAKE_AGENT = "No daemon can take a new agent now.";
 /** The dialog closed during the round trip (served by the overview). */
 export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no daemon was chosen.";
 /** The dialog closed during the round trip, so there was nothing to discard. */
@@ -241,13 +241,13 @@ const FALLBACK_MODE_PAGE = 8;
 /** The page `index` of a list of `capacity`-sized pages is on. */
 const pageOfIndex = (index: number, capacity: number) => Math.floor(index / Math.max(1, capacity)) + 1;
 /** The agent is not among the ones this deck offers any more. */
-export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this daemon any more, so the Command was not changed.";
+const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this daemon any more, so the Command was not changed.";
 /** An orchestration is selected, so there is no Command field to fill. */
 export const COMMAND_HIDDEN_BY_ORCHESTRATION = "An orchestration is selected and each of its roles runs its own command, so the Command was not changed.";
 /** The words after "name it" were only punctuation. */
-export const NO_NAME_HEARD = "No name was heard after that, so the Name was not changed.";
+const NO_NAME_HEARD = "No name was heard after that, so the Name was not changed.";
 /** A Command dispatch arrived with no command in it (Rust refuses that first, so this is the dialog's own line). */
-export const NO_COMMAND_HEARD = "No command was heard, so the Command was not changed.";
+const NO_COMMAND_HEARD = "No command was heard, so the Command was not changed.";
 
 /*
   PRD #802 D5 — why a spoken start opened no confirmation. Each names what is
@@ -257,13 +257,13 @@ export const NO_COMMAND_HEARD = "No command was heard, so the Command was not ch
 /** The dialog is not open (it closed during the round trip). */
 export const NO_NEW_AGENT_DIALOG = "The New agent dialog is not open, so nothing was started.";
 /** No deck chosen yet. */
-export const START_NEEDS_DECK = "Nothing was started: choose a daemon first.";
+const START_NEEDS_DECK = "Nothing was started: choose a daemon first.";
 /** A deck, but no directory chosen yet. */
 export const START_NEEDS_DIRECTORY = "Nothing was started: choose a directory first — the agent needs one to start in.";
 /** A start is already in flight or waiting for the deck to list it. */
 export const START_IN_FLIGHT = "A start is already under way, so nothing else was started.";
 /** The sentence was about the Command field (PR #1451 round 4, audit A1): a start is asked for on its own. */
-export const START_SAID_A_COMMAND = "Nothing was started: a sentence that sets the command does not also start the agent — say “start it” on its own.";
+const START_SAID_A_COMMAND = "Nothing was started: a sentence that sets the command does not also start the agent — say “start it” on its own.";
 
 /**
  * A spoken Name as the Name field takes it: the words after the marked

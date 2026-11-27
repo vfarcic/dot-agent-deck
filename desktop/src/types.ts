@@ -20,8 +20,8 @@ export type RuntimeMode = "fixture" | "live";
  */
 export const UNREPORTED = "Unavailable";
 
-export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
-export type RunHealth = "healthy" | "attention" | "failed" | "idle";
+type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
+type RunHealth = "healthy" | "attention" | "failed" | "idle";
 /**
  * The status an agent is shown in. `needs_input` and `idle` are the TUI's
  * Needs Input and Idle (issue #1676): an agent waiting on the user and one that
@@ -181,7 +181,7 @@ export type AgentBackground = {
   subagents: number;
   sinceMs?: number;
 };
-export type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
+type StageStatus = "queued" | "active" | "passed" | "failed" | "waiting" | "blocked";
 /** PR #2491 decision 2026-11-26 — `card` is the agent pane's Card tab, offered where the agent's daemon shows cards. */
 export type PanelTab = "terminal" | "card" | "diff" | "checks" | "handoffs" | "artifacts";
 /** The part of the Card tab a pane opened at: a card's references `+N` opens it at the references, its actions `+N` at the actions. */
@@ -534,7 +534,7 @@ export interface DaemonProjectListing {
   primary?: string;
 }
 
-export interface DaemonOrchestrationRole {
+interface DaemonOrchestrationRole {
   /** Identity: matched by name at the launch, and it becomes the pane's label. */
   name: string;
   /** `name`, escaped for rendering. */
@@ -716,19 +716,19 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
  */
 
 /** Where a card is grouped: by the dispatcher that started it, its orchestration, or neither. */
-export interface AgentCardGroup {
+interface AgentCardGroup {
   id: string;
   kind: "dispatcher" | "orchestration" | "standalone" | string;
   label: string | null;
 }
 
-export interface AgentCardRelations {
+interface AgentCardRelations {
   dispatcher?: { key: string; name: string } | null;
   orchestration?: { id: string; label: string; role: string; is_orchestrator: boolean } | null;
 }
 
 /** What the agent itself last published — the agent's word, not checked by the deck. */
-export interface AgentCardReport {
+interface AgentCardReport {
   source: "agent";
   status: "working" | "waiting" | "done" | "failed" | string;
   summary: string | null;
@@ -736,7 +736,7 @@ export interface AgentCardReport {
   revision: number;
 }
 
-export interface AgentCardField {
+interface AgentCardField {
   name: string;
   label: string;
   description: string | null;
@@ -748,7 +748,7 @@ export interface AgentCardField {
   value: unknown;
 }
 
-export interface AgentCardQuestion {
+interface AgentCardQuestion {
   id: string;
   text: string;
   source: "agent" | string;
@@ -757,7 +757,7 @@ export interface AgentCardQuestion {
 }
 
 /** The latest delivery of one prompt action to the agent's inbox. */
-export interface AgentCardDelivery {
+interface AgentCardDelivery {
   message_id: string;
   state: "queued" | "delivered" | "uncertain" | "not_delivered" | string;
   detail: string | null;
@@ -800,7 +800,7 @@ export interface AgentCardAction {
 }
 
 /** One action the user invoked on a card: what was sent, exactly, and what became of it. Kept after the report stops offering the action. */
-export interface AgentCardDeliveryRecord {
+interface AgentCardDeliveryRecord {
   action_id: string;
   label: string;
   /** The exact text sent: the action's prompt, or the user's reply. */
@@ -1004,7 +1004,7 @@ export type CardCatalogEdit =
  * and the agent generation shown. An `execute` entry also carries the
  * `action_token` and `instance_id` its preview answered.
  */
-export interface CardBatchEntry {
+interface CardBatchEntry {
   pane_id: string;
   agent_id: string;
   action_token?: string;
@@ -1129,7 +1129,7 @@ export interface WorkflowStage {
   enabled: boolean;
 }
 
-export interface CheckResult {
+interface CheckResult {
   id: string;
   name: string;
   status: "passed" | "failed" | "running" | "queued";
@@ -1137,7 +1137,7 @@ export interface CheckResult {
   command?: string;
 }
 
-export interface Artifact {
+interface Artifact {
   id: string;
   name: string;
   kind: "file" | "report" | "recording";
@@ -1606,7 +1606,7 @@ export interface AgentProfile {
  * PRD #1258 M4 — one watched role's filesystem on a deck's host, as its daemon
  * reports it. A figure the daemon could not read is absent, never zero.
  */
-export interface HostDiskUsage {
+interface HostDiskUsage {
   role: string;
   freeBytes?: number;
   totalBytes?: number;
@@ -1893,7 +1893,7 @@ export interface DeckActionResult {
   agentIncarnation?: string;
 }
 
-export interface OrchestrationLaunchRole {
+interface OrchestrationLaunchRole {
   role: string;
   command: string;
   start: boolean;

@@ -453,6 +453,21 @@ async function openTreeCards(page: Page): Promise<void> {
   await expect(page.getByTestId("agent-cards-tree")).toBeVisible();
 }
 
+// Issue #2533 — two trees opened in one row, each in its own captioned box:
+// issue-queue with its orchestration prd-2374 opened inside it, and
+// prd-queue's seven agents wrapped into two rows under a bus each.
+desktopScenario("agent-cards-wrapped", async (page) => {
+  await page.setViewportSize({ width: 1440, height: 1180 });
+  await openTreeCards(page);
+  const toggleOf = (name: string) => page.locator("article[data-card-key]").filter({ has: page.getByRole("button", { name: `Open ${name}`, exact: true }) }).getByTestId("agent-card-toggle");
+  for (const name of ["issue-queue", "prd-queue", "prd-2374"]) await toggleOf(name).click();
+  await expect(page.getByTestId("agent-cards-box")).toHaveCount(2);
+  await expect(page.getByTestId("agent-cards-box-caption")).toHaveText(["issue-queue", "prd-queue"]);
+  await expect(page.locator("article[data-card-key][data-depth='2']")).toHaveCount(3);
+  const prdQueue = page.locator("[data-testid='agent-cards-band']").nth(1).locator(":scope [data-testid='agent-cards-tree-level']").first();
+  await expect(prdQueue).toHaveAttribute("data-rows", "2");
+});
+
 // PR #2491 decision 2026-11-25 — the daemon's ⋯ menu, just left of its New
 // agent button, open on Card actions; no line of counts or buttons above
 // the cards.

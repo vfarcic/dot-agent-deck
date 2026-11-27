@@ -471,8 +471,28 @@ pub const LOCAL_SPEECH_IMAGE: &str = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cp
 ///
 /// OpenAI's transcription endpoint. The panel names the provider so a user
 /// knows which key to paste — which the old `Remote service` label did not.
+///
+/// `gpt-transcribe` replaced `whisper-1` (issue #1820), which OpenAI retires on
+/// 2027-02-26. Measured 2026-11-26 on the 15 clips in `voice/fixtures/speech/`,
+/// each placed in room tone the way `transcribe.rs`'s `spoken()` places them,
+/// loud (peak 3,000 over 120) and quiet (800 over 80), two runs, plus three
+/// non-speech clips (a quiet room, a desk knock, a cough-like burst):
+///
+/// | model | word for word | median | p90 | quiet room / knock / cough |
+/// | --- | ---: | ---: | ---: | --- |
+/// | `whisper-1` (`verbose_json`) | 49/60 | 1,255 ms | 1,724 ms | "Thank you for watching." / "" / "" |
+/// | `gpt-transcribe` (`json`) | **56/60** | **415 ms** | **604 ms** | "" / "" / "" |
+///
+/// Its four misses are the kristin "Type off." ("Hypoff.", "Hi, boss.");
+/// `whisper-1` also misses the john "Type off." and the quiet kristin "Type
+/// on." and "Stop.". The 2026-10-22 run in the issue agrees (52/60 at 467 ms
+/// against 50/60 at 808 ms). **What it costs is timing**: a `gpt-*` model
+/// refuses `verbose_json` ([`crate::voice::transcribe::response_format_for`]),
+/// so its reply carries no word or segment timing, and of
+/// [`crate::voice::evidence`]'s three checks of a transcript against the audio
+/// only the word count applies. It is also $0.0045 a minute against $0.006.
 pub const HOSTED_SPEECH_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
-pub const HOSTED_SPEECH_MODEL: &str = "whisper-1";
+pub const HOSTED_SPEECH_MODEL: &str = "gpt-transcribe";
 
 /// Where each command protocol's preset provider is, and which model it is
 /// asked for.
@@ -493,31 +513,57 @@ pub const HOSTED_COMMAND_MODEL: &str = "claude-haiku-4-5";
 /// [`crate::voice::openai`] speaks. **The default since PRD #802's one-key
 /// work** — see [`IntentBackend`] for why.
 ///
-/// `gpt-5-mini` is now a measured choice rather than a plausible one. Through
-/// the shipped builder and parser against the 24 phrase fixtures, with
-/// [`OPENAI_COMMAND_REASONING_EFFORT`] and the 4096 ceiling:
+/// `gpt-6-luna` replaced `gpt-5-mini` (issue #1820), which OpenAI shuts down on
+/// 2026-12-11. Measured 2026-11-26 with a real key through the shipped builder
+/// and parser: every fixture `voice_desktop_phrases_001` and `_002` run (407 in
+/// all) plus judge tests 003–009, `--test-threads=1`. `gpt-5-mini` ran on
+/// `main`'s prompts, the others on this file's. Cost charges every input token
+/// at the uncached rate of the 2026-10-22 list prices, so it is an upper bound:
+/// 97–100% of input tokens were cached.
 ///
-/// | configuration | score | median | cost | reasoning tokens |
-/// | --- | ---: | ---: | ---: | ---: |
-/// | `reasoning_effort: "minimal"` | **24/24** | **818 ms** | $0.0073 | 0 |
-/// | provider-default reasoning | 24/24 | 1,778 ms | $0.0161 | 4,416 |
-/// | *`claude-haiku-4-5`, for scale* | *24/24* | *780 ms* | — | — |
+/// | model (effort) | fixtures /407, by run | judges 003–009 | median | p90 | per 1,000 requests |
+/// | --- | --- | --- | ---: | ---: | ---: |
+/// | `gpt-5-mini` (`minimal`) | 399, 392 | 005 and 009 red in both full runs, green re-run alone | 1,198 ms | 1,472 ms | $4.00 |
+/// | `gpt-6-luna` (`none`), before tuning | 394 | 006 red in both runs | — | — | — |
+/// | `gpt-6-luna` (`none`), as shipped | 391, 394 | green in both | 972 ms | 1,290 ms | **$1.58** |
+/// | `gpt-6-luna` (`none`), two earlier tunings | 397, 394, 396; 394, 394 | 009 red once in five | — | — | — |
+/// | `gpt-5.4-mini` (`none`) | 385, 378 | 005 red once, 009 red once | 809 ms | 997 ms | $11.92 |
 ///
-/// So it is level with the Anthropic preset on accuracy, within 40 ms of it on
-/// latency, and reasoning is worth **twice the cost and twice the wall clock**
-/// for no score. `gpt-4.1-mini` was here before the measurement and was never
-/// run against anything; it went rather than being kept as a second untested
-/// coordinate.
+/// `gpt-5-mini`'s first run lost 23 fixtures to the organisation's rate limit;
+/// its 399 is that run with those 23 re-run, two of which failed. The two
+/// earlier tunings differed from the shipped one only by a sentence in the
+/// OpenAI params description, dropped because it could settle an ambiguous
+/// reference itself; replaying the captured requests ten times each, it
+/// changed no deck answer by more than one in ten. So across seven tuned runs `gpt-6-luna` scored 391 to
+/// 397, inside `gpt-5-mini`'s 392 to 399, at about 0.4× its cost, and
+/// `gpt-5.4-mini` trailed both at about 3× `gpt-5-mini`'s cost. The tuning:
+/// the meaning check's sentence about bare starts ([`crate::voice::meaning`]),
+/// which took 006 from red to green, and two more tries at a directory
+/// reference that matches nothing ([`crate::voice::outcome::resolve_dir_ref`]).
+/// Missed by `gpt-6-luna` in both shipped runs: `choose-new-agent-deck-not-switch`,
+/// `open-overview-running`, `deck-hidden-go-back` (red on `gpt-5-mini` in one
+/// of its two runs), `close-back`, `choose-deck-glued-name`,
+/// `filter-directories-dialog-closed`, `close-orchestration-by-category`,
+/// `close-orchestration-the-whole-run`, `start-orchestration-button-label`,
+/// `choose-mode-orch-chip-label` and `choose-mode-dispatcher-chip-label`.
+///
+/// The 2026-09-20 measurement that made `gpt-5-mini` the default, on the 24
+/// fixtures of the day: 24/24 at an 818 ms median with `minimal`, and 24/24
+/// at 1,778 ms and twice the cost with provider-default reasoning, so
+/// reasoning bought nothing then either.
 pub const OPENAI_COMMAND_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-pub const OPENAI_COMMAND_MODEL: &str = "gpt-5-mini";
+pub const OPENAI_COMMAND_MODEL: &str = "gpt-6-luna";
 
 /// The `reasoning_effort` the OpenAI command preset sends, and **only** that
 /// preset.
 ///
 /// A routing decision over a closed enum has no reasoning to do, and the
-/// measurement above says so twice over: `minimal` scored the same 24/24 while
-/// spending **zero** reasoning tokens, at half the latency and half the price.
-/// With it the largest response was 28 completion tokens.
+/// measurement above says so: `gpt-5-mini` scored the same 24/24 at `minimal`
+/// as at provider-default reasoning, spending **zero** reasoning tokens at
+/// half the latency and half the price. `gpt-6-luna` refuses `minimal` with a
+/// 400 that lists `none`, `low`, `medium`, `high` and `xhigh`, so the preset
+/// sends `none`, which spent zero reasoning tokens across the 5,078 logged
+/// requests above, the largest reply being 108 completion tokens.
 ///
 /// # Why it is scoped to the preset and cannot leak
 ///
@@ -534,9 +580,9 @@ pub const OPENAI_COMMAND_MODEL: &str = "gpt-5-mini";
 /// Every edit a user can make moves off it: another provider, a gateway in
 /// front of OpenAI, a server on loopback, or the same endpoint with a different
 /// model. Each of those then gets provider-default reasoning, which is the safe
-/// direction to be wrong in **because** the ceiling is 4096 — the 24/24 row
-/// above is that configuration.
-pub const OPENAI_COMMAND_REASONING_EFFORT: &str = "minimal";
+/// direction to be wrong in **because** the ceiling is 4096 — the 2026-09-20
+/// provider-default 24/24 above is that configuration.
+pub const OPENAI_COMMAND_REASONING_EFFORT: &str = "none";
 
 /// The speech stage: which transcriber, where it is, which model, and which
 /// language it is told the speech is in.
@@ -885,13 +931,45 @@ impl<'de> Deserialize<'de> for IntentSettings {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let doc = StageSpec::deserialize(deserializer)?.into_document();
         let preset = Self::for_backend(doc.backend.unwrap_or_default());
+        let endpoint = doc.endpoint.unwrap_or_else(|| preset.endpoint.clone());
+        let model = match doc.model {
+            Some(model) if is_retired_preset_model(&preset, &endpoint, &model) => {
+                preset.model.clone()
+            }
+            Some(model) => model,
+            None => preset.model.clone(),
+        };
         Ok(Self {
-            endpoint: doc.endpoint.unwrap_or(preset.endpoint),
-            model: doc.model.unwrap_or(preset.model),
+            endpoint,
+            model,
             max_tokens: doc.max_tokens.unwrap_or(preset.max_tokens),
             backend: preset.backend,
         })
     }
+}
+
+/// Models an earlier build wrote as the OpenAI command preset, which OpenAI has
+/// since retired (issue #1820).
+///
+/// The Voice panel writes a stage's whole preset into the document when the
+/// backend changes, so `model = "gpt-5-mini"` is in the settings of anyone who
+/// switched Commands to OpenAI on an older build, whether or not they ever
+/// chose a model. OpenAI shuts `gpt-5-mini` down on 2026-12-11, so a stored copy
+/// is read as this build's preset instead of being kept until it fails.
+const RETIRED_OPENAI_COMMAND_MODELS: &[&str] = &["gpt-5-mini"];
+
+/// Whether `model` is a retired preset model stored at the OpenAI preset's own
+/// endpoint. A retired model at any other endpoint, such as a gateway or a
+/// server on this machine, is the user's and is kept: whether it still
+/// answers there is that server's business, not OpenAI's retirement list.
+fn is_retired_preset_model(
+    preset: &IntentSettings,
+    endpoint: &ServiceUrl,
+    model: &ModelId,
+) -> bool {
+    preset.backend == IntentBackend::OpenaiCompatible
+        && *endpoint == preset.endpoint
+        && RETIRED_OPENAI_COMMAND_MODELS.contains(&model.as_str())
 }
 
 /// The longest `[voice]` token this build will accept, on either side.
@@ -1026,7 +1104,7 @@ impl VoiceToken for TranscriptionBackend {
 /// # The default is OpenAI so that ONE key runs the whole feature
 ///
 /// Both stages of voice can be hosted, and Speech's hosted option is OpenAI's
-/// `whisper-1`. While Commands defaulted to Anthropic, going hosted on both
+/// (`whisper-1` when this was decided, [`HOSTED_SPEECH_MODEL`] now). While Commands defaulted to Anthropic, going hosted on both
 /// meant two vendors, two accounts and two keys pasted into one panel — for a
 /// feature whose whole pitch is that it works the moment you turn it on.
 /// Defaulting Commands to OpenAI closes that: **one OpenAI key runs both
@@ -1037,7 +1115,7 @@ impl VoiceToken for TranscriptionBackend {
 /// waited on `gpt-5-mini` being measured through the shipped builder and parser
 /// against the 24 phrase fixtures: 24/24 at an 818 ms median, against
 /// `claude-haiku-4-5`'s 24/24 at 780 ms — level on accuracy, 38 ms apart on
-/// latency. [`OPENAI_COMMAND_MODEL`] has the table, including what
+/// latency. [`OPENAI_COMMAND_MODEL`] has the measurements, including what
 /// [`OPENAI_COMMAND_REASONING_EFFORT`] is worth.
 ///
 /// **An earlier sweep scored 18/24 and that was OUR defect, not the model's.**
@@ -6116,7 +6194,7 @@ mod tests {
                 HOSTED_SPEECH_ENDPOINT,
                 "https://api.openai.com/v1/audio/transcriptions",
             ),
-            (HOSTED_SPEECH_MODEL, "whisper-1"),
+            (HOSTED_SPEECH_MODEL, "gpt-transcribe"),
             (
                 HOSTED_COMMAND_ENDPOINT,
                 "https://api.anthropic.com/v1/messages",
@@ -6126,7 +6204,7 @@ mod tests {
                 OPENAI_COMMAND_ENDPOINT,
                 "https://api.openai.com/v1/chat/completions",
             ),
-            (OPENAI_COMMAND_MODEL, "gpt-5-mini"),
+            (OPENAI_COMMAND_MODEL, "gpt-6-luna"),
         ] {
             assert_eq!(
                 constant, value,
@@ -7152,6 +7230,54 @@ mod tests {
         assert!(raw.contains("mode = \"high-contrast\""), "{raw}");
         assert_eq!(written.appearance.mode, AppearanceMode::System);
         assert_eq!(written.zoom.level, ZoomLevel::snap(1.25));
+    }
+
+    /// Scenario (issue #1820): a document an older build wrote when the user
+    /// switched Commands to OpenAI holds the retired `gpt-5-mini` at OpenAI's
+    /// endpoint. It loads as this build's preset model, with the preset's
+    /// reasoning effort, while the same model at a gateway is kept as written.
+    #[test]
+    fn a_stored_retired_openai_command_model_loads_as_the_current_preset() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"openai_compatible\"\n\
+             endpoint = \"https://api.openai.com/v1/chat/completions\"\n\
+             model = \"gpt-5-mini\"\nmax_tokens = 4096\n",
+        )
+        .unwrap();
+        let intent = load_from(&path)
+            .voice
+            .expect("the section is present")
+            .intent;
+        assert_eq!(intent.model.as_str(), OPENAI_COMMAND_MODEL);
+        assert_eq!(
+            intent,
+            IntentSettings::for_backend(IntentBackend::OpenaiCompatible)
+        );
+        assert_eq!(
+            intent.reasoning_effort(),
+            Some(OPENAI_COMMAND_REASONING_EFFORT)
+        );
+
+        std::fs::write(
+            &path,
+            "version = 1\n\n[voice.intent]\nbackend = \"openai_compatible\"\n\
+             endpoint = \"https://gateway.example.com/v1/chat/completions\"\n\
+             model = \"gpt-5-mini\"\n",
+        )
+        .unwrap();
+        let intent = load_from(&path)
+            .voice
+            .expect("the section is present")
+            .intent;
+        assert_eq!(
+            intent.model.as_str(),
+            "gpt-5-mini",
+            "a gateway's model is the user's"
+        );
+        assert_eq!(intent.reasoning_effort(), None);
     }
 
     /// Scenario (issue #828): a hand-written voice stage that names only its
@@ -9450,7 +9576,7 @@ max_tokens = 1024
 [voice.transcription]
 backend = \"remote\"
 endpoint = \"https://api.openai.com/v1/audio/transcriptions\"
-model = \"whisper-1\"
+model = \"gpt-transcribe\"
 language = \"sr\"
 
 [zoom]

@@ -807,3 +807,138 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
   });
 });
 
+
+/*
+ * Issue #2533 (PRD #2374 decision 2026-11-26) — an opened tree wraps into rows
+ * instead of scrolling sideways, in a box of its own captioned with its root.
+ * jsdom lays nothing out, so the frame's width is set and what is asserted is
+ * what the layout drew for it: the rows, their buses and spines, the boxes.
+ */
+describe("desktop/agent-cards/144 — an opened tree wraps into rows, in a captioned box (issue #2533)", () => {
+  const DISPATCHER = entry("20", "dispatcher", { rollup: { total: 11, worst: "working", counts: { working: 11 }, needs_you: 0 } });
+  const units = Array.from({ length: 7 }, (_, at) => entry(`2${at + 1}`, `unit-${at + 1}`, { parent: key("20"), status: "working", relations: { dispatcher: { key: key("20"), name: "dispatcher" } } }));
+  const TEAM = entry("30", "team", { parent: key("20"), status: "working", relations: { dispatcher: { key: key("20"), name: "dispatcher" }, orchestration: { id: "o-9", label: "team", role: "lead", is_orchestrator: true } }, rollup: { total: 4, worst: "working", counts: { working: 4 }, needs_you: 0 } });
+  const roles = Array.from({ length: 4 }, (_, at) => entry(`3${at + 1}`, `role-${at + 1}`, { parent: key("30"), status: "working", relations: { orchestration: { id: "o-9", label: "team", role: `role-${at + 1}`, is_orchestrator: false } } }));
+  const PAIR = entry("40", "pair", { rollup: { total: 2, worst: "idle", counts: { idle: 2 }, needs_you: 0 } });
+  const pair = [entry("41", "left", { parent: key("40") }), entry("42", "right", { parent: key("40") })];
+  const WIDE = [DISPATCHER, ...units, TEAM, ...roles, PAIR, ...pair];
+
+  let frameWidth = 1000;
+  let descriptor: PropertyDescriptor | undefined;
+  beforeEach(() => {
+    descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      get(this: HTMLElement) { return this.classList.contains("agent-cards-deck") ? frameWidth : 0; },
+    });
+  });
+  afterEach(() => {
+    if (descriptor) Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: descriptor.get });
+    else delete (HTMLElement.prototype as unknown as Record<string, unknown>).clientWidth;
+  });
+
+  const boxOf = (root: AgentCardEntry) => {
+    const band = document.querySelector(`[data-testid='agent-cards-band'][data-root-key="${root.key}"]`);
+    if (!(band instanceof HTMLElement)) throw new Error(`no tree open under ${root.name}`);
+    return within(band).getByTestId("agent-cards-box");
+  };
+  /** A level's rows, each as the names of the cards in it. */
+  const itemsByRow = (level: Element) => {
+    const rows: Element[][] = [];
+    for (const item of level.querySelectorAll(":scope > .agent-cards-tree-item")) (rows[Number(item.getAttribute("data-row"))] ??= []).push(item);
+    return rows;
+  };
+  const rowsOf = (level: Element) => itemsByRow(level)
+    .map((row) => row.map((item) => within(item.querySelector(":scope > article") as HTMLElement).getByTestId("agent-card-open-agent").textContent));
+  const topLevel = (root: AgentCardEntry) => boxOf(root).querySelector(":scope > [data-testid='agent-cards-tree-level']")!;
+  const lines = (level: Element) => itemsByRow(level).map((row) => ({
+    bus: row.flatMap((item) => [...item.querySelectorAll(":scope > [data-testid='agent-cards-bus']")]).length,
+    spine: row.flatMap((item) => [...item.querySelectorAll(":scope > [data-testid='agent-cards-spine']")]).length,
+  }));
+
+  /// Scenario: at a frame 1300 pixels wide, open a dispatcher with eight agents under it and a root with two beside it. Each tree is in its own box named after its root; the dispatcher's eight wrap into two rows, five and three, each row with its own line and one spine joining the first row to the second; the pair fits in one row and has no spine.
+  it("desktop/agent-cards/144: each opened root's tree is in its own captioned box, wrapped into rows each joined to the parent", () => {
+    frameWidth = 1300;
+    cardsView(runtime(WIDE));
+    fireEvent.click(toggle(DISPATCHER));
+    fireEvent.click(toggle(PAIR));
+    expect(screen.getAllByTestId("agent-cards-box")).toHaveLength(2);
+    expect(within(boxOf(DISPATCHER)).getByTestId("agent-cards-box-caption").textContent).toBe("dispatcher");
+    expect(within(boxOf(PAIR)).getByTestId("agent-cards-box-caption").textContent).toBe("pair");
+    expect(boxOf(DISPATCHER).getAttribute("aria-label")).toBe("Agents under dispatcher");
+    expect(boxOf(PAIR).getAttribute("role")).toBe("group");
+    // Every box has the same look: no per-tree colour, only the class the theme's tint comes from.
+    for (const box of screen.getAllByTestId("agent-cards-box")) {
+      expect(box.className).toBe("agent-cards-box");
+      expect(box.style.background).toBe("");
+      expect(box.style.backgroundColor).toBe("");
+    }
+
+    expect(rowsOf(topLevel(DISPATCHER))).toEqual([
+      ["unit-1", "unit-2", "unit-3", "unit-4", "unit-5"],
+      ["unit-6", "unit-7", "team"],
+    ]);
+    expect(lines(topLevel(DISPATCHER))).toEqual([{ bus: 1, spine: 1 }, { bus: 1, spine: 0 }]);
+    expect(rowsOf(topLevel(PAIR))).toEqual([["left", "right"]]);
+    expect(lines(topLevel(PAIR))).toEqual([{ bus: 1, spine: 0 }]);
+    // The roots stay where they were, side by side in the first row, in the daemon's order.
+    expect(roots()).toEqual([DISPATCHER.key, PAIR.key]);
+  });
+
+  /// Scenario: with the dispatcher's tree open, narrow the frame from 1300 to 760 and then to 420 pixels. Its eight agents rewrap into more rows each time, every row but the last with a spine to the next; opening the orchestration inside it shows its four roles as a level of their own under it, wrapped to fit too.
+  it("desktop/agent-cards/144: a narrower frame wraps into more rows, at every level", () => {
+    const observers: (() => void)[] = [];
+    const realObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(callback: () => void) { observers.push(callback); }
+      observe() { /* every callback is run on a resize */ }
+      unobserve() { /* not used by the grid */ }
+      disconnect() { /* not used here */ }
+    } as unknown as typeof ResizeObserver;
+    try {
+      frameWidth = 1300;
+      cardsView(runtime(WIDE));
+      fireEvent.click(toggle(DISPATCHER));
+      const resize = (next: number) => { frameWidth = next; act(() => observers.forEach((callback) => callback())); };
+      const counts = () => rowsOf(topLevel(DISPATCHER)).map((row) => row.length);
+
+      expect(counts()).toEqual([5, 3]);
+      resize(760);
+      expect(counts()).toEqual([3, 3, 2]);
+      expect(lines(topLevel(DISPATCHER)).map((row) => row.spine)).toEqual([1, 1, 0]);
+      resize(420);
+      expect(counts()).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+      expect(lines(topLevel(DISPATCHER)).map((row) => row.spine)).toEqual([1, 1, 1, 1, 1, 1, 1, 0]);
+
+      resize(760);
+      fireEvent.click(toggle(TEAM));
+      const teamCard = cardOf(TEAM.key);
+      const nested = teamCard.parentElement!.querySelector(":scope > [data-testid='agent-cards-tree-level']");
+      expect(nested, "the orchestration's roles are a level under its card").not.toBeNull();
+      expect(boxOf(DISPATCHER).contains(nested)).toBe(true);
+      expect(rowsOf(nested!).flat()).toEqual(["role-1", "role-2", "role-3", "role-4"]);
+      expect(rowsOf(nested!).length, "the roles wrap within the room left under the orchestration").toBeGreaterThan(1);
+      expect(cardOf(roles[0].key).getAttribute("data-depth")).toBe("2");
+      // The open orchestration takes a row of its own, and the spine passes it.
+      expect(rowsOf(topLevel(DISPATCHER)).find((row) => row.includes("team"))).toEqual(["team"]);
+      expect(screen.getAllByTestId("agent-cards-box")).toHaveLength(1);
+    } finally {
+      globalThis.ResizeObserver = realObserver;
+    }
+  });
+
+  /// Scenario: at a 1300 pixel frame, open the dispatcher, put the keyboard on its orchestration's open arrow, which shares a row with two other agents, and press it. The orchestration's roles open under it and it moves to a row of its own, and the keyboard is still on its arrow (PR #2550 review).
+  it("desktop/agent-cards/144: opening a card that moves to another row keeps the keyboard on it", () => {
+    frameWidth = 1300;
+    cardsView(runtime(WIDE));
+    fireEvent.click(toggle(DISPATCHER));
+    expect(rowsOf(topLevel(DISPATCHER))[1]).toEqual(["unit-6", "unit-7", "team"]);
+    const arrow = toggle(TEAM);
+    arrow.focus();
+    fireEvent.click(arrow, { detail: 0 });
+    expect(rowsOf(topLevel(DISPATCHER)).find((row) => row.includes("team"))).toEqual(["team"]);
+    expect(toggle(TEAM).getAttribute("aria-expanded")).toBe("true");
+    expect(toggle(TEAM), "the same arrow is still on screen").toBe(arrow);
+    expect(document.activeElement).toBe(arrow);
+  });
+});
