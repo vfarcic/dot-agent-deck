@@ -20690,6 +20690,17 @@ mod tests {
             .expect("the slow worker reaches its restart")
             .unwrap();
         let fast_dispatch = dispatch(fast);
+        // The fast worker has asked for its turn once its old agent's episode
+        // is closed: it finds the turn held by the slow worker and closes it
+        // before waiting. Only then is the slow one let go, so the fast one is
+        // not still on its way there, as it can be on a loaded runner.
+        tokio::time::timeout(spacing * 4, async {
+            while registry.waiting_notice_is_current(fast, episode) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the fast worker asks for its turn while the slow one holds it");
         go.send(()).unwrap();
         // The fast worker is in its paced wait once the slow one has its fresh
         // agent, and keeps its old agent until the wait is over.
