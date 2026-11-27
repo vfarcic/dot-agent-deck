@@ -3065,6 +3065,71 @@ fn request_003_a_request_raised_with_no_client_opens_when_one_attaches() {
     );
 }
 
+/// Scenario: Start the TUI against a deck with no pending request and open
+/// Help, then make a schedule's run-now be refused so the deck raises a
+/// request while Help is open. The footer says `1 approval waiting` instead of
+/// the review covering Help; closing Help with `Esc` opens the review on its
+/// own and the badge goes.
+#[spec("config-trust/request/006")]
+#[test]
+fn request_006_a_request_held_behind_a_dialog_is_said_in_the_footer() {
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("held-project");
+    std::fs::create_dir_all(&project).expect("create project");
+    write_trust_config(&project, CODER_COMMAND, false);
+    let toml = format!(
+        "[[scheduled_tasks]]\n\
+         name = \"held-sched\"\n\
+         cron = \"0 0 1 1 *\"\n\
+         working_dir = \"{}\"\n\
+         command = \"cat\"\n\
+         prompt = \"TRUST-REQUEST-HELD\"\n\
+         enabled = true\n",
+        toml_str(&project.to_string_lossy())
+    );
+    let daemon = common::spawn_daemon_serve_untrusted(Some(&toml), "0", &[]);
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 50)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    deck.send_bytes(b"?");
+    deck.wait_for_string("Press ? or Esc to close");
+
+    daemon.run_now("held-sched").expect("run-now");
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            pending_trust_requests(&daemon.attach_socket).len() == 1
+        }),
+        "the refused fire leaves one request pending: {:?}",
+        pending_trust_requests(&daemon.attach_socket)
+    );
+    deck.wait_until_grid("the footer saying an approval is waiting", |grid| {
+        grid.contains("1 approval waiting") && grid.contains("Press ? or Esc to close")
+    });
+    assert!(
+        !deck.snapshot_grid().contains(PROMPT_TITLE),
+        "the review waits behind Help rather than covering it"
+    );
+
+    deck.send_bytes(b"\x1b");
+    deck.wait_until_grid("the review opening once Help closes", |grid| {
+        grid.contains(PROMPT_TITLE) && grid.contains("Asked by: scheduled task 'held-sched'")
+    });
+    deck.wait_for_string(REQUEST_FOOTER);
+    assert!(
+        !deck.snapshot_grid().contains("approval waiting"),
+        "no badge while the review is open"
+    );
+}
+
 /// Refuse `dispatch <unit> --orchestration trust-orch` from a fresh caller pane
 /// of a never-approved deck, wait for the review the deck opens on its own, and
 /// answer the deck, its attach socket and the caller's pane id.

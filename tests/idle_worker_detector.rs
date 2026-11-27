@@ -427,6 +427,43 @@ impl IdleHarness {
         take_tasks_in_background(&self.registry, roles);
     }
 
+    /// Wait until `role`'s worker has acknowledged its delegated task (taken
+    /// by [`take_tasks_in_background`]), and answer an instant no later than
+    /// that acknowledgement: when the last poll that still found it
+    /// unacknowledged began, or `since` when the first poll already found it.
+    /// The dispatch holds the idle clock until the acknowledgement, so a watch
+    /// armed for this task cannot fall due before the answer plus its timeout.
+    /// Panics when the task is not taken within the child boot budget.
+    async fn wait_until_task_taken(
+        &self,
+        role: &str,
+        since: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        let pane = worker_pane(role);
+        let mut before_ack = since;
+        let taken = tokio::time::timeout(common::child_boot_budget(), async {
+            loop {
+                let polled_at = tokio::time::Instant::now();
+                if self
+                    .registry
+                    .pane_current_agent_id(&pane)
+                    .is_some_and(|agent| task_acknowledged_by(&self.registry, &pane, &agent))
+                {
+                    return;
+                }
+                before_ack = polled_at;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            taken.is_ok(),
+            "precondition: the {role} worker never took its delegated task; inbox = {:?}",
+            self.registry.inbox().list(&pane)
+        );
+        before_ack
+    }
+
     /// Send `role`'s work-done and return when it was ACCEPTED: the instant
     /// `prepare_work_done` returned, which is after it retired the pane's
     /// outstanding delegation and with it the idle watch. The report is then
@@ -1045,20 +1082,30 @@ fn idle_worker_002_work_done_cancels_idle_prompt() {
 
 /// One attempt at `scheduler/idle-worker/002` with `timeout` as the idle
 /// timeout. The work-done must be accepted before the responsive worker's watch
-/// can fire: that watch is armed inside the delegate, so its deadline is no
-/// earlier than `delegated + timeout`, and `work_done` returns its acceptance
-/// only after `prepare_work_done` retired the record.
+/// can fire: the dispatch holds that watch's clock until the worker
+/// acknowledges its task, so its deadline is no earlier than `taken + timeout`
+/// (see [`IdleHarness::wait_until_task_taken`]), and `work_done` returns its
+/// acceptance only after `prepare_work_done` retired the record.
+///
+/// The work-done is sent once the worker has taken its task, as a worker
+/// does. A fixed pause instead raced the delegate's detached dispatch: on a
+/// starved box (main's run 45804812316, io full 32.5%) the task was not yet
+/// posted when the work-done went out, so the work-done named no task, was
+/// delivered as a note that completes nothing, and the idle prompt then fired
+/// for the responsive worker — a correct product, failed by the test's order.
 async fn work_done_before_the_deadline(timeout: Duration) -> Result<(), Late> {
     let harness = IdleHarness::new(&["silent-control", "responsive-worker"], None).await;
     let delegated = tokio::time::Instant::now();
     harness
         .delegate(&["silent-control", "responsive-worker"])
         .await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let taken = harness
+        .wait_until_task_taken("responsive-worker", delegated)
+        .await;
     let accepted = harness.work_done("responsive-worker").await;
     landed_in_time(
         "the responsive worker's work-done",
-        delegated,
+        taken,
         accepted,
         timeout,
     )?;

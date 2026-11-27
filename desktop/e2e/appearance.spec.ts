@@ -198,3 +198,39 @@ test.describe("appearance in a real engine", () => {
     expect({ r: parts[0], g: parts[1], b: parts[2] }).toEqual(DARK_CANVAS);
   });
 });
+
+/*
+ * PR #2491 — the Appearance choice applies on the Dashboard, the screen the app
+ * opens on. It was applied only by the deck screen (behind the experimental
+ * flag since #1307), so choosing Light or Dark from the Dashboard's Settings
+ * changed nothing until the next launch, and never in the browser preview.
+ */
+test.describe("the Appearance choice on the Dashboard", () => {
+  /// Scenario: Open the app on a light machine, on the Dashboard, open Settings and choose Dark: the root says dark and the Dashboard's ground turns dark at once. Choose Light on a dark machine and it turns light; choose System and it follows the machine again.
+  test("choosing Dark or Light in Settings repaints the Dashboard at once", async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.goto("/?fixture=1&state=docs");
+    await page.getByTestId("open-overview").click();
+    await expect(page.locator(".overview-row").first()).toBeVisible();
+    const ground = () => page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor);
+    expect(luminance(await ground()), "a light machine starts light").toBeGreaterThan(0.5);
+
+    await page.getByTestId("open-settings").click();
+    const choose = async (label: string) => {
+      await page.getByRole("radiogroup", { name: "Appearance" }).getByText(label, { exact: true }).click();
+      await expect(page.getByRole("radio", { name: label })).toBeChecked();
+    };
+    await choose("Dark");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect.poll(async () => luminance(await ground()), { message: "Dark turns the Dashboard dark" }).toBeLessThan(0.05);
+
+    await page.emulateMedia({ colorScheme: "dark" });
+    await choose("Light");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await expect.poll(async () => luminance(await ground()), { message: "Light turns it light on a dark machine" }).toBeGreaterThan(0.5);
+
+    await choose("System");
+    await expect(page.locator("html")).not.toHaveAttribute("data-theme", /.*/);
+    await expect.poll(async () => luminance(await ground()), { message: "System follows the dark machine" }).toBeLessThan(0.05);
+  });
+});

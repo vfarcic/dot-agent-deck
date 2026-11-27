@@ -84,7 +84,7 @@ Rules:
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
 
-/// PRD #120: the seed prompt for the flag-gated `schedule: issues` authoring
+/// PRD #120: the seed prompt for the `schedule: issues` authoring
 /// option. DISTINCT from [`schedule_authoring_seed_prompt`]: it authors an
 /// ISSUE-DISPATCH task — on each fire the daemon enumerates a repo's open issues
 /// and dispatches one agent per issue into a per-issue worktree — so it gathers
@@ -292,10 +292,11 @@ pub fn compose_dispatcher_seed(working_dir: &Path) -> String {
 pub enum AuthoringKind {
     /// The TUI's `schedule` option: author one cron-scheduled prompt.
     Schedule,
-    /// The TUI's flag-gated `schedule: issues` option: author one scheduled
-    /// GitHub issue-dispatch task. The daemon composes it whatever its own
-    /// experimental flag says; a client that mirrors the TUI hides it unless
-    /// [`crate::new_agent_options::NewAgentOptions::experimental`] is true.
+    /// The TUI's `schedule: issues` option: author one scheduled GitHub
+    /// issue-dispatch task. The daemon composes it whatever its own
+    /// experimental flag says; since issue #193 no client hides it on that
+    /// flag either (a desktop build from before #193 still does, reading
+    /// [`crate::new_agent_options::NewAgentOptions::experimental`]).
     ScheduleIssues,
     /// The TUI's `dispatcher` option: an ordinary agent that also knows the
     /// `dot-agent-deck dispatch` verb.

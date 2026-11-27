@@ -21,7 +21,10 @@ type Request = { id: number; project: string; configDir: string; orchestration: 
 
 const REQUEST: Request = { id: 4, project: "/srv/demo", configDir: "/srv/demo", orchestration: "team", digest: "ab12", askedBy: "dispatch" };
 
-function snapshot(deckId: string, requests: Request[]) {
+/** An agent the local deck runs, for the user to be in. */
+const BUILDER = { id: "agent-1", paneId: "pane-1", displayName: "Builder", agentType: "claude", status: "working", toolCount: 0, rows: 32, cols: 120, incarnation: `process-${LOCAL}`, tab: { kind: "dashboard" } };
+
+function snapshot(deckId: string, requests: Request[], agents: unknown[] = []) {
   const local = deckId === LOCAL;
   return {
     connection: {
@@ -37,7 +40,7 @@ function snapshot(deckId: string, requests: Request[]) {
       incarnation: `process-${deckId}`,
       ...(requests.length ? { trustRequests: requests } : {}),
     },
-    agents: [],
+    agents,
     protocolVersion: 10,
     source: "daemon",
     fleet: [LOCAL, REMOTE],
@@ -52,7 +55,7 @@ type Call = { command: string; args: Record<string, unknown> };
 type MockWindow = Window & { __dadCalls: Call[]; __dadEmit: (payload: unknown) => void; __dadListening: () => boolean };
 
 /** The app on its live bridge, the local deck connected with nothing pending, and the remote deck listing `remote`. */
-async function open(page: Page, remote: Request[]): Promise<void> {
+async function open(page: Page, remote: Request[], before?: () => Promise<void>, localAgents: unknown[] = []): Promise<void> {
   await page.addInitScript(({ local }) => {
     const callbacks = new Map<number, (event: unknown) => void>();
     const listeners = new Map<string, number[]>();
@@ -113,13 +116,14 @@ async function open(page: Page, remote: Request[]): Promise<void> {
     Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
       value: { unregisterListener: (_event: string, id: number) => callbacks.delete(id) },
     });
-  }, { local: snapshot(LOCAL, []) });
+  }, { local: snapshot(LOCAL, [], localAgents) });
   await page.goto("/?live=1");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   // The remote deck's watcher reports after the bootstrap, as the crate's do —
   // once the bridge listens, or the snapshot is emitted to nobody (seen on
   // WebKit, whose start is slower).
   await page.waitForFunction(() => (window as unknown as MockWindow).__dadListening());
+  await before?.();
   await page.evaluate((payload) => (window as unknown as MockWindow).__dadEmit(payload), snapshot(REMOTE, remote));
 }
 
@@ -184,5 +188,34 @@ test.describe("An in-deck approval request (issue #2330)", () => {
     await expect(page.getByTestId("trust-request-toast")).toContainText("The approval request for orchestration 'team' was answered elsewhere.");
     expect(await calls(page, "desktop_deny_trust_request")).toEqual([]);
     expect(await calls(page, "desktop_approve_project_trust")).toEqual([]);
+  });
+
+  /** Scenario: the user is in an agent's pane when a deck asks for an approval. The pane stays on screen and is not covered, and a marker saying "1 approval waiting" is on screen over it; clicking the marker opens the review over the pane, naming the deck that asked. */
+  test("says an approval is waiting while an agent's pane is open", async ({ page }) => {
+    await open(page, [REQUEST], async () => {
+      await page.getByRole("row", { name: "Open Builder agent", exact: true }).locator(".overview-state .status-label").click();
+      await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+    }, [BUILDER]);
+    const marker = page.getByRole("button", { name: /1 approval waiting/ });
+    await expect(marker).toBeInViewport({ ratio: 1 });
+    await expect(review(page)).toHaveCount(0);
+    await marker.click();
+    const dialog = review(page);
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByTestId("project-trust-deck")).toHaveText(HOST);
+    await expect(dialog.getByRole("button", { name: "Approve", exact: true })).toBeInViewport({ ratio: 1 });
+    await expect(page.getByTestId("agent-pane-overlay")).toBeAttached();
+    await expect(marker).toHaveCount(0);
+  });
+
+  /** Scenario: a deck asks for an approval while the user is in an agent's pane, and the user goes back to the dashboard. The review comes up on its own. */
+  test("opens a held review once the pane closes", async ({ page }) => {
+    await open(page, [REQUEST], async () => {
+      await page.getByRole("row", { name: "Open Builder agent", exact: true }).locator(".overview-state .status-label").click();
+      await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+    }, [BUILDER]);
+    await expect(review(page)).toHaveCount(0);
+    await page.getByTestId("agent-pane-overlay").getByRole("button", { name: "Back to dashboard" }).click();
+    await expect(review(page)).toBeVisible();
   });
 });

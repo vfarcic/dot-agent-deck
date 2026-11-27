@@ -1043,7 +1043,9 @@ pub async fn handle_utterance(
 ///
 /// **The request**: the backend is handed no agents, no decks and neither
 /// dialog declaration, so `prompt::data_turn` is `None` and the request is the
-/// instructions and response schema, the command table and the transcript —
+/// instructions and response schema, the command table (with the agent
+/// dashboard's state beside it when declared, which names nothing observed)
+/// and the transcript —
 /// plus what every request carries, the model name, the token ceiling and, for
 /// an off-machine endpoint, the key. **The table**: every
 /// row that [`needs_labels`] is `callable: false` with
@@ -1128,6 +1130,7 @@ pub async fn handle_utterance_with_dictation(
         new_agent,
         dictation,
         VoiceReadingState::default(),
+        None,
         transcript,
         labels,
         show_deck,
@@ -1136,7 +1139,9 @@ pub async fn handle_utterance_with_dictation(
 }
 
 /// [`handle_utterance_with_dictation`], with reading mode and the app's own
-/// speech declared too (PRD #1497) — which is what `desktop_voice_resolve`
+/// speech declared too (PRD #1497), and the agent dashboard's state (PR
+/// #2491, 2026-11-25: [`super::VoiceDashboard`], which the command model and
+/// the meaning check are both told) — which is what `desktop_voice_resolve`
 /// calls.
 ///
 /// Reading's switches and the way of silencing the app are answered by
@@ -1144,7 +1149,7 @@ pub async fn handle_utterance_with_dictation(
 /// and while the app was speaking (`reading.speaking`), nothing else is
 /// answered at all: every other utterance is [`VoiceOutcome::Dropped`], with
 /// no backend call (D8).
-// Twelve: each piece of live state from its own owner, for
+// Thirteen: each piece of live state from its own owner, for
 // `handle_utterance_with`'s reason.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_utterance_with_modes(
@@ -1157,6 +1162,7 @@ pub async fn handle_utterance_with_modes(
     new_agent: Option<&VoiceNewAgent>,
     dictation: Option<&VoiceDictationTarget>,
     reading: VoiceReadingState,
+    dashboard: Option<&super::VoiceDashboard>,
     transcript: Transcript,
     labels: LabelSharing,
     show_deck: bool,
@@ -1206,6 +1212,7 @@ pub async fn handle_utterance_with_modes(
         decks,
         directories,
         new_agent,
+        dashboard,
         transcript,
         labels,
         show_deck,
@@ -1246,6 +1253,7 @@ pub async fn handle_utterance_after_local_intercepts(
         decks,
         directories,
         new_agent,
+        None,
         transcript,
         LabelSharing::Shared,
         true,
@@ -1256,7 +1264,7 @@ pub async fn handle_utterance_after_local_intercepts(
 /// Everything [`handle_utterance_with_modes`] does once no intercept answered
 /// the utterance; [`handle_utterance_after_local_intercepts`] is its door for
 /// tests.
-// Ten: `handle_utterance_with`'s reason.
+// Eleven: `handle_utterance_with`'s reason.
 #[allow(clippy::too_many_arguments)]
 async fn after_local_intercepts(
     resolver: &dyn IntentResolver,
@@ -1266,6 +1274,7 @@ async fn after_local_intercepts(
     decks: &[VoiceDeck],
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
+    dashboard: Option<&super::VoiceDashboard>,
     transcript: Transcript,
     labels: LabelSharing,
     show_deck: bool,
@@ -1278,7 +1287,10 @@ async fn after_local_intercepts(
         backend,
     };
 
-    let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
+    let mut commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
+    // PR #2491 (2026-11-25): the rows whose meaning the dashboard's state
+    // changes say what it is right now.
+    super::schema::annotate_dashboard(&mut commands, dashboard);
     // Every deck, including the ones a new agent cannot start on (issue
     // #1491): the Daemon selector switches to any of them, so the model has
     // to see them all to answer `switch_deck` with the one the user meant.
@@ -1308,7 +1320,8 @@ async fn after_local_intercepts(
         screen,
         directories,
         new_agent,
-    ));
+    )
+    .dashboard(dashboard));
     let mut ballot = Ballot::new([
         resolver.judge_meaning(classification.clone()),
         resolver.judge_meaning(classification),
@@ -1323,6 +1336,8 @@ async fn after_local_intercepts(
             decks: if withheld { &[] } else { decks },
             directories: directories.filter(|_| !withheld),
             new_agent: new_agent.filter(|_| !withheld),
+            // App state in its own words, never a label: sent either way.
+            dashboard,
         }))
         .await;
     // Taken before anything is rendered: what the user waited for is the
@@ -6698,7 +6713,7 @@ pub enum ChoiceMatch {
 
 /// Resolve a spoken mode against the Mode chips the New agent form OFFERS
 /// (PRD #1223) — never a list of modes this crate knows, because the row varies
-/// by the deck's capabilities, its experimental flag and whether the directory
+/// by the deck's capabilities and whether the directory
 /// is a project, and a chip that is not offered must be refused.
 ///
 /// A chip answers to its label with the punctuation spoken as a space
@@ -6730,7 +6745,7 @@ pub(super) fn mode_names(choice: &VoiceChoice) -> Vec<String> {
 /// name the withheld chip — resolved over offered and withheld together, a
 /// withheld winner is refused. Or the model may have answered with the
 /// nearest OFFERED chip: measured on `gpt-5-mini`, "set the mode to schedule
-/// issues" on a deck with its flag off came back as `schedule` three runs in a
+/// issues" on a deck that withheld that chip came back as `schedule` three runs in a
 /// row, whatever the row's description said. So the TRANSCRIPT is checked too:
 /// when it contains a withheld chip's words, and the chip the answer resolved
 /// to is a strict part of that withheld one, the user asked for the withheld
@@ -7045,8 +7060,8 @@ const CHOICE_FILLER: [&str; 10] = [
 ///
 /// The general word-subset rule accepts a name whose words are all in the
 /// reference, so "the tester" reaches `tester`. Over a closed set that varies
-/// by deck that rule is wrong in exactly the case that matters: on a deck whose
-/// experimental flag is off there is no `schedule: issues` chip, and "schedule
+/// by deck that rule is wrong in exactly the case that matters: on a deck that
+/// cannot compose it there is no `schedule: issues` chip, and "schedule
 /// issues" is a word-superset of the `schedule` chip that IS there — so the
 /// user who asked for the one chip that is not offered would silently get the
 /// other one. So the reference may exceed a name only by [`CHOICE_FILLER`]
@@ -11779,8 +11794,9 @@ mod tests {
         }
     }
 
-    /// A form on a project directory of a deck whose flag is off: no
-    /// `schedule: issues` chip, one orchestration, and the deck's registry.
+    /// A form on a project directory of a deck that cannot compose the
+    /// issue-dispatch seed: no `schedule: issues` chip, one orchestration, and
+    /// the deck's registry.
     fn new_agent_form() -> VoiceNewAgent {
         VoiceNewAgent {
             form: Some(crate::voice::VoiceNewAgentForm {
@@ -12010,8 +12026,8 @@ mod tests {
 
     #[tokio::test]
     async fn voice_outcome_choose_mode_refuses_a_chip_the_form_does_not_offer() {
-        // `schedule: issues` is shown only when the deck's experimental flag
-        // is on; this form's deck has it off, so the chip is not there.
+        // `schedule: issues` is shown only when the deck can compose it; this
+        // form's deck cannot, so the chip is not there.
         let resolver = StubResolver::new().answering(
             "mode schedule issues",
             IntentAnswer::new("choose_mode").with_param("mode", "schedule issues"),
@@ -20070,6 +20086,7 @@ mod tests {
             None,
             typing.then_some(&target),
             reading,
+            None,
             Transcript::new(said),
             LabelSharing::Shared,
             true,

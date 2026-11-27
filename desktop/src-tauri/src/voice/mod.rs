@@ -335,7 +335,7 @@ pub struct VoiceNewAgent {
 ///
 /// **The chips and the picker entries are the ones the dialog actually
 /// offers**, never a list this crate knows: the Mode row varies by the deck's
-/// capabilities, the deck's experimental flag, and whether the chosen
+/// capabilities and whether the chosen
 /// directory is a project with orchestrations; the agent list is the deck's
 /// own registry, or the desktop's labelled fallback for a deck that does not
 /// report one. A spoken mode or agent type resolves against these and nothing
@@ -354,8 +354,8 @@ pub struct VoiceNewAgentForm {
     /// The agents the deck offers, as the dialog declares them — its registry, or this app's fallback copy for a deck that reports none.
     pub agent_types: Vec<VoiceChoice>,
     /// The Mode chips the dialog KNOWS and withholds on this form — an
-    /// authoring kind the deck cannot compose, or `schedule: issues` with the
-    /// deck's experimental flag off. Never resolvable: they are here so that a
+    /// authoring kind the deck cannot compose (since issue #193 the deck's
+    /// experimental flag withholds none). Never resolvable: they are here so that a
     /// user who names one is told it is not offered, instead of being handed
     /// the nearest chip that is (a model shown only the offered chips was
     /// measured substituting `schedule` for "schedule issues").
@@ -401,6 +401,40 @@ pub struct VoiceReadingState {
     /// The app was speaking while this utterance was recorded.
     #[serde(default)]
     pub speaking: bool,
+}
+
+/// PR #2491 (2026-11-25) — the agent dashboard as the voice panel declares it
+/// with an utterance on it: which view shows and whether Needs you only is on.
+///
+/// The command model is shown it ([`prompt::state`]) and so is the meaning
+/// check ([`meaning::Place`]), because one sentence means two things by it:
+/// "show all cards" turns Needs you only off while it is on, and switches to
+/// the Cards view while it is off and the Table shows. App state in the app's
+/// own words, never an observed name, so it is sent whatever the voice
+/// settings say about labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDashboard {
+    pub view: DashboardView,
+    pub needs_you_only: bool,
+}
+
+/// The agent dashboard's two views, as [`VoiceDashboard`] names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardView {
+    Table,
+    Cards,
+}
+
+impl DashboardView {
+    /// The view's name in the model's state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DashboardView::Table => "table",
+            DashboardView::Cards => "cards",
+        }
+    }
 }
 
 /// One entry of a closed set on screen: the id the dialog selects by, and the
@@ -942,5 +976,35 @@ mod tests {
     fn voice_transcript_is_empty_ignores_whitespace() {
         assert!(Transcript::new("   \t\n").is_empty());
         assert!(!Transcript::new(" a ").is_empty());
+    }
+
+    /// Scenario: the voice panel declares the agent dashboard as
+    /// `{"view": "table", "needsYouOnly": true}`; it reads as that view with
+    /// the filter on, and a view the dashboard does not have, a missing field
+    /// or an extra one is refused (PR #2491, 2026-11-25).
+    #[test]
+    fn voice_dashboard_declaration_reads_the_view_and_needs_you_only() {
+        let declared: VoiceDashboard =
+            serde_json::from_str(r#"{"view":"table","needsYouOnly":true}"#).expect("declared");
+        assert_eq!(
+            declared,
+            VoiceDashboard {
+                view: DashboardView::Table,
+                needs_you_only: true
+            }
+        );
+        let cards: VoiceDashboard =
+            serde_json::from_str(r#"{"view":"cards","needsYouOnly":false}"#).expect("declared");
+        assert_eq!(cards.view, DashboardView::Cards);
+        for refused in [
+            r#"{"view":"grid","needsYouOnly":true}"#,
+            r#"{"view":"table"}"#,
+            r#"{"view":"table","needsYouOnly":true,"agents":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<VoiceDashboard>(refused).is_err(),
+                "{refused}"
+            );
+        }
     }
 }

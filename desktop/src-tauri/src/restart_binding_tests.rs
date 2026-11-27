@@ -46,6 +46,45 @@ struct Script {
     generate_reply: Option<AttachResponse>,
     silent_generate: bool,
     generate_requests: Vec<serde_json::Value>,
+    /// Issue #2399 re-review: an `invoke-card-action-batch` is read and never
+    /// answered, the connection held open.
+    silent_batch: bool,
+    /// Every `invoke-card-action-batch` request, as sent.
+    batch_requests: Vec<serde_json::Value>,
+    /// Issue #2399: an `invoke-card-action-batch` is read and the connection
+    /// closed without an answer — a deck that goes away mid-batch.
+    drop_batch: bool,
+    /// Issue #2399: a `Hello` that asks to be followed by a request is read
+    /// and the connection closed — a deck that goes away before a request
+    /// is written.
+    drop_follow_on_hello: bool,
+    /// Issue #2399: an `invoke-card-action-batch` is answered with this
+    /// refusal of the whole request.
+    refuse_batch: Option<&'static str>,
+    /// PR #2491 review: an `invoke-card-action-batch` is answered with this
+    /// per-entry result.
+    batch_answer: Option<dot_agent_deck::agent_cards::CardBatchResult>,
+    /// Issue #2399 (PR #2491 scope extension): whether the deck advertises
+    /// `agent-cards-catalog-edit`, when set; unset advertises what this build
+    /// does.
+    catalog_edit_capability: Option<bool>,
+    /// Every `card-catalog-edit` request, as sent.
+    catalog_edit_requests: Vec<serde_json::Value>,
+    /// A `card-catalog-edit` is read and never answered, the connection held
+    /// open.
+    silent_catalog_edit: bool,
+    /// A `card-catalog-edit` is answered with this refusal.
+    refuse_catalog_edit: Option<&'static str>,
+    /// A `list-agent-cards` is answered with an empty card list (issue #2399
+    /// review: the cards snapshot carries the editor's capability).
+    list_cards: bool,
+    /// PR #2491 review: every `Hello` names this attach protocol, when set —
+    /// a deck the establishment handshake classifies incompatible.
+    hello_protocol: Option<u32>,
+    /// PR #2491 review: a `Hello` that asks to be followed by a request names
+    /// this attach protocol, when set, while the establishment `Hello` names
+    /// this build's.
+    follow_on_hello_protocol: Option<u32>,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -148,10 +187,13 @@ impl RestartingDeck {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dad-{tag}-{}-{unique}", std::process::id()));
+        // No tag in the path: macOS's temp folder is about 50 bytes long and a
+        // socket's path must stay under its 104, which a long tag overran.
+        let dir = std::env::temp_dir().join(format!("dad-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create the scratch dir");
         let socket = dir.join("s");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the deck");
+        let listener = tokio::net::UnixListener::bind(&socket)
+            .unwrap_or_else(|e| panic!("bind the deck {tag} at {}: {e}", socket.display()));
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .expect("restate 0o600 on the socket inode");
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -187,6 +229,31 @@ impl RestartingDeck {
                                 if script.lock().unwrap().silent_generate {
                                     std::future::pending::<()>().await;
                                 }
+                            }
+                            if op == "invoke-card-action-batch" {
+                                script.lock().unwrap().batch_requests.push(request.clone());
+                                if script.lock().unwrap().silent_batch {
+                                    std::future::pending::<()>().await;
+                                }
+                                if script.lock().unwrap().drop_batch {
+                                    return;
+                                }
+                            }
+                            if op == "card-catalog-edit" {
+                                script
+                                    .lock()
+                                    .unwrap()
+                                    .catalog_edit_requests
+                                    .push(request.clone());
+                                if script.lock().unwrap().silent_catalog_edit {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            if op == "hello"
+                                && request["follow_on"] == true
+                                && script.lock().unwrap().drop_follow_on_hello
+                            {
+                                return;
                             }
                             if op == "stop-agent" {
                                 script.lock().unwrap().stop_requests.push(request.clone());
@@ -226,6 +293,20 @@ impl RestartingDeck {
                                         );
                                     }
                                 }
+                                if let Some(advertise) =
+                                    script.lock().unwrap().catalog_edit_capability
+                                {
+                                    let capabilities = hello.capabilities.get_or_insert_default();
+                                    capabilities.retain(|cap| {
+                                        cap != dot_agent_deck::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT
+                                    });
+                                    if advertise {
+                                        capabilities.push(
+                                            dot_agent_deck::daemon_protocol::CAP_AGENT_CARDS_CATALOG_EDIT
+                                                .into(),
+                                        );
+                                    }
+                                }
                                 if let Some(advertise) = script.lock().unwrap().keep_capability {
                                     let capabilities = hello.capabilities.get_or_insert_default();
                                     capabilities.retain(|cap| {
@@ -236,6 +317,17 @@ impl RestartingDeck {
                                             dot_agent_deck::daemon_protocol::CAP_KEEP_WORKTREE
                                                 .into(),
                                         );
+                                    }
+                                }
+                                {
+                                    let script = script.lock().unwrap();
+                                    let protocol = if request["follow_on"] == true {
+                                        script.follow_on_hello_protocol.or(script.hello_protocol)
+                                    } else {
+                                        script.hello_protocol
+                                    };
+                                    if let Some(protocol) = protocol {
+                                        hello.server_version = Some(protocol);
                                     }
                                 }
                                 if let Some(advertise) = script.lock().unwrap().answer_capability {
@@ -266,6 +358,50 @@ impl RestartingDeck {
                                         .unwrap_or_else(|| {
                                             AttachResponse::with_id("m-config".into())
                                         })
+                                } else if op == "list-agent-cards"
+                                    && script.lock().unwrap().list_cards
+                                {
+                                    AttachResponse {
+                                        agent_cards: Some(
+                                            dot_agent_deck::agent_cards::AgentCardList {
+                                                instance_id: process.to_string(),
+                                                revision: 1,
+                                                entries: Vec::new(),
+                                                catalog_errors: Vec::new(),
+                                            },
+                                        ),
+                                        ..AttachResponse::ok()
+                                    }
+                                } else if op == "card-catalog-edit" {
+                                    match script.lock().unwrap().refuse_catalog_edit {
+                                        Some(refusal) => AttachResponse::err(refusal),
+                                        None => AttachResponse {
+                                            card_catalog_edit: Some(
+                                                dot_agent_deck::card_catalog::editable_catalog(
+                                                    None,
+                                                ),
+                                            ),
+                                            ..AttachResponse::ok()
+                                        },
+                                    }
+                                } else if let Some(refusal) = script
+                                    .lock()
+                                    .unwrap()
+                                    .refuse_batch
+                                    .filter(|_| op == "invoke-card-action-batch")
+                                {
+                                    AttachResponse::err(refusal)
+                                } else if let Some(answer) = script
+                                    .lock()
+                                    .unwrap()
+                                    .batch_answer
+                                    .clone()
+                                    .filter(|_| op == "invoke-card-action-batch")
+                                {
+                                    AttachResponse {
+                                        card_action_batch: Some(answer),
+                                        ..AttachResponse::ok()
+                                    }
                                 } else {
                                     with_live(serve(&op), live)
                                 };
@@ -1349,4 +1485,1086 @@ async fn handshake_013_a_start_result_names_the_process_that_answered_it() {
     let bound = client.bound_to(Some("a".to_string()).into());
     assert_eq!(bound.launch_incarnation().as_deref(), Some("a"));
     assert!(client.launch_incarnation().is_unnamed());
+}
+
+/// Scenario (issue #2399 re-review): the user sends "Go ahead" to two agents
+/// on a deck that takes the batch request and never answers it. When the
+/// batch's bound runs out each agent's result is "unknown", with a sentence
+/// saying the deck may still deliver it, never "failed"; the request was sent
+/// once and not again. A preview the deck never answers fails at the ordinary
+/// round-trip bound instead, since a preview sends nothing.
+#[tokio::test]
+async fn a_card_batch_the_deck_never_answers_ends_unknown_at_its_bound_and_is_not_resent() {
+    use dot_agent_deck::agent_cards::{CardBatchEntry, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-silent", "a");
+    deck.script.lock().unwrap().silent_batch = true;
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let entries: Vec<_> = ["1", "2"]
+        .iter()
+        .map(|id| CardBatchEntry {
+            pane_id: format!("pane-{id}"),
+            agent_id: (*id).to_string(),
+            action_token: "token".into(),
+            instance_id: "a".into(),
+        })
+        .collect();
+    let deadline = crate::card_batch_reply_timeout(CardBatchMode::Execute, entries.len());
+    assert_eq!(
+        deadline,
+        crate::daemon_bridge::DECK_REPLY_TIMEOUT + crate::CARD_BATCH_ENTRY_ALLOWANCE * 2,
+        "an execution's bound grows with its entries"
+    );
+    // PR #2491 review: and stops growing at the ceiling, so a large batch
+    // cannot hold the app for long.
+    let largest = crate::card_batch_reply_timeout(
+        CardBatchMode::Execute,
+        dot_agent_deck::agent_cards::MAX_BATCH_ENTRIES,
+    );
+    assert_eq!(largest, crate::CARD_BATCH_EXECUTE_CEILING);
+    assert!(
+        largest <= std::time::Duration::from_secs(180),
+        "the ceiling is at most three minutes: {largest:?}"
+    );
+    assert_eq!(
+        crate::card_batch_reply_timeout(CardBatchMode::Execute, usize::MAX),
+        crate::CARD_BATCH_EXECUTE_CEILING,
+        "however many entries a request names"
+    );
+
+    // Paused, so the bound elapses as soon as nothing but the silent batch is
+    // left to wait on.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let sent = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-silent-1",
+        entries.clone(),
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+
+    let result = sent.expect("an unanswered execution still answers each entry");
+    assert_eq!(result.request_id, "batch-silent-1");
+    let agents: Vec<_> = result
+        .entries
+        .iter()
+        .map(|entry| entry.agent_id.as_str())
+        .collect();
+    assert_eq!(agents, ["1", "2"], "every entry sent is answered");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_ne!(entry.outcome, dot_agent_deck::agent_cards::BATCH_FAILED);
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_NO_ANSWER)
+        );
+        assert_eq!(
+            entry.message.as_deref(),
+            Some(crate::card_batch_no_answer_message(deadline).as_str())
+        );
+    }
+    assert!(
+        crate::card_batch_no_answer_message(deadline).contains("may still deliver"),
+        "the sentence does not claim nothing was sent"
+    );
+    assert!(
+        waited >= deadline && waited < deadline + crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+        "the answer comes from the batch's bound: {waited:?}"
+    );
+    {
+        let script = deck.script.lock().unwrap();
+        assert_eq!(
+            script.batch_requests.len(),
+            1,
+            "the batch is not sent again"
+        );
+        assert_eq!(script.batch_requests[0]["mode"], "execute");
+    }
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let previewed = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Preview,
+        "batch-silent-2",
+        entries,
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    let failure = previewed.expect_err("an unanswered preview fails: it sent nothing");
+    assert!(failure.contains("did not answer the preview"), "{failure}");
+    let bound = crate::card_batch_reply_timeout(CardBatchMode::Preview, 2);
+    assert_eq!(bound, crate::daemon_bridge::DECK_REPLY_TIMEOUT);
+    assert!(
+        waited >= bound && waited < bound * 2,
+        "the preview's bound is the round trip's: {waited:?}"
+    );
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 2);
+
+    // PR #2491 review: an execution large enough that its per-entry bound
+    // passes the ceiling is answered at the ceiling.
+    let many: Vec<_> = (0..40)
+        .map(|id| CardBatchEntry {
+            pane_id: format!("pane-{id}"),
+            agent_id: id.to_string(),
+            action_token: "token".into(),
+            instance_id: "a".into(),
+        })
+        .collect();
+    assert!(
+        crate::daemon_bridge::DECK_REPLY_TIMEOUT
+            + crate::CARD_BATCH_ENTRY_ALLOWANCE * many.len() as u32
+            > crate::CARD_BATCH_EXECUTE_CEILING,
+        "precondition: uncapped, this batch would wait past the ceiling"
+    );
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let large = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-silent-3",
+        many,
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    let large = large.expect("an unanswered execution still answers each entry");
+    assert_eq!(large.entries.len(), 40);
+    let ceiling = crate::CARD_BATCH_EXECUTE_CEILING;
+    for entry in &large.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_eq!(
+            entry.message.as_deref(),
+            Some(crate::card_batch_no_answer_message(ceiling).as_str())
+        );
+    }
+    assert!(
+        waited >= ceiling && waited < ceiling + crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+        "a large batch waits no longer than the ceiling: {waited:?}"
+    );
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 3);
+}
+
+/// Two batch entries for agents `1` and `2`, as their preview on process `a`
+/// answered them.
+fn batch_entries() -> Vec<dot_agent_deck::agent_cards::CardBatchEntry> {
+    ["1", "2"]
+        .iter()
+        .map(|id| dot_agent_deck::agent_cards::CardBatchEntry {
+            pane_id: format!("pane-{id}"),
+            agent_id: (*id).to_string(),
+            action_token: "token".into(),
+            instance_id: "a".into(),
+        })
+        .collect()
+}
+
+/// Scenario (issue #2399): the user sends "Go ahead" to two agents on a deck
+/// that reads the batch request and then closes the connection without
+/// answering. Each agent's result is "unknown" with a sentence saying the
+/// connection broke after the request was sent and it is not known whether
+/// the agent got it, never "failed"; the request was sent once and not again.
+#[tokio::test]
+async fn a_card_batch_whose_connection_breaks_after_sending_ends_unknown_and_is_not_resent() {
+    use dot_agent_deck::agent_cards::CardBatchMode;
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-dropped", "a");
+    deck.script.lock().unwrap().drop_batch = true;
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-dropped-1",
+        batch_entries(),
+    )
+    .await
+    .expect("an execution whose connection broke still answers each entry");
+
+    assert_eq!(result.request_id, "batch-dropped-1");
+    let agents: Vec<_> = result
+        .entries
+        .iter()
+        .map(|entry| entry.agent_id.as_str())
+        .collect();
+    assert_eq!(agents, ["1", "2"], "every entry sent is answered");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_CONNECTION_LOST)
+        );
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "the deck's answer was lost or could not be read after the request was sent"
+            ) && message.contains("not known whether this agent got it"),
+            "{message}"
+        );
+        assert!(!message.contains("nothing was sent"), "{message}");
+    }
+    let script = deck.script.lock().unwrap();
+    assert_eq!(
+        script.batch_requests.len(),
+        1,
+        "the batch is not sent again"
+    );
+    assert_eq!(script.batch_requests[0]["mode"], "execute");
+}
+
+/// Scenario (issue #2399): the user sends "Go ahead" to two agents on a deck
+/// that closes the connection on the `Hello` the batch would follow, so the
+/// request is never written. Each agent's result is "failed", saying nothing
+/// was sent, and no batch request reached the deck. A deck that reads the
+/// request and refuses it whole also answers each agent "failed": it ran none.
+#[tokio::test]
+async fn a_card_batch_refused_before_sending_fails_and_sends_nothing() {
+    use dot_agent_deck::agent_cards::{BATCH_FAILED, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-unsent", "a");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    deck.script.lock().unwrap().drop_follow_on_hello = true;
+
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-unsent-1",
+        batch_entries(),
+    )
+    .await
+    .expect("an execution that was not sent still answers each entry");
+    assert_eq!(result.entries.len(), 2);
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_FAILED, "{entry:?}");
+        assert_eq!(entry.code.as_deref(), Some(crate::CODE_CARD_BATCH_NOT_SENT));
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(message.ends_with("; nothing was sent"), "{message}");
+    }
+    assert!(
+        deck.script.lock().unwrap().batch_requests.is_empty(),
+        "no batch request was written"
+    );
+
+    // Control: the same deck reads the request and refuses it whole.
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.drop_follow_on_hello = false;
+        script.refuse_batch = Some("invoke-card-action-batch: request_invalid");
+    }
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-unsent-2",
+        batch_entries(),
+    )
+    .await
+    .expect("a refused execution still answers each entry");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_FAILED, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_DECK_REFUSED)
+        );
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("request_invalid") && message.ends_with("; nothing was delivered"),
+            "{message}"
+        );
+    }
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
+}
+
+/// Scenario (PR #2491 review): the user sends "Go ahead" to two agents while
+/// acquiring the link to their deck takes 20 s, and the deck then never
+/// answers the batch. The whole send still ends at the batch's one bound, so
+/// the dialog is held no longer than it: each agent reads "unknown". When the
+/// link is not acquired within the bound at all, each agent reads "failed",
+/// nothing sent, and no batch request reaches the deck.
+#[tokio::test]
+async fn a_card_batch_s_bound_covers_acquiring_the_link_to_its_deck() {
+    use dot_agent_deck::agent_cards::{BATCH_FAILED, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-slow-link", "a");
+    deck.script.lock().unwrap().silent_batch = true;
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let deadline = crate::card_batch_reply_timeout(CardBatchMode::Execute, 2);
+    let slow_link = std::time::Duration::from_secs(20);
+    assert!(
+        slow_link < deadline,
+        "precondition: the link arrives in time"
+    );
+    let gate = state.daemon.establishment_gate_for_test(&deck.endpoint());
+
+    tokio::time::pause();
+    let held = Arc::clone(&gate).lock_owned().await;
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(slow_link).await;
+        drop(held);
+    });
+    let started = tokio::time::Instant::now();
+    let sent = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-slow-link-1",
+        batch_entries(),
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    release.await.unwrap();
+    let result = sent.expect("an unanswered execution still answers each entry");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_NO_ANSWER)
+        );
+    }
+    assert!(
+        waited >= deadline && waited < deadline + std::time::Duration::from_secs(1),
+        "the time spent acquiring the link counts against the one bound: {waited:?}"
+    );
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
+
+    tokio::time::pause();
+    let held = Arc::clone(&gate).lock_owned().await;
+    let started = tokio::time::Instant::now();
+    let sent = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-slow-link-2",
+        batch_entries(),
+    )
+    .await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+    drop(held);
+    let result = sent.expect("an execution that was not sent still answers each entry");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_FAILED, "{entry:?}");
+        assert_eq!(entry.code.as_deref(), Some(crate::CODE_CARD_BATCH_NOT_SENT));
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(message.ends_with("; nothing was sent"), "{message}");
+    }
+    assert!(
+        waited >= deadline && waited < deadline + std::time::Duration::from_secs(1),
+        "a link never acquired ends at the same bound: {waited:?}"
+    );
+    assert_eq!(
+        deck.script.lock().unwrap().batch_requests.len(),
+        1,
+        "no batch request was written"
+    );
+}
+
+/// Scenario (PR #2491 review): the user previews "Go ahead" on two agents of
+/// a deck that refuses the request whole, as it refuses a batch naming more
+/// cards than it allows. Each agent is skipped with the deck's own reason,
+/// rather than read as a deck that did not answer, and nothing is sent.
+#[tokio::test]
+async fn a_card_batch_preview_the_deck_refuses_skips_each_agent_with_the_deck_s_reason() {
+    use dot_agent_deck::agent_cards::{BATCH_SKIPPED, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-preview-refused", "a");
+    deck.script.lock().unwrap().refuse_batch =
+        Some("invoke-card-action-batch: a batch may name at most 256 cards; this one names more");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Preview,
+        "batch-preview-refused-1",
+        batch_entries(),
+    )
+    .await
+    .expect("a refused preview answers each entry");
+    assert_eq!(result.entries.len(), 2);
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_SKIPPED, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_DECK_REFUSED)
+        );
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("at most 256 cards")
+                && message.ends_with("; nothing is sent to this agent"),
+            "{message}"
+        );
+        assert!(!message.contains("did not answer"), "{message}");
+    }
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
+}
+
+/// Scenario (PR #2491 review): the user sends "Go ahead" to two agents, and
+/// the deck starts the batch: it posts to the first agent and its run is cut
+/// short before it can say what became of the second, or it answers a repeat
+/// of a batch whose outcomes it did not keep. The first agent reads as the
+/// deck answered it, and an agent the deck cannot account for reads "unknown"
+/// with the deck's own code and sentence, never "failed" and never "nothing
+/// was delivered".
+#[tokio::test]
+async fn a_card_batch_the_deck_started_and_cannot_account_for_reads_unknown_not_failed() {
+    use dot_agent_deck::agent_cards::{
+        BATCH_DELIVERED, BATCH_FAILED, BATCH_UNKNOWN, CODE_BATCH_ANSWER_NOT_KEPT,
+        CODE_BATCH_INTERRUPTED, CardBatchMode, CardBatchOutcome, CardBatchResult,
+    };
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-unaccounted", "a");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let unknown = |pane: &str, agent: &str, code: &str| {
+        CardBatchOutcome {
+        pane_id: pane.into(),
+        agent_id: agent.into(),
+        outcome: BATCH_UNKNOWN.into(),
+        code: Some(code.into()),
+        message: Some("it is not known whether this agent got it; check its card's delivery history before sending again".into()),
+        ..Default::default()
+    }
+    };
+    for (request_id, answer) in [
+        (
+            "batch-cut-short",
+            vec![
+                CardBatchOutcome {
+                    pane_id: "pane-1".into(),
+                    agent_id: "1".into(),
+                    outcome: BATCH_DELIVERED.into(),
+                    message_id: Some("m-1".into()),
+                    state: Some("queued".into()),
+                    ..Default::default()
+                },
+                unknown("pane-2", "2", CODE_BATCH_INTERRUPTED),
+            ],
+        ),
+        (
+            "batch-not-kept",
+            vec![
+                unknown("pane-1", "1", CODE_BATCH_ANSWER_NOT_KEPT),
+                unknown("pane-2", "2", CODE_BATCH_ANSWER_NOT_KEPT),
+            ],
+        ),
+    ] {
+        deck.script.lock().unwrap().batch_answer = Some(CardBatchResult {
+            request_id: request_id.into(),
+            entries: answer.clone(),
+        });
+        let result = crate::agent_card_invoke_batch_on(
+            &state,
+            &wire,
+            "a",
+            "go",
+            CardBatchMode::Execute,
+            request_id,
+            batch_entries(),
+        )
+        .await
+        .expect("an execution the deck started answers each entry");
+        assert_eq!(
+            result.entries, answer,
+            "{request_id}: passed on as the deck answered it"
+        );
+        for entry in &result.entries {
+            assert_ne!(entry.outcome, BATCH_FAILED, "{request_id}: {entry:?}");
+            let message = entry.message.as_deref().unwrap_or_default();
+            assert!(
+                !message.contains("nothing was delivered"),
+                "{request_id}: {message}"
+            );
+        }
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .filter(|e| e.outcome == crate::CARD_BATCH_UNKNOWN)
+                .count(),
+            answer.iter().filter(|e| e.outcome == BATCH_UNKNOWN).count(),
+            "{request_id}: the deck's unknown is the bridge's"
+        );
+    }
+    assert_eq!(
+        deck.script.lock().unwrap().batch_requests.len(),
+        2,
+        "each sent once"
+    );
+}
+
+/// Scenario (PR #2491 review): the user previews "Go ahead" on two agents of a
+/// deck that answers and declines it before the request: its handshake names
+/// another attach protocol, so the app classifies it incompatible, or only
+/// the `Hello` on the request's own connection does. Each agent is skipped
+/// with that reason, rather than read as a deck that could not be reached or
+/// did not answer, and no batch request is written. Sending to them is still
+/// "failed", nothing sent.
+#[tokio::test]
+async fn a_card_batch_preview_a_deck_declines_at_its_handshake_skips_each_agent_with_the_reason() {
+    use dot_agent_deck::agent_cards::{BATCH_FAILED, BATCH_SKIPPED, CardBatchMode};
+    use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    for (tag, at_establishment) in [
+        ("batch-declined-establishment", true),
+        ("batch-declined-follow-on", false),
+    ] {
+        let deck = RestartingDeck::start(tag, "a");
+        {
+            let mut script = deck.script.lock().unwrap();
+            if at_establishment {
+                script.hello_protocol = Some(PROTOCOL_VERSION + 1);
+            } else {
+                script.follow_on_hello_protocol = Some(PROTOCOL_VERSION + 1);
+            }
+        }
+        let _local = select(&deck);
+        let state = DesktopState::default();
+        let wire = crate::dto::deck_wire_id(&deck.endpoint());
+        let preview = crate::agent_card_invoke_batch_on(
+            &state,
+            &wire,
+            "a",
+            "go",
+            CardBatchMode::Preview,
+            &format!("{tag}-preview"),
+            batch_entries(),
+        )
+        .await
+        .expect("a declined preview answers each entry");
+        assert_eq!(preview.entries.len(), 2, "{tag}");
+        for entry in &preview.entries {
+            assert_eq!(entry.outcome, BATCH_SKIPPED, "{tag}: {entry:?}");
+            assert_eq!(
+                entry.code.as_deref(),
+                Some(crate::CODE_CARD_BATCH_DECK_REFUSED),
+                "{tag}"
+            );
+            let message = entry.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains(&format!("attach protocol v{}", PROTOCOL_VERSION + 1))
+                    && message.ends_with("; nothing is sent to this agent"),
+                "{tag}: {message}"
+            );
+            assert!(
+                !message.contains("could not be reached"),
+                "{tag}: {message}"
+            );
+        }
+        let executed = crate::agent_card_invoke_batch_on(
+            &state,
+            &wire,
+            "a",
+            "go",
+            CardBatchMode::Execute,
+            &format!("{tag}-execute"),
+            batch_entries(),
+        )
+        .await
+        .expect("a declined execution answers each entry");
+        for entry in &executed.entries {
+            assert_eq!(entry.outcome, BATCH_FAILED, "{tag}: {entry:?}");
+            assert_eq!(
+                entry.code.as_deref(),
+                Some(crate::CODE_CARD_BATCH_NOT_SENT),
+                "{tag}"
+            );
+        }
+        assert!(
+            deck.script.lock().unwrap().batch_requests.is_empty(),
+            "{tag}: no batch request was written"
+        );
+    }
+}
+
+/// The edit the card-action editor's transport tests send: add a `ship`
+/// action.
+fn catalog_add() -> dot_agent_deck::card_catalog::CatalogActionEdit {
+    dot_agent_deck::card_catalog::CatalogActionEdit::Add {
+        action: dot_agent_deck::card_catalog::CatalogActionInput {
+            name: "ship".into(),
+            description: "Offer when it is ready.".into(),
+            prompt: "Ship it.".into(),
+            icon: Some("rocket".into()),
+            ..Default::default()
+        },
+    }
+}
+
+/// Scenario (issue #2399, PR #2491 scope extension): the user opens the Card
+/// actions editor on a deck whose daemon does not advertise it, and then on
+/// one that does. The first is sent no request — reading and saving both
+/// answer the sentence that the daemon's release cannot be edited from the
+/// app — and the second gets exactly the request the editor made, the edit
+/// as given, and its catalog comes back.
+#[tokio::test]
+async fn a_card_catalog_edit_goes_only_to_a_deck_that_advertises_it() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-gate", "a");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(false);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+
+    for edit in [None, Some(catalog_add())] {
+        let refused = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), edit)
+            .await
+            .expect_err("an older daemon cannot edit its card actions");
+        assert_eq!(refused, crate::CARD_CATALOG_EDIT_UNSUPPORTED);
+        assert!(
+            refused.contains("cannot be edited from the app"),
+            "{refused}"
+        );
+    }
+    assert!(
+        deck.script.lock().unwrap().catalog_edit_requests.is_empty(),
+        "nothing is sent to a daemon that does not advertise the editor"
+    );
+
+    drop(_local);
+
+    // Control: a deck that advertises it. The capabilities a trusted link
+    // holds are its `Hello`'s, so this is a deck of its own.
+    let deck = RestartingDeck::start("catalog-edit-gate-on", "b");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let read = crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), None)
+        .await
+        .expect("a read is answered");
+    let names: Vec<_> = read
+        .actions
+        .iter()
+        .map(|a| a.action.name.as_str())
+        .collect();
+    assert_eq!(names, ["go-ahead", "merge"]);
+    crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), Some(catalog_add()))
+        .await
+        .expect("an edit is answered");
+    let script = deck.script.lock().unwrap();
+    assert_eq!(script.catalog_edit_requests.len(), 2);
+    assert_eq!(script.catalog_edit_requests[0]["op"], "card-catalog-edit");
+    assert!(
+        script.catalog_edit_requests[0]
+            .get("edit")
+            .is_none_or(|edit| edit.is_null()),
+        "a read carries no edit"
+    );
+    assert_eq!(
+        script.catalog_edit_requests[1]["edit"],
+        serde_json::to_value(catalog_add()).unwrap()
+    );
+}
+
+/// Scenario (issue #2399, PR #2491 scope extension): the user saves an action
+/// the deck's daemon refuses. The editor is given the daemon's own reason, as
+/// the daemon worded it, and nothing else is sent.
+#[tokio::test]
+async fn a_refused_card_catalog_edit_comes_back_as_the_daemon_s_reason() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-refused", "a");
+    const REASON: &str = "catalog.actions \"Ship It\": bad name; use 1 to 40 lowercase letters, digits and '-', starting with a letter or digit";
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.catalog_edit_capability = Some(true);
+        script.refuse_catalog_edit = Some(REASON);
+    }
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let refused = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add()))
+        .await
+        .expect_err("a refused edit is an error");
+    assert_eq!(refused, REASON, "the daemon's reason, as it gave it");
+    assert_eq!(deck.script.lock().unwrap().catalog_edit_requests.len(), 1);
+}
+
+/// Scenario (issue #2399, PR #2491 scope extension): the user saves an action
+/// on a deck that takes the request and never answers. The editor is told,
+/// at the ordinary round-trip bound, that the deck did not answer and that
+/// the action may have been saved; the request was sent once, not again. A
+/// read the deck never answers ends at the same bound.
+#[tokio::test]
+async fn a_card_catalog_edit_the_deck_never_answers_is_bounded() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-silent", "a");
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.catalog_edit_capability = Some(true);
+        script.silent_catalog_edit = true;
+    }
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    let bound = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let edited =
+        crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add())).await;
+    let waited = started.elapsed();
+    let read = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), None).await;
+    tokio::time::resume();
+
+    let edited = edited.expect_err("an unanswered edit is an error");
+    assert!(
+        edited.contains("did not answer") && edited.contains("may have been saved"),
+        "{edited}"
+    );
+    assert!(
+        waited >= bound && waited < bound + std::time::Duration::from_secs(1),
+        "the wait ends at the bound: {waited:?}"
+    );
+    let read = read.expect_err("an unanswered read is an error");
+    assert!(read.contains("did not answer"), "{read}");
+    assert!(!read.contains("saved"), "a read saves nothing: {read}");
+    assert_eq!(
+        deck.script.lock().unwrap().catalog_edit_requests.len(),
+        2,
+        "each request was sent once"
+    );
+}
+
+/// Scenario (PR #2491 review, Qodo 10): the user saves an action on a deck
+/// whose daemon goes away, or goes quiet, before the edit is written: it closes
+/// the connection on the `Hello` that would carry the edit, or never answers
+/// that `Hello`. The editor is told plainly that nothing was saved, not that
+/// it may have been, and no edit request reached the deck. Control: a deck
+/// that reads the edit and never answers still says it may have been saved.
+#[tokio::test]
+async fn a_card_catalog_edit_that_fails_before_it_is_written_says_nothing_was_saved() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-unsent", "a");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+
+    // The deck closes the connection on the `Hello` that would carry the edit.
+    deck.script.lock().unwrap().drop_follow_on_hello = true;
+    let dropped = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add()))
+        .await
+        .expect_err("an edit that was never written is an error");
+    assert!(
+        !dropped.contains(crate::CARD_CATALOG_EDIT_MAY_HAVE_SAVED),
+        "nothing was sent, so nothing may have been saved: {dropped}"
+    );
+    assert!(dropped.contains("nothing was saved"), "{dropped}");
+
+    // The deck never answers that `Hello`: the bound runs out before the edit
+    // is written.
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.drop_follow_on_hello = false;
+        script.silent_hello = true;
+    }
+    tokio::time::pause();
+    let silent =
+        crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add())).await;
+    tokio::time::resume();
+    let silent = silent.expect_err("an edit whose `Hello` is never answered is an error");
+    assert!(
+        !silent.contains(crate::CARD_CATALOG_EDIT_MAY_HAVE_SAVED),
+        "the edit was never written: {silent}"
+    );
+    assert!(silent.contains("nothing was saved"), "{silent}");
+    assert!(
+        deck.script.lock().unwrap().catalog_edit_requests.is_empty(),
+        "no edit reached the deck"
+    );
+
+    // Control: the deck reads the edit and never answers it.
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.silent_hello = false;
+        script.silent_catalog_edit = true;
+    }
+    tokio::time::pause();
+    let unanswered =
+        crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add())).await;
+    tokio::time::resume();
+    let unanswered = unanswered.expect_err("an unanswered edit is an error");
+    assert!(
+        unanswered.contains(crate::CARD_CATALOG_EDIT_MAY_HAVE_SAVED),
+        "{unanswered}"
+    );
+    assert_eq!(deck.script.lock().unwrap().catalog_edit_requests.len(), 1);
+}
+
+/// Scenario (PR #2491 review, Qodo 4): the user reads a deck's card actions
+/// from daemon process `a`, the daemon restarts as process `b`, and the user
+/// saves an action from the list `a` answered. The save is bound to `a`, so
+/// `b` is sent no edit and the editor is told the daemon was restarted and
+/// nothing was saved; a read bound to `a` is refused the same way. Control: a
+/// read and a save bound to `b`, the process now answering, reach it.
+#[tokio::test]
+async fn a_card_catalog_edit_bound_to_a_replaced_daemon_is_refused() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-replaced", "a");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), None)
+        .await
+        .expect("a read bound to the process answering is answered");
+    assert_eq!(deck.received_by("a"), ["card-catalog-edit"]);
+
+    deck.restart_as("b");
+    let refused = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), Some(catalog_add()))
+        .await
+        .expect_err("an edit bound to the replaced process is refused");
+    assert_eq!(
+        refused,
+        format!("{}; nothing was saved", crate::CARD_CATALOG_DAEMON_REPLACED)
+    );
+    assert!(refused.contains("restarted"), "{refused}");
+    assert!(
+        !refused.contains(crate::CARD_CATALOG_EDIT_MAY_HAVE_SAVED),
+        "nothing was sent, so nothing may have been saved: {refused}"
+    );
+    let read = crate::agent_card_catalog_edit_on(&state, &wire, Some("a"), None)
+        .await
+        .expect_err("a read bound to the replaced process is refused");
+    assert_eq!(read, crate::CARD_CATALOG_DAEMON_REPLACED);
+    assert!(
+        deck.received_by("b").is_empty(),
+        "the replacement was sent nothing meant for the process it replaced"
+    );
+    assert_eq!(deck.script.lock().unwrap().catalog_edit_requests.len(), 1);
+
+    crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), None)
+        .await
+        .expect("a read bound to the process now answering is answered");
+    crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), Some(catalog_add()))
+        .await
+        .expect("an edit bound to the process now answering is answered");
+    assert_eq!(
+        deck.received_by("b"),
+        ["card-catalog-edit", "card-catalog-edit"]
+    );
+}
+
+/// Scenario (PR #2491 audit, A1): the app asks to read or save a deck's card
+/// actions without naming the daemon process they were read from (no
+/// `instance_id`, or an empty one), here after the deck's daemon restarted as
+/// process `b`. Nothing is sent and no connection is opened: the read is
+/// refused, and the save is refused saying nothing was saved, instead of
+/// going unbound to whichever process answers now. Control: the same save
+/// naming `b` reaches it.
+#[tokio::test]
+async fn a_card_catalog_edit_naming_no_daemon_process_is_refused_before_connecting() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("catalog-edit-unnamed", "a");
+    deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    deck.restart_as("b");
+
+    for instance in [None, Some("")] {
+        let refused =
+            crate::agent_card_catalog_edit_on(&state, &wire, instance, Some(catalog_add()))
+                .await
+                .expect_err("an edit naming no daemon process is refused");
+        assert_eq!(
+            refused,
+            format!("{}; nothing was saved", crate::CARD_CATALOG_DAEMON_UNNAMED),
+            "{instance:?}"
+        );
+        let read = crate::agent_card_catalog_edit_on(&state, &wire, instance, None)
+            .await
+            .expect_err("a read naming no daemon process is refused");
+        assert_eq!(read, crate::CARD_CATALOG_DAEMON_UNNAMED, "{instance:?}");
+    }
+    assert_eq!(
+        deck.hellos("a") + deck.hellos("b"),
+        0,
+        "no connection was opened"
+    );
+    assert!(
+        deck.received_by("b").is_empty(),
+        "the deck was sent nothing"
+    );
+    assert!(deck.script.lock().unwrap().catalog_edit_requests.is_empty());
+
+    crate::agent_card_catalog_edit_on(&state, &wire, Some("b"), Some(catalog_add()))
+        .await
+        .expect("an edit naming the process answering reaches it");
+    assert_eq!(deck.received_by("b"), ["card-catalog-edit"]);
+}
+
+/// Scenario (issue #2399 review, finding 1): the Card actions editor reads and
+/// saves the deck it names. With deck A selected, a read and an edit naming A
+/// reach A alone; a read or an edit naming deck B, which the app is not
+/// observing, is refused and reaches neither deck. Once B is the selected deck,
+/// its read and edit reach B alone, and a form still naming A — the deck it
+/// was opened on — is refused rather than written to the deck now selected.
+#[tokio::test]
+async fn a_card_catalog_edit_reaches_only_the_deck_it_names() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let a = RestartingDeck::start("catalog-edit-route-a", "a");
+    let b = RestartingDeck::start("catalog-edit-route-b", "b");
+    for deck in [&a, &b] {
+        deck.script.lock().unwrap().catalog_edit_capability = Some(true);
+    }
+    let sent = |deck: &RestartingDeck| deck.script.lock().unwrap().catalog_edit_requests.clone();
+    let a_wire = crate::dto::deck_wire_id(&a.endpoint());
+    let b_wire = crate::dto::deck_wire_id(&b.endpoint());
+    assert_ne!(a_wire, b_wire, "precondition: two decks");
+
+    let selected = select(&a);
+    let state = DesktopState::default();
+    crate::agent_card_catalog_edit_on(&state, &a_wire, Some("a"), None)
+        .await
+        .expect("a read of the selected deck is answered");
+    crate::agent_card_catalog_edit_on(&state, &a_wire, Some("a"), Some(catalog_add()))
+        .await
+        .expect("an edit of the selected deck is answered");
+    assert_eq!(sent(&a).len(), 2, "A got its read and its edit");
+    assert_eq!(
+        sent(&a)[1]["edit"],
+        serde_json::to_value(catalog_add()).unwrap()
+    );
+    for edit in [None, Some(catalog_add())] {
+        let refused = crate::agent_card_catalog_edit_on(&state, &b_wire, Some("b"), edit)
+            .await
+            .expect_err("a deck the app does not observe is not edited");
+        assert!(
+            refused.contains("not one this app is observing"),
+            "{refused}"
+        );
+    }
+    assert_eq!(sent(&a).len(), 2, "nothing meant for B reached A");
+    assert!(sent(&b).is_empty(), "nothing reached the unobserved B");
+    drop(selected);
+
+    let _selected = select(&b);
+    let state = DesktopState::default();
+    crate::agent_card_catalog_edit_on(&state, &b_wire, Some("b"), None)
+        .await
+        .expect("a read of the newly selected deck is answered");
+    crate::agent_card_catalog_edit_on(&state, &b_wire, Some("b"), Some(catalog_add()))
+        .await
+        .expect("an edit of the newly selected deck is answered");
+    let stale = crate::agent_card_catalog_edit_on(&state, &a_wire, Some("a"), Some(catalog_add()))
+        .await
+        .expect_err("a form opened on A is not written once A is gone");
+    assert!(stale.contains("not one this app is observing"), "{stale}");
+    assert_eq!(sent(&b).len(), 2, "B got its read and its edit");
+    assert_eq!(sent(&a).len(), 2, "A got nothing after it left");
+}
+
+/// Scenario (issue #2399 review, finding 1): the cards snapshot the webview
+/// draws says whether the deck's daemon advertised the Card actions editor,
+/// which is what makes the editor editable or read-only for that deck: a deck
+/// advertising it reads `catalogEdit: true`, one that does not reads `false`.
+#[tokio::test]
+async fn the_card_catalog_edit_capability_reaches_the_cards_snapshot() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    for advertise in [true, false] {
+        let deck = RestartingDeck::start("catalog-edit-snapshot", "a");
+        {
+            let mut script = deck.script.lock().unwrap();
+            script.catalog_edit_capability = Some(advertise);
+            script.list_cards = true;
+        }
+        let _local = select(&deck);
+        let state = DesktopState::default();
+        state.consume_agent_cards();
+        let wire = crate::dto::deck_wire_id(&deck.endpoint());
+        let cards = crate::agent_cards_list_on(&state, &wire)
+            .await
+            .expect("the deck's cards are read")
+            .expect("the deck advertises cards");
+        let snapshot = serde_json::to_value(&cards).unwrap();
+        assert_eq!(snapshot["deckId"], wire.as_str());
+        assert_eq!(
+            snapshot["catalogEdit"], advertise,
+            "advertised {advertise}: {snapshot:#}"
+        );
+        assert!(
+            deck.script.lock().unwrap().catalog_edit_requests.is_empty(),
+            "reading cards sends no catalog request"
+        );
+    }
 }

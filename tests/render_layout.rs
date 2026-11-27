@@ -234,7 +234,7 @@ fn layout_006_zoom_hides_the_sidebar_and_keeps_the_marked_border() {
 
 /// Scenario: Render the new-pane form with four long orchestration names into
 /// an 80×30 `TestBackend` buffer, so the Mode chip row (`[No mode]`, four
-/// `[Orch: …]` chips, `[schedule]`, `[dispatcher]`) is far wider than the modal,
+/// `[Orch: …]` chips, `[schedule]`, `[schedule: issues]`, `[dispatcher]`) is far wider than the modal,
 /// which is capped at 90% of the terminal. Every chip must render whole between
 /// the modal's `│ … │` borders on some row, exactly once, and the Name and
 /// Command fields must still render below the chips rather than being
@@ -264,6 +264,7 @@ fn layout_007_new_pane_mode_chips_wrap_instead_of_clipping() {
     let mut chips: Vec<String> = vec!["[No mode]".to_string()];
     chips.extend(ORCHESTRATIONS.iter().map(|n| format!("[Orch: {n}]")));
     chips.push("[schedule]".to_string());
+    chips.push("[schedule: issues]".to_string());
     chips.push("[dispatcher]".to_string());
     for chip in &chips {
         let count: usize = inner_rows

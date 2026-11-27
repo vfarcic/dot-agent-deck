@@ -147,18 +147,24 @@ pub struct NewAgentOptions {
     #[serde(default)]
     pub agents: Vec<AgentOption>,
     /// The daemon process's own experimental-flag state
-    /// ([`crate::features::experimental_enabled`]). A client uses it to decide
-    /// which surfaces to show for this deck; the daemon branches on nothing
-    /// here.
+    /// ([`crate::features::experimental_enabled`]). A client may use it to
+    /// decide which surfaces to show for this deck; the daemon branches on
+    /// nothing here.
+    ///
+    /// Issue #193: the one surface a client gated on it, the desktop's
+    /// `schedule: issues` chip, graduated, and this build's desktop no longer
+    /// reads it. It stays on the wire unchanged because a desktop build from
+    /// before #193 still shows that chip only when this reads `true`; dropping
+    /// it would hide the chip from such a build even with the flag on.
     #[serde(default)]
     pub experimental: bool,
     /// The authoring kinds this daemon can compose a seed for — the values
     /// `StartAgent.authoring_kind` accepts ([`crate::authoring_seeds::AuthoringKind::ALL`],
     /// in the TUI Mode cycler's order). Every kind this build knows, whatever
-    /// the experimental flag says: the flag decides what a client SHOWS, which
-    /// is the client's call (the desktop hides `schedule-issues` unless
-    /// [`Self::experimental`] is true, as the TUI hides its chip), not what the
-    /// daemon can do. Empty from a daemon predating PRD #1223 M7, which is the
+    /// the experimental flag says: the flag never decided what the daemon can
+    /// do. Since issue #193 neither client hides `schedule-issues` on the flag
+    /// (a desktop build from before #193 hides it unless [`Self::experimental`]
+    /// is true). Empty from a daemon predating PRD #1223 M7, which is the
     /// honest answer from one that cannot.
     #[serde(default)]
     pub authoring_kinds: Vec<String>,
@@ -535,8 +541,8 @@ mod tests {
             assert_eq!(
                 options.authoring_kinds,
                 ["schedule", "schedule-issues", "dispatcher"],
-                "PRD #1223 M7: the daemon lists every kind it can compose; filtering \
-                 `schedule-issues` on the flag is the client's job"
+                "PRD #1223 M7: the daemon lists every kind it can compose, whatever \
+                 its flag says"
             );
         }
     }

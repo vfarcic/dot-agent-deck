@@ -72,7 +72,7 @@ export function placeCards(decks: readonly { deckId: string | undefined; connect
   });
 }
 
-/** Where the overlay moves: one card on, one back, or to the next card that needs the user. */
+/** Where the pane's header moves: one agent on, one back, or to the next one that needs the user. */
 export type CardStep = "next" | "previous" | "needs-you";
 
 /**
@@ -120,7 +120,7 @@ export function reportStatusLabel(status: string): string {
   return words ? `${words[0].toUpperCase()}${words.slice(1)}` : "Unknown";
 }
 
-/** Why a card needs the user, in words, for its marker's hover and the overlay. */
+/** Why a card needs the user, in words, for its marker's hover and the Card tab. */
 const NEEDS_YOU_REASON: Record<string, string> = {
   stopped: "its agent stopped",
   native_question: "the agent is asking a question in its terminal",
@@ -172,6 +172,11 @@ const DELIVERY_DETAIL: Record<string, string> = {
   cancelled: "cancelled",
 };
 
+/** A delivery state in words, as a card's delivery history says it (`queued` reads "Queued for the agent"). */
+export function deliveryStateWord(state: string): string {
+  return DELIVERY_STATE[state] ?? state.replace(/_/g, " ");
+}
+
 export function deliverySentence(delivery: Pick<NonNullable<AgentCardAction["last_delivery"]>, "state" | "detail">): string {
   const state = DELIVERY_STATE[delivery.state] ?? delivery.state;
   if (!delivery.detail) return state;
@@ -199,30 +204,52 @@ export function fieldValueText(value: unknown): string {
   }
 }
 
-/** A field value the overlay may offer as a link: an `http(s)` URL and nothing else. */
-export function linkOf(type: string, value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  if (type !== "url" && type !== "pull_request" && type !== "issue") return undefined;
-  return /^https?:\/\//i.test(value) ? value : undefined;
-}
+/**
+ * What a spoken label names on a card (PR #2491 review J3, audit K2): one
+ * action, none, or more than one — an ambiguous label is refused, never read
+ * as "none" and retried as something else.
+ */
+export type SpokenLabelMatch =
+  | { outcome: "found"; action: AgentCardAction }
+  | { outcome: "none" }
+  | { outcome: "ambiguous"; count: number };
 
 /**
  * The action a spoken label names on `entry`: an action's label, or a question
  * option's label (its action is `question/<q>/<o>`). Matched ignoring case and
- * surrounding punctuation; `undefined` when none or more than one matches.
+ * surrounding punctuation. The command model gives back "answer main" for
+ * "answer main to the coder" — the verb the user said, then the button's
+ * words — so the phrase is tried again without a leading `answer`, `press`,
+ * `send` or `say`, but only when it named nothing as said: a label that
+ * starts with the verb itself is found whole, and one several buttons share
+ * stays ambiguous.
  */
-export function actionBySpokenLabel(entry: AgentCardEntry, spoken: string): AgentCardAction | undefined {
+export function spokenLabelMatch(entry: AgentCardEntry, spoken: string): SpokenLabelMatch {
   const norm = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
   const wanted = norm(spoken);
-  if (!wanted) return undefined;
+  if (!wanted) return { outcome: "none" };
+  const said = matchSpokenLabel(entry, wanted, norm);
+  if (said.outcome !== "none") return said;
+  const bare = wanted.replace(/^(answer|press|send|say)\s+/, "");
+  return bare !== wanted && bare ? matchSpokenLabel(entry, bare, norm) : said;
+}
+
+/** {@link spokenLabelMatch}'s action when it found exactly one; `undefined` for none and for an ambiguous label. */
+export function actionBySpokenLabel(entry: AgentCardEntry, spoken: string): AgentCardAction | undefined {
+  const match = spokenLabelMatch(entry, spoken);
+  return match.outcome === "found" ? match.action : undefined;
+}
+
+function matchSpokenLabel(entry: AgentCardEntry, wanted: string, norm: (value: string) => string): SpokenLabelMatch {
   const optionLabels = new Map<string, string>();
   for (const question of entry.questions) for (const option of question.options) optionLabels.set(option.action_id, option.label);
   const labelOf = (action: AgentCardAction) => optionLabels.get(action.id) ?? action.label;
-  const exact = entry.actions.filter((action) => norm(labelOf(action)) === wanted || norm(action.id) === wanted);
-  if (exact.length === 1) return exact[0];
-  if (exact.length > 1) return undefined;
-  const partial = entry.actions.filter((action) => norm(labelOf(action)).includes(wanted));
-  return partial.length === 1 ? partial[0] : undefined;
+  const pick = (found: AgentCardAction[]): SpokenLabelMatch | undefined => (
+    found.length === 1 ? { outcome: "found", action: found[0] } : found.length > 1 ? { outcome: "ambiguous", count: found.length } : undefined
+  );
+  return pick(entry.actions.filter((action) => norm(labelOf(action)) === wanted || norm(action.id) === wanted))
+    ?? pick(entry.actions.filter((action) => norm(labelOf(action)).includes(wanted)))
+    ?? { outcome: "none" };
 }
 
 /** The label an action shows: a question option's own label, else the action's. */
@@ -380,14 +407,6 @@ export function exactTextString(value: string): string {
   return exactTextSegments(value).map((segment) => segment.shown).join("");
 }
 
-/**
- * What the overlay is doing besides showing the card: asking to confirm (or,
- * from the table's menu, to review) one action, or taking a reply. A confirm
- * step holds the `token` of the definition it shows, so what the user
- * confirms is what is sent: if the agent changes the action meanwhile, the
- * step says so and sends nothing until the new text was reviewed.
- */
-export type CardOverlayStep = { kind: "confirm"; actionId: string; token: string } | { kind: "reply"; /** Words to put in the reply box when the step opens (a spoken reply). */ text?: string } | { /** Issue #2418 review: opened at the card's checked references, from its `+N`. */ kind: "references" };
 
 /**
  * The answer to the last press of each action definition on one card, by the
@@ -412,6 +431,26 @@ export function acceptCardsSnapshot(held: AgentCardsSnapshot | undefined, next: 
   if (!connection?.connected) return false;
   if (connection.incarnation !== undefined && next.instanceId !== connection.incarnation) return false;
   return !(held && held.instanceId === next.instanceId && next.revision < held.revision);
+}
+
+/**
+ * PR #2491 review L1 — what a deck's CURRENT cards listing says of one
+ * agent's card, for a pane kept on that card while its agent is gone:
+ *
+ * - `listed`: the listing holds it;
+ * - `omitted`: a listing from the daemon process the deck is connected to
+ *   now leaves it out, or that process is not the one the card was for — the
+ *   card is gone, and only this retires the pane;
+ * - `awaiting`: no listing from the current process yet (a deck that has just
+ *   reconnected answers its agents before its cards are read). The agents'
+ *   list says nothing about the cards, so the pane waits.
+ */
+export type CardListing = "listed" | "omitted" | "awaiting";
+
+export function cardListing(snapshot: AgentCardsSnapshot | undefined, connection: { incarnation?: string }, agentId: string, incarnation: string | undefined): CardListing {
+  if (incarnation !== undefined && connection.incarnation !== undefined && connection.incarnation !== incarnation) return "omitted";
+  if (!snapshot || (connection.incarnation !== undefined && snapshot.instanceId !== connection.incarnation)) return "awaiting";
+  return snapshot.entries.some((entry) => entry.agent_id === agentId && (incarnation === undefined || entry.instance_id === "" || entry.instance_id === incarnation)) ? "listed" : "omitted";
 }
 
 /**

@@ -1,0 +1,25 @@
+---
+source: tests/render_upgrade_all_dialog.rs
+expression: text
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Upgrade all daemons ─────────────────────────────────────────────────────────────────────────┐  
+  │                                                                                              │  
+  │ Stopping after this daemon…                                                                  │  
+  │ mac-studio: Kept running: installed 0.52.0; the daemon keeps running 0.51.0, as you chose.   │  
+  │ pi: Skipped: already runs 0.52.0.                                                            │  
+  │ build-box: Upgrading: installing the new version…                                            │  
+  │ laptop: Failed: it could not be checked: ssh: connect to host laptop port 22: No route to    │  
+  │ host                                                                                         │  
+  │                                                                                              │  
+  │                                                                                              │  
+  │ Wait for the daemon being upgraded to finish.                                                │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘
