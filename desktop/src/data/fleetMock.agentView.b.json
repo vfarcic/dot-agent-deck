@@ -1,0 +1,907 @@
+[
+ {
+  "version": "1.0",
+  "createSurface": {
+   "surfaceId": "fleet",
+   "catalogId": "https://agent-deck.devopstoolkit.ai/a2ui/fleet/v1/catalog.json"
+  }
+ },
+ {
+  "version": "1.0",
+  "updateComponents": {
+   "surfaceId": "fleet",
+   "components": [
+    {
+     "id": "st-needs",
+     "component": "Stat",
+     "value": "7",
+     "label": "need your word",
+     "tone": "attention"
+    },
+    {
+     "id": "st-close",
+     "component": "Stat",
+     "value": "1",
+     "label": "safe to close",
+     "tone": "ok"
+    },
+    {
+     "id": "st-work",
+     "component": "Stat",
+     "value": "2",
+     "label": "still working"
+    },
+    {
+     "id": "summary-row",
+     "component": "Row",
+     "children": [
+      "st-needs",
+      "st-close",
+      "st-work"
+     ],
+     "gap": "l",
+     "align": "start"
+    },
+    {
+     "id": "title",
+     "component": "Text",
+     "text": "Seven things wait on you; four of them are pull requests one word from moving.",
+     "variant": "h1"
+    },
+    {
+     "id": "title-note",
+     "component": "Text",
+     "text": "Decisions are the dispatcher's from 13:00. Pull request and issue state below is the deck's own check at 13:17, and in places it has moved since the notes were written.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "header",
+     "component": "Column",
+     "children": [
+      "title",
+      "summary-row",
+      "title-note"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "s1-h",
+     "component": "Text",
+     "text": "Approved, waiting for someone to land them",
+     "variant": "h2"
+    },
+    {
+     "id": "n1-ico",
+     "component": "Icon",
+     "name": "merge"
+    },
+    {
+     "id": "n1-pr",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2501,
+     "detail": "full"
+    },
+    {
+     "id": "n1-head",
+     "component": "Row",
+     "children": [
+      "n1-ico",
+      "n1-pr"
+     ],
+     "gap": "s",
+     "align": "center"
+    },
+    {
+     "id": "n1-t",
+     "component": "Text",
+     "text": "Re-wakes an idle pane whose waiter never takes its mail. The agent reviewer approved it on 2026-11-25, but the unit that opened it has been closed, so nobody is merging it."
+    },
+    {
+     "id": "n1-iss",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2385,
+     "detail": "badge"
+    },
+    {
+     "id": "n1-iss-l",
+     "component": "Text",
+     "text": "Issue",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "n1-iss-row",
+     "component": "Row",
+     "children": [
+      "n1-iss-l",
+      "n1-iss"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "n1-drift",
+     "component": "Text",
+     "text": "The 13:00 note called CI green and ready; compare it with the deck's check above before choosing how to land it.",
+     "variant": "caption",
+     "tone": "attention"
+    },
+    {
+     "id": "n1-b1",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Merge #2501 through merge-pr",
+     "primary": false
+    },
+    {
+     "id": "n1-b2",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Dispatch a unit to update the branch and merge #2501",
+     "primary": false
+    },
+    {
+     "id": "n1-b3",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Leave #2501 for prageethw",
+     "primary": false
+    },
+    {
+     "id": "n1-btns",
+     "component": "Row",
+     "children": [
+      "n1-b1",
+      "n1-b2",
+      "n1-b3"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n1",
+     "component": "Card",
+     "tone": "attention",
+     "children": [
+      "n1-head",
+      "n1-t",
+      "n1-iss-row",
+      "n1-drift",
+      "n1-btns"
+     ]
+    },
+    {
+     "id": "n4-ico",
+     "component": "Icon",
+     "name": "merge"
+    },
+    {
+     "id": "n4-pr",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2528,
+     "detail": "full"
+    },
+    {
+     "id": "n4-head",
+     "component": "Row",
+     "children": [
+      "n4-ico",
+      "n4-pr"
+     ],
+     "gap": "s",
+     "align": "center"
+    },
+    {
+     "id": "n4-t",
+     "component": "Text",
+     "text": "Renovate: lucide-react 1.79.0. Checks green; it waits for a review because the agent reviewer gives Renovate PRs no vote."
+    },
+    {
+     "id": "n4-b1",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Approve #2528 as me and merge",
+     "primary": false
+    },
+    {
+     "id": "n4-b2",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Leave #2528 to Renovate",
+     "primary": false
+    },
+    {
+     "id": "n4-btns",
+     "component": "Row",
+     "children": [
+      "n4-b1",
+      "n4-b2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n4",
+     "component": "Card",
+     "children": [
+      "n4-head",
+      "n4-t",
+      "n4-btns"
+     ]
+    },
+    {
+     "id": "n2-ico",
+     "component": "Icon",
+     "name": "eye"
+    },
+    {
+     "id": "n2-pr",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2523,
+     "detail": "full"
+    },
+    {
+     "id": "n2-head",
+     "component": "Row",
+     "children": [
+      "n2-ico",
+      "n2-pr"
+     ],
+     "gap": "s",
+     "align": "center"
+    },
+    {
+     "id": "n2-t",
+     "component": "Text",
+     "text": "Renovate: devbox 0.23.0. Approved by the agent reviewer, but labelled `manual-review` and `needs-human-eye`: a person has to read it before it merges."
+    },
+    {
+     "id": "n2-b1",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Summarise what devbox 0.23.0 changes for this repo",
+     "primary": true
+    },
+    {
+     "id": "n2-b2",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Merge #2523 through merge-pr",
+     "primary": false
+    },
+    {
+     "id": "n2-btns",
+     "component": "Row",
+     "children": [
+      "n2-b1",
+      "n2-b2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n2",
+     "component": "Card",
+     "children": [
+      "n2-head",
+      "n2-t",
+      "n2-btns"
+     ]
+    },
+    {
+     "id": "s1",
+     "component": "Column",
+     "children": [
+      "s1-h",
+      "n1",
+      "n4",
+      "n2"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "s2-h",
+     "component": "Text",
+     "text": "Failing",
+     "variant": "h2"
+    },
+    {
+     "id": "n3-ico",
+     "component": "Icon",
+     "name": "alert"
+    },
+    {
+     "id": "n3-pr",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2527,
+     "detail": "full"
+    },
+    {
+     "id": "n3-head",
+     "component": "Row",
+     "children": [
+      "n3-ico",
+      "n3-pr"
+     ],
+     "gap": "s",
+     "align": "center"
+    },
+    {
+     "id": "n3-t",
+     "component": "Text",
+     "text": "Renovate: @opencode/cli 2.4.2. `RWX: linux` fails. The same bump last time needed the npm half of the pin in `scripts/opencode-pins/v2/` updated to match `scripts/box/bootstrap.sh`; probably the same here."
+    },
+    {
+     "id": "n3-prev",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2500,
+     "detail": "badge"
+    },
+    {
+     "id": "n3-prev-l",
+     "component": "Text",
+     "text": "Last time",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "n3-prev-row",
+     "component": "Row",
+     "children": [
+      "n3-prev-l",
+      "n3-prev"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "n3-b1",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Fix the pin lockstep on #2527 as on #2500 and push",
+     "primary": false
+    },
+    {
+     "id": "n3-b2",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Read the failure first and tell me",
+     "primary": false
+    },
+    {
+     "id": "n3-btns",
+     "component": "Row",
+     "children": [
+      "n3-b1",
+      "n3-b2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n3",
+     "component": "Card",
+     "tone": "danger",
+     "children": [
+      "n3-head",
+      "n3-t",
+      "n3-prev-row",
+      "n3-btns"
+     ]
+    },
+    {
+     "id": "s2",
+     "component": "Column",
+     "children": [
+      "s2-h",
+      "n3"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "s3-h",
+     "component": "Text",
+     "text": "Questions only you can answer",
+     "variant": "h2"
+    },
+    {
+     "id": "n7-ico",
+     "component": "Icon",
+     "name": "pause"
+    },
+    {
+     "id": "n7-title",
+     "component": "Text",
+     "text": "The cards work is paused for this view",
+     "variant": "h3"
+    },
+    {
+     "id": "n7-head",
+     "component": "Row",
+     "children": [
+      "n7-ico",
+      "n7-title"
+     ],
+     "gap": "s",
+     "align": "center"
+    },
+    {
+     "id": "n7-prd",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2374,
+     "detail": "full"
+    },
+    {
+     "id": "n7-t",
+     "component": "Text",
+     "text": "These four are held until you compare the fleet view mock-ups:"
+    },
+    {
+     "id": "n7-a",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2486,
+     "detail": "badge"
+    },
+    {
+     "id": "n7-b",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2487,
+     "detail": "badge"
+    },
+    {
+     "id": "n7-c",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2395,
+     "detail": "badge"
+    },
+    {
+     "id": "n7-d",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2396,
+     "detail": "badge"
+    },
+    {
+     "id": "n7-held",
+     "component": "Row",
+     "children": [
+      "n7-a",
+      "n7-b",
+      "n7-c",
+      "n7-d"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n7-b1",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Resume the cards queue with #2486",
+     "primary": false
+    },
+    {
+     "id": "n7-b2",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Keep holding",
+     "primary": false
+    },
+    {
+     "id": "n7-btns",
+     "component": "Row",
+     "children": [
+      "n7-b1",
+      "n7-b2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n7",
+     "component": "Card",
+     "children": [
+      "n7-head",
+      "n7-prd",
+      "n7-t",
+      "n7-held",
+      "n7-btns"
+     ]
+    },
+    {
+     "id": "n5-ico",
+     "component": "Icon",
+     "name": "question"
+    },
+    {
+     "id": "n5-title",
+     "component": "Text",
+     "text": "From the batch-actions unit",
+     "variant": "h3"
+    },
+    {
+     "id": "n5-head",
+     "component": "Row",
+     "children": [
+      "n5-ico",
+      "n5-title"
+     ],
+     "gap": "s",
+     "align": "center"
+    },
+    {
+     "id": "n5-q",
+     "component": "Text",
+     "text": "With both filters on, should \"clear the filter\" and \"show everything\" clear the text filter and Needs you only together?",
+     "variant": "quote"
+    },
+    {
+     "id": "n5-t",
+     "component": "Text",
+     "text": "The unit recommends yes; not implemented.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "n5-a",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2399,
+     "detail": "badge"
+    },
+    {
+     "id": "n5-b",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2487,
+     "detail": "badge"
+    },
+    {
+     "id": "n5-refs",
+     "component": "Row",
+     "children": [
+      "n5-a",
+      "n5-b"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n5-b1",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Yes: record it on #2487",
+     "primary": false
+    },
+    {
+     "id": "n5-b2",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "No: keep them separate",
+     "primary": false
+    },
+    {
+     "id": "n5-btns",
+     "component": "Row",
+     "children": [
+      "n5-b1",
+      "n5-b2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n5",
+     "component": "Card",
+     "children": [
+      "n5-head",
+      "n5-q",
+      "n5-t",
+      "n5-refs",
+      "n5-btns"
+     ]
+    },
+    {
+     "id": "n6-ico",
+     "component": "Icon",
+     "name": "flask"
+    },
+    {
+     "id": "n6-title",
+     "component": "Text",
+     "text": "Two tests share the weakness the flaky-test fix (#2530) removed",
+     "variant": "h3"
+    },
+    {
+     "id": "n6-head",
+     "component": "Row",
+     "children": [
+      "n6-ico",
+      "n6-title"
+     ],
+     "gap": "s",
+     "align": "center"
+    },
+    {
+     "id": "n6-t",
+     "component": "Text",
+     "text": "`tests/idle_worker_detector.rs` near lines 2040 and 2136 sends work-done after a fixed 300 ms sleep. They have not failed yet."
+    },
+    {
+     "id": "n6-b1",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Dispatch a unit to make both wait for the task's acknowledgement",
+     "primary": false
+    },
+    {
+     "id": "n6-b2",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Skip",
+     "primary": false
+    },
+    {
+     "id": "n6-btns",
+     "component": "Row",
+     "children": [
+      "n6-b1",
+      "n6-b2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "n6",
+     "component": "Card",
+     "tone": "quiet",
+     "children": [
+      "n6-head",
+      "n6-t",
+      "n6-btns"
+     ]
+    },
+    {
+     "id": "s3",
+     "component": "Column",
+     "children": [
+      "s3-h",
+      "n7",
+      "n5",
+      "n6"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "s4-h",
+     "component": "Text",
+     "text": "Safe to close",
+     "variant": "h2"
+    },
+    {
+     "id": "c1-ag",
+     "component": "AgentRef",
+     "agent": "dispatch-issue-2533",
+     "detail": "full"
+    },
+    {
+     "id": "c1-t",
+     "component": "Text",
+     "text": "Its work is done: `main`'s run 45990241668 for 227fe2cf is green."
+    },
+    {
+     "id": "c1-pr",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2550,
+     "detail": "badge"
+    },
+    {
+     "id": "c1-iss",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2533,
+     "detail": "badge"
+    },
+    {
+     "id": "c1-refs",
+     "component": "Row",
+     "children": [
+      "c1-pr",
+      "c1-iss"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "c1-stale",
+     "component": "Text",
+     "text": "Its own card still reads \"Waiting for review\" and \"Merge when told to\"; the deck's checks above are newer than that report.",
+     "variant": "caption",
+     "tone": "attention"
+    },
+    {
+     "id": "c1-close",
+     "component": "DeckAction",
+     "operation": "close",
+     "agents": [
+      "dispatch-issue-2533"
+     ],
+     "label": "Close dispatch-issue-2533"
+    },
+    {
+     "id": "c1",
+     "component": "Card",
+     "tone": "ok",
+     "children": [
+      "c1-ag",
+      "c1-t",
+      "c1-refs",
+      "c1-stale",
+      "c1-close"
+     ]
+    },
+    {
+     "id": "s4",
+     "component": "Column",
+     "children": [
+      "s4-h",
+      "c1"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "s5-h",
+     "component": "Text",
+     "text": "Still working",
+     "variant": "h2"
+    },
+    {
+     "id": "w1-ag",
+     "component": "AgentRef",
+     "agent": "dispatch-issue-2555",
+     "detail": "full"
+    },
+    {
+     "id": "w1-t",
+     "component": "Text",
+     "text": "A notice's X does nothing while an agent's pane is open. Its card: fixed, running gates, next it commits and opens the PR.",
+     "variant": "caption"
+    },
+    {
+     "id": "w1",
+     "component": "Column",
+     "children": [
+      "w1-ag",
+      "w1-t"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "w2-ag",
+     "component": "AgentRef",
+     "agent": "dispatch-prd-2557-mockups",
+     "detail": "full"
+    },
+    {
+     "id": "w2-t",
+     "component": "Text",
+     "text": "The fleet view mock-ups.",
+     "variant": "caption"
+    },
+    {
+     "id": "w2",
+     "component": "Column",
+     "children": [
+      "w2-ag",
+      "w2-t"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "work-list",
+     "component": "List",
+     "children": [
+      "w1",
+      "w2"
+     ]
+    },
+    {
+     "id": "s5",
+     "component": "Column",
+     "children": [
+      "s5-h",
+      "work-list"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "s6-h",
+     "component": "Text",
+     "text": "Something else",
+     "variant": "h3"
+    },
+    {
+     "id": "disp-ag",
+     "component": "AgentRef",
+     "agent": "dispatcher",
+     "detail": "name"
+    },
+    {
+     "id": "disp-reply",
+     "component": "ReplyButton",
+     "agent": "dispatcher",
+     "label": "Tell the dispatcher"
+    },
+    {
+     "id": "s6",
+     "component": "Card",
+     "tone": "quiet",
+     "children": [
+      "s6-h",
+      "disp-ag",
+      "disp-reply"
+     ]
+    },
+    {
+     "id": "main-col",
+     "component": "Column",
+     "children": [
+      "s1",
+      "s2",
+      "s3"
+     ],
+     "gap": "l",
+     "weight": 2
+    },
+    {
+     "id": "side-col",
+     "component": "Column",
+     "children": [
+      "s4",
+      "s5",
+      "s6"
+     ],
+     "gap": "l",
+     "weight": 1
+    },
+    {
+     "id": "body",
+     "component": "Row",
+     "children": [
+      "main-col",
+      "side-col"
+     ],
+     "gap": "l",
+     "align": "start"
+    },
+    {
+     "id": "root",
+     "component": "Column",
+     "children": [
+      "header",
+      "body"
+     ],
+     "gap": "l"
+    }
+   ]
+  }
+ },
+ {
+  "version": "1.0",
+  "updateDataModel": {
+   "surfaceId": "fleet",
+   "path": "/composedAt",
+   "value": "2026-11-27T13:17:00Z"
+  }
+ }
+]

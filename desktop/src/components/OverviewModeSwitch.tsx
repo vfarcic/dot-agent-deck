@@ -21,7 +21,7 @@ export function OverviewModeSwitch({ mode, controls, consumeCards }: { mode: Ove
   }, [consumeCards]);
   /* PRD 2557 MOCK-UP: the fleet view as a third view of the dashboard, shown only in the mock scene. */
   const mock = fleetMockState() !== undefined;
-  const fleet = mock && fleetMockView() === "fleet";
+  const fleet = mock && fleetMockView() !== "cards";
   return (
     <div className="overview-mode-switch" role="radiogroup" aria-label="Dashboard view" data-testid="overview-mode-switch">
       <button

@@ -1,0 +1,66 @@
+/* PRD 2557 — MOCK-UP styles for the agent-composed fleet view, never merged. Only the app's own tokens. */
+.agent-view { display: flex; flex-direction: column; gap: 14px; padding: 4px 2px 24px; color: var(--ink); }
+.av-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 6px 12px; border: 1px dashed var(--line-strong); border-radius: var(--radius); background: var(--paper-sunken); font-size: var(--text-sm); color: var(--muted); }
+.av-strip > strong { color: var(--ink); font-size: var(--text-base); }
+.av-strip-fresh { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; }
+.av-strip-fresh svg { color: var(--green); }
+.av-strip-refused { color: var(--red); font-weight: 700; }
+.av-surface { display: flex; flex-direction: column; gap: 12px; }
+
+.av-column { display: flex; flex-direction: column; min-width: 0; }
+.av-row { display: flex; flex-wrap: wrap; min-width: 0; }
+.av-row.no-wrap { flex-wrap: nowrap; }
+.av-row.align-start { align-items: flex-start; }
+.av-row.align-center { align-items: center; }
+.av-row.align-end { align-items: flex-end; }
+.av-row > .av-cell { min-width: 0; }
+.gap-s { gap: 5px 6px; }
+.gap-m { gap: 10px 12px; }
+.gap-l { gap: 18px 20px; }
+
+.av-text { margin: 0; line-height: 1.45; font-size: var(--text-base); color: var(--ink-soft); }
+.av-text code { padding: 0 4px; border-radius: 3px; background: var(--paper-sunken-strong); font-size: .92em; }
+.av-text.v-h1 { font-size: 22px; line-height: 1.25; font-weight: 800; color: var(--ink); }
+.av-text.v-h2 { font-size: var(--text-xl); line-height: 1.3; font-weight: 750; color: var(--ink); }
+.av-text.v-h3 { font-size: var(--text-lg); line-height: 1.35; font-weight: 700; color: var(--ink); }
+.av-text.v-caption { font-size: var(--text-sm); color: var(--muted); }
+.av-text.v-quote { padding-left: 10px; border-left: 3px solid var(--line-strong); font-style: italic; }
+.av-text.tone-muted { color: var(--muted); }
+.av-text.tone-attention { color: var(--amber-ink); }
+.av-text.tone-danger { color: var(--red); }
+.av-text.tone-ok { color: var(--green); }
+
+.av-list { display: flex; flex-direction: column; }
+.av-list.dir-vertical > .av-list-item { padding: 7px 0; }
+.av-list.dir-vertical > .av-list-item + .av-list-item { border-top: 1px solid var(--line); }
+.av-list.dir-horizontal { flex-direction: row; flex-wrap: wrap; gap: 6px 0; }
+.av-list.dir-horizontal > .av-list-item { padding: 0 12px; }
+.av-list.dir-horizontal > .av-list-item:first-child { padding-left: 0; }
+.av-list.dir-horizontal > .av-list-item + .av-list-item { border-left: 1px solid var(--line); }
+
+.av-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-strong); min-width: 0; }
+.av-card.tone-attention { border-color: var(--amber-rim); border-left: 4px solid var(--amber); }
+.av-card.tone-danger { border-color: var(--red-rim); border-left: 4px solid var(--red); }
+.av-card.tone-ok { border-color: var(--green-rim); border-left: 4px solid var(--green); }
+.av-card.tone-quiet { border-color: transparent; background: var(--paper-sunken); }
+
+.av-divider { width: 100%; margin: 2px 0; border: 0; border-top: 1px solid var(--line); }
+.av-icon { flex: none; color: var(--muted); }
+.av-icon.icon-bell, .av-icon.icon-alert { color: var(--amber); }
+.av-icon.icon-check, .av-icon.icon-merge { color: var(--green); }
+
+.av-stat { display: flex; flex-direction: column; min-width: 84px; }
+.av-stat strong { font-size: 26px; line-height: 1.1; font-weight: 800; color: var(--ink); }
+.av-stat span { font-size: var(--text-sm); color: var(--muted); }
+.av-stat.tone-attention strong { color: var(--amber-ink); }
+.av-stat.tone-danger strong { color: var(--red); }
+.av-stat.tone-ok strong { color: var(--green); }
+.av-stat.tone-muted strong { color: var(--muted); }
+
+.av-ref.detail-badge .fleet-ref-words { display: none; }
+.av-agent { display: inline-flex; align-items: center; gap: 6px; font-size: var(--text-base); }
+.av-agent small { color: var(--muted); font-size: var(--text-sm); }
+.av-prompt { font-weight: 600; max-width: 100%; text-align: left; }
+.av-prompt span { white-space: normal; }
+.av-prompt.secondary svg { flex: none; color: var(--teal); }
+.av-reply { color: var(--muted); border-style: dashed; font-weight: 600; }

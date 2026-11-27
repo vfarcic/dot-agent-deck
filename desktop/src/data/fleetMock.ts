@@ -26,9 +26,16 @@ export function fleetMockState(): FleetMockState | undefined {
   return mock && FLEET_MOCK_STATES.includes(mock) ? mock : "composed";
 }
 
-export function fleetMockView(): "fleet" | "cards" {
+export function fleetMockView(): "fleet" | "agent" | "cards" {
   if (typeof window === "undefined") return "cards";
-  return new URLSearchParams(window.location.search).get("view") === "fleet" ? "fleet" : "cards";
+  const view = new URLSearchParams(window.location.search).get("view");
+  return view === "fleet" || view === "agent" ? view : "cards";
+}
+
+/** Round 2: which agent's composition the agent-composed view draws (`composer=a|b`). */
+export function fleetMockComposer(): string {
+  if (typeof window === "undefined") return "a";
+  return new URLSearchParams(window.location.search).get("composer") ?? "a";
 }
 
 export interface LivePullRequest {

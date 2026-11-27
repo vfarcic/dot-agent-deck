@@ -22,17 +22,17 @@ import "./FleetViewMock.css";
 const ISSUE_ICON: Record<string, Icon> = { open: IssueOpenedIcon, closed: IssueClosedIcon, merged: GitMergeIcon };
 
 /** Backticked spans as code, everything else as plain text (A2UI Text is text; the deck draws no markup but this). */
-function Prose({ text }: { text: string }) {
+export function Prose({ text }: { text: string }) {
   const parts = text.split(/(`[^`]+`)/g);
   return <>{parts.map((part, at) => part.startsWith("`") && part.endsWith("`") ? <code key={at}>{part.slice(1, -1)}</code> : <Fragment key={at}>{part}</Fragment>)}</>;
 }
 
-function StatusPill({ status }: { status: string }) {
+export function StatusPill({ status }: { status: string }) {
   return <span className={`status-label card-status ${cardStatusClass(status)}`}>{cardStatusLabel(status)}</span>;
 }
 
 /** A pull request or issue the dispatcher named, drawn from the deck's own check — never from the dispatcher's words. */
-function DeckRef({ kind, number }: { kind: "pull_request" | "issue"; number: number }) {
+export function DeckRef({ kind, number }: { kind: "pull_request" | "issue"; number: number }) {
   const ref = deckCheck(kind, number);
   const view = referenceView(ref);
   if (kind === "pull_request" && "pullRequest" in view) {
