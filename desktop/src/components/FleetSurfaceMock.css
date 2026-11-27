@@ -1,0 +1,69 @@
+/* PRD 2557 — MOCK-UP styles, round 3, never merged. Only the app's own tokens. */
+.agent-view { --fs-tone: var(--muted); --fs-tone-soft: var(--paper-sunken-strong); --fs-tone-rim: var(--line-strong); }
+.agent-view .tone-info { --fs-tone: var(--teal); --fs-tone-soft: var(--teal-wash); --fs-tone-rim: var(--teal-edge); }
+.agent-view .tone-attention { --fs-tone: var(--amber); --fs-tone-soft: var(--amber-soft); --fs-tone-rim: var(--amber-rim); }
+.agent-view .tone-danger { --fs-tone: var(--red); --fs-tone-soft: var(--red-soft); --fs-tone-rim: var(--red-rim); }
+.agent-view .tone-ok { --fs-tone: var(--green); --fs-tone-soft: var(--green-soft); --fs-tone-rim: var(--green-rim); }
+.agent-view .tone-muted { --fs-tone: var(--faint); --fs-tone-soft: var(--paper-sunken); --fs-tone-rim: var(--line); }
+
+.av-card.fs-card.tone-info { border-color: var(--teal-edge); border-left: 4px solid var(--teal); }
+.av-card.fs-card.tone-muted { border-color: transparent; background: var(--paper-sunken); }
+
+.fs-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border: 1px solid var(--fs-tone-rim); border-radius: 10px; background: var(--fs-tone-soft); color: var(--ink); font-size: var(--text-sm); font-weight: 700; white-space: nowrap; }
+.fs-chip.tone-attention { color: var(--amber-ink); }
+.fs-chip.tone-danger { color: var(--red); }
+.fs-ref { gap: 6px; }
+
+.fs-progress { display: flex; flex-direction: column; gap: 4px; min-width: 160px; }
+.fs-progress-head { display: flex; justify-content: space-between; gap: 8px; font-size: var(--text-sm); color: var(--ink-soft); }
+.fs-progress-head small { color: var(--muted); }
+.fs-progress-track { height: 8px; border-radius: 4px; background: var(--paper-sunken-strong); overflow: hidden; }
+.fs-progress-track i { display: block; height: 100%; background: var(--fs-tone); }
+.fs-progress.tone-default .fs-progress-track i { background: var(--teal); }
+
+.fs-chart { margin: 0; display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
+.fs-chart figcaption { font-size: var(--text-sm); font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.fs-bar-row { display: grid; grid-template-columns: minmax(90px, max-content) 1fr 28px; align-items: center; gap: 8px; font-size: var(--text-sm); }
+.fs-bar-label { color: var(--ink-soft); }
+.fs-bar-track { height: 10px; border-radius: 5px; background: var(--paper-sunken-strong); overflow: hidden; }
+.fs-bar-track i { display: block; height: 100%; background: var(--fs-tone); }
+.fs-bar-track i.tone-default { background: var(--teal); }
+.fs-bar-row strong { text-align: right; }
+.fs-donut-body { display: flex; align-items: center; gap: 14px; }
+.fs-donut-body ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; font-size: var(--text-sm); color: var(--ink-soft); }
+.fs-donut-body li { display: flex; align-items: center; gap: 6px; }
+.fs-donut-track { fill: none; stroke: var(--paper-sunken-strong); stroke-width: 6; }
+.fs-donut-arc { fill: none; stroke: var(--fs-tone); stroke-width: 6; }
+.fs-donut-arc.tone-default { stroke: var(--teal); }
+.fs-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--fs-tone); }
+.fs-dot.tone-default { background: var(--teal); }
+
+.fs-board { display: grid; gap: 10px; align-items: start; }
+.fs-lane { display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--line); border-top: 3px solid var(--fs-tone); border-radius: var(--radius); background: var(--paper-sunken); }
+.fs-lane.tone-default { border-top-color: var(--line-strong); }
+.fs-lane > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 10px; font-size: var(--text-sm); font-weight: 800; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-soft); }
+.fs-lane > header b { min-width: 20px; height: 20px; padding: 0 6px; display: inline-grid; place-items: center; border-radius: 10px; background: var(--fs-tone-soft); border: 1px solid var(--fs-tone-rim); color: var(--ink); letter-spacing: 0; }
+.fs-lane-body { display: flex; flex-direction: column; gap: 8px; padding: 0 8px 8px; }
+.fs-lane-body > .av-card { padding: 8px 10px; gap: 6px; }
+
+.fs-timeline { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+.fs-timeline li { position: relative; display: grid; grid-template-columns: 12px 46px 1fr; align-items: baseline; gap: 8px; padding: 4px 0; font-size: var(--text-base); color: var(--ink-soft); }
+.fs-timeline li .fs-dot { position: relative; top: 1px; }
+.fs-timeline li + li::before { content: ""; position: absolute; left: 4px; top: -6px; height: 14px; border-left: 1px solid var(--line-strong); }
+.fs-timeline time { color: var(--muted); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+
+.fs-input-label { font-size: var(--text-sm); font-weight: 700; color: var(--muted); }
+.fs-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.fs-picker.is-checkboxes { flex-direction: column; align-items: stretch; gap: 0; }
+.fs-picker.is-checkboxes legend { padding: 0 0 4px; }
+.fs-check { display: flex; align-items: center; gap: 8px; padding: 5px 2px; font-size: var(--text-base); color: var(--ink-soft); }
+.fs-check + .fs-check { border-top: 1px solid var(--line); }
+.fs-check input { width: 15px; height: 15px; accent-color: var(--teal); }
+.fs-choice-chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--paper-strong); font-size: var(--text-sm); font-weight: 650; }
+.fs-choice-chip.is-chosen { border-color: var(--teal-edge); background: var(--teal-wash); color: var(--teal-wash-ink); }
+.fs-select, .fs-text { min-height: 30px; padding: 4px 8px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--paper-strong); color: var(--ink); font: inherit; font-size: var(--text-base); }
+.fs-picker.is-dropdown { display: inline-flex; }
+.fs-field { display: flex; flex-direction: column; gap: 4px; min-width: 260px; }
+.fs-text { width: 100%; box-sizing: border-box; }
+.agent-view .av-prompt:disabled { opacity: .55; cursor: not-allowed; }
+.av-column > .av-prompt { align-self: flex-start; }

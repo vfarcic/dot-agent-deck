@@ -10,6 +10,8 @@ const CAPTURED = (JSON.parse(fs.readFileSync(path.join(import.meta.dirname, ".."
 const SETTINGS_KEY = "dot-agent-deck.desktop-settings";
 const HEIGHT = Number(process.env.FLEET_MOCK_HEIGHT ?? "2200");
 const COMPOSERS = (process.env.FLEET_MOCK_COMPOSERS ?? "a,b").split(",");
+/* Round 2 (`a`, `b`) is the `agent` view; round 3 (`dispatcher`, `standin-N`) the `surface` view. */
+const viewOf = (composer: string) => (composer === "a" || composer === "b" ? "agent" : "surface");
 
 test.use({ viewport: { width: 1280, height: HEIGHT } });
 
@@ -19,7 +21,7 @@ async function shoot(page: Page, composer: string, theme: "light" | "dark"): Pro
   await page.addInitScript(([key, mode]) => {
     window.localStorage.setItem(key, JSON.stringify({ version: 1, appearance: { mode }, zoom: { level: 1 } }));
   }, [SETTINGS_KEY, theme] as const);
-  await page.goto(`/?fixture=1&state=docs&cards=fleet-mock&mock=composed&view=agent&composer=${composer}`);
+  await page.goto(`/?fixture=1&state=docs&cards=fleet-mock&mock=composed&view=${viewOf(composer)}&composer=${composer}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   if (!(await page.getByTestId("overview-mode-switch").isVisible())) await page.getByTestId("open-overview").click();
   await expect(page.getByTestId("fleet-view")).toBeVisible();

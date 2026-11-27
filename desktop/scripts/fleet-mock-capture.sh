@@ -7,12 +7,25 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$HERE/src/data/fleetMock.live.json"
+OUT="${FLEET_MOCK_LIVE_OUT:-$HERE/src/data/fleetMock.live.json}"
 DAD="${DAD_BIN:-$HOME/.local/bin/dot-agent-deck}"
 REPO=vfarcic/dot-agent-deck
 PRS=(2501 2523 2527 2528 2550)
 ISSUES=(2385 2399 2487 2530 2533 2555 2557 2374 2486 2395 2396)
 MAIN_RUN=45990241668
+# Round 3: also every pull request and issue a composed view names (FLEET_MOCK_REFS_FROM, comma-separated view files).
+if [[ -n "${FLEET_MOCK_REFS_FROM:-}" ]]; then
+  IFS=, read -ra views <<< "$FLEET_MOCK_REFS_FROM"
+  while read -r kind n; do
+    if [[ $kind == pull_request ]]; then PRS+=("$n"); else ISSUES+=("$n"); fi
+  done < <(python3 -I -c 'import json,sys
+for path in sys.argv[1:]:
+    for m in json.load(open(path)):
+        for c in m.get("updateComponents", {}).get("components", []):
+            if c.get("component") == "DeckRef": print(c.get("kind"), int(c.get("number")))' "${views[@]}" | sort -u)
+  mapfile -t PRS < <(printf '%s\n' "${PRS[@]}" | sort -un)
+  mapfile -t ISSUES < <(printf '%s\n' "${ISSUES[@]}" | sort -un)
+fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -20,10 +33,10 @@ trap 'rm -rf "$tmp"' EXIT
 "$DAD" daemon status > "$tmp/status.tsv"
 "$DAD" card list > "$tmp/cards.json"
 for n in "${PRS[@]}"; do
-  gh pr view "$n" --repo "$REPO" --json number,title,state,reviewDecision,mergeStateStatus,labels,author,mergedAt,mergeCommit,statusCheckRollup > "$tmp/pr-$n.json" 2>/dev/null
+  gh pr view "$n" --repo "$REPO" --json number,title,state,reviewDecision,mergeStateStatus,labels,author,mergedAt,mergeCommit,statusCheckRollup > "$tmp/pr-$n.json" 2>/dev/null || { echo "not a pull request: #$n" >&2; rm -f "$tmp/pr-$n.json"; }
 done
 for n in "${ISSUES[@]}"; do
-  gh issue view "$n" --repo "$REPO" --json number,title,state,labels > "$tmp/issue-$n.json"
+  gh issue view "$n" --repo "$REPO" --json number,title,state,labels > "$tmp/issue-$n.json" 2>/dev/null || { echo "not an issue: #$n" >&2; rm -f "$tmp/issue-$n.json"; }
 done
 gh run view "$MAIN_RUN" --repo "$REPO" --json databaseId,conclusion,status,headSha > "$tmp/run.json"
 
