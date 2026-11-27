@@ -41,7 +41,7 @@ Applies when the diff touches the daemon, the TUI↔daemon protocol, orchestrati
 
 - [ ] A new user-visible surface (pane, field, command, tab, footer, keybinding) ships visible unless a person's explicit instruction to gate it is recorded (in the PRD, the issue or the PR). A surface that is not gated is **not** a finding; a surface gated without such an instruction is.
 - [ ] If a person asked for the flag: exactly **one** wrapper in `src/features.rs` (`show_<feature>()`), and it is checked **only at the render / input-binding seam**. Business logic, daemon protocols, and hook handling must not branch on the flag — it is a presentation switch (M3.2).
-- [ ] The flag is noted in the PRD, the changelog fragment, and `docs/develop/experimental-flag.md`, and a `graduate-<feature>` follow-up issue exists.
+- [ ] The flag is noted in the PRD, the changelog fragment, and `docs/develop/experimental-flag.md`, and a `graduate-<feature>` follow-up issue exists and carries the `graduation` label (the stale bot closes it otherwise).
 
 ## F. Docs and changelog
 
