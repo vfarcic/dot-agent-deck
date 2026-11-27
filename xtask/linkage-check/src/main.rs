@@ -282,6 +282,11 @@ mod review_findings;
 /// script is driven under `bash` against an offline `gh` stand-in.
 #[cfg(all(test, unix))]
 mod review_wait;
+/// PR #2523: renovate.json's jetify-com/devbox manager moves the `devbox`
+/// task's tarball SHA-256 with `DEVBOX_USE_VERSION`. Tests only: the task
+/// itself is what fails when the two disagree, and only on an RWX run.
+#[cfg(test)]
+mod rwx_devbox_checksum;
 /// Issue #2529: the tool caches of `.rwx/ci.yml`'s tasks built on `nix-install`
 /// carry the Nix release in their names, and renovate.json's NixOS/nix manager
 /// moves those names with `NIX_VERSION`. Tests only — RWX accepts any name, so
