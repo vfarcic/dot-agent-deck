@@ -517,27 +517,35 @@ pub const HOSTED_COMMAND_MODEL: &str = "claude-haiku-4-5";
 /// 2026-12-11. Measured 2026-11-26 with a real key through the shipped builder
 /// and parser: every fixture `voice_desktop_phrases_001` and `_002` run (407 in
 /// all) plus judge tests 003–009, `--test-threads=1`. `gpt-5-mini` ran on
-/// `main`'s prompts; `gpt-6-luna` ran on this file's prompts, after the tuning
-/// below. Cost charges every input token at the uncached rate of the 2026-10-22
-/// list prices, so it is an upper bound: 97–100% of input tokens were cached.
+/// `main`'s prompts, the others on this file's. Cost charges every input token
+/// at the uncached rate of the 2026-10-22 list prices, so it is an upper bound:
+/// 97–100% of input tokens were cached.
 ///
-/// | model (effort) | fixtures, by run | judges 003–009 | median | p90 | per 1,000 requests |
+/// | model (effort) | fixtures /407, by run | judges 003–009 | median | p90 | per 1,000 requests |
 /// | --- | --- | --- | ---: | ---: | ---: |
 /// | `gpt-5-mini` (`minimal`) | 399, 392 | 005 and 009 red in both full runs, green re-run alone | 1,198 ms | 1,472 ms | $4.00 |
 /// | `gpt-6-luna` (`none`), before tuning | 394 | 006 red in both runs | — | — | — |
-/// | `gpt-6-luna` (`none`) | 397, 394, 396 | green in all three | **961 ms** | **1,269 ms** | **$1.58** |
+/// | `gpt-6-luna` (`none`), as shipped | 391, 394 | green in both | 972 ms | 1,290 ms | **$1.58** |
+/// | `gpt-6-luna` (`none`), two earlier tunings | 397, 394, 396; 394, 394 | 009 red once in five | — | — | — |
+/// | `gpt-5.4-mini` (`none`) | 385, 378 | 005 red once, 009 red once | 809 ms | 997 ms | $11.92 |
 ///
 /// `gpt-5-mini`'s first run lost 23 fixtures to the organisation's rate limit;
-/// its 399 is that run with those 23 re-run, two of which failed. So the two are
-/// level on the manifest, and `gpt-6-luna` is faster, at about 0.4× the cost.
-/// The tuning was three changes, each measured on its own first: the meaning
-/// check's sentence about bare starts ([`crate::voice::meaning`]), which took
-/// 006 from red to green; the sentence in the OpenAI params description about
-/// copying a listed name ([`crate::voice::openai`]); and a second, filler-free
-/// try at a directory reference ([`crate::voice::outcome::resolve_dir_ref`]).
-/// What it missed in all three runs: `open-overview-running`, `deck-hidden-go-back`
-/// (red on `gpt-5-mini` in both runs too), `filter-directories-dialog-closed`,
-/// `close-orchestration-by-category` and `choose-mode-dispatcher-chip-label`.
+/// its 399 is that run with those 23 re-run, two of which failed. The two
+/// earlier tunings differed from the shipped one only by a sentence in the
+/// OpenAI params description, dropped because it could settle an ambiguous
+/// reference itself; replaying the captured requests ten times each, it
+/// changed no deck answer by more than one in ten. So across seven tuned runs `gpt-6-luna` scored 391 to
+/// 397, inside `gpt-5-mini`'s 392 to 399, at about 0.4× its cost, and
+/// `gpt-5.4-mini` trailed both at about 3× `gpt-5-mini`'s cost. The tuning:
+/// the meaning check's sentence about bare starts ([`crate::voice::meaning`]),
+/// which took 006 from red to green, and two more tries at a directory
+/// reference that matches nothing ([`crate::voice::outcome::resolve_dir_ref`]).
+/// Missed by `gpt-6-luna` in both shipped runs: `choose-new-agent-deck-not-switch`,
+/// `open-overview-running`, `deck-hidden-go-back` (red on `gpt-5-mini` in one
+/// of its two runs), `close-back`, `choose-deck-glued-name`,
+/// `filter-directories-dialog-closed`, `close-orchestration-by-category`,
+/// `close-orchestration-the-whole-run`, `start-orchestration-button-label`,
+/// `choose-mode-orch-chip-label` and `choose-mode-dispatcher-chip-label`.
 ///
 /// The 2026-09-20 measurement that made `gpt-5-mini` the default, on the 24
 /// fixtures of the day: 24/24 at an 818 ms median with `minimal`, and 24/24
@@ -554,8 +562,8 @@ pub const OPENAI_COMMAND_MODEL: &str = "gpt-6-luna";
 /// as at provider-default reasoning, spending **zero** reasoning tokens at
 /// half the latency and half the price. `gpt-6-luna` refuses `minimal` with a
 /// 400 that lists `none`, `low`, `medium`, `high` and `xhigh`, so the preset
-/// sends `none`, which spent zero reasoning tokens across the 5,078 requests
-/// above, the largest reply being 108 completion tokens.
+/// sends `none`, which spent zero reasoning tokens across the 5,078 logged
+/// requests above, the largest reply being 108 completion tokens.
 ///
 /// # Why it is scoped to the preset and cannot leak
 ///

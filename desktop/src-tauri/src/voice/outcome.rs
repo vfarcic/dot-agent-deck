@@ -6534,6 +6534,8 @@ pub enum DirRefMatch {
 /// a second attempt rather than the first, so a reference that already matches
 /// keeps the answer it had: "the billing folder" beside both `billing` and
 /// `billing-service` is still `billing`, which the whole reference names.
+/// A reference that still matches nothing is compared run together
+/// ([`match_run_together`]).
 /// `gpt-6-luna` handed the user's words back as the value for `open-dir-by-one-word`
 /// and `open-dir-by-its-last-word` (2026-11-26), two fixtures `gpt-5-mini`
 /// passed in both of its runs that day.
@@ -6554,10 +6556,49 @@ pub fn resolve_dir_ref(spoken: &str, directories: Option<&VoiceDirectories>) -> 
         .filter(|word| !DIR_REF_FILLER.contains(word))
         .collect::<Vec<_>>()
         .join(" ");
-    if bare.is_empty() || bare == reference {
-        return found;
+    if !bare.is_empty() && bare != reference {
+        let found = match_dir_ref(&bare, directories);
+        if found != DirRefMatch::None {
+            return found;
+        }
     }
-    match_dir_ref(&bare, directories)
+    match_run_together(&bare, directories)
+}
+
+/// The last try for a directory reference, a name spoken or transcribed run
+/// together ("BillingService" for `billing-service`, issue #1820): the
+/// reference and each name compared with case and every character but letters
+/// and digits removed. Only an exact match counts, and two of them are
+/// ambiguous.
+fn match_run_together(reference: &str, directories: &VoiceDirectories) -> DirRefMatch {
+    let compact = |value: &str| -> String {
+        value
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let reference = compact(reference);
+    if reference.is_empty() {
+        return DirRefMatch::None;
+    }
+    let hits: Vec<_> = directories
+        .entries
+        .iter()
+        .filter(|entry| compact(&entry.name) == reference)
+        .collect();
+    match hits.as_slice() {
+        [] => DirRefMatch::None,
+        [one] => DirRefMatch::One {
+            path: one.path.clone(),
+            name: one.name.clone(),
+        },
+        _ => DirRefMatch::Ambiguous(
+            hits.iter()
+                .map(|entry| Candidate::new(&entry.path, &entry.name))
+                .collect(),
+        ),
+    }
 }
 
 /// The words a directory reference may carry around the name without naming
@@ -9765,9 +9806,10 @@ mod tests {
     }
 
     /// Scenario (issue #1820): the command model hands back the user's own
-    /// words, "the service directory" or "the billing folder", for a listed
-    /// `billing-service`. With the filler words dropped they name it; a
-    /// reference the whole of which already matches keeps that answer.
+    /// words, "the service directory", "the billing folder" or
+    /// "BillingService", for a listed `billing-service`. With the filler words
+    /// dropped, or compared run together, they name it; a reference the whole
+    /// of which already matches keeps that answer.
     #[test]
     fn voice_outcome_dir_ref_drops_filler_only_when_nothing_matched() {
         let level = listing(&["billing-service", "docs", "infra"], true);
@@ -9785,6 +9827,30 @@ mod tests {
         assert_eq!(
             resolve_dir_ref("the folder", Some(&level)),
             DirRefMatch::None
+        );
+        // A name run together is compared with its separators removed.
+        for said in [
+            "BillingService",
+            "billingservice",
+            "the BillingService folder",
+        ] {
+            assert_eq!(
+                resolve_dir_ref(said, Some(&level)),
+                DirRefMatch::One {
+                    path: "/home/dev/code/billing-service".to_string(),
+                    name: "billing-service".to_string(),
+                },
+                "{said}"
+            );
+        }
+        // Two names that are the same run together are ambiguous.
+        let twins = listing(&["billing-service", "billing.service", "docs"], true);
+        assert_eq!(
+            resolve_dir_ref("BillingService", Some(&twins)).ambiguous_labels(),
+            Some(vec![
+                "billing-service".to_string(),
+                "billing.service".to_string()
+            ])
         );
         // `billing` is named by the whole reference, so the retry never runs
         // and `billing-service` does not make it ambiguous.

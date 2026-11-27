@@ -78,18 +78,8 @@ use super::resolver::{IntentAnswer, IntentError, IntentRequest};
 use super::schema::{AnnotatedCommand, CHAIN_INSTRUCTIONS, TOOL_INSTRUCTIONS, TOOL_NAME};
 
 /// What `params` is described as to the model.
-///
-/// The "exactly as listed" sentence is for `gpt-6-luna` (issue #1820), which
-/// read "as the user referred to them" over a row's own "exactly as listed"
-/// and handed back the user's words. In five replays of each captured request
-/// (2026-11-26) it took "open dir BillingService" from `BillingService` 5 of 5
-/// to `billing-service` 4 of 5, and "shut down the whole run" from the words
-/// 5 of 5 to the listed title 2 of 5.
 const PARAMS_DESCRIPTION: &str = "The params the chosen action declares, as the user referred to \
-    them — or the agent's `label`, for a reference the user made by state. Where the action's \
-    description says to set a param exactly as listed, copy the listed name the user meant from \
-    the state, never the user's own words: for \"open the api folder\" over a listed \
-    `payments-api`, the value is `payments-api`, not `the api folder`. List only a param the \
+    them — or the agent's `label`, for a reference the user made by state. List only a param the \
     user's own words refer to; leave out every other, including one the chosen action takes but \
     the user did not mention — never fill one in from the screen. The app resolves each one \
     against live state.";
