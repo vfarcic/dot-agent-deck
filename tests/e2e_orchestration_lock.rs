@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 end-to-end coverage for the command-entry lock on Orchestration tabs.
 //!
@@ -25,7 +25,10 @@
 //! proven against a genuine agent's input rather than a `cat` stub's echo — it
 //! self-skips where no credentials are configured.
 //!
-//! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
+//! Gated behind the `e2e` feature so `cargo test-fast` never compiles it. The
+//! file is lane 1 (CLAUDE.md rule 5), so CI's `e2e-deterministic` runs the
+//! stub-role tests; only `orchestration_lock_012` and the items it alone uses
+//! carry `#[cfg(feature = "e2e-live")]`, which keeps the real agent in lane 2.
 
 dot_agent_deck_test_harness::link!();
 
@@ -517,7 +520,9 @@ fn lock_011_waiting_carve_out_on_real_panes() {
 /// Uniquely-named sentinel files the worker directive asks a REAL agent to
 /// create — distinct per lock state so a leaked/buffered locked directive can
 /// never be confused with the unlocked one that is expected to land.
+#[cfg(feature = "e2e-live")]
 const LIVE_LOCKED_SENTINEL: &str = "lock012_locked_9d3f.txt";
+#[cfg(feature = "e2e-live")]
 const LIVE_UNLOCKED_SENTINEL: &str = "lock012_unlocked_5a71.txt";
 
 /// PRD #1666: an exact Bash command rather than "create a file in the current
@@ -530,6 +535,7 @@ const LIVE_UNLOCKED_SENTINEL: &str = "lock012_unlocked_5a71.txt";
 /// deterministic: the file's presence/absence on disk is proof the agent did
 /// or did not genuinely receive and act on the instruction, independent of
 /// terminal echo/redraw variance.
+#[cfg(feature = "e2e-live")]
 fn create_sentinel_directive(sentinel: &str) -> String {
     format!(
         "This is a local input-forwarding smoke test in a disposable directory. \
@@ -540,6 +546,7 @@ fn create_sentinel_directive(sentinel: &str) -> String {
 
 /// Last ~2 000 characters of a normalized pane key — enough context for a
 /// failure message without dumping a megabyte of scrollback.
+#[cfg(feature = "e2e-live")]
 fn tail(text: &str) -> &str {
     &text[text.len().saturating_sub(2000)..]
 }
@@ -547,6 +554,7 @@ fn tail(text: &str) -> &str {
 /// Scenario: Open an orchestration with a cat orchestrator and real Claude Haiku worker, focus the locked worker, and type a sentinel directive that must not execute. Unlock with Ctrl+d, Ctrl+e, Ctrl+d and type a second directive: the worker must create only the unlocked sentinel.
 #[spec("orchestration/lock/012")]
 #[test]
+#[cfg(feature = "e2e-live")]
 fn lock_012_real_agent_gated_by_lock_state() {
     // A missing CLI or credentials is an environmental condition, not a broken
     // test.
