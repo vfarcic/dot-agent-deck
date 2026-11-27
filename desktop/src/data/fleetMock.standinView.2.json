@@ -1,0 +1,1084 @@
+[
+ {
+  "version": "1.0",
+  "createSurface": {
+   "surfaceId": "fleet",
+   "catalogId": "https://agent-deck.devopstoolkit.ai/a2ui/fleet/v1/catalog.json"
+  }
+ },
+ {
+  "version": "1.0",
+  "updateComponents": {
+   "surfaceId": "fleet",
+   "components": [
+    {
+     "id": "title",
+     "component": "Text",
+     "text": "Fleet: what waits on you, and where the work stands",
+     "variant": "h1"
+    },
+    {
+     "id": "subtitle",
+     "component": "Text",
+     "text": "Composed from the deck's snapshot of 20:38 UTC, 27 Nov. Five things wait on you; one unit is working; main's CI is known only up to #2550.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "header",
+     "component": "Column",
+     "children": [
+      "title",
+      "subtitle"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "st-needs",
+     "component": "Stat",
+     "value": "5",
+     "label": "waiting on you",
+     "tone": "attention"
+    },
+    {
+     "id": "st-open",
+     "component": "Stat",
+     "value": "7",
+     "label": "open pull requests"
+    },
+    {
+     "id": "st-merged",
+     "component": "Stat",
+     "value": "3",
+     "label": "merged today",
+     "tone": "ok"
+    },
+    {
+     "id": "st-agents",
+     "component": "Stat",
+     "value": "1 / 2",
+     "label": "agents working",
+     "tone": "info"
+    },
+    {
+     "id": "st-main",
+     "component": "Stat",
+     "value": "?",
+     "label": "main CI after #2556, #2558",
+     "tone": "attention"
+    },
+    {
+     "id": "stats",
+     "component": "Row",
+     "children": [
+      "st-needs",
+      "st-open",
+      "st-merged",
+      "st-agents",
+      "st-main"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "needs-h",
+     "component": "Text",
+     "text": "Waiting on you",
+     "variant": "h2"
+    },
+    {
+     "id": "a-head-icon",
+     "component": "Icon",
+     "name": "eye"
+    },
+    {
+     "id": "a-head-text",
+     "component": "Text",
+     "text": "Fleet view mock-ups: your word on #2557",
+     "variant": "h3"
+    },
+    {
+     "id": "a-head",
+     "component": "Row",
+     "children": [
+      "a-head-icon",
+      "a-head-text"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "a-issue",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2557,
+     "detail": "status"
+    },
+    {
+     "id": "a-agent",
+     "component": "AgentRef",
+     "agent": "dispatch-prd-2557-mockups",
+     "detail": "full"
+    },
+    {
+     "id": "a-refs",
+     "component": "Row",
+     "children": [
+      "a-issue",
+      "a-agent"
+     ],
+     "gap": "m",
+     "align": "start"
+    },
+    {
+     "id": "a-body",
+     "component": "Text",
+     "text": "The unit reported at 13:31 that the mock-ups are posted on #2557 and it waits for you to confirm them or ask for changes. Its card still reads \"Round 1 posted\", so that field may be behind what is on the issue."
+    },
+    {
+     "id": "a-feedback",
+     "component": "TextField",
+     "path": "/mockupFeedback",
+     "label": "Changes you want",
+     "placeholder": "What to change in the fleet view mock-ups",
+     "multiline": true
+    },
+    {
+     "id": "a-ok",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "The #2557 fleet view mock-ups are confirmed; go on to the next milestone",
+     "primary": true
+    },
+    {
+     "id": "a-change",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Change the #2557 fleet view mock-ups: {/mockupFeedback}"
+    },
+    {
+     "id": "a-btns",
+     "component": "Row",
+     "children": [
+      "a-ok",
+      "a-change"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "card-a",
+     "component": "Card",
+     "tone": "attention",
+     "children": [
+      "a-head",
+      "a-refs",
+      "a-body",
+      "a-feedback",
+      "a-btns"
+     ]
+    },
+    {
+     "id": "b-head-icon",
+     "component": "Icon",
+     "name": "eye"
+    },
+    {
+     "id": "b-head-text",
+     "component": "Text",
+     "text": "devbox 0.23.0 (#2523) asks for a person to look",
+     "variant": "h3"
+    },
+    {
+     "id": "b-head",
+     "component": "Row",
+     "children": [
+      "b-head-icon",
+      "b-head-text"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "b-pr",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2523,
+     "detail": "full"
+    },
+    {
+     "id": "b-chip1",
+     "component": "Chip",
+     "text": "needs-human-eye",
+     "tone": "attention"
+    },
+    {
+     "id": "b-chip2",
+     "component": "Chip",
+     "text": "manual-review",
+     "tone": "attention"
+    },
+    {
+     "id": "b-chips",
+     "component": "Row",
+     "children": [
+      "b-chip1",
+      "b-chip2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "b-body",
+     "component": "Text",
+     "text": "Renovate labelled it for a human even though the agent reviewer approved it. The snapshot does not say what to look at."
+    },
+    {
+     "id": "b-merge",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "I have looked at #2523 (devbox 0.23.0): merge it",
+     "primary": true
+    },
+    {
+     "id": "b-summary",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Summarise what devbox 0.23.0 changes for us before I decide on #2523"
+    },
+    {
+     "id": "b-hold",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Hold #2523; leave it open"
+    },
+    {
+     "id": "b-btns",
+     "component": "Row",
+     "children": [
+      "b-merge",
+      "b-summary",
+      "b-hold"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "card-b",
+     "component": "Card",
+     "tone": "attention",
+     "children": [
+      "b-head",
+      "b-pr",
+      "b-chips",
+      "b-body",
+      "b-btns"
+     ]
+    },
+    {
+     "id": "c-head-icon",
+     "component": "Icon",
+     "name": "alert"
+    },
+    {
+     "id": "c-head-text",
+     "component": "Text",
+     "text": "The doorbell re-wake fix (#2501) is approved but conflicts with main",
+     "variant": "h3"
+    },
+    {
+     "id": "c-head",
+     "component": "Row",
+     "children": [
+      "c-head-icon",
+      "c-head-text"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "c-pr",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2501,
+     "detail": "full"
+    },
+    {
+     "id": "c-issue",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2385,
+     "detail": "badge"
+    },
+    {
+     "id": "c-fixes",
+     "component": "Text",
+     "text": "fixes",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "c-refs",
+     "component": "Row",
+     "children": [
+      "c-fixes",
+      "c-issue"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "c-body",
+     "component": "Text",
+     "text": "No agent in the deck is working on it. Resolving the conflict means a new commit, which voids the approval, so it will need reviewing again."
+    },
+    {
+     "id": "c-fix",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Resolve #2501's conflict with main and get it re-reviewed",
+     "primary": true
+    },
+    {
+     "id": "c-leave",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Leave #2501 as it is for now"
+    },
+    {
+     "id": "c-btns",
+     "component": "Row",
+     "children": [
+      "c-fix",
+      "c-leave"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "card-c",
+     "component": "Card",
+     "tone": "danger",
+     "children": [
+      "c-head",
+      "c-pr",
+      "c-refs",
+      "c-body",
+      "c-btns"
+     ]
+    },
+    {
+     "id": "d-head-icon",
+     "component": "Icon",
+     "name": "question"
+    },
+    {
+     "id": "d-head-text",
+     "component": "Text",
+     "text": "Two issues are claimed in-progress with no agent on them",
+     "variant": "h3"
+    },
+    {
+     "id": "d-head",
+     "component": "Row",
+     "children": [
+      "d-head-icon",
+      "d-head-text"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "d-2374",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2374,
+     "detail": "status"
+    },
+    {
+     "id": "d-2385",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2385,
+     "detail": "status"
+    },
+    {
+     "id": "d-refs",
+     "component": "Row",
+     "children": [
+      "d-2374",
+      "d-2385"
+     ],
+     "gap": "m",
+     "align": "start"
+    },
+    {
+     "id": "d-body",
+     "component": "Text",
+     "text": "Only #2557 has a live agent in the deck. #2374 (the agent cards PRD) and #2385 (the bug #2501 fixes) both carry in-progress. The claims may be held from somewhere the deck cannot see, so check before releasing."
+    },
+    {
+     "id": "d-pick",
+     "component": "ChoicePicker",
+     "path": "/releaseClaims",
+     "options": [
+      "#2374",
+      "#2385"
+     ],
+     "multiple": true,
+     "display": "checkboxes",
+     "label": "Claims to release"
+    },
+    {
+     "id": "d-release",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Release the in-progress claim on {/releaseClaims}"
+    },
+    {
+     "id": "d-check",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Find out who holds the in-progress claims on #2374 and #2385 and tell me",
+     "primary": true
+    },
+    {
+     "id": "d-btns",
+     "component": "Row",
+     "children": [
+      "d-check",
+      "d-release"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "card-d",
+     "component": "Card",
+     "tone": "attention",
+     "children": [
+      "d-head",
+      "d-refs",
+      "d-body",
+      "d-pick",
+      "d-btns"
+     ]
+    },
+    {
+     "id": "e-head-icon",
+     "component": "Icon",
+     "name": "package"
+    },
+    {
+     "id": "e-head-text",
+     "component": "Text",
+     "text": "Three dependency updates have no approval yet",
+     "variant": "h3"
+    },
+    {
+     "id": "e-head",
+     "component": "Row",
+     "children": [
+      "e-head-icon",
+      "e-head-text"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "e-2527",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2527,
+     "detail": "status"
+    },
+    {
+     "id": "e-2527-chip",
+     "component": "Chip",
+     "text": "manual-review",
+     "tone": "attention"
+    },
+    {
+     "id": "e-2527-row",
+     "component": "Row",
+     "children": [
+      "e-2527",
+      "e-2527-chip"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "e-2528",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2528,
+     "detail": "status"
+    },
+    {
+     "id": "e-2559",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2559,
+     "detail": "status"
+    },
+    {
+     "id": "e-list",
+     "component": "List",
+     "children": [
+      "e-2527-row",
+      "e-2528",
+      "e-2559"
+     ]
+    },
+    {
+     "id": "e-body",
+     "component": "Text",
+     "text": "Two still have checks running. Tick the ones to verify and put in front of the agent reviewer once their checks finish."
+    },
+    {
+     "id": "e-pick",
+     "component": "ChoicePicker",
+     "path": "/toVerify",
+     "options": [
+      "#2527 @opencode/cli 2.4.2",
+      "#2528 lucide-react 1.79.0",
+      "#2559 @types/node 26.6.7"
+     ],
+     "multiple": true,
+     "display": "checkboxes",
+     "label": "Updates to verify"
+    },
+    {
+     "id": "e-go",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Verify and request the agent review for {/toVerify}",
+     "primary": true
+    },
+    {
+     "id": "card-e",
+     "component": "Card",
+     "children": [
+      "e-head",
+      "e-list",
+      "e-body",
+      "e-pick",
+      "e-go"
+     ]
+    },
+    {
+     "id": "needs-list",
+     "component": "List",
+     "children": [
+      "card-a",
+      "card-b",
+      "card-c",
+      "card-d",
+      "card-e"
+     ]
+    },
+    {
+     "id": "needs",
+     "component": "Column",
+     "children": [
+      "needs-h",
+      "needs-list"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "prs-h",
+     "component": "Text",
+     "text": "Pull requests",
+     "variant": "h2"
+    },
+    {
+     "id": "bd-2523",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2523,
+     "detail": "status"
+    },
+    {
+     "id": "ln-held",
+     "component": "Lane",
+     "title": "Ready, held for a person",
+     "tone": "attention",
+     "children": [
+      "bd-2523"
+     ]
+    },
+    {
+     "id": "bd-2501",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2501,
+     "detail": "status"
+    },
+    {
+     "id": "ln-conflict",
+     "component": "Lane",
+     "title": "Conflicts with main",
+     "tone": "danger",
+     "children": [
+      "bd-2501"
+     ]
+    },
+    {
+     "id": "bd-2545",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2545,
+     "detail": "status"
+    },
+    {
+     "id": "bd-2527",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2527,
+     "detail": "status"
+    },
+    {
+     "id": "bd-2559",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2559,
+     "detail": "status"
+    },
+    {
+     "id": "ln-ci",
+     "component": "Lane",
+     "title": "Checks running",
+     "tone": "info",
+     "children": [
+      "bd-2545",
+      "bd-2527",
+      "bd-2559"
+     ]
+    },
+    {
+     "id": "bd-2528",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2528,
+     "detail": "status"
+    },
+    {
+     "id": "ln-review",
+     "component": "Lane",
+     "title": "Awaiting review",
+     "tone": "muted",
+     "children": [
+      "bd-2528"
+     ]
+    },
+    {
+     "id": "bd-2550",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2550,
+     "detail": "status"
+    },
+    {
+     "id": "bd-2556",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2556,
+     "detail": "status"
+    },
+    {
+     "id": "bd-2558",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2558,
+     "detail": "status"
+    },
+    {
+     "id": "ln-merged",
+     "component": "Lane",
+     "title": "Merged today",
+     "tone": "ok",
+     "children": [
+      "bd-2550",
+      "bd-2556",
+      "bd-2558"
+     ]
+    },
+    {
+     "id": "board",
+     "component": "Board",
+     "children": [
+      "ln-held",
+      "ln-conflict",
+      "ln-ci",
+      "ln-review",
+      "ln-merged"
+     ]
+    },
+    {
+     "id": "prs-note",
+     "component": "Text",
+     "text": "#2545 (voice defaults) is approved and waits on one check; nothing to do unless it fails.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "prs",
+     "component": "Column",
+     "children": [
+      "prs-h",
+      "board",
+      "prs-note"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "work-h",
+     "component": "Text",
+     "text": "Work in flight",
+     "variant": "h2"
+    },
+    {
+     "id": "ag-h",
+     "component": "Text",
+     "text": "Agents",
+     "variant": "h3"
+    },
+    {
+     "id": "ag-disp",
+     "component": "AgentRef",
+     "agent": "dispatcher",
+     "detail": "full"
+    },
+    {
+     "id": "ag-unit",
+     "component": "AgentRef",
+     "agent": "dispatch-prd-2557-mockups",
+     "detail": "full"
+    },
+    {
+     "id": "ag-list",
+     "component": "List",
+     "children": [
+      "ag-disp",
+      "ag-unit"
+     ]
+    },
+    {
+     "id": "card-agents",
+     "component": "Card",
+     "tone": "muted",
+     "weight": 1,
+     "children": [
+      "ag-h",
+      "ag-list"
+     ]
+    },
+    {
+     "id": "p-h",
+     "component": "Text",
+     "text": "Agent cards PRD",
+     "variant": "h3"
+    },
+    {
+     "id": "p-prd",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2374,
+     "detail": "badge"
+    },
+    {
+     "id": "p-prog",
+     "component": "Progress",
+     "value": 2,
+     "max": 6,
+     "label": "sub-issues closed, of the six the snapshot holds",
+     "tone": "info"
+    },
+    {
+     "id": "p-open-h",
+     "component": "Text",
+     "text": "Open and unclaimed",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "p-2395",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2395,
+     "detail": "badge"
+    },
+    {
+     "id": "p-2396",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2396,
+     "detail": "badge"
+    },
+    {
+     "id": "p-2486",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2486,
+     "detail": "badge"
+    },
+    {
+     "id": "p-2487",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2487,
+     "detail": "badge"
+    },
+    {
+     "id": "p-open",
+     "component": "List",
+     "children": [
+      "p-2395",
+      "p-2396",
+      "p-2486",
+      "p-2487"
+     ]
+    },
+    {
+     "id": "p-pick",
+     "component": "ChoicePicker",
+     "path": "/toStart",
+     "options": [
+      "#2395 project catalog",
+      "#2396 compact fields as columns",
+      "#2486 issue labels on the card",
+      "#2487 filter Cards by labels"
+     ],
+     "multiple": true,
+     "display": "checkboxes",
+     "label": "Start next"
+    },
+    {
+     "id": "p-go",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Start work on {/toStart}"
+    },
+    {
+     "id": "card-prd",
+     "component": "Card",
+     "weight": 2,
+     "children": [
+      "p-h",
+      "p-prd",
+      "p-prog",
+      "p-open-h",
+      "p-open",
+      "p-pick",
+      "p-go"
+     ]
+    },
+    {
+     "id": "work-row",
+     "component": "Row",
+     "children": [
+      "card-agents",
+      "card-prd"
+     ],
+     "gap": "m",
+     "align": "start"
+    },
+    {
+     "id": "work",
+     "component": "Column",
+     "children": [
+      "work-h",
+      "work-row"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "tl-h",
+     "component": "Text",
+     "text": "Today",
+     "variant": "h2"
+    },
+    {
+     "id": "tl",
+     "component": "Timeline",
+     "items": [
+      {
+       "time": "11:24",
+       "text": "#2550 merged (Cards tree wraps into rows); main CI green on its merge commit",
+       "tone": "ok"
+      },
+      {
+       "time": "12:38",
+       "text": "#2556 merged (role_start_pacing_005 fix); no main CI result in the snapshot",
+       "tone": "attention"
+      },
+      {
+       "time": "13:31",
+       "text": "dispatch-prd-2557-mockups reported the mock-ups posted on #2557",
+       "tone": "info"
+      },
+      {
+       "time": "14:01",
+       "text": "#2558 merged (notice X with a pane open); no main CI result in the snapshot",
+       "tone": "attention"
+      },
+      {
+       "time": "20:38",
+       "text": "Snapshot taken",
+       "tone": "muted"
+      }
+     ]
+    },
+    {
+     "id": "tl-check",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Check main's CI for the #2556 and #2558 merge commits and tell me if anything is red"
+    },
+    {
+     "id": "today",
+     "component": "Column",
+     "children": [
+      "tl-h",
+      "tl",
+      "tl-check"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "u-head-icon",
+     "component": "Icon",
+     "name": "question"
+    },
+    {
+     "id": "u-head-text",
+     "component": "Text",
+     "text": "What the snapshot leaves unclear",
+     "variant": "h3"
+    },
+    {
+     "id": "u-head",
+     "component": "Row",
+     "children": [
+      "u-head-icon",
+      "u-head-text"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "u1",
+     "component": "Text",
+     "text": "main's CI result is for #2550's merge commit only; #2556 and #2558 merged after it and their runs are not in the snapshot."
+    },
+    {
+     "id": "u2",
+     "component": "Text",
+     "text": "dispatch-prd-2557-mockups shows Working (Bash) now, but its last report (13:31) says done and waiting on you, and its progress field reads \"Round 1 posted\". It may be doing new work it has not reported."
+    },
+    {
+     "id": "u3",
+     "component": "Text",
+     "text": "#2530 is listed among the issues with state \"merged\", which reads like a pull request. It is left out of the view."
+    },
+    {
+     "id": "u4",
+     "component": "Text",
+     "text": "The agent cards sub-issues are numbered out of 5, but only 2/5, 3/5 and 4/5 are in the snapshot, plus three unnumbered ones. The progress bar counts the six it can see, not the whole PRD."
+    },
+    {
+     "id": "u-list",
+     "component": "List",
+     "children": [
+      "u1",
+      "u2",
+      "u3",
+      "u4"
+     ]
+    },
+    {
+     "id": "card-unsure",
+     "component": "Card",
+     "tone": "muted",
+     "children": [
+      "u-head",
+      "u-list"
+     ]
+    },
+    {
+     "id": "other-field",
+     "component": "TextField",
+     "path": "/other",
+     "label": "Anything else",
+     "placeholder": "Tell the dispatcher what you want",
+     "multiline": true
+    },
+    {
+     "id": "other-send",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "{/other}"
+    },
+    {
+     "id": "other",
+     "component": "Column",
+     "children": [
+      "other-field",
+      "other-send"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "div1",
+     "component": "Divider"
+    },
+    {
+     "id": "div2",
+     "component": "Divider"
+    },
+    {
+     "id": "root",
+     "component": "Column",
+     "children": [
+      "header",
+      "stats",
+      "needs",
+      "prs",
+      "work",
+      "today",
+      "div1",
+      "card-unsure",
+      "div2",
+      "other"
+     ],
+     "gap": "l"
+    }
+   ]
+  }
+ },
+ {
+  "version": "1.0",
+  "updateDataModel": {
+   "surfaceId": "fleet",
+   "path": "/toVerify",
+   "value": [
+    "#2528 lucide-react 1.79.0"
+   ]
+  }
+ },
+ {
+  "version": "1.0",
+  "updateDataModel": {
+   "surfaceId": "fleet",
+   "path": "/composedAt",
+   "value": "2026-11-27T20:40:41Z"
+  }
+ }
+]

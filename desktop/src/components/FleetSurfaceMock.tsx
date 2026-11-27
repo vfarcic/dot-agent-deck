@@ -251,6 +251,22 @@ function Node({ ctx, id, seen }: { ctx: Ctx; id: string; seen: Set<string> }): R
   }
 }
 
+/**
+ * Pull requests opened by other boxes' dispatchers, left out of the posted images (the
+ * repository is public and they are not this deck's work). A DeckRef to one becomes a muted
+ * placeholder chip and its number in the agent's words becomes "another box's PR", so a
+ * lane's count still matches what the agent composed.
+ */
+const OFF_DECK = [2545, 2548, 2549, 2554];
+const OFF_DECK_WORDS = new RegExp(`#(?:${OFF_DECK.join("|")})\\b(?: \\([^)]*\\))?`, "g");
+
+function leftOut(component: A2uiComponent): A2uiComponent {
+  if (component.component === "DeckRef" && OFF_DECK.includes(Number(component.number))) {
+    return { id: component.id, component: "Chip", text: "another box's PR, left out", tone: "muted" } as A2uiComponent;
+  }
+  return JSON.parse(JSON.stringify(component).replace(OFF_DECK_WORDS, "another box's PR")) as A2uiComponent;
+}
+
 export function FleetSurfaceMock({ composer }: { composer: string }) {
   const messages = file<A2uiMessage[]>(composer === "dispatcher" ? "dispatcherView" : `standinView.${composer.replace(/^standin-/, "")}`) ?? [];
   const live = file<LiveDoc>("live.r3");
@@ -262,7 +278,7 @@ export function FleetSurfaceMock({ composer }: { composer: string }) {
       if ("updateComponents" in message) {
         for (const component of message.updateComponents.components) {
           // Refused before the view reaches the desktop: a type outside the catalog.
-          if ((FLEET_SURFACE_CATALOG as readonly string[]).includes(component.component)) byId.set(component.id, component);
+          if ((FLEET_SURFACE_CATALOG as readonly string[]).includes(component.component)) byId.set(component.id, leftOut(component));
           else refused.push(`${component.id} (${component.component})`);
         }
       } else if ("updateDataModel" in message) {

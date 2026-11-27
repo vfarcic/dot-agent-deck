@@ -1,0 +1,932 @@
+[
+ {
+  "version": "1.0",
+  "createSurface": {
+   "surfaceId": "fleet",
+   "catalogId": "https://agent-deck.devopstoolkit.ai/a2ui/fleet/v1/catalog.json"
+  }
+ },
+ {
+  "version": "1.0",
+  "updateComponents": {
+   "surfaceId": "fleet",
+   "components": [
+    {
+     "id": "h-title",
+     "component": "Text",
+     "text": "What needs you, and what is moving",
+     "variant": "h1"
+    },
+    {
+     "id": "h-sub",
+     "component": "Text",
+     "text": "Composed from the deck's snapshot of 20:38 UTC, 27 Nov. Pull request and issue chips below are the deck's own live check, so they may be newer than my words.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "s-needs",
+     "component": "Stat",
+     "value": "5",
+     "label": "waiting on you",
+     "tone": "attention"
+    },
+    {
+     "id": "s-open",
+     "component": "Stat",
+     "value": "6",
+     "label": "open pull requests",
+     "tone": "info"
+    },
+    {
+     "id": "s-merged",
+     "component": "Stat",
+     "value": "3",
+     "label": "merged today",
+     "tone": "ok"
+    },
+    {
+     "id": "s-units",
+     "component": "Stat",
+     "value": "1",
+     "label": "unit working",
+     "tone": "default"
+    },
+    {
+     "id": "s-main",
+     "component": "Stat",
+     "value": "green?",
+     "label": "main CI: last run seen is for #2550, not the two merges after it",
+     "tone": "attention"
+    },
+    {
+     "id": "stats",
+     "component": "Row",
+     "children": [
+      "s-needs",
+      "s-open",
+      "s-merged",
+      "s-units",
+      "s-main"
+     ],
+     "gap": "l"
+    },
+    {
+     "id": "w-title",
+     "component": "Text",
+     "text": "Waiting on you",
+     "variant": "h2"
+    },
+    {
+     "id": "w1-icon",
+     "component": "Icon",
+     "name": "bell"
+    },
+    {
+     "id": "w1-head",
+     "component": "Text",
+     "text": "The fleet view mock-ups are posted and the unit is waiting for your word",
+     "variant": "h3"
+    },
+    {
+     "id": "w1-headrow",
+     "component": "Row",
+     "children": [
+      "w1-icon",
+      "w1-head"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "w1-ref",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2557,
+     "detail": "status"
+    },
+    {
+     "id": "w1-agent",
+     "component": "AgentRef",
+     "agent": "dispatch-prd-2557-mockups",
+     "detail": "full"
+    },
+    {
+     "id": "w1-refs",
+     "component": "Row",
+     "children": [
+      "w1-ref",
+      "w1-agent"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "w1-body",
+     "component": "Text",
+     "text": "Its report (13:31 UTC) reads: \"Fleet view mock-ups posted on #2557; waiting for the maintainer's word\". Its next step is \"Maintainer confirms or asks for changes on #2557\"."
+    },
+    {
+     "id": "w1-ok",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Tell dispatch-prd-2557-mockups the mock-ups on #2557 are confirmed and it can go on to the next milestone",
+     "primary": true
+    },
+    {
+     "id": "w1-changes",
+     "component": "TextField",
+     "path": "/mockupChanges",
+     "label": "Or ask for changes",
+     "placeholder": "What should change in the mock-ups?",
+     "multiline": true
+    },
+    {
+     "id": "w1-send",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Tell dispatch-prd-2557-mockups to revise the #2557 mock-ups: {/mockupChanges}",
+     "primary": false
+    },
+    {
+     "id": "w1-btns",
+     "component": "Row",
+     "children": [
+      "w1-ok"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "w1",
+     "component": "Card",
+     "tone": "attention",
+     "children": [
+      "w1-headrow",
+      "w1-refs",
+      "w1-body",
+      "w1-btns",
+      "w1-changes",
+      "w1-send"
+     ]
+    },
+    {
+     "id": "w2-icon",
+     "component": "Icon",
+     "name": "eye"
+    },
+    {
+     "id": "w2-head",
+     "component": "Text",
+     "text": "Renovate's devbox bump asks for a human eye before it merges",
+     "variant": "h3"
+    },
+    {
+     "id": "w2-headrow",
+     "component": "Row",
+     "children": [
+      "w2-icon",
+      "w2-head"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "w2-ref",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2523,
+     "detail": "full"
+    },
+    {
+     "id": "w2-chip1",
+     "component": "Chip",
+     "text": "needs-human-eye",
+     "tone": "attention"
+    },
+    {
+     "id": "w2-chip2",
+     "component": "Chip",
+     "text": "manual-review",
+     "tone": "attention"
+    },
+    {
+     "id": "w2-chips",
+     "component": "Row",
+     "children": [
+      "w2-chip1",
+      "w2-chip2"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "w2-body",
+     "component": "Text",
+     "text": "The agent reviewer has approved it and CI is green, but its labels say a person should look at the devbox v0.23.0 change first. Nothing else holds it."
+    },
+    {
+     "id": "w2-merge",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "I have looked at #2523 (devbox v0.23.0); merge it and watch main's run",
+     "primary": true
+    },
+    {
+     "id": "w2-hold",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Hold #2523; do not merge the devbox bump yet",
+     "primary": false
+    },
+    {
+     "id": "w2-btns",
+     "component": "Row",
+     "children": [
+      "w2-merge",
+      "w2-hold"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "w2",
+     "component": "Card",
+     "tone": "attention",
+     "children": [
+      "w2-headrow",
+      "w2-ref",
+      "w2-chips",
+      "w2-body",
+      "w2-btns"
+     ]
+    },
+    {
+     "id": "w3-icon",
+     "component": "Icon",
+     "name": "alert"
+    },
+    {
+     "id": "w3-head",
+     "component": "Text",
+     "text": "An approved doorbell fix conflicts with main, and no unit is on it",
+     "variant": "h3"
+    },
+    {
+     "id": "w3-headrow",
+     "component": "Row",
+     "children": [
+      "w3-icon",
+      "w3-head"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "w3-ref",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2501,
+     "detail": "full"
+    },
+    {
+     "id": "w3-iss",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2385,
+     "detail": "status"
+    },
+    {
+     "id": "w3-refs",
+     "component": "Row",
+     "children": [
+      "w3-ref",
+      "w3-iss"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "w3-body",
+     "component": "Text",
+     "text": "#2501 fixes #2385. It is approved with green CI, but GitHub reports a conflict with main. Resolving the conflict means a new commit on the branch, which will probably dismiss the approval. I see no agent in the deck working on it."
+    },
+    {
+     "id": "w3-fix",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Resolve #2501's conflicts with main, get CI green and the approval re-cast, then report back",
+     "primary": true
+    },
+    {
+     "id": "w3-leave",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Leave #2501 as it is for now",
+     "primary": false
+    },
+    {
+     "id": "w3-btns",
+     "component": "Row",
+     "children": [
+      "w3-fix",
+      "w3-leave"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "w3",
+     "component": "Card",
+     "tone": "danger",
+     "children": [
+      "w3-headrow",
+      "w3-refs",
+      "w3-body",
+      "w3-btns"
+     ]
+    },
+    {
+     "id": "w4-icon",
+     "component": "Icon",
+     "name": "question"
+    },
+    {
+     "id": "w4-head",
+     "component": "Text",
+     "text": "I cannot see main's CI for the last two merges",
+     "variant": "h3"
+    },
+    {
+     "id": "w4-headrow",
+     "component": "Row",
+     "children": [
+      "w4-icon",
+      "w4-head"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "w4-a",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2556,
+     "detail": "badge"
+    },
+    {
+     "id": "w4-b",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2558,
+     "detail": "badge"
+    },
+    {
+     "id": "w4-refs",
+     "component": "Row",
+     "children": [
+      "w4-a",
+      "w4-b"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "w4-body",
+     "component": "Text",
+     "text": "The only main run in my snapshot succeeded on #2550's merge commit (11:24 UTC). #2556 merged at 12:38 and #2558 at 14:01, and I have no run for either. They may well be green; I just do not know, and a merge counts as done only once main's run for it is green."
+    },
+    {
+     "id": "w4-check",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Check main's CI runs for the #2556 and #2558 merge commits and report any red",
+     "primary": true
+    },
+    {
+     "id": "w4",
+     "component": "Card",
+     "tone": "attention",
+     "children": [
+      "w4-headrow",
+      "w4-refs",
+      "w4-body",
+      "w4-check"
+     ]
+    },
+    {
+     "id": "w5-icon",
+     "component": "Icon",
+     "name": "pin"
+    },
+    {
+     "id": "w5-head",
+     "component": "Text",
+     "text": "Agent cards (#2374) is marked in progress, but no unit is working on it",
+     "variant": "h3"
+    },
+    {
+     "id": "w5-headrow",
+     "component": "Row",
+     "children": [
+      "w5-icon",
+      "w5-head"
+     ],
+     "gap": "s",
+     "align": "start",
+     "wrap": false
+    },
+    {
+     "id": "w5-prd",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2374,
+     "detail": "status"
+    },
+    {
+     "id": "w5-prog",
+     "component": "Progress",
+     "value": 2,
+     "max": 6,
+     "label": "Agent cards sub-issues closed (of the six in my snapshot)",
+     "tone": "info"
+    },
+    {
+     "id": "w5-body",
+     "component": "Text",
+     "text": "#2399 and #2533 are closed. Four are still open and unclaimed. The in-progress label on #2374 may be a stale claim, or someone may be working on it outside the deck; I cannot tell which."
+    },
+    {
+     "id": "w5-i1",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2395,
+     "detail": "status"
+    },
+    {
+     "id": "w5-i2",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2396,
+     "detail": "status"
+    },
+    {
+     "id": "w5-i3",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2486,
+     "detail": "status"
+    },
+    {
+     "id": "w5-i4",
+     "component": "DeckRef",
+     "kind": "issue",
+     "number": 2487,
+     "detail": "status"
+    },
+    {
+     "id": "w5-list",
+     "component": "List",
+     "children": [
+      "w5-i1",
+      "w5-i2",
+      "w5-i3",
+      "w5-i4"
+     ]
+    },
+    {
+     "id": "w5-pick",
+     "component": "ChoicePicker",
+     "path": "/toStart",
+     "label": "Tick the sub-issues to start",
+     "multiple": true,
+     "display": "checkboxes",
+     "options": [
+      "#2395 project catalog by source",
+      "#2396 compact fields as table columns",
+      "#2486 issue labels and worst status on the card",
+      "#2487 filter Cards by issue labels"
+     ]
+    },
+    {
+     "id": "w5-start",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Start work on {/toStart}",
+     "primary": true
+    },
+    {
+     "id": "w5-who",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Find out who, if anyone, is working on #2374, and release its in-progress label if nobody is",
+     "primary": false
+    },
+    {
+     "id": "w5-btns",
+     "component": "Row",
+     "children": [
+      "w5-start",
+      "w5-who"
+     ],
+     "gap": "s",
+     "align": "start"
+    },
+    {
+     "id": "w5",
+     "component": "Card",
+     "tone": "default",
+     "children": [
+      "w5-headrow",
+      "w5-prd",
+      "w5-prog",
+      "w5-body",
+      "w5-list",
+      "w5-pick",
+      "w5-btns"
+     ]
+    },
+    {
+     "id": "waiting",
+     "component": "Column",
+     "children": [
+      "w-title",
+      "w1",
+      "w2",
+      "w3",
+      "w4",
+      "w5"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "b-title",
+     "component": "Text",
+     "text": "Pull requests",
+     "variant": "h2"
+    },
+    {
+     "id": "b-sub",
+     "component": "Text",
+     "text": "Grouped by what each one waits on. The chips are the deck's verdict.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "b-2523",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2523,
+     "detail": "status"
+    },
+    {
+     "id": "b-2501",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2501,
+     "detail": "status"
+    },
+    {
+     "id": "lane-you",
+     "component": "Lane",
+     "title": "Waits on you",
+     "tone": "attention",
+     "children": [
+      "b-2523",
+      "b-2501"
+     ]
+    },
+    {
+     "id": "b-2545",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2545,
+     "detail": "status"
+    },
+    {
+     "id": "b-2545-n",
+     "component": "Text",
+     "text": "Approved; one check still running.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "b-2545-c",
+     "component": "Column",
+     "children": [
+      "b-2545",
+      "b-2545-n"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "b-2528",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2528,
+     "detail": "status"
+    },
+    {
+     "id": "b-2527",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2527,
+     "detail": "status"
+    },
+    {
+     "id": "b-2559",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2559,
+     "detail": "status"
+    },
+    {
+     "id": "b-ren-n",
+     "component": "Text",
+     "text": "Renovate bumps waiting on the agent reviewer (and CI for two of them). #2527 is labelled manual-review.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "lane-moving",
+     "component": "Lane",
+     "title": "Moving without you",
+     "tone": "info",
+     "children": [
+      "b-2545-c",
+      "b-2528",
+      "b-2527",
+      "b-2559",
+      "b-ren-n"
+     ]
+    },
+    {
+     "id": "b-2550",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2550,
+     "detail": "badge"
+    },
+    {
+     "id": "b-2556",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2556,
+     "detail": "badge"
+    },
+    {
+     "id": "b-2558",
+     "component": "DeckRef",
+     "kind": "pull_request",
+     "number": 2558,
+     "detail": "badge"
+    },
+    {
+     "id": "lane-merged",
+     "component": "Lane",
+     "title": "Merged today",
+     "tone": "ok",
+     "children": [
+      "b-2550",
+      "b-2556",
+      "b-2558"
+     ]
+    },
+    {
+     "id": "board",
+     "component": "Board",
+     "children": [
+      "lane-you",
+      "lane-moving",
+      "lane-merged"
+     ]
+    },
+    {
+     "id": "b-review",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "Request the agent reviewer on #2528 now (CI is already green) instead of waiting for the daily sweep",
+     "primary": false
+    },
+    {
+     "id": "prs",
+     "component": "Column",
+     "children": [
+      "b-title",
+      "b-sub",
+      "board",
+      "b-review"
+     ],
+     "gap": "m"
+    },
+    {
+     "id": "t-title",
+     "component": "Text",
+     "text": "Today",
+     "variant": "h2"
+    },
+    {
+     "id": "timeline",
+     "component": "Timeline",
+     "items": [
+      {
+       "time": "11:24",
+       "text": "#2550 merged: an opened Cards tree wraps into rows (closes #2533). Main's run on it is green.",
+       "tone": "ok"
+      },
+      {
+       "time": "12:38",
+       "text": "#2556 merged: role_start_pacing_005 test fix. No main run seen.",
+       "tone": "attention"
+      },
+      {
+       "time": "13:31",
+       "text": "dispatch-prd-2557-mockups reported the fleet view mock-ups posted on #2557.",
+       "tone": "info"
+      },
+      {
+       "time": "14:01",
+       "text": "#2558 merged: a notice's X works while a pane is open (closes #2555). No main run seen.",
+       "tone": "attention"
+      },
+      {
+       "time": "20:38",
+       "text": "Snapshot taken: one unit working, nothing failing.",
+       "tone": "muted"
+      }
+     ]
+    },
+    {
+     "id": "today",
+     "component": "Column",
+     "children": [
+      "t-title",
+      "timeline"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "a-title",
+     "component": "Text",
+     "text": "Agents",
+     "variant": "h2"
+    },
+    {
+     "id": "a-me",
+     "component": "AgentRef",
+     "agent": "dispatcher",
+     "detail": "full"
+    },
+    {
+     "id": "a-me-n",
+     "component": "Text",
+     "text": "Me. Idle between requests.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "a-me-c",
+     "component": "Column",
+     "children": [
+      "a-me",
+      "a-me-n"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "a-unit",
+     "component": "AgentRef",
+     "agent": "dispatch-prd-2557-mockups",
+     "detail": "full"
+    },
+    {
+     "id": "a-unit-n",
+     "component": "Text",
+     "text": "On #2557. Its card says \"done, waiting for the maintainer\" and \"Round 1 posted\", yet it is running Bash now. Its card may simply not have been updated since later rounds; nothing looks wrong.",
+     "variant": "caption",
+     "tone": "muted"
+    },
+    {
+     "id": "a-unit-c",
+     "component": "Column",
+     "children": [
+      "a-unit",
+      "a-unit-n"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "agents-row",
+     "component": "Row",
+     "children": [
+      "a-me-c",
+      "a-unit-c"
+     ],
+     "gap": "l",
+     "align": "start"
+    },
+    {
+     "id": "agents",
+     "component": "Column",
+     "children": [
+      "a-title",
+      "agents-row"
+     ],
+     "gap": "s"
+    },
+    {
+     "id": "u-title",
+     "component": "Text",
+     "text": "What I am not sure of",
+     "variant": "h3"
+    },
+    {
+     "id": "u1",
+     "component": "Text",
+     "text": "Whether main is green after #2556 and #2558: my snapshot has no run for either merge commit."
+    },
+    {
+     "id": "u2",
+     "component": "Text",
+     "text": "Whether the in-progress labels on #2374 and #2385 are live claims. #2385 has #2501 open against it; #2374 has no unit I can see."
+    },
+    {
+     "id": "u3",
+     "component": "Text",
+     "text": "Why #2545 reads unstable: probably the one check still running, which may not be a required one."
+    },
+    {
+     "id": "u4",
+     "component": "Text",
+     "text": "Whether the six Agent cards sub-issues I see are all of them: the titles number them out of five, and 1/5 and 5/5 are not in my snapshot."
+    },
+    {
+     "id": "unsure",
+     "component": "Card",
+     "tone": "muted",
+     "children": [
+      "u-title",
+      "u1",
+      "u2",
+      "u3",
+      "u4"
+     ]
+    },
+    {
+     "id": "ask-field",
+     "component": "TextField",
+     "path": "/ask",
+     "label": "Anything else",
+     "placeholder": "Ask me something, or tell me what to do next",
+     "multiline": true
+    },
+    {
+     "id": "ask-send",
+     "component": "PromptButton",
+     "agent": "dispatcher",
+     "text": "{/ask}",
+     "primary": true
+    },
+    {
+     "id": "ask",
+     "component": "Card",
+     "children": [
+      "ask-field",
+      "ask-send"
+     ]
+    },
+    {
+     "id": "root",
+     "component": "Column",
+     "children": [
+      "h-title",
+      "h-sub",
+      "stats",
+      "waiting",
+      "Divider-1",
+      "prs",
+      "today",
+      "agents",
+      "unsure",
+      "ask"
+     ],
+     "gap": "l"
+    },
+    {
+     "id": "Divider-1",
+     "component": "Divider"
+    }
+   ]
+  }
+ },
+ {
+  "version": "1.0",
+  "updateDataModel": {
+   "surfaceId": "fleet",
+   "path": "/composedAt",
+   "value": "2026-11-27T20:40:30Z"
+  }
+ }
+]
