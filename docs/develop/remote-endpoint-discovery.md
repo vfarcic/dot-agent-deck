@@ -34,7 +34,9 @@ Issue [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121) is a neighb
 The snippet's first rung runs the far host's own binary:
 
 ```sh
-for dad_cmd in "${HOME:-}/.local/bin/dot-agent-deck" "$(command -v dot-agent-deck 2>/dev/null)"; do
+for dad_cmd in "${HOME:-}/.local/bin/dot-agent-deck" "$(command -v dot-agent-deck 2>/dev/null)" \
+    /opt/homebrew/bin/dot-agent-deck /usr/local/bin/dot-agent-deck \
+    /home/linuxbrew/.linuxbrew/bin/dot-agent-deck; do
   [ -n "$dad_cmd" ] && [ -x "$dad_cmd" ] || continue
   dad_answer=$("$dad_cmd" daemon endpoint 2>/dev/null); dad_rc=$?
   if [ "$dad_rc" = 0 ] && [ -n "$dad_answer" ]; then printf '%s\n' "$dad_answer"; exit 0; fi
@@ -47,7 +49,7 @@ done
 
 | check | what it establishes | what it does not |
 | --- | --- | --- |
-| the path comes from `attach_socket_path()` | it is the path this build's daemon calls `bind(2)` on — the same function, not a copy | nothing about what is there |
+| the path comes from `endpoint_resolve::served_attach_endpoint()` | it is the path this build's daemon binds: `attach_socket_path()`'s resolution, or, on the temp-dir fallback arm when nothing answers there, a relocated endpoint that does ([#1173](https://github.com/vfarcic/dot-agent-deck/issues/1173)) — this build's own code, not a shell restatement of it | nothing about what is there |
 | `verify_endpoint_trusted` | not a symlink, is a socket, owned by this uid, mode exactly `0o600` | that the owner is the daemon rather than another process of the same user |
 | a bounded `Hello` round trip | a live listener exists and speaks the attach protocol | that the listener is the deck's daemon |
 
@@ -96,7 +98,7 @@ The snippet is executed as a program under every `sh` the machine has by `remote
 
   **This is a clarity choice and not a defence**, which matters because the stronger claim is false and was checked: writing it with `command -v` produces the same answer in every case tested, because a non-executable file then fails to exec at rc `126` and `|| continue` catches that. The mutation was run and no test distinguishes the two spellings.
 
-- **Both install locations, in that order.** `~/.local/bin` is where this repo's own installer writes, and is often absent from the `PATH` of a non-interactive `ssh` command; a host whose deck came from a package manager has only the `PATH` one. Trying both means an older build at `~/.local/bin` does not hide a newer one on `PATH`.
+- **Every install location, in that order.** `~/.local/bin` is where this repo's own installer writes, and is often absent from the `PATH` of a non-interactive `ssh` command; a host whose deck came from a package manager has only the `PATH` one; and Homebrew's `bin` under each of `remote::HOMEBREW_PREFIXES` comes last, because that `PATH` usually lacks it too ([#1372](https://github.com/vfarcic/dot-agent-deck/issues/1372); `the_probe_names_every_homebrew_prefix` keeps the two lists in step). Trying each in turn means an older build at `~/.local/bin` does not hide a newer one on `PATH`.
 
 - **`2>/dev/null` on the invocation, for one narrow reason.** An older build's clap diagnostic would otherwise land in the probe's captured stderr, and `endpoint_test::discover_socket` reads that stream on its failure path to choose between two *states*: it reports `NoRemoteSocket` — "this run could not learn a path" — only when the captured stderr is empty, and `TransportFailed` otherwise. A diagnostic we expect and have already handled would downgrade an honest answer into a transport error the user cannot act on. Note how narrow that is: on the ordinary older-build path the snippet exits 0 with a path from the rungs below that parses, `discover_socket` returns before it reaches the classification, and the captured stderr is not read.
 
