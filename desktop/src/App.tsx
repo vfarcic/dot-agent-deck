@@ -75,7 +75,7 @@ import { stopDaemonConfirmCopy, stopDaemonOffer } from "./lib/stopDaemon";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
 import { useQuestionNotifications } from "./hooks/useQuestionNotifications";
-import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
+import { NOTICE_PEER_PROPS, OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground, useNoOverlayAbove } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
 import { useZoom } from "./hooks/useZoom";
@@ -3127,6 +3127,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   ];
 
   return (
+    <>
     <div className={`control-deck ${evidenceOpen && !allDecks ? "with-evidence" : ""}`}>
       <main className="deck-main">
         <header className="topbar">
@@ -3328,14 +3329,19 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {trustReview.shown && <ProjectTrustDialog review={trustReview.shown} onApprove={approveReviewed} onCancel={trustReview.cancel} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
+    </div>
       {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
           above the sentence — since issue #1234 from the runtime's own queue,
           whether the sentence is a notice or the runtime's error. The overview
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
+      {/* Issue #2555: a sibling of the deck rather than inside it, as the
+          overview's is, so the notices are a modal peer of every overlay: one
+          mounted by the shell (the pull request browser, Settings) inerts the
+          whole deck, which would take the notices with it if they were in it. */}
       <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} restartInterrupted={restartInterrupted} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} antigravity={antigravityNotice} onDismissAntigravity={onDismissAntigravityNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
-    </div>
+    </>
   );
 }
 
@@ -3372,9 +3378,13 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
   }, [newestWarning, newestWorktree, message, restart, star, antigravity, trust]);
+  /* Issue #2555: the stack is a modal peer, reachable over the agent's pane.
+     Show navigates to the dashboard and opens a dialog there, which is the way
+     out of a pane but not of a dialog drawn above one, so it waits for those. */
+  const showReachable = useNoOverlayAbove(OVERLAY_LAYER.pane);
   if (!message && !warnings?.length && !restart && !worktrees?.length && !star && !antigravity && !trust) return null;
   return (
-    <div className="toast-stack" ref={stack}>
+    <div className="toast-stack" ref={stack} {...NOTICE_PEER_PROPS}>
       {worktrees?.map((kept) => (
         <div key={`worktree-${kept.id}`} className="toast toast-restart" data-testid="worktree-kept-toast" role="status">
           <AlertTriangle size={15} />
@@ -3404,7 +3414,7 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
             {restartInterrupted && (
               <span className="toast-hint" data-testid="restart-toast-interrupted">
                 {restartInterrupted.text}{" "}
-                <button type="button" className="button secondary compact" data-testid="restart-toast-interrupted-show" onClick={() => VOICE_ACTIONS.showInterruptedWork.run(restartInterrupted.context, {})}>Show</button>
+                <button type="button" className="button secondary compact" data-testid="restart-toast-interrupted-show" disabled={!showReachable} onClick={() => VOICE_ACTIONS.showInterruptedWork.run(restartInterrupted.context, {})}>Show</button>
               </span>
             )}
           </div>
