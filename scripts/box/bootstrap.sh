@@ -552,7 +552,7 @@ step "agents"
 # installed some other way is left alone, and a binary that answers nothing
 # readable is reported, not replaced, since a broken 2.x cannot be told from
 # anything else that way.
-OPENCODE_2_VERSION=2.4.1
+OPENCODE_2_VERSION=2.4.2
 OPENCODE_2_DIR="$HOME/.local/share/dot-agent-deck/opencode-2"
 OPENCODE_2_BIN="$OPENCODE_2_DIR/node_modules/.bin/opencode"
 OC_BIN="$HOME/.opencode/bin/opencode"
