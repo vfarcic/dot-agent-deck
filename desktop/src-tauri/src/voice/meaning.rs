@@ -583,7 +583,8 @@ genuinely cannot tell, leave the action off.\n\
 \n\
 First write `explanation`: one short sentence saying what the sentence asks the app for, if \
 anything, and quoting whatever else it says besides that request (or saying it says nothing \
-else) — and, when it asks to start or run something, any place or name it gives for that (or \
+else): the words that make the request, in whatever words it is put, and the words that only \
+describe it are the request, never something else it says — and, when it asks to start or run something, any place or name it gives for that (or \
 saying it gives none). Then `names_target`: `yes` when the sentence says anything about where something is to \
 start or run — on, in or at any daemon, deck, machine, host, server or other place, whether it \
 names that place or only describes it (some other one, a different one, a remote one), since \
@@ -1184,6 +1185,14 @@ mod tests {
             "it asks to start or create something only when it asks for a new one or for a \
              start.",
             "`only` is `no` whenever the explanation quotes anything else.",
+            // Issue #2563: `gpt-6-luna` quoted a paraphrased request as
+            // something said besides it ("asks to start typing mode and adds
+            // “capture my speech as text from now on”"), answering `only: no`
+            // in 71 of 200 votes on that sentence; with this clause, 1 of
+            // 200. The mixed-content and submit-in-passing refusals stayed
+            // at 0 of 20 votes each.
+            "the words that make the request, in whatever words it is put, and the words that \
+             only describe it are the request, never something else it says",
             "— and, when it asks to start or run something, any place or name it gives for that \
              (or saying it gives none). Then `names_target`: `yes` when the sentence says anything \
              about where something is to start or run",

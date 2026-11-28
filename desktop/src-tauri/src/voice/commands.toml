@@ -1421,11 +1421,19 @@ meaning     = "whole"
 # answered locally ahead of the model in every mode (`outcome::reading_intercept`), so "reading on" said while
 # typing turns reading on instead of being typed. No param: the panel owns the
 # switch's save (`VoiceControlPanel.tsx`, `lib/reading.ts`).
+#
+# **"Reads the agents' updates aloud" is there for the meaning check (issue
+# #2563).** With the description saying only that the app "speaks a short
+# summary of each turn", `gpt-6-luna` answered the documented paraphrase
+# "narrate future agent updates aloud" with no action in 8 of 200 votes, some
+# of them while explaining that it asked for agent updates to be read aloud;
+# with the agents' updates named, 200 of 200. "read the tester's last update
+# aloud" and "show me the agent updates" still listed this row in 0 of 30.
 [[commands]]
 id          = "reading_on"
-description = """Turn on reading, the Settings switch: from now on the app speaks a short summary of
-each turn every agent on this deck finishes, and their permission prompts and errors as they
-happen, on any screen. Use when the user asks for this and nothing else: "reading on", "start
+description = """Turn on reading, the Settings switch: from now on the app reads the agents' updates
+aloud, on any screen: a short summary of each turn every agent on this deck finishes, and their
+permission prompts and errors as they happen. Use when the user asks for this and nothing else: "reading on", "start
 reading", "reading mode on", "read to me", or the same request in other words. It reads nothing
 already on screen."""
 invoke      = "startReading"
