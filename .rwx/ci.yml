@@ -622,7 +622,7 @@ tasks:
       # release's checksums.txt), rather than the get.jetify.com script.
       # renovate.json's jetify-com/devbox manager moves that checksum with
       # `DEVBOX_USE_VERSION` in one PR (PR #2523), and xtask/linkage-check's
-      # rwx_devbox_checksum fails the build when the manager stops reading it.
+      # rwx_release_checksums fails the build when the manager stops reading it.
       # Issue #2160: a single HTTP 504 from this download turned the run red.
       # `--retry 5 --retry-all-errors` makes up to six attempts on any failure
       # (5xx, connection reset, timeout) with curl's doubling backoff

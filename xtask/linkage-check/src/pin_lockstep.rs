@@ -2241,25 +2241,30 @@ fn an_rwx_config_missing_a_pin_fails() {
 /// Issue #2566: `.rwx/` pins nextest as its GitHub release tag, because
 /// renovate.json's manager looks the release up by that tag to move the
 /// checksum. A bare `X.Y.Z` there is a pin that manager cannot read, so the
-/// guard must refuse it rather than compare it and pass.
+/// guard must refuse it rather than skip it, including when another `.rwx/`
+/// file still carries a valid pin that agrees (PR #2570 review).
 #[test]
 fn an_rwx_nextest_pin_without_its_tag_prefix_fails() {
     if !bash_present() {
         eprintln!("SKIP: needs `bash` on PATH");
         return;
     }
-    let rwx = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1").replace(
-        "CARGO_NEXTEST_RELEASE: cargo-nextest-0.9.143",
-        "CARGO_NEXTEST_RELEASE: 0.9.143",
-    );
-    let out = rwx_fixture(&rwx).run();
+    let valid = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1");
+    let fixture = rwx_fixture(&valid);
+    fs::write(
+        fixture.dir.path().join(".rwx/sandbox.yml"),
+        "tasks:\n  - key: nextest\n    env:\n      CARGO_NEXTEST_RELEASE: 0.9.143\n",
+    )
+    .expect("write the second fixture RWX config");
+    let out = fixture.run();
     let text = combined(&out);
     assert!(
         !out.status.success(),
-        "an RWX nextest pin without its `cargo-nextest-` tag prefix must fail:\n{text}"
+        "an RWX nextest pin without its `cargo-nextest-` tag prefix must fail, even beside \
+         a valid one:\n{text}"
     );
     assert!(
-        text.contains("nextest"),
-        "the failure must name the class:\n{text}"
+        text.contains(".rwx/sandbox.yml") && text.contains("unreadable cargo-nextest pin"),
+        "the failure must name the file and the unreadable pin:\n{text}"
     );
 }

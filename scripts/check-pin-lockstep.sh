@@ -605,10 +605,12 @@ rwx_files() {
 # customManager puts before its `currentValue`, and `$2` names the pin in
 # errors. A line that carries the prefix without an exact X.Y.Z after it is an
 # error rather than a non-site: Renovate's regex would skip it, so the pin
-# would silently stop being bumped. Full-line comments are excluded, as
-# everywhere else here.
+# would silently stop being bumped. `$3`, when given, is a literal the value
+# must start with and that is stripped before the X.Y.Z check (nextest's
+# release-tag prefix); a value without it is an error too, for the same reason.
+# Full-line comments are excluded, as everywhere else here.
 scan_rwx() {
-  local prefix="$1" what="$2" f hit lineno rest token value
+  local prefix="$1" what="$2" tag="${3:-}" f hit lineno rest token value
   while IFS= read -r f; do
     while IFS= read -r hit; do
       lineno="${hit%%:*}"
@@ -619,6 +621,14 @@ scan_rwx() {
         # quote or `/`), so anything left after an exact X.Y.Z, such as a
         # pre-release `-beta.1`, is a different version and fails below.
         value="$(printf '%s' "$token" | sed -E "s#^${prefix}##")"
+        if [ -n "$tag" ]; then
+          if [ "${value#"$tag"}" = "$value" ]; then
+            printf '%s%s:%s has an unreadable %s pin: %s. renovate.json matches the release tag %sX.Y.Z here; anything else silently stops being tracked.\n' \
+              "$SCAN_ERR" "${f#"$root"/}" "$lineno" "$what" "'$token'" "$tag"
+            continue
+          fi
+          value="${value#"$tag"}"
+        fi
         if ! printf '%s' "$value" | grep -qE "$SEMVER"; then
           printf '%s%s:%s has an unreadable %s pin: %s. renovate.json matches an exact X.Y.Z here; anything else silently stops being tracked.\n' \
             "$SCAN_ERR" "${f#"$root"/}" "$lineno" "$what" "'$token'"
@@ -639,9 +649,11 @@ scan_rwx_toolchain() {
 }
 # nextest is pinned as its GitHub release TAG (issue #2566), so the
 # `cargo-nextest-` is part of renovate.json's `currentValue` there, which that
-# manager's `regex:` versioning reads X.Y.Z back out of. It is stripped here
-# with the key so the rest compares with devbox.json as the other pins do.
-scan_rwx_nextest() { scan_rwx 'CARGO_NEXTEST_RELEASE:[[:space:]]*cargo-nextest-' 'cargo-nextest'; }
+# manager's `regex:` versioning reads X.Y.Z back out of. Lines are found by the
+# key alone, so a value that lost the prefix is reported rather than skipped,
+# and the prefix is stripped so the rest compares with devbox.json as the
+# other pins do.
+scan_rwx_nextest() { scan_rwx 'CARGO_NEXTEST_RELEASE:[[:space:]]*' 'cargo-nextest' 'cargo-nextest-'; }
 scan_rwx_pnpm() { scan_rwx 'pnpm@' 'pnpm'; }
 scan_rwx_gotask() { scan_rwx 'go-task/task/releases/download/v' 'go-task'; }
 
