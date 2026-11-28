@@ -55,7 +55,7 @@ Round 1's issues also give the cost, the type (which sets when the change takes 
 
 | source | how | notes |
 | --- | --- | --- |
-| Honeycomb, environment `test` | the Honeycomb MCP server (`.mcp.json`): `run_query`, `list_spans`, `get_span_details`, `get_triggers`, `list_boards` | datasets `dot-agent-deck`, `claude-code`, `codex_cli_rs`, `opencode`, `pi`, `metrics`, `renovate`. If the server is unavailable, stop: round 1 deliberately did not substitute Dash0, which started mid-window (2026-10-31 14:46 UTC) |
+| Honeycomb, environment `test` | the Honeycomb MCP server (`.mcp.json`): `run_query`, `list_spans`, `get_span_details`, `get_triggers`, `list_boards` | datasets `dot-agent-deck`, `claude-code`, `codex_cli_rs`, `opencode`, `pi`, `metrics`, `renovate`. If the server is unavailable, stop |
 | GitHub | `gh api` (REST) and GraphQL | PR dump with reviews, threads, comments and timeline; `ci.yml` runs and per-attempt jobs; JUnit artifacts of GitHub runs |
 | RWX | `rwx runs list --repository dot-agent-deck --definition .rwx/ci.yml --json`, `rwx results <run-id> --json`, `scripts/rwx-junit.sh <run-id> <dir>`, `rwx logs <task-attempt-id>` | per-test results from each test task's `junit.xml` artifact for runs after #2101 merged; from the task logs before that (see traps) |
 | Builds, coverage, mutants | `rwx sandbox exec -- <command>` with `DAD_REMOTE_EXEC=rwx`, never locally on the shared box | a snapshot of the code at a commit, not of the window: say so in the comment |

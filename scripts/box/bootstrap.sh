@@ -50,20 +50,17 @@
 # otelcol-hostmetrics (relay/config.yaml beside this script, installed as
 # ~/.config/otelcol/config.yaml), an OpenTelemetry Collector that receives OTLP
 # on 127.0.0.1:4318, drops the agents' high-volume internal spans, adds the
-# box's host metrics and forwards everything to Honeycomb and, when its keys are
-# there, Dash0. Its keys live in env files only the operator can read, which
-# the run checks for before it changes anything:
-#   ~/.config/otelcol/honeycomb.env  HONEYCOMB_API_KEY=...                       (required)
-#   ~/.config/otelcol/dash0.env      DASH0_ENDPOINT=...  DASH0_AUTH_TOKEN=...    (optional)
-# one NAME=value per line, unquoted (Docker's --env-file format), each a regular
-# file of the operator's that no other user can read. A missing file
-# is written (mode 600) from the same variables in the environment this script
-# runs with (HONEYCOMB_INGEST_KEY, .env.vals.yaml's name, works for the first),
-# so running it from a vals shell fills both; an existing file is never
-# rewritten. Without dash0.env the relay runs without its Dash0 exporter, except
-# that a box whose installed config still has it stops with an error rather
-# than dropping Dash0 silently. The container is recreated only when its image,
-# config, parameters or key files change, and the previous one and its config
+# box's host metrics and forwards everything to Honeycomb. Its key lives in an
+# env file only the operator can read, which the run checks for before it
+# changes anything:
+#   ~/.config/otelcol/honeycomb.env  HONEYCOMB_API_KEY=...
+# one NAME=value per line, unquoted (Docker's --env-file format), a regular
+# file of the operator's that no other user can read. A missing file is
+# written (mode 600) from the same variable in the environment this script
+# runs with (or HONEYCOMB_INGEST_KEY, .env.vals.yaml's name), so running it
+# from a vals shell fills it; an existing file is never rewritten. The
+# container is recreated only when its image,
+# config, parameters or key file changes, and the previous one and its config
 # are put back when the new one does not stay up. It also installs
 # dot-agent-deck-collector, the per-run resource collector, as the systemd user
 # service dot-agent-deck-collector (user/ beside this script), sending to the
@@ -121,7 +118,6 @@ RELAY_IMAGE=otel/opentelemetry-collector-contrib:0.120.0
 RELAY_DIR="$HOME/.config/otelcol"
 RELAY_CONFIG="$RELAY_DIR/config.yaml"
 HONEYCOMB_ENV="$RELAY_DIR/honeycomb.env"
-DASH0_ENV="$RELAY_DIR/dash0.env"
 # Written once this script has started the relay, so a later run knows it
 # manages it without asking Docker, which may not be running yet.
 RELAY_MANAGED="$RELAY_DIR/.dad-box-managed"
@@ -199,25 +195,15 @@ if [ "$RELAY_INSTALL" = 1 ]; then
     { [ -d "$RELAY_DIR" ] && [ ! -L "$RELAY_DIR" ] && [ -O "$RELAY_DIR" ]; } || relay_fail "$RELAY_DIR must be a directory (not a link) owned by $ME"
     (( (8#$(stat -c %a "$RELAY_DIR") & 8#022) == 0 )) || relay_fail "$RELAY_DIR can be written by other users; run: chmod go-w $RELAY_DIR"
   fi
-  for f in "$HONEYCOMB_ENV" "$DASH0_ENV"; do
-    if [ -e "$f" ] || [ -L "$f" ]; then
-      { [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ]; } || relay_fail "$f must be a regular file (not a link) owned by $ME"
-      (( (8#$(stat -c %a "$f") & 8#077) == 0 )) || relay_fail "$f can be read by other users; run: chmod 600 $f"
-    fi
-  done
+  f="$HONEYCOMB_ENV"
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    { [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ]; } || relay_fail "$f must be a regular file (not a link) owned by $ME"
+    (( (8#$(stat -c %a "$f") & 8#077) == 0 )) || relay_fail "$f can be read by other users; run: chmod 600 $f"
+  fi
   if [ -f "$HONEYCOMB_ENV" ]; then
     env_file_sets "$HONEYCOMB_ENV" HONEYCOMB_API_KEY || relay_fail "$HONEYCOMB_ENV does not set HONEYCOMB_API_KEY"
   elif [ -z "${HONEYCOMB_API_KEY:-}${HONEYCOMB_INGEST_KEY:-}" ]; then
     relay_fail "no Honeycomb key: create $HONEYCOMB_ENV (HONEYCOMB_API_KEY=..., mode 600), or run with HONEYCOMB_API_KEY or HONEYCOMB_INGEST_KEY set (a vals shell sets the second)"
-  fi
-  if [ -f "$DASH0_ENV" ]; then
-    env_file_sets "$DASH0_ENV" DASH0_ENDPOINT DASH0_AUTH_TOKEN || relay_fail "$DASH0_ENV must set both DASH0_ENDPOINT and DASH0_AUTH_TOKEN"
-  elif [ -n "${DASH0_ENDPOINT:-}" ] && [ -n "${DASH0_AUTH_TOKEN:-}" ]; then
-    :
-  elif [ -n "${DASH0_ENDPOINT:-}${DASH0_AUTH_TOKEN:-}" ]; then
-    relay_fail "only one of DASH0_ENDPOINT and DASH0_AUTH_TOKEN is set; set both, or neither to run the relay without Dash0"
-  elif [ -f "$RELAY_CONFIG" ] && grep -qF 'otlphttp/dash0' "$RELAY_CONFIG"; then
-    relay_fail "$RELAY_CONFIG sends to Dash0 but there is no $DASH0_ENV; create it (DASH0_ENDPOINT=... and DASH0_AUTH_TOKEN=..., mode 600) to keep Dash0, or delete $RELAY_CONFIG to drop it"
   fi
   # host networking: another listener on the relay's port would leave the
   # container failing to bind. A running relay container is taken to be that
@@ -718,33 +704,8 @@ if [ "$RELAY_INSTALL" = 1 ]; then
     mv "$HONEYCOMB_ENV.dad-box" "$HONEYCOMB_ENV"
     echo "  wrote $HONEYCOMB_ENV from the environment"
   fi
-  if [ ! -f "$DASH0_ENV" ] && [ -n "${DASH0_ENDPOINT:-}" ] && [ -n "${DASH0_AUTH_TOKEN:-}" ]; then
-    ( umask 077; printf 'DASH0_ENDPOINT=%s\nDASH0_AUTH_TOKEN=%s\n' "$DASH0_ENDPOINT" "$DASH0_AUTH_TOKEN" > "$DASH0_ENV.dad-box" )
-    mv "$DASH0_ENV.dad-box" "$DASH0_ENV"
-    echo "  wrote $DASH0_ENV from the environment"
-  fi
   RELAY_ENV_ARGS=(--env-file "$HONEYCOMB_ENV")
-  if [ -f "$DASH0_ENV" ]; then
-    RELAY_ENV_ARGS+=(--env-file "$DASH0_ENV")
-    cp "$HERE/relay/config.yaml" "$RELAY_CONFIG.dad-box"
-  else
-    # No Dash0 keys: the same config without its Dash0 exporter, the comment
-    # above it and its place in each pipeline. The Collector refuses to start
-    # with an unset ${env:DASH0_ENDPOINT}, so the exporter cannot stay.
-    awk '
-      /^  #/ { held = held $0 "\n"; next }
-      /^  otlphttp\/dash0:$/ { held = ""; dropping = 1; next }
-      dropping && /^    / { next }
-      { dropping = 0; printf "%s", held; held = ""; gsub(/, otlphttp\/dash0\]/, "]"); print }
-      END { printf "%s", held }
-    ' "$HERE/relay/config.yaml" > "$RELAY_CONFIG.dad-box"
-    if grep -qi dash0 "$RELAY_CONFIG.dad-box"; then
-      rm -f "$RELAY_CONFIG.dad-box"
-      echo "bootstrap.sh: could not take Dash0 out of $HERE/relay/config.yaml; the relay is left as it was" >&2
-      exit 1
-    fi
-    echo "  no $DASH0_ENV: running without the Dash0 exporter"
-  fi
+  cp "$HERE/relay/config.yaml" "$RELAY_CONFIG.dad-box"
   chmod 0644 "$RELAY_CONFIG.dad-box"   # read by the Collector's non-root user, whatever the umask
   RELAY_RUN_ARGS=(--name "$RELAY_CONTAINER" --restart unless-stopped --network host
                   -v "/:/hostfs:ro,rslave" -v "$RELAY_CONFIG:/etc/otelcol-contrib/config.yaml:ro")
@@ -760,16 +721,14 @@ if [ "$RELAY_INSTALL" = 1 ]; then
     exit 1
   fi
   # The container carries a fingerprint of what it was started from: image,
-  # parameters, config, and each key file's inode, size and modification time
+  # parameters, config, and the key file's inode, size and modification time
   # to the nanosecond (not its contents). A different one, or none, means
   # recreate it.
   relay_fp="$(
     {
       printf '%s\n' "$RELAY_IMAGE" "${RELAY_RUN_ARGS[@]}" "${RELAY_ENV_ARGS[@]}"
       cat "$RELAY_CONFIG.dad-box"
-      for f in "$HONEYCOMB_ENV" "$DASH0_ENV"; do
-        if [ -f "$f" ]; then stat -c '%n %i %s %y' "$f"; fi
-      done
+      stat -c '%n %i %s %y' "$HONEYCOMB_ENV"
     } | sha256sum | cut -c1-16
   )"
   # A replacement interrupted after it set the previous relay aside (below)
