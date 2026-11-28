@@ -72,7 +72,7 @@ fn run_py(body: &str) -> Output {
         \x20    independent_review_at, independent_review_evidence,\n\
         \x20    describe_independent_review, insufficient_retry_due,\n\
         \x20    INSUFFICIENT_RETRIES_PER_HEAD, INTEGRITY_FILTERED_AUTHORS,\n\
-        \x20    stale_own_rejections)\n\
+        \x20    stale_own_rejections, SUMMARY_SETTLE_SECONDS)\n\
          REQ = ('build', 'build-macos', 'build-windows', 'security', 'e2e-deterministic')\n\
          def crun(name, conclusion='success', status='completed', started_at=None, run_id=None):\n\
         \x20   return {{'name': name, 'status': status, 'conclusion': conclusion,\n\
@@ -83,6 +83,10 @@ fn run_py(body: &str) -> Output {
          '\",\"verdict\":\"APPROVE\",\"reasons\":[]}}\\n```')\n\
          MARKER = '\\n<!-- gh-aw-agentic-workflow: Review one pull request, workflow_id: pr-review -->'\n\
          def comment(login, body):\n    return {{'user': {{'login': login}}, 'body': body}}\n\
+         OLD = '2026-01-01T00:00:00Z'\n\
+         def qodo_summary(body, created=OLD, updated=OLD):\n\
+        \x20   return {{'user': {{'login': 'qodo-code-review[bot]'}}, 'body': body,\n\
+        \x20           'created_at': created, 'updated_at': updated}}\n\
          def review(login, commit_id, state='APPROVED'):\n\
         \x20   return {{'user': {{'login': login}}, 'commit_id': commit_id, 'state': state}}\n\
          APP = 'dot-agent-deck-reviewer[bot]'\n\
@@ -1126,9 +1130,129 @@ fn a_finding_re_anchored_to_this_head_does_not_count() {
 fn a_summary_comment_naming_this_head_counts() {
     assert_py_ok(
         "assert independent_review_at(SHA, \
-         [{'user': {'login': 'qodo-code-review[bot]'}, 'body': 'reviewed ' + SHA}], [], []) \
+         [qodo_summary('reviewed ' + SHA)], [], []) \
          == 'qodo-code-review[bot]'",
     );
+}
+
+// Issue #2564: Qodo names a new head in its summary comment before it has
+// finished reviewing that head (issue #2507, measured by PR #2544), so the
+// comment counts only once it has settled. `now` is passed explicitly so the
+// clock is the test's, and `T` is a fixed instant.
+const SETTLE_PRELUDE: &str = r#"from datetime import datetime, timezone
+T = 1_800_000_000
+def iso(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+QODO = 'qodo-code-review[bot]'
+SETTLE, FIRST = SUMMARY_SETTLE_SECONDS[QODO]
+def finding(sha, reply_to=None, login=QODO):
+    return {'user': {'login': login}, 'commit_id': sha, 'original_commit_id': sha,
+            'in_reply_to_id': reply_to}
+"#;
+
+fn assert_settle_ok(body: &str) {
+    assert_py_ok(&format!("{SETTLE_PRELUDE}{body}"));
+}
+
+/// Scenario: the issue's case. Qodo's comment was created on an earlier head and,
+/// a minute ago, edited so its marker names this head, and no finding for this
+/// head has arrived yet. That is the early marker, not a finished review, so
+/// nothing covers the head; once Qodo's finding on the head lands, it does.
+#[test]
+fn an_early_marker_without_findings_is_not_a_finished_review() {
+    assert_settle_ok(
+        r#"early = qodo_summary('<!-- https://github.com/o/r/commit/' + SHA + ' -->',
+                     created=iso(T - 3600), updated=iso(T - 60))
+assert independent_review_evidence(SHA, [early], [], [], now=T) is None
+assert independent_review_at(SHA, [early], [], [], now=T) is None
+ev = independent_review_evidence(SHA, [early], [finding(SHA)], [], now=T)
+assert ev == {'login': QODO, 'artefact': 'inline review comment'}, ev
+"#,
+    );
+}
+
+/// Scenario: an edited comment naming the head with no finding counts once its
+/// last edit is the settle period old, and not a second sooner. That is a
+/// push which brought no Qodo finding, the case #2544 prices at 15 minutes.
+#[test]
+fn an_edited_summary_counts_once_its_last_edit_has_settled() {
+    assert_settle_ok(
+        r#"def edited(age):
+    return qodo_summary('reviewed ' + SHA, created=iso(T - 7200), updated=iso(T - age))
+assert independent_review_at(SHA, [edited(SETTLE - 1)], [], [], now=T) is None
+assert independent_review_at(SHA, [edited(SETTLE)], [], [], now=T) == QODO
+assert independent_review_at(SHA, [edited(SETTLE + 600)], [], [], now=T) == QODO
+"#,
+    );
+}
+
+/// Scenario: a PR's first Qodo review is posted in one step, the comment
+/// created with it and never edited, so it counts after the short grace
+/// rather than the full settle period.
+#[test]
+fn a_never_edited_summary_counts_after_the_first_review_grace() {
+    assert_settle_ok(
+        r#"def fresh(age):
+    return qodo_summary('reviewed ' + SHA, created=iso(T - age), updated=iso(T - age))
+assert independent_review_at(SHA, [fresh(FIRST - 1)], [], [], now=T) is None
+assert independent_review_at(SHA, [fresh(FIRST)], [], [], now=T) == QODO
+"#,
+    );
+}
+
+/// Scenario: a Qodo reply in a review thread written while this was the head
+/// answers that thread; it is not Qodo reviewing the head, so it covers
+/// nothing, while a finding that is not a reply does.
+#[test]
+fn a_reply_in_a_review_thread_is_not_inline_coverage() {
+    assert_settle_ok(
+        r#"assert independent_review_at(SHA, [], [finding(SHA, reply_to=5)], [], now=T) is None
+assert independent_review_at(SHA, [], [finding(SHA)], [], now=T) == QODO
+"#,
+    );
+}
+
+/// Scenario: a Qodo summary comment whose timestamps are missing or unreadable
+/// cannot be shown to have settled, so it covers nothing (a withheld vote is
+/// the safe direction). Greptile has no settle rule, because it posts its
+/// summary when its one review is complete, so its summary still counts as is.
+#[test]
+fn an_unreadable_qodo_summary_does_not_count_and_greptiles_is_unchanged() {
+    assert_settle_ok(
+        r#"bare = comment(QODO, 'reviewed ' + SHA)
+assert independent_review_at(SHA, [bare], [], [], now=T) is None
+odd = qodo_summary('reviewed ' + SHA, created='yesterday', updated='yesterday')
+assert independent_review_at(SHA, [odd], [], [], now=T) is None
+g = comment('greptile-apps[bot]', 'reviewed ' + SHA)
+assert independent_review_at(SHA, [g], [], [], now=T) == 'greptile-apps[bot]'
+"#,
+    );
+}
+
+/// The settle numbers are COPIED from `.claude/skills/pr-create/reviewers.json`
+/// rather than read from it, because `.claude/` is not in `DENY_PATHS` and the
+/// gate must not be relaxable through a path this workflow may approve
+/// unattended (see `SUMMARY_SETTLE_SECONDS`). This pins the copy: every
+/// independent reviewer with a settle rule in one has the same rule in the
+/// other, so `wait-reviews.sh` and the vote job cannot disagree about when
+/// Qodo has finished a head without this going red.
+#[test]
+fn the_settle_rule_matches_the_wait_scripts_registry() {
+    let registry = repo_root().join(".claude/skills/pr-create/reviewers.json");
+    assert_py_ok(&format!(
+        r#"import json
+from pr_review_common import INDEPENDENT_REVIEWERS
+reg = json.load(open({registry:?}))
+want = {{}}
+for r in reg['reviewers']:
+    s = r['signal']
+    if s.get('settle_minutes') is not None and r['login'] in INDEPENDENT_REVIEWERS:
+        want[r['login']] = (s['settle_minutes'] * 60, s['first_review_settle_minutes'] * 60)
+assert want, 'reviewers.json has no settle rule for an independent reviewer'
+assert SUMMARY_SETTLE_SECONDS == want, (SUMMARY_SETTLE_SECONDS, want)
+"#,
+        registry = registry.to_string_lossy(),
+    ));
 }
 
 /// The freshness half. A review of an earlier commit says nothing about what is
@@ -1197,9 +1321,8 @@ fn no_evidence_reads_as_no_independent_review() {
 fn the_summary_comment_is_named_as_the_artefact_that_covers_the_head() {
     assert_py_ok(
         r#"old = '8' * 40
-summary = {'user': {'login': 'qodo-code-review[bot]'},
-           'body': '<!-- https://github.com/o/r/commit/' + SHA + ' -->',
-           'html_url': 'https://github.com/o/r/pull/1#issuecomment-6'}
+summary = qodo_summary('<!-- https://github.com/o/r/commit/' + SHA + ' -->')
+summary['html_url'] = 'https://github.com/o/r/pull/1#issuecomment-6'
 first = review('qodo-code-review[bot]', old, 'COMMENTED')
 ev = independent_review_evidence(SHA, [summary], [], [first])
 assert ev == {'login': 'qodo-code-review[bot]', 'artefact': 'summary comment'}, ev
@@ -1444,8 +1567,8 @@ fn the_selector_retries_an_abstention_once_and_hands_over_the_coverage() {
         r#"import os, tempfile, json
 import pr_review_select as sel
 ins = {'verdict': 'INSUFFICIENT', 'head_sha': SHA, 'pr': 7}
-summary = {'user': {'login': 'qodo-code-review[bot]'}, 'body': 'reviewed ' + SHA,
-           'html_url': 'https://github.com/o/r/pull/7#issuecomment-1'}
+summary = qodo_summary('reviewed ' + SHA)
+summary['html_url'] = 'https://github.com/o/r/pull/7#issuecomment-1'
 sel.gh_json = lambda *a: [{'number': 7, 'author': {'login': 'vfarcic'}, 'isDraft': False,
     'headRefOid': SHA, 'headRepositoryOwner': {'login': 'o'}, 'reviewDecision': ''}]
 sel.check_status = lambda repo, sha: (True, 'green', [])
@@ -1643,7 +1766,7 @@ vote.gh_json = lambda *a: {'headRefOid': SHA, 'isDraft': False, 'reviewDecision'
 vote.pr_reviews = lambda repo, n: [mine]
 vote.checks_green = lambda repo, sha: (True, 'green')
 vote.latest_verdict = lambda repo, n: approve
-vote.pr_comments = lambda repo, n: [comment('qodo-code-review[bot]', 'reviewed ' + SHA)]
+vote.pr_comments = lambda repo, n: [qodo_summary('reviewed ' + SHA)]
 vote.pr_review_comments = lambda repo, n: []
 vote.trusted_verdicts_at = lambda repo, n, sha: [approve]
 vote.pr_changed_paths = lambda repo, n: ['a.rs', 'b.rs']
