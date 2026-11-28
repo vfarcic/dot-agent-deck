@@ -59,32 +59,25 @@ exporters:
     endpoint: https://api.honeycomb.io
     headers:
       x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
-  # Everything also goes to Dash0 (2026-10-31, for #1980's analysis), into its
-  # default dataset. Each exporter queues and retries on its own, so an outage
-  # at one backend does not hold up the other.
-  otlphttp/dash0:
-    endpoint: ${env:DASH0_ENDPOINT}
-    headers:
-      Authorization: Bearer ${env:DASH0_AUTH_TOKEN}
 
 service:
   pipelines:
     metrics/host:
       receivers: [hostmetrics]
       processors: [resourcedetection/host, batch]
-      exporters: [otlphttp/hostmetrics, otlphttp/dash0]
+      exporters: [otlphttp/hostmetrics]
     traces:
       receivers: [otlp]
       processors: [filter/agent-internals, batch]
-      exporters: [otlphttp/agents, otlphttp/dash0]
+      exporters: [otlphttp/agents]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/agents, otlphttp/dash0]
+      exporters: [otlphttp/agents]
     metrics/agents:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/agents, otlphttp/dash0]
+      exporters: [otlphttp/agents]
   telemetry:
     metrics:
       level: none
