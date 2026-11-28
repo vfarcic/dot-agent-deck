@@ -4,7 +4,10 @@
      prds/77-tui-testing-harness.md so the tooling no longer depends on a
      PRD's location/lifecycle. Entry format: `##### <area>/<sub>/<NNN> — <headline>`
      followed by `- **Layer:** …` bullets; the `## Test Case Catalog`
-     heading is the section the parser keys on — keep it. -->
+     heading is the section the parser keys on — keep it. An ID heads
+     exactly one entry, though several tests may share it: linkage-check
+     rule 20 fails on a heading used twice, which is what two branches
+     that each took the next free number merge to (issue #2513). -->
 
 # Test-Case Catalog
 
