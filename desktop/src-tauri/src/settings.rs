@@ -644,9 +644,17 @@ impl<'de> Deserialize<'de> for TranscriptionSettings {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let doc = StageSpec::deserialize(deserializer)?.into_document();
         let preset = Self::for_backend(doc.backend.unwrap_or_default());
+        let endpoint = doc.endpoint.unwrap_or_else(|| preset.endpoint.clone());
+        let model = match doc.model {
+            Some(model) if is_retired_speech_preset_model(&preset, &endpoint, &model) => {
+                preset.model
+            }
+            Some(model) => model,
+            None => preset.model,
+        };
         let stage = Self {
-            endpoint: doc.endpoint.unwrap_or(preset.endpoint),
-            model: doc.model.unwrap_or(preset.model),
+            endpoint,
+            model,
             backend: preset.backend,
             language: doc.language.unwrap_or(preset.language),
         };
@@ -657,6 +665,41 @@ impl<'de> Deserialize<'de> for TranscriptionSettings {
         }
         Ok(stage)
     }
+}
+
+/// Models an earlier build wrote as the OpenAI Speech preset, which OpenAI
+/// retires (issue #2539).
+///
+/// The Voice panel writes a stage's whole preset into the document when the
+/// backend changes, so `model = "whisper-1"` is in the settings of anyone who
+/// switched Speech to OpenAI before issue #1820 moved the preset, whether or
+/// not they ever chose a model. OpenAI shuts `whisper-1` down on 2027-02-26, so
+/// a stored copy is read as this build's preset instead of being kept until
+/// it fails: [`RETIRED_OPENAI_COMMAND_MODELS`]' reasoning, for the other stage.
+///
+/// **What this costs**: `whisper-1` is the one OpenAI transcription model that
+/// reports word and segment timing, so a user who chose it for
+/// [`crate::voice::evidence`]'s timing checks gets only the word count at
+/// OpenAI's endpoint from this build on, before the shutdown date rather than
+/// on it. Telling that user apart from one whose document holds the old
+/// preset is not possible from the document, and the second is the common
+/// case. `gpt-4o-transcribe` and `gpt-4o-mini-transcribe` retire on the same
+/// date but were never the preset, so a stored one is the user's choice and is
+/// kept; `docs/desktop/voice.md` says they retire.
+const RETIRED_OPENAI_SPEECH_MODELS: &[&str] = &["whisper-1"];
+
+/// Whether `model` is a retired Speech preset model stored at the OpenAI
+/// preset's own endpoint. The same model at any other endpoint, such as a
+/// gateway or a speech server on this machine, is the user's and is kept, as
+/// [`is_retired_preset_model`] keeps a Commands model there.
+fn is_retired_speech_preset_model(
+    preset: &TranscriptionSettings,
+    endpoint: &ServiceUrl,
+    model: &ModelId,
+) -> bool {
+    preset.backend == TranscriptionBackend::Remote
+        && *endpoint == preset.endpoint
+        && RETIRED_OPENAI_SPEECH_MODELS.contains(&model.as_str())
 }
 
 /// What a keyless backend pointed off this machine is refused with.
@@ -7232,12 +7275,14 @@ mod tests {
         assert_eq!(written.zoom.level, ZoomLevel::snap(1.25));
     }
 
-    /// Scenario (issue #1820): a document an older build wrote when the user
-    /// switched Commands to OpenAI holds the retired `gpt-5-mini` at OpenAI's
-    /// endpoint. It loads as this build's preset model, with the preset's
-    /// reasoning effort, while the same model at a gateway is kept as written.
+    /// Scenario (issues #1820 and #2539): a document an older build wrote when
+    /// the user switched Commands, or Speech, to OpenAI holds the retired
+    /// preset model at OpenAI's endpoint: `gpt-5-mini`, or `whisper-1`. Each
+    /// loads as this build's preset model (Commands with the preset's reasoning
+    /// effort, Speech keeping the user's language), while the same model at a
+    /// gateway is kept as written.
     #[test]
-    fn a_stored_retired_openai_command_model_loads_as_the_current_preset() {
+    fn a_stored_retired_openai_preset_model_loads_as_the_current_preset() {
         let dir = tempdir();
         let path = dir.path().join(SETTINGS_FILE_NAME);
         std::fs::write(
@@ -7278,6 +7323,60 @@ mod tests {
             "a gateway's model is the user's"
         );
         assert_eq!(intent.reasoning_effort(), None);
+
+        // Speech (issue #2539): what the panel wrote when the user picked
+        // OpenAI on a build whose preset was `whisper-1`, and the same with the
+        // endpoint left out, which the load fills in from the preset.
+        let load_speech = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            load_from(&path)
+                .voice
+                .expect("the section is present")
+                .transcription
+        };
+        for document in [
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
+             endpoint = \"https://api.openai.com/v1/audio/transcriptions\"\n\
+             model = \"whisper-1\"\nlanguage = \"sr\"\n",
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
+             model = \"whisper-1\"\nlanguage = \"sr\"\n",
+        ] {
+            let speech = load_speech(document);
+            assert_eq!(speech.model.as_str(), HOSTED_SPEECH_MODEL, "{document}");
+            assert_eq!(
+                speech,
+                TranscriptionSettings {
+                    language: SpeechLanguage::from_str_lossy("sr"),
+                    ..TranscriptionSettings::for_backend(TranscriptionBackend::Remote)
+                },
+                "the user's language survives the fold: {document}"
+            );
+        }
+
+        // Kept as written: `whisper-1` at a gateway or on this machine, and a
+        // transcription model the preset never was.
+        for (document, model) in [
+            (
+                "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
+                 endpoint = \"https://gateway.example.com/v1/audio/transcriptions\"\n\
+                 model = \"whisper-1\"\n",
+                "whisper-1",
+            ),
+            (
+                "version = 1\n\n[voice.transcription]\nbackend = \"local\"\n\
+                 endpoint = \"http://127.0.0.1:18000/v1/audio/transcriptions\"\n\
+                 model = \"whisper-1\"\n",
+                "whisper-1",
+            ),
+            (
+                "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
+                 endpoint = \"https://api.openai.com/v1/audio/transcriptions\"\n\
+                 model = \"gpt-4o-transcribe\"\n",
+                "gpt-4o-transcribe",
+            ),
+        ] {
+            assert_eq!(load_speech(document).model.as_str(), model, "{document}");
+        }
     }
 
     /// Scenario (issue #828): a hand-written voice stage that names only its
