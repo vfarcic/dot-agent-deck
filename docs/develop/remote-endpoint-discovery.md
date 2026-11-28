@@ -4,9 +4,14 @@ Issue [#1174](https://github.com/vfarcic/dot-agent-deck/issues/1174). This page 
 
 ## What it is not
 
-**It does not authenticate the listener, and no forwarded endpoint is self-describing.** The desktop opens the remote path with `ssh -L`, which terminates the connection locally: any peer credential readable at the near end describes the local `ssh` client, never whatever is listening on the far host. So the local defence that exists — `verify_endpoint_trusted`'s `lstat` of the endpoint inode, run by `daemon_attach` before connect — passes *by construction* for a forwarded socket, correctly and uninformatively: the inode it checks is the one our own `ssh` created, under our own uid, at our own mode.
+**It does not authenticate the listener, and no forwarded endpoint is self-describing.** The desktop opens the remote path with `ssh -L`, which terminates the connection locally: any peer credential readable at the near end describes the local `ssh` client, never whatever is listening on the far host. So the local check that runs on connecting to a forwarded socket — the peer-uid comparison in `platform::ipc`'s Unix connect path — passes *by construction*, correctly and uninformatively: the peer it reads is our own `ssh`, running under our own uid.
 
-Be precise about what that local defence is, because the obvious stronger description is wrong and #1174's own text carries it (PR #1191 review, P2). On `main` the client's connect path performs **no peer-credential check at all**. `platform::peercred` exports `peer_pid` and nothing else, and its caller uses it to identify a process to terminate — a lifecycle concern, not a trust check. A `peer_uid_raw` arrives with [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121); until that lands, "checked by peer uid after connect" describes no code in this tree.
+Be precise about what the local defences are, because each is easy to describe as more than it is (PR #1191 review, P2). Two of them bear on this, and neither looks past the near end:
+
+- **`verify_endpoint_trusted`'s `lstat` of the endpoint inode** — not a symlink, a socket, owned by this uid, mode exactly `0o600` — runs before a connect on **local** endpoints: `daemon_attach`'s lazy-spawn path, and the desktop's `establish`, which calls it under `endpoint.as_local()`. It is not run against the forwarded socket, which `remote_tunnel` keeps out of the `LocalEndpoint` type: a `0o600` inode we own says only that our own `ssh` created it.
+- **A peer-uid check after connect**, added by [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121) round two (PR #1179). `refuse_foreign_peer` runs inside each of the three Unix connect entry points (`IpcStream::connect`, `IpcClient::connect`, `IpcClient::connect_timeout`), reads the peer's uid from the kernel's record of the connection (`platform::peercred::peer_uid_raw`: `SO_PEERCRED` on Linux, `getpeereid` elsewhere), and refuses a listener running as another uid. That closes the window between the `lstat` and the connect, in which a name freed by a daemon unlinking its socket could be bound by another user. It narrows the local defence; it does not reach the far host, because over `ssh -L` the peer is the local `ssh` client.
+
+So "checked by peer uid after connect" now describes code in this tree, but for a forwarded endpoint the uid it checks is ours by construction, and the conclusion below is unchanged.
 
 What the far side can establish is therefore the whole of the boundary, and it stops short of identity. A completed attach-protocol `Hello` proves something is listening and speaks this wire. It does not prove that something is the deck's daemon. An attacker **already running as the remote login user** can bind a `0o600` socket of their own at the resolved path, answer the handshake, and replace the binary the resolver itself runs from. Against that actor nothing here adds a refusal.
 
@@ -27,7 +32,7 @@ Discovery used to be a shell snippet alone — `REMOTE_SOCKET_PROBE`, a restatem
 
 Above those sat a maintenance property worth naming separately: the rule had **two implementations**, this program's and a shell restatement of it, under a doc-comment obligation to keep them in step that nothing enforced. The two drifting shows up as a discovered path that never forwards.
 
-Issue [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121) is a neighbour, not a duplicate. It moves the temp-dir fallback into an owner-only per-uid directory and adds `-S` / `! -h` / `-O` clauses to the snippet's candidates, which closes a **foreign-uid** shadowing route. It was not offered as authentication and does not address either bullet above.
+Issue [#1121](https://github.com/vfarcic/dot-agent-deck/issues/1121) is a neighbour, not a duplicate. Its fix (PR #1179) moved the temp-dir fallback into an owner-only per-uid directory, added `-S` / `! -h` / `-O` clauses to the temp-dir arm's two candidates, and added the connect-time peer-uid check described above, all aimed at a **foreign-uid** actor. None of it was offered as authentication, and it addresses neither bullet above.
 
 ## The mechanism
 
@@ -78,7 +83,7 @@ Two of the three gains are immediate and one is latent, and an earlier draft of 
 
 - **An untrusted endpoint is no longer forwarded.** Immediate, and now binding.
 - **One implementation of the rule instead of two.** Immediate.
-- **A stale inode is detected** — but a dead endpoint exits `3`, so the snippet falls through and the rungs below still name the path. The user still gets `DeckNotAnswering`, exactly as before. The detection pays off when the resolver has a *second* candidate to move on to, which is the shape that arrives with #1121. Calling this an availability fix today would be an over-claim.
+- **A stale inode is detected** — but a dead endpoint exits `3`, so the snippet falls through and the rungs below still name the path. The user still gets `DeckNotAnswering`, exactly as before. The detection pays off when the resolver has a *second* candidate to move on to. #1121 did not bring one — `served_attach_endpoint` reads no legacy spelling — and the relocated endpoints [#1173](https://github.com/vfarcic/dot-agent-deck/issues/1173) added are consulted only when the per-uid directory is not an owner-only directory of ours: a squatted directory, not a dead daemon's leftover inode in our own one. Calling this an availability fix today would be an over-claim.
 
 ### Why it costs nothing on the wire
 
@@ -119,5 +124,5 @@ What would actually bind against a same-uid attacker is a secret that uid cannot
 - **Same-uid impersonation on the remote host**, as above, accepted rather than pending ([#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189)).
 - **Hosts running an older build**, which fall through to the filesystem rungs and gain none of the three checks.
 - **The `DOT_AGENT_DECK_ATTACH_SOCKET` and `XDG_RUNTIME_DIR` fallback rungs are still printed with no test at all** when the resolver is unavailable. That is unchanged behaviour, not a new gap, and it is bounded by the same "older build" case above.
-- **The resolver checks one candidate**, the one `attach_socket_path()` resolves. It does not itself try a legacy spelling, so the stale-inode detection above stays latent until it has a second candidate to fall to.
+- **The resolver has a second candidate in one case**: on the temp-dir fallback arm, when nothing answers at the per-uid path and that directory is not an owner-only directory of ours, it reports an answering relocated endpoint instead (#1173). It does not itself try a legacy spelling, so for a dead daemon's inode in the user's own per-uid directory the stale-inode detection above stays latent.
 - **The residuals `remote_tunnel::forced_options` already records** are untouched by any of this and are a different boundary: the user's own ssh config decides which host keys count as trusted (`KnownHostsCommand`, `UserKnownHostsFile`), and their `LocalForward` / `RemoteForward` / `DynamicForward` are inherited for the tunnel's whole life because `ClearAllForwardings` would clear our own `-L`.
