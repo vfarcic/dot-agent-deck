@@ -227,11 +227,26 @@ fn repository_pins_are_in_lockstep() {
     );
 }
 
-/// One renovate.json customManager, compiled: its one file pattern and its one
-/// matchString.
+/// One renovate.json customManager, compiled: its one file pattern, its one
+/// matchString and, when it sets a `regex:` versioningTemplate, that regex.
 struct RenovateManager {
     files: Regex,
     matcher: Regex,
+    /// The RWX nextest manager's `currentValue` is the release tag
+    /// (`cargo-nextest-X.Y.Z`, issue #2566), and its `regex:` versioning is
+    /// what reads the version out of it, so the comparison reads it the same
+    /// way rather than stripping a prefix it would have to keep in step.
+    versioning: Option<Regex>,
+}
+
+/// A customManager's `regex:` versioningTemplate, compiled, or `None` for a
+/// manager that uses its datasource's own versioning.
+fn regex_versioning(manager: &serde_json::Value) -> Option<Regex> {
+    let template = manager["versioningTemplate"].as_str()?;
+    let pattern = template
+        .strip_prefix("regex:")
+        .unwrap_or_else(|| panic!("versioningTemplate {template:?} is not a regex: versioning"));
+    Some(Regex::new(pattern).unwrap_or_else(|e| panic!("versioningTemplate {template:?}: {e}")))
 }
 
 /// renovate.json's customManagers that read `dep_name` from the `devbox`
@@ -289,6 +304,7 @@ fn renovate_devbox_managers(dep_name: &str, expected: usize) -> Vec<RenovateMana
                     .unwrap_or_else(|e| panic!("the {dep_name} managerFilePatterns regex: {e}")),
                 matcher: Regex::new(&only("matchStrings"))
                     .unwrap_or_else(|e| panic!("the {dep_name} matchString: {e}")),
+                versioning: regex_versioning(manager),
             }
         })
         .collect()
@@ -340,7 +356,23 @@ fn renovate_sites(managers: &[RenovateManager], root: &Path) -> Vec<String> {
                     .name("currentValue")
                     .expect("the matchString captures currentValue");
                 let line = text[..value.start()].matches('\n').count() + 1;
-                sites.push(format!("{rel}:{line} {}", value.as_str()));
+                let version = match &manager.versioning {
+                    None => value.as_str().to_string(),
+                    Some(versioning) => {
+                        let parts = versioning.captures(value.as_str()).unwrap_or_else(|| {
+                            panic!(
+                                "{rel}:{line}: {:?} is not a version under its manager's \
+                                 versioningTemplate, so Renovate would not bump it",
+                                value.as_str()
+                            )
+                        });
+                        format!(
+                            "{}.{}.{}",
+                            &parts["major"], &parts["minor"], &parts["patch"]
+                        )
+                    }
+                };
+                sites.push(format!("{rel}:{line} {version}"));
             }
         }
     }
@@ -625,6 +657,78 @@ fn renovate_reads_the_box_bootstraps_opencode_pins() {
         sites, expected,
         "renovate.json's customManagers must read exactly bootstrap.sh's two OpenCode pins, \
          as npm's opencode-ai and @opencode/cli (issue #2051)"
+    );
+}
+
+/// Issue #2566: Renovate ages each dependency on its own, so a group whose
+/// halves carry different `minimumReleaseAge`s opens with the younger-allowed
+/// half alone. PR #2527 moved bootstrap.sh's OpenCode 2.x while the npm lane's
+/// three days held scripts/opencode-pins/v2 back. Each OpenCode rule must
+/// apply to both managers and carry the npm lane's age.
+#[test]
+fn renovate_ages_both_halves_of_each_opencode_pin_alike() {
+    let config = read_json("renovate.json");
+    let rules = config["packageRules"].as_array().expect("packageRules");
+    let npm_lane: Vec<&serde_json::Value> = rules
+        .iter()
+        .filter(|r| r["matchManagers"] == serde_json::json!(["npm"]))
+        .filter(|r| r["matchPackageNames"].is_null() && r["matchFileNames"].is_null())
+        .filter(|r| r["minimumReleaseAge"].is_string())
+        .collect();
+    let [npm_lane] = npm_lane[..] else {
+        panic!(
+            "renovate.json must carry exactly one npm-wide minimumReleaseAge rule, found {}",
+            npm_lane.len()
+        );
+    };
+    let age = &npm_lane["minimumReleaseAge"];
+    for (_, package, _) in OPENCODE_PINS {
+        let own: Vec<&serde_json::Value> = rules
+            .iter()
+            .filter(|r| r["matchPackageNames"] == serde_json::json!([package]))
+            .filter(|r| r["groupName"].is_string())
+            .collect();
+        let [rule] = own[..] else {
+            panic!(
+                "renovate.json must carry exactly one group rule for {package}, found {}",
+                own.len()
+            );
+        };
+        assert!(
+            rule["matchManagers"].is_null(),
+            "the {package} rule must apply to the npm and the regex manager alike"
+        );
+        assert_eq!(
+            &rule["minimumReleaseAge"], age,
+            "the {package} rule must carry the npm lane's minimumReleaseAge, or its bootstrap \
+             half arrives without its npm half (PR #2527)"
+        );
+    }
+}
+
+/// Issue #2566: under the `crate` datasource's default `cargo` versioning a
+/// bare `0.9.149` is the requirement `^0.9.149`, which every later 0.9.x
+/// satisfies, so the workflows' nextest manager offered no update. It must
+/// read the pin as an exact version.
+#[test]
+fn renovate_reads_the_workflow_nextest_pin_as_an_exact_version() {
+    let config = read_json("renovate.json");
+    let managers: Vec<&serde_json::Value> = config["customManagers"]
+        .as_array()
+        .expect("customManagers")
+        .iter()
+        .filter(|m| m["depNameTemplate"] == "cargo-nextest" && m["datasourceTemplate"] == "crate")
+        .collect();
+    let [manager] = managers[..] else {
+        panic!(
+            "renovate.json must carry exactly one crate-datasource cargo-nextest manager, found {}",
+            managers.len()
+        );
+    };
+    assert_eq!(
+        manager["versioningTemplate"], "semver",
+        "the workflows' cargo-nextest manager must use semver versioning; under cargo's a \
+         bare X.Y.Z is a caret requirement and no 0.9.x bump is ever offered (issue #2566)"
     );
 }
 
@@ -1922,6 +2026,7 @@ fn renovate_rwx_lockstep_managers() -> Vec<RenovateManager> {
                 .expect("the RWX file pattern compiles"),
                 matcher: Regex::new(strings[0].as_str().expect("a string matchString"))
                     .expect("an RWX matchString compiles"),
+                versioning: regex_versioning(m),
             }
         })
         .collect();
@@ -1979,8 +2084,8 @@ fn rwx_config(rust: &str, nextest: &str, pnpm: &str, gotask: &str) -> String {
          run: curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain {rust}\n  \
          - key: nextest\n    \
          env:\n      \
-         CARGO_NEXTEST_VERSION: {nextest}\n    \
-         run: curl -fsSL -o /tmp/n.tar.gz https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${{CARGO_NEXTEST_VERSION}}/cargo-nextest-${{CARGO_NEXTEST_VERSION}}-x86_64-unknown-linux-gnu.tar.gz\n  \
+         CARGO_NEXTEST_RELEASE: cargo-nextest-{nextest}\n    \
+         run: curl -fsSL -o /tmp/n.tar.gz https://github.com/nextest-rs/nextest/releases/download/${{CARGO_NEXTEST_RELEASE}}/${{CARGO_NEXTEST_RELEASE}}-x86_64-unknown-linux-gnu.tar.gz\n  \
          - key: pnpm\n    \
          run: npm install -g pnpm@{pnpm}\n  \
          - key: go-task\n    \
@@ -2112,7 +2217,7 @@ fn an_rwx_config_missing_a_pin_fails() {
     let full = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1");
     for (class, marker) in [
         ("gotask", "go-task/task/releases"),
-        ("nextest", "CARGO_NEXTEST_VERSION:"),
+        ("nextest", "CARGO_NEXTEST_RELEASE:"),
         ("pnpm", "pnpm@"),
     ] {
         let rwx: String = full
@@ -2131,4 +2236,35 @@ fn an_rwx_config_missing_a_pin_fails() {
             "the failure must name the class:\n{text}"
         );
     }
+}
+
+/// Issue #2566: `.rwx/` pins nextest as its GitHub release tag, because
+/// renovate.json's manager looks the release up by that tag to move the
+/// checksum. A bare `X.Y.Z` there is a pin that manager cannot read, so the
+/// guard must refuse it rather than skip it, including when another `.rwx/`
+/// file still carries a valid pin that agrees (PR #2570 review).
+#[test]
+fn an_rwx_nextest_pin_without_its_tag_prefix_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    let valid = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1");
+    let fixture = rwx_fixture(&valid);
+    fs::write(
+        fixture.dir.path().join(".rwx/sandbox.yml"),
+        "tasks:\n  - key: nextest\n    env:\n      CARGO_NEXTEST_RELEASE: 0.9.143\n",
+    )
+    .expect("write the second fixture RWX config");
+    let out = fixture.run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "an RWX nextest pin without its `cargo-nextest-` tag prefix must fail, even beside \
+         a valid one:\n{text}"
+    );
+    assert!(
+        text.contains(".rwx/sandbox.yml") && text.contains("unreadable cargo-nextest pin"),
+        "the failure must name the file and the unreadable pin:\n{text}"
+    );
 }

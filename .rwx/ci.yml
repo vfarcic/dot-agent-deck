@@ -172,16 +172,18 @@ tasks:
     if: ${{ tasks.backend.values.active == 'true' }}
     use: rust
     env:
-      CARGO_NEXTEST_VERSION: 0.9.149
+      CARGO_NEXTEST_RELEASE: cargo-nextest-0.9.149
     run: |
       # The release asset, checked against its published SHA-256, rather than
-      # get.nexte.st piped straight into tar (issue #2300). A version bump
-      # needs the new checksum: the `.sha256` beside the tarball on the
-      # `cargo-nextest-<X.Y.Z>` GitHub release. The retry flags are the devbox
+      # get.nexte.st piped straight into tar (issue #2300). The pin is the
+      # GitHub release's TAG, and renovate.json's RWX nextest manager reads it
+      # together with the checksum below, so a Renovate bump moves both (issue
+      # #2566). A bump by hand needs the new checksum too: the `.sha256` beside
+      # the tarball on the new release. The retry flags are the devbox
       # download's in `.rwx/ci.yml`, which says what each one does.
       mkdir -p "$HOME/.cargo/bin"
       curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 -o /tmp/cargo-nextest.tar.gz \
-        "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${CARGO_NEXTEST_VERSION}/cargo-nextest-${CARGO_NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+        "https://github.com/nextest-rs/nextest/releases/download/${CARGO_NEXTEST_RELEASE}/${CARGO_NEXTEST_RELEASE}-x86_64-unknown-linux-gnu.tar.gz"
       echo "32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770  /tmp/cargo-nextest.tar.gz" | sha256sum -c -
       tar -xzf /tmp/cargo-nextest.tar.gz -C "$HOME/.cargo/bin" cargo-nextest
       cargo nextest --version
@@ -620,7 +622,7 @@ tasks:
       # release's checksums.txt), rather than the get.jetify.com script.
       # renovate.json's jetify-com/devbox manager moves that checksum with
       # `DEVBOX_USE_VERSION` in one PR (PR #2523), and xtask/linkage-check's
-      # rwx_devbox_checksum fails the build when the manager stops reading it.
+      # rwx_release_checksums fails the build when the manager stops reading it.
       # Issue #2160: a single HTTP 504 from this download turned the run red.
       # `--retry 5 --retry-all-errors` makes up to six attempts on any failure
       # (5xx, connection reset, timeout) with curl's doubling backoff

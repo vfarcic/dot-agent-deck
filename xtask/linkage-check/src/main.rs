@@ -282,17 +282,18 @@ mod review_findings;
 /// script is driven under `bash` against an offline `gh` stand-in.
 #[cfg(all(test, unix))]
 mod review_wait;
-/// PR #2523: renovate.json's jetify-com/devbox manager moves the `devbox`
-/// task's tarball SHA-256 with `DEVBOX_USE_VERSION`. Tests only: the task
-/// itself is what fails when the two disagree, and only on an RWX run.
-#[cfg(test)]
-mod rwx_devbox_checksum;
 /// Issue #2529: the tool caches of `.rwx/ci.yml`'s tasks built on `nix-install`
 /// carry the Nix release in their names, and renovate.json's NixOS/nix manager
 /// moves those names with `NIX_VERSION`. Tests only — RWX accepts any name, so
 /// a name a bump leaves behind shows only when a run restores the wrong cache.
 #[cfg(test)]
 mod rwx_nix_cache_keys;
+/// PR #2523 and issue #2566: renovate.json's jetify-com/devbox and RWX
+/// cargo-nextest managers move each `.rwx/` download's tarball SHA-256 with its
+/// version. Tests only: the task itself is what fails when the two disagree,
+/// and only on an RWX run.
+#[cfg(test)]
+mod rwx_release_checksums;
 /// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
 /// prefix test that decides which worktree a toolchain process is building for.
 /// Tests only — the rule lives in the script, no CI job runs it, and both ways
