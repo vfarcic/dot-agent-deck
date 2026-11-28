@@ -689,7 +689,9 @@ impl<'de> Deserialize<'de> for TranscriptionSettings {
 const RETIRED_OPENAI_SPEECH_MODELS: &[&str] = &["whisper-1"];
 
 /// Whether `model` is a retired Speech preset model stored at the OpenAI
-/// preset's own endpoint. The same model at any other endpoint, such as a
+/// preset's own endpoint, however a hand edit spelled its host's case or
+/// default port ([`ServiceUrl::same_url`]): OpenAI's retirement applies there
+/// whatever the spelling. The same model at any other endpoint, such as a
 /// gateway or a speech server on this machine, is the user's and is kept, as
 /// [`is_retired_preset_model`] keeps a Commands model there.
 fn is_retired_speech_preset_model(
@@ -698,7 +700,7 @@ fn is_retired_speech_preset_model(
     model: &ModelId,
 ) -> bool {
     preset.backend == TranscriptionBackend::Remote
-        && *endpoint == preset.endpoint
+        && endpoint.same_url(&preset.endpoint)
         && RETIRED_OPENAI_SPEECH_MODELS.contains(&model.as_str())
 }
 
@@ -1002,7 +1004,7 @@ impl<'de> Deserialize<'de> for IntentSettings {
 const RETIRED_OPENAI_COMMAND_MODELS: &[&str] = &["gpt-5-mini"];
 
 /// Whether `model` is a retired preset model stored at the OpenAI preset's own
-/// endpoint. A retired model at any other endpoint, such as a gateway or a
+/// endpoint, compared with [`ServiceUrl::same_url`]. A retired model at any other endpoint, such as a gateway or a
 /// server on this machine, is the user's and is kept: whether it still
 /// answers there is that server's business, not OpenAI's retirement list.
 fn is_retired_preset_model(
@@ -1011,7 +1013,7 @@ fn is_retired_preset_model(
     model: &ModelId,
 ) -> bool {
     preset.backend == IntentBackend::OpenaiCompatible
-        && *endpoint == preset.endpoint
+        && endpoint.same_url(&preset.endpoint)
         && RETIRED_OPENAI_COMMAND_MODELS.contains(&model.as_str())
 }
 
@@ -4395,7 +4397,66 @@ fn merged_document(
             .map(|current| current.as_table() as &dyn toml_edit::TableLike),
         false,
     );
+    if let (Some(ancestor), Some(current)) = (&ancestor, &current) {
+        for stage in ["transcription", "intent"] {
+            write_folded_model_with_its_endpoint(
+                &mut document,
+                &incoming,
+                ancestor,
+                current,
+                stage,
+            );
+        }
+    }
     Ok(document.to_string())
+}
+
+/// Write a voice stage's model when the file holds one this build folds on
+/// load and the caller moved that stage's endpoint (issue #2539 review).
+///
+/// A retired preset model is folded only at the preset's own endpoint
+/// ([`is_retired_preset_model`], [`is_retired_speech_preset_model`]), so the
+/// panel shows the current preset while the file still holds the retired id.
+/// An endpoint edit leaves the model's data the same in `ancestor` and
+/// `incoming`, so [`merge_tables`] keeps the file's retired id, and at the new
+/// endpoint the next load would no longer fold it: the user would see the
+/// model change back to one they never chose. So the model the user saw is
+/// written with the endpoint.
+///
+/// Only a **folded** value is replaced, told apart by the file's text
+/// differing from this build's reading of it (`current`). A model another
+/// writer set since the caller loaded reads as written, so it stands, as
+/// [`merge_tables`] would keep it.
+fn write_folded_model_with_its_endpoint(
+    document: &mut toml_edit::DocumentMut,
+    incoming: &toml_edit::DocumentMut,
+    ancestor: &toml_edit::DocumentMut,
+    current: &toml_edit::DocumentMut,
+    stage: &str,
+) {
+    let field = |doc: &toml_edit::DocumentMut, key: &str| {
+        doc.get("voice")
+            .and_then(|voice| voice.get(stage))
+            .and_then(|stage| stage.get(key))
+            .and_then(toml_edit::Item::as_str)
+            .map(str::to_owned)
+    };
+    let endpoint_moved = field(ancestor, "endpoint") != field(incoming, "endpoint");
+    let on_disk = field(document, "model");
+    let folded = on_disk.is_some() && on_disk != field(current, "model");
+    let Some(model) = field(incoming, "model") else {
+        return;
+    };
+    if !(endpoint_moved && folded) {
+        return;
+    }
+    if let Some(table) = document
+        .get_mut("voice")
+        .and_then(|voice| voice.get_mut(stage))
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        table.insert("model", toml_edit::value(model));
+    }
 }
 
 /// Deep-merge `incoming` into `base`: two tables merge key by key, anything
@@ -7340,6 +7401,13 @@ mod tests {
              model = \"whisper-1\"\nlanguage = \"sr\"\n",
             "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
              model = \"whisper-1\"\nlanguage = \"sr\"\n",
+            // OpenAI's endpoint spelled another way by hand still retires it.
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
+             endpoint = \"https://API.OpenAI.com/v1/audio/transcriptions\"\n\
+             model = \"whisper-1\"\nlanguage = \"sr\"\n",
+            "version = 1\n\n[voice.transcription]\nbackend = \"remote\"\n\
+             endpoint = \"https://api.openai.com:443/v1/audio/transcriptions\"\n\
+             model = \"whisper-1\"\nlanguage = \"sr\"\n",
         ] {
             let speech = load_speech(document);
             assert_eq!(speech.model.as_str(), HOSTED_SPEECH_MODEL, "{document}");
@@ -7347,6 +7415,8 @@ mod tests {
                 speech,
                 TranscriptionSettings {
                     language: SpeechLanguage::from_str_lossy("sr"),
+                    // The user's spelling of the endpoint is kept as written.
+                    endpoint: speech.endpoint.clone(),
                     ..TranscriptionSettings::for_backend(TranscriptionBackend::Remote)
                 },
                 "the user's language survives the fold: {document}"
@@ -7422,6 +7492,59 @@ mod tests {
             load_from(&path).voice,
             renamed.voice,
             "after changing only the model"
+        );
+    }
+
+    /// Scenario (issue #2539 review): a document an older build wrote holds a
+    /// retired preset model at OpenAI's endpoint, which this build shows as the
+    /// current preset. The user changes only that stage's endpoint, to a
+    /// gateway. The reload must show the model the user saw, not the retired
+    /// one, which at a gateway would no longer be folded. Another window's
+    /// model edit, which this build does not fold, must still stand.
+    #[test]
+    fn an_endpoint_edit_keeps_the_model_a_retired_preset_was_shown_as() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let retired = "version = 1\n\n\
+             [voice.intent]\nbackend = \"openai_compatible\"\n\
+             endpoint = \"https://api.openai.com/v1/chat/completions\"\n\
+             model = \"gpt-5-mini\"\n\n\
+             [voice.transcription]\nbackend = \"remote\"\n\
+             endpoint = \"https://api.openai.com/v1/audio/transcriptions\"\n\
+             model = \"whisper-1\"\n";
+        std::fs::write(&path, retired).unwrap();
+
+        let loaded = load_from(&path);
+        let mut edited = loaded.clone();
+        let voice = edited.voice.as_mut().unwrap();
+        voice.transcription.endpoint =
+            ServiceUrl::parse("https://gateway.example.com/v1/audio/transcriptions").unwrap();
+        voice.intent.endpoint =
+            ServiceUrl::parse("https://gateway.example.com/v1/chat/completions").unwrap();
+        save_to(&path, Some(&loaded), &edited).unwrap();
+
+        let reloaded = load_from(&path).voice.unwrap();
+        assert_eq!(reloaded.transcription.model.as_str(), HOSTED_SPEECH_MODEL);
+        assert_eq!(reloaded.intent.model.as_str(), OPENAI_COMMAND_MODEL);
+        assert_eq!(reloaded, edited.voice.clone().unwrap(), "what the user saw");
+
+        // The control: another window set a model this build does not fold
+        // after this one loaded. An endpoint edit from the stale copy is not a
+        // model edit, so the other window's model stands.
+        std::fs::write(&path, retired).unwrap();
+        let loaded = load_from(&path);
+        std::fs::write(
+            &path,
+            retired.replace("model = \"whisper-1\"", "model = \"gpt-4o-transcribe\""),
+        )
+        .unwrap();
+        let mut edited = loaded.clone();
+        edited.voice.as_mut().unwrap().transcription.endpoint =
+            ServiceUrl::parse("https://gateway.example.com/v1/audio/transcriptions").unwrap();
+        save_to(&path, Some(&loaded), &edited).unwrap();
+        assert_eq!(
+            load_from(&path).voice.unwrap().transcription.model.as_str(),
+            "gpt-4o-transcribe"
         );
     }
 
