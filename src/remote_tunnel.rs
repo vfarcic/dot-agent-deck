@@ -1794,10 +1794,13 @@ mod tunnel {
     /// above describes it. The snippet's first move is to run the far host's
     /// own `dot-agent-deck daemon endpoint`, which answers from inside this
     /// program rather than from a shell restatement of it: it resolves the path
-    /// with [`crate::platform::paths::attach_socket_path`] itself, runs
+    /// with [`crate::endpoint_resolve::served_attach_endpoint`] itself — the
+    /// answer of [`crate::platform::paths::resolve_attach_socket_path`], or, on
+    /// its temp-dir fallback arm when nothing answers there, a relocated
+    /// endpoint that does (issue #1173) — runs
     /// [`crate::platform::fsperm::verify_endpoint_trusted`] on it, completes a
     /// bounded attach-protocol `Hello` against whatever is listening, and
-    /// prints nothing unless all three hold.
+    /// prints the path only when both of those pass.
     ///
     /// Two things that buys, stated at their real width:
     ///
