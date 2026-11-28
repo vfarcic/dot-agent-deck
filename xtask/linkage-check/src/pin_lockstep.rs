@@ -732,6 +732,58 @@ fn renovate_reads_the_workflow_nextest_pin_as_an_exact_version() {
     );
 }
 
+/// Issue #2568: the same gap as #2566, for every other custom manager that
+/// reads the `crate` datasource (tauri-driver, cross) or takes its datasource
+/// from the file it reads, which for cargo-shear and cargo-mutants is `crate`.
+/// Each must read its pin as an exact version, so a manager added later in
+/// either shape is held to it too.
+#[test]
+fn renovate_reads_every_crate_custom_pin_as_an_exact_version() {
+    let config = read_json("renovate.json");
+    let managers = config["customManagers"].as_array().expect("customManagers");
+    let can_read_crate = |m: &serde_json::Value| {
+        m["datasourceTemplate"] == "crate"
+            || (m.get("datasourceTemplate").is_none()
+                && m["matchStrings"].as_array().is_some_and(|ss| {
+                    ss.iter()
+                        .any(|s| s.as_str().is_some_and(|s| s.contains("(?<datasource>")))
+                }))
+    };
+    let label = |m: &serde_json::Value| {
+        m["depNameTemplate"]
+            .as_str()
+            .map_or_else(|| format!("{}", m["managerFilePatterns"]), str::to_string)
+    };
+    let crate_managers: Vec<&serde_json::Value> =
+        managers.iter().filter(|m| can_read_crate(m)).collect();
+    let names: Vec<String> = crate_managers.iter().map(|m| label(m)).collect();
+    for expected in ["cargo-nextest", "tauri-driver", "cross"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "expected a crate-datasource custom manager for {expected}, found {names:?}; \
+             if it moved to another datasource, update this list"
+        );
+    }
+    assert!(
+        crate_managers
+            .iter()
+            .any(|m| m.get("datasourceTemplate").is_none()),
+        "expected the comment-driven manager (find-targets.sh's cargo-shear and \
+         cargo-mutants) among {names:?}"
+    );
+    let caret: Vec<String> = crate_managers
+        .iter()
+        .filter(|m| m["versioningTemplate"] != "semver")
+        .map(|m| label(m))
+        .collect();
+    assert!(
+        caret.is_empty(),
+        "these custom managers can read the crate datasource without `versioningTemplate: \
+         \"semver\"`, so cargo versioning reads each bare X.Y.Z pin as `^X.Y.Z` and Renovate \
+         offers no update inside that range (issue #2568): {caret:?}"
+    );
+}
+
 #[test]
 fn agreeing_fixture_passes() {
     if !bash_present() {

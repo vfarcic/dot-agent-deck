@@ -55,11 +55,12 @@
     },
     {
       "customType": "regex",
-      "description": "The tauri-driver version the desktop-driver job installs (issue #953), written once as `TAURI_DRIVER_VERSION: <X.Y.Z>` in that job's `env:`. It is not duplicated in devbox.json — CI installs it with `cargo install --locked` from crates.io and devbox carries no copy — so scripts/check-pin-lockstep.sh has no second site to compare it with; `desktop/scripts/driver-test.sh` reads this same line for a local run rather than restating the number, which is what keeps local and CI on one driver. No automerge rule matches it, so a bump waits for a human, which is right for the component that decides whether the flake-prone tier can even start a session.",
+      "description": "The tauri-driver version the desktop-driver job installs (issue #953), written once as `TAURI_DRIVER_VERSION: <X.Y.Z>` in that job's `env:`. It is not duplicated in devbox.json — CI installs it with `cargo install --locked` from crates.io and devbox carries no copy — so scripts/check-pin-lockstep.sh has no second site to compare it with; `desktop/scripts/driver-test.sh` reads this same line for a local run rather than restating the number, which is what keeps local and CI on one driver. No automerge rule matches it, so a bump waits for a human, which is right for the component that decides whether the flake-prone tier can even start a session. `semver` versioning, as the workflow cargo-nextest manager above uses (issue #2568): the `crate` datasource's default `cargo` versioning reads a bare X.Y.Z as the requirement `^X.Y.Z`, which every later release in that range already satisfies, so this pin was offered no update at all.",
       "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/", "/^\\.rwx/[^/]+\\.ya?ml$/"],
       "matchStrings": ["TAURI_DRIVER_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "crate",
-      "depNameTemplate": "tauri-driver"
+      "depNameTemplate": "tauri-driver",
+      "versioningTemplate": "semver"
     },
     {
       "customType": "regex",
@@ -142,17 +143,19 @@
     },
     {
       "customType": "regex",
-      "description": "The `cross` version the aarch64 builds install: release.yml's aarch64 leg, the aarch64-crossbuild-check.yml check that exists to predict it, and `.rwx/ci.yml`'s `aarch64-crossbuild` task (docs/develop/rwx.md). One manager over the three files, so one PR moves all of them and the check keeps predicting the release build.",
+      "description": "The `cross` version the aarch64 builds install: release.yml's aarch64 leg, the aarch64-crossbuild-check.yml check that exists to predict it, and `.rwx/ci.yml`'s `aarch64-crossbuild` task (docs/develop/rwx.md). One manager over the three files, so one PR moves all of them and the check keeps predicting the release build. `semver` versioning, as the workflow cargo-nextest manager above uses (issue #2568): the `crate` datasource's default `cargo` versioning reads a bare X.Y.Z as the requirement `^X.Y.Z`, which every later release in that range already satisfies, so this pin was offered no update at all.",
       "managerFilePatterns": ["/^\\.github/workflows/aarch64-crossbuild-check\\.yml$/", "/^\\.github/workflows/release\\.yml$/", "/^\\.rwx/ci\\.yml$/"],
       "matchStrings": ["cargo install cross --locked --version (?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "crate",
-      "depNameTemplate": "cross"
+      "depNameTemplate": "cross",
+      "versioningTemplate": "semver"
     },
     {
       "customType": "regex",
-      "description": "The static tools `/code-cleanup` picks its targets from (issue #1819): cargo-shear, cargo-mutants and knip, each pinned once in `.claude/skills/code-cleanup/find-targets.sh` as `<NAME>_VERSION=<X.Y.Z>` under a `# renovate: datasource=<datasource> depName=<package>` comment, which is where this manager reads the datasource and package from. The script refuses a cargo tool installed at any other version, naming the `cargo install --locked` command for the pin, and runs knip as `pnpm dlx knip@<pin>`, so a bump here is the whole upgrade. `code_cleanup_009_renovate_reads_every_tool_pin` in xtask/linkage-check/src/code_cleanup_scope.rs runs this matchString over the real script and requires it to extract every pin, so a pin written in another layout goes red there instead of silently rotting. `.rwx/sandbox.yml` repeats the cargo-mutants pin in the same layout, indented inside a `run:` block (hence the `\\s*` before the variable), so the RWX sandbox can run `/code-cleanup`'s mutation step; this manager bumps both copies in one PR, and `code_cleanup_018_the_sandbox_installs_the_pinned_cargo_mutants` fails when they differ or when this matchString stops reading the sandbox's copy.",
+      "description": "The static tools `/code-cleanup` picks its targets from (issue #1819): cargo-shear, cargo-mutants and knip, each pinned once in `.claude/skills/code-cleanup/find-targets.sh` as `<NAME>_VERSION=<X.Y.Z>` under a `# renovate: datasource=<datasource> depName=<package>` comment, which is where this manager reads the datasource and package from. The script refuses a cargo tool installed at any other version, naming the `cargo install --locked` command for the pin, and runs knip as `pnpm dlx knip@<pin>`, so a bump here is the whole upgrade. `code_cleanup_009_renovate_reads_every_tool_pin` in xtask/linkage-check/src/code_cleanup_scope.rs runs this matchString over the real script and requires it to extract every pin, so a pin written in another layout goes red there instead of silently rotting. `.rwx/sandbox.yml` repeats the cargo-mutants pin in the same layout, indented inside a `run:` block (hence the `\\s*` before the variable), so the RWX sandbox can run `/code-cleanup`'s mutation step; this manager bumps both copies in one PR, and `code_cleanup_018_the_sandbox_installs_the_pinned_cargo_mutants` fails when they differ or when this matchString stops reading the sandbox's copy. `semver` versioning for every pin this manager reads (issue #2568): the cargo tools come from the `crate` datasource, whose default `cargo` versioning reads a bare X.Y.Z as the requirement `^X.Y.Z` and so offered cargo-shear and cargo-mutants no update at all; the matchString accepts only an exact X.Y.Z, which `semver` reads the same way npm's versioning does, so knip is unaffected.",
       "managerFilePatterns": ["/^\\.claude/skills/code-cleanup/find-targets\\.sh$/", "/^\\.rwx/sandbox\\.yml$/"],
-      "matchStrings": ["#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+)\\s+depName=(?<depName>[a-z0-9-]+)\\s*\\n\\s*[A-Z_]+_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"]
+      "matchStrings": ["#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+)\\s+depName=(?<depName>[a-z0-9-]+)\\s*\\n\\s*[A-Z_]+_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "versioningTemplate": "semver"
     },
     {
       "customType": "regex",
