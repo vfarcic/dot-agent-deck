@@ -637,7 +637,11 @@ scan_rwx_toolchain() {
   scan_rwx 'rust-version:[[:space:]]*' 'Rust toolchain'
   scan_rwx '--default-toolchain[[:space:]]+' 'Rust toolchain'
 }
-scan_rwx_nextest() { scan_rwx 'CARGO_NEXTEST_VERSION:[[:space:]]*' 'cargo-nextest'; }
+# nextest is pinned as its GitHub release TAG (issue #2566), so the
+# `cargo-nextest-` is part of renovate.json's `currentValue` there, which that
+# manager's `regex:` versioning reads X.Y.Z back out of. It is stripped here
+# with the key so the rest compares with devbox.json as the other pins do.
+scan_rwx_nextest() { scan_rwx 'CARGO_NEXTEST_RELEASE:[[:space:]]*cargo-nextest-' 'cargo-nextest'; }
 scan_rwx_pnpm() { scan_rwx 'pnpm@' 'pnpm'; }
 scan_rwx_gotask() { scan_rwx 'go-task/task/releases/download/v' 'go-task'; }
 
