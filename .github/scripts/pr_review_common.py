@@ -11,6 +11,8 @@ import json
 import re
 import subprocess
 import sys
+import time
+from datetime import datetime
 
 # The contexts the `main-protected` ruleset requires, as a LAST-RESORT FALLBACK.
 #
@@ -533,18 +535,72 @@ def pr_changed_paths(repo, number):
 # rather than a repository variable: it shows up in a diff and is reviewed.
 INDEPENDENT_REVIEWERS = ("qodo-code-review[bot]", "greptile-apps[bot]")
 
+# Issue #2564: a summary comment that names the head is not yet a FINISHED
+# review for the reviewers listed here, as `(settle_seconds,
+# first_review_settle_seconds)`. On a push after the first, Qodo moves the
+# head marker in its "Code Review by Qodo" comment to the new head usually
+# within a minute, and posts that head's findings up to about 12 minutes later
+# (issue #2507: 130 of its 340 inline findings on 150 PRs came 47 s to 714 s
+# after the comment first named their head). So the comment counts only once
+# it was never edited and is `first_review_settle_seconds` old (a PR's first
+# review, which Qodo posts in one step), or its last edit is `settle_seconds`
+# old. A finding on the head ends the wait sooner, through the inline shape.
+#
+# The rule and its numbers are #2544's `settle_minutes` and
+# `first_review_settle_minutes` for Qodo in
+# `.claude/skills/pr-create/reviewers.json`, which `wait-reviews.sh` reads. They
+# are COPIED here rather than read from there, on purpose: `.claude/` is not in
+# DENY_PATHS, so a gate that read that file would let a pull request this
+# workflow may approve unattended relax the gate that approval rests on. Same
+# reason INDEPENDENT_REVIEWERS is a list in code. A linkage-check test pins the
+# two copies together, so they cannot drift silently.
+#
+# Greptile is absent: it reviews once, when the PR opens, and posts its summary
+# when the review is complete (reviewers.json's note on it).
+SUMMARY_SETTLE_SECONDS = {"qodo-code-review[bot]": (15 * 60, 1 * 60)}
 
-def independent_review_at(sha, comments, review_comments, reviews):
+
+def _epoch(timestamp):
+    """A GitHub ISO-8601 timestamp as epoch seconds, or None when unreadable."""
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _summary_settled(login, comment, now):
+    """Has this summary comment sat long enough to be a finished review? (#2564)
+
+    True for a reviewer without a settle rule. For one with a rule, a comment
+    whose timestamps cannot be read is NOT settled: the safe direction is a
+    withheld vote, never an approval resting on a review that may be unfinished.
+    """
+    rule = SUMMARY_SETTLE_SECONDS.get(login)
+    if rule is None:
+        return True
+    settle, first_review_settle = rule
+    created = _epoch(comment.get("created_at"))
+    updated = _epoch(comment.get("updated_at"))
+    if created is None or updated is None:
+        return False
+    if created == updated and now - created >= first_review_settle:
+        return True
+    return now - updated >= settle
+
+
+def independent_review_at(sha, comments, review_comments, reviews, now=None):
     """Did an independent reviewer look at THIS head? The reviewer's login, or None.
 
     The vote job's question, answered by `independent_review_evidence`, which
     also says where the evidence is.
     """
-    evidence = independent_review_evidence(sha, comments, review_comments, reviews)
+    evidence = independent_review_evidence(sha, comments, review_comments, reviews, now)
     return evidence["login"] if evidence else None
 
 
-def independent_review_evidence(sha, comments, review_comments, reviews):
+def independent_review_evidence(sha, comments, review_comments, reviews, now=None):
     """Did an independent reviewer look at THIS head, and through what? (issue #1270)
 
     Returns `{"login", "artefact"}` or None. `artefact` names the shape that
@@ -580,7 +636,15 @@ def independent_review_evidence(sha, comments, review_comments, reviews):
         commits land rather than posting a new one. Measured 2026-09-24 on
         #1268: the comment's `created_at` sat two commits behind the head while
         its body cited the head SHA, so `created_at` is not the freshness
-        signal and a timestamp comparison would read as stale.
+        signal and a timestamp comparison would read as stale. Naming the head
+        is necessary but, for Qodo, not enough (issue #2564): the marker moves
+        to a new head before that head's review is finished, so the comment
+        counts only once it has settled (`SUMMARY_SETTLE_SECONDS`), judged
+        against `now`, epoch seconds, which defaults to the current time.
+
+    A REPLY in a review thread (`in_reply_to_id` set) does not count as the
+    inline shape: it answers a thread rather than reviewing the head, and
+    #2544's signal for a finished Qodo review excludes replies for that reason.
 
     Absence is not a defect — it means nobody independent has read this head
     yet, which is a reason to withhold an approval rather than to refuse the
@@ -588,6 +652,8 @@ def independent_review_evidence(sha, comments, review_comments, reviews):
     """
     if not sha:
         return None
+    if now is None:
+        now = time.time()
 
     def found(login, artefact):
         return {"login": login, "artefact": artefact}
@@ -606,11 +672,19 @@ def independent_review_evidence(sha, comments, review_comments, reviews):
         # `original_commit_id` is where the comment was WRITTEN; `commit_id`
         # follows the head. See the docstring -- reading the latter makes this
         # gate vacuous on any pull request that ever received an inline finding.
-        if login in INDEPENDENT_REVIEWERS and comment.get("original_commit_id") == sha:
+        if (
+            login in INDEPENDENT_REVIEWERS
+            and comment.get("original_commit_id") == sha
+            and comment.get("in_reply_to_id") is None
+        ):
             return found(login, "inline review comment")
     for comment in comments or ():
         login = ((comment.get("user") or {}).get("login")) or ""
-        if login in INDEPENDENT_REVIEWERS and sha in (comment.get("body") or ""):
+        if (
+            login in INDEPENDENT_REVIEWERS
+            and sha in (comment.get("body") or "")
+            and _summary_settled(login, comment, now)
+        ):
             return found(login, "summary comment")
     return None
 
@@ -625,7 +699,9 @@ def describe_independent_review(evidence):
     if not evidence:
         return (
             "none: no submitted review, inline review comment or summary comment by "
-            f"{' or '.join(INDEPENDENT_REVIEWERS)} covers this head SHA"
+            f"{' or '.join(INDEPENDENT_REVIEWERS)} covers this head SHA (a Qodo "
+            "summary comment naming the head counts only once its review of the head "
+            "has settled, issue #2564)"
         )
     # No URL, and no id (issue #1847): see `independent_review_evidence`.
     return f"{evidence['login']}, through its {evidence['artefact']}"
@@ -967,10 +1043,14 @@ def pr_reviews(repo, pr_number):
 
 
 def pr_comments(repo, pr_number):
-    """Every issue comment on a pull request, paginated. Same paging reason."""
+    """Every issue comment on a pull request, paginated. Same paging reason.
+
+    `created_at` and `updated_at` are what tell `independent_review_evidence`
+    whether Qodo's summary comment has settled (issue #2564).
+    """
     return gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {body, user: {login: .user.login}}]",
+        "--jq", "[.[] | {body, created_at, updated_at, user: {login: .user.login}}]",
     )
 
 
@@ -987,7 +1067,10 @@ def pr_review_comments(repo, pr_number):
     """
     return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {commit_id, original_commit_id, body, user: {login: .user.login}}]",
+        # `in_reply_to_id`: a reply answers a thread rather than reviewing the
+        # head, so it is not inline coverage (issue #2564).
+        "--jq", "[.[] | {commit_id, original_commit_id, in_reply_to_id, body, "
+        "user: {login: .user.login}}]",
     )
 
 
