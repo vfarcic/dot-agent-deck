@@ -1150,6 +1150,16 @@ const RULES: &[Rule] = &[
                   would run in no CI job (issues #2091, #2108). See `e2e_shard_selection`.",
         check: rule_e2e_only_tests_are_selected,
     },
+    Rule {
+        number: 20,
+        name: "catalog-heading-used-once",
+        summary: "No catalog ID heads more than one `##### <area>/<sub>/<NNN>` entry anywhere in \
+                  `tests/CATALOG.md`. Several tests under one entry stay legal; two entries under \
+                  one ID is what two branches that both took the next free number merge to \
+                  without a git conflict (issue #2513). It does not see a collision whose \
+                  conflict was resolved by keeping one entry; see `duplicate_heading_failures`.",
+        check: rule_catalog_heading_used_once,
+    },
 ];
 
 /// Everything the rules read, resolved once before any of them runs.
@@ -1161,6 +1171,8 @@ const RULES: &[Rule] = &[
 struct Inputs {
     root: PathBuf,
     catalog_ids: BTreeSet<String>,
+    /// Rule 20: every catalog heading by id, the whole file.
+    catalog_headings: BTreeMap<String, Vec<CatalogHeading>>,
     allowlist: BTreeSet<String>,
     docs_config: xtask_docs::DocsConfig,
     occurrences: Vec<SpecOccurrence>,
@@ -1615,13 +1627,15 @@ fn gather_inputs(root: PathBuf) -> Result<Inputs, ExitCode> {
     let allowlist_path = paths::join_repo_relative(&root, ALLOWLIST_PATH);
     let tests_dir = root.join(TESTS_DIR);
 
-    let catalog_ids = match parse_catalog_ids(&catalog_path) {
-        Ok(ids) => ids,
+    let catalog_text = match std::fs::read_to_string(&catalog_path) {
+        Ok(text) => text,
         Err(e) => {
             eprintln!("failed to parse catalog at {}: {e}", catalog_path.display());
             return Err(ExitCode::from(2));
         }
     };
+    let catalog_ids = parse_catalog_ids(&catalog_text);
+    let catalog_headings = catalog_headings(&catalog_text);
     let allowlist = match read_allowlist(&allowlist_path) {
         Ok(set) => set,
         Err(e) => {
@@ -1649,6 +1663,7 @@ fn gather_inputs(root: PathBuf) -> Result<Inputs, ExitCode> {
     Ok(Inputs {
         root,
         catalog_ids,
+        catalog_headings,
         allowlist,
         docs_config,
         occurrences,
@@ -1922,8 +1937,7 @@ fn repo_root() -> PathBuf {
 /// occurrence of `##### <area>/<sub>/<NNN>` (the catalog entry header
 /// form). The deliberate-skips table at the bottom uses table rows,
 /// not headers, so it is excluded by construction.
-fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeSet<String>> {
-    let text = std::fs::read_to_string(catalog_path)?;
+fn parse_catalog_ids(text: &str) -> BTreeSet<String> {
     let mut in_catalog = false;
     let header_re = Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\b")
         .expect("catalog header regex compiles");
@@ -1940,7 +1954,91 @@ fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeSet<String>> {
             ids.insert(caps.get(1).unwrap().as_str().to_string());
         }
     }
-    Ok(ids)
+    ids
+}
+
+/// One `##### <id> — <headline>` heading, where rule 20 found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogHeading {
+    /// 1-based line in `tests/CATALOG.md`.
+    line: usize,
+    /// The text after the id, separator stripped, so a failure can show the
+    /// two entries apart.
+    headline: String,
+}
+
+/// Every `##### <area>/<sub>/<NNN>` heading in the WHOLE catalog file, keyed
+/// by id, in file order (issue #2513).
+///
+/// Deliberately not limited to the `## Test Case Catalog` sections
+/// [`parse_catalog_ids`] reads: the desktop sections further down
+/// (`## Desktop agent cards (webview)`, the native driver scenarios) number
+/// their entries by the same "next free number" habit, so two branches can
+/// collide there exactly as they can in the Rust half. On `main` when this
+/// was written no id headed two entries anywhere in the file (2,432 headings).
+fn catalog_headings(text: &str) -> BTreeMap<String, Vec<CatalogHeading>> {
+    let header_re =
+        Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\b[\s\u{2014}-]*(.*)$")
+            .expect("catalog heading regex compiles");
+    let mut out: BTreeMap<String, Vec<CatalogHeading>> = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        if let Some(caps) = header_re.captures(line) {
+            out.entry(caps[1].to_string())
+                .or_default()
+                .push(CatalogHeading {
+                    line: i + 1,
+                    headline: caps[2].trim().to_string(),
+                });
+        }
+    }
+    out
+}
+
+/// Rule 20 (issue #2513): a catalog id heads at most one entry.
+///
+/// **Why the heading and not the tests.** Ids are picked by hand as the next
+/// free number in an area, so two branches cut from the same base both pick
+/// the same one. Each adds its own `##### <id>` entry, usually at a different
+/// place in the area (one next to a related entry, one at the end), and the
+/// two `#[spec]` annotations sit in different functions — so git merges both
+/// halves cleanly and `main` ends up with two unrelated tests under one id.
+/// That is what PRs #2463 and #2457 did with `upgrade/tui-upgrade/004` on
+/// 2026-11-22. The tests cannot tell that apart from the legitimate case: one
+/// entry covering several tests is common (91 ids on `main` span more than one
+/// file, one of them 78 tests), so neither a count nor a file spread is a
+/// signal. What a clean merge of the collision leaves and the legitimate case never
+/// does is a SECOND entry: [`parse_catalog_ids`] collects ids into a set, so
+/// before this rule the duplicate collapsed silently and rules 1 and 2 both
+/// passed.
+///
+/// **What it does not catch.** Two branches that insert their entry at the
+/// same line conflict in git instead; a person resolving that conflict by
+/// keeping one heading leaves one entry over two tests, which is
+/// indistinguishable from the legitimate case and passes this rule.
+fn duplicate_heading_failures(headings: &BTreeMap<String, Vec<CatalogHeading>>) -> Vec<String> {
+    headings
+        .iter()
+        .filter(|(_, entries)| entries.len() > 1)
+        .map(|(id, entries)| {
+            let where_ = entries
+                .iter()
+                .map(|h| format!("line {}: {:?}", h.line, h.headline))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "catalog ID `{id}` heads {} entries in {CATALOG_PATH} ({where_}) — one entry per \
+                 ID; several tests may share an entry, but two entries under one ID is what two \
+                 branches that each took the next free number merge to without a conflict \
+                 (issue #2513). Give the newer entry, and its #[spec] annotations and function \
+                 name prefixes, the next ID free on main",
+                entries.len()
+            )
+        })
+        .collect()
+}
+
+fn rule_catalog_heading_used_once(inputs: &Inputs) -> Vec<String> {
+    duplicate_heading_failures(&inputs.catalog_headings)
 }
 
 fn read_allowlist(path: &Path) -> std::io::Result<BTreeSet<String>> {
@@ -3626,5 +3724,108 @@ let y = 2;"###;
         assert!(out.contains("let _ = r_value;"));
         // The trailing line comment is still stripped.
         assert!(!out.contains("line comment after"));
+    }
+
+    // --- rule 20: a catalog ID heads one entry (issue #2513) ---
+
+    /// The shape #2463 and #2457 merged to: two `##### upgrade/tui-upgrade/004`
+    /// entries in different places of one area. Built inline rather than read
+    /// from the checkout so the rule's own logic stays in the fast tier.
+    const COLLIDED_CATALOG: &str = "\
+## Test Case Catalog
+
+#### upgrade/tui-upgrade
+
+##### upgrade/tui-upgrade/001 — The badge's key opens the dialog.
+- **Layer:** L2.
+
+##### upgrade/tui-upgrade/004 — Confirming the dialog also upgrades the release collector.
+- **Layer:** L2.
+
+##### upgrade/tui-upgrade/003 — The TUI notices a release published while it runs.
+- **Layer:** L2.
+
+##### upgrade/tui-upgrade/004 — A terminal focus-in re-checks for a release.
+- **Layer:** L2.
+";
+
+    /// Two branches each add `upgrade/tui-upgrade/004` at a different
+    /// place in the area, which git merges without a conflict. The rule names the
+    /// id once, with both lines and both headlines, so a reader can tell which
+    /// entry to renumber.
+    #[test]
+    fn catalog_heading_used_once_names_both_entries_of_a_collided_id() {
+        let failures = duplicate_heading_failures(&catalog_headings(COLLIDED_CATALOG));
+        assert_eq!(
+            failures.len(),
+            1,
+            "one finding per collided id: {failures:#?}"
+        );
+        let f = &failures[0];
+        for needle in [
+            "`upgrade/tui-upgrade/004` heads 2 entries",
+            "line 8: \"Confirming the dialog also upgrades the release collector.\"",
+            "line 14: \"A terminal focus-in re-checks for a release.\"",
+            "issue #2513",
+        ] {
+            assert!(f.contains(needle), "finding lacks {needle:?}: {f}");
+        }
+        // The set the other rules read still collapses the duplicate, which is
+        // exactly why rules 1 and 2 could not see it.
+        assert_eq!(parse_catalog_ids(COLLIDED_CATALOG).len(), 3);
+    }
+
+    /// The legitimate case the issue says to keep: one entry, any number of
+    /// tests. The rule reads only headings, so a single entry passes however
+    /// many `#[spec]` annotations name it, and distinct ids never trip it.
+    #[test]
+    fn catalog_heading_used_once_passes_one_entry_per_id() {
+        let text = COLLIDED_CATALOG.replacen(
+            "##### upgrade/tui-upgrade/004 — A terminal",
+            "##### upgrade/tui-upgrade/005 — A terminal",
+            1,
+        );
+        let headings = catalog_headings(&text);
+        assert_eq!(headings.len(), 4);
+        assert!(duplicate_heading_failures(&headings).is_empty());
+    }
+
+    /// The desktop sections below the `## Test Case Catalog` ones number their
+    /// entries the same way, so a collision there counts too, even though
+    /// [`parse_catalog_ids`] does not read those sections.
+    #[test]
+    fn catalog_heading_used_once_covers_sections_outside_the_rust_catalog() {
+        let text = "\
+## Desktop agent cards (webview)
+
+##### desktop/agent-cards/031 — One thing.
+- **Test:** vitest.
+
+##### desktop/agent-cards/031 — Another thing.
+- **Test:** vitest.
+";
+        assert!(parse_catalog_ids(text).is_empty());
+        let failures = duplicate_heading_failures(&catalog_headings(text));
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("`desktop/agent-cards/031` heads 2 entries"));
+    }
+
+    /// A mention of an id that is not an entry heading — a deeper or shallower
+    /// heading, a cross-reference in a bullet — is not a second entry.
+    #[test]
+    fn catalog_heading_used_once_ignores_mentions_that_are_not_entry_headings() {
+        let text = "\
+##### upgrade/tui-upgrade/004 — The entry.
+- **Does not assert:** the focus re-check (`upgrade/tui-upgrade/004`).
+#### upgrade/tui-upgrade/004
+###### upgrade/tui-upgrade/004 — too deep
+";
+        let headings = catalog_headings(text);
+        assert_eq!(
+            headings["upgrade/tui-upgrade/004"].len(),
+            1,
+            "{headings:#?}"
+        );
+        assert!(duplicate_heading_failures(&headings).is_empty());
     }
 }
