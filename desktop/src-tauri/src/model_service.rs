@@ -205,6 +205,17 @@ impl ServiceUrl {
         &self.0
     }
 
+    /// Whether this and `other` name the same URL once parsed, so a host's
+    /// case and a scheme's default port spelled out do not tell two apart.
+    /// The stored text is untouched; this only compares. A value that does
+    /// not parse, which [`Self::parse`] never produces, compares as text.
+    pub fn same_url(&self, other: &Self) -> bool {
+        match (reqwest::Url::parse(&self.0), reqwest::Url::parse(&other.0)) {
+            (Ok(this), Ok(that)) => this == that,
+            _ => self == other,
+        }
+    }
+
     /// Whether this points at this machine.
     ///
     /// What the transcription backend reads to decide between *the service
